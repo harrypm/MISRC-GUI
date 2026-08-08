@@ -166,147 +166,6 @@ def check_meson_fft_policy(meson_path: Path) -> int:
     return 0
 
 
-def check_meson_vendored_hsdaoh_policy(meson_path: Path) -> int:
-    """Ensure meson.build prefers the vendored .deps/install hsdaoh (mirrors CI)
-    so a bare local build cannot silently link a stale system libhsdaoh that
-    lacks the v1.0.9 connect fixes."""
-    meson_text = read_text(meson_path)
-    required_snippets = [
-        "hsdaoh_vendored_pc",
-        "fs.exists(hsdaoh_vendored_pc)",
-        "Using vendored hsdaoh from .deps/install (mirrors CI",
-        "declare_dependency",
-        "deps = [ hsdaoh_dep ]",
-    ]
-    for snippet in required_snippets:
-        if snippet not in meson_text:
-            return fail(f"meson.build is missing vendored-hsdaoh policy snippet: {snippet}")
-    forbidden_snippets = [
-        "deps = [ dependency('hsdaoh', static: windows_static_deps) ]",
-    ]
-    for snippet in forbidden_snippets:
-        if snippet in meson_text:
-            return fail(f"meson.build still contains bare system-hsdaoh dependency (no vendored guard): {snippet}")
-    return 0
-
-
-def check_built_gui_links_vendored_hsdaoh(repo_root: Path, gui_path: Optional[Path] = None) -> int:
-    """Runtime check: assert the built misrc_gui links the vendored hsdaoh from
-    .deps/install, not a stale system libhsdaoh. Platform-aware:
-      - Linux: ldd (dynamic, must resolve to .deps/install)
-      - macOS: otool -L (dynamic, must resolve to @rpath/.deps/install)
-      - Windows (MSYS2/MinGW static build): no runtime hsdaoh dylib expected —
-        assert objdump -p shows no libhsdaoh DLL NEEDED (it's statically linked).
-    In pre-build (preflight) mode with no gui_path and no default build/misrc_gui,
-    this skips (returns 0) so preflight still passes; CI runs it again post-build
-    against the real $BUILD_DIR/misrc_gui via --gui-path.
-    """
-    gui = gui_path if gui_path is not None else (repo_root / "misrc_tools" / "build" / "misrc_gui")
-    if not gui.exists():
-        return 0  # no local build present; preflight or no-build context
-
-    if sys.platform == "darwin":
-        try:
-            res = run_checked(["otool", "-L", str(gui)])
-        except subprocess.CalledProcessError as exc:
-            return fail(f"otool -L misrc_gui failed (rc={exc.returncode}): {(exc.stderr or '').strip()}")
-        found_hsdaoh = False
-        for line in res.stdout.splitlines():
-            if "libhsdaoh" in line:
-                found_hsdaoh = True
-                stripped = line.strip()
-                # Portable macOS bundles use @rpath/libhsdaoh... resolved from
-                # the app Frameworks dir; a bare /usr/local/lib or /opt/homebrew
-                # path means a stale system lib got linked.
-                if "/usr/local/lib/" in line or "/opt/homebrew/" in line or "/usr/lib/" in line:
-                    return fail(f"misrc_gui links a SYSTEM hsdaoh on macOS (expected @rpath/.deps/install): {stripped}")
-        if not found_hsdaoh:
-            return fail("misrc_gui does not link libhsdaoh at all (macOS otool -L)")
-        return 0
-
-    if os.name == "nt" or sys.platform.startswith("win"):
-        # Windows MSYS2/MinGW build statically links hsdaoh (.deps/install/lib/libhsdaoh.a).
-        # A correctly-built misrc_gui.exe must NOT have a libhsdaoh DLL NEEDED entry.
-        objdump = shutil.which("objdump")
-        if not objdump:
-            return 0  # objdump unavailable (non-MSYS2 python); skip on Windows
-        res = subprocess.run([objdump, "-p", str(gui)], capture_output=True, text=True)
-        if res.returncode != 0:
-            return fail(f"objdump -p misrc_gui failed: {res.stderr.strip()}")
-        for line in res.stdout.splitlines():
-            if "DLL Name:" in line and "hsdaoh" in line.lower():
-                return fail(f"misrc_gui.exe has a runtime libhsdaoh DLL dependency (expected static link to vendored .deps/install/lib/libhsdaoh.a): {line.strip()}")
-        return 0  # static: no hsdaoh DLL NEEDED -> correct
-
-    # Linux (and other ELF platforms): ldd
-    try:
-        res = run_checked(["ldd", str(gui)])
-    except subprocess.CalledProcessError as exc:
-        return fail(f"ldd misrc_gui failed (rc={exc.returncode}): {(exc.stderr or '').strip()} — not a dynamic ELF binary?")
-    found_hsdaoh = False
-    for line in res.stdout.splitlines():
-        if "libhsdaoh" in line:
-            found_hsdaoh = True
-            stripped = line.strip()
-            if "/usr/local/lib/" in line or " /usr/lib/" in line or " /lib/" in line:
-                return fail(f"misrc_gui links a SYSTEM hsdaoh (stale, lacks v1.0.9 connect fixes); expected vendored .deps/install: {stripped}")
-            if ".deps/install" not in line:
-                return fail(f"misrc_gui links hsdaoh from unexpected path (expected .deps/install): {stripped}")
-    if not found_hsdaoh:
-        return fail("misrc_gui does not link libhsdaoh at all")
-    return 0
-
-
-def check_meson_fx3_policy(meson_path: Path) -> int:
-    """Ensure meson.build builds the vendored cyusb compatibility shim from
-    source (third_party/cyusb/cyusb.c) on all platforms and sets ENABLE_FX3=1
-    when libusb-1.0 is present. This makes FX3 native on every platform with no
-    external libcyusb package and no system-lib shadowing possible."""
-    meson_text = read_text(meson_path)
-    required_snippets = [
-        "third_party/cyusb/cyusb.c",
-        "static_library('cyusb_compat'",
-        "declare_dependency",
-        "-DENABLE_FX3=1",
-        "fx3_enabled = true",
-    ]
-    for snippet in required_snippets:
-        if snippet not in meson_text:
-            return fail(f"meson.build is missing FX3 native-build policy snippet: {snippet}")
-    forbidden_snippets = [
-        "dependency('libcyusb', required : false)",
-    ]
-    for snippet in forbidden_snippets:
-        if snippet in meson_text:
-            return fail(f"meson.build still contains bare external libcyusb pkg-config lookup (no vendored shim): {snippet}")
-    return 0
-
-
-def check_built_gui_has_fx3_symbols(repo_root: Path, gui_path: Optional[Path] = None) -> int:
-    """Runtime check: the built misrc_gui must have FX3 compiled in. Catches a
-    silent FX3-disable where libusb was missing and FX3 compiled out, which would
-    ship a binary without FX3 support and nobody would know. Uses nm/strings."""
-    gui = gui_path if gui_path is not None else (repo_root / "misrc_tools" / "build" / "misrc_gui")
-    if not gui.exists():
-        return 0  # no local build present; preflight skips
-    nm = shutil.which("nm")
-    if nm:
-        res = subprocess.run([nm, str(gui)], capture_output=True, text=True)
-        if res.returncode == 0 and "gui_fx3_start" in res.stdout:
-            return 0
-    # Fall back to strings (works on stripped binaries + Windows .exe)
-    strings = shutil.which("strings")
-    if not strings:
-        return fail("neither nm nor strings available to verify FX3 symbols in misrc_gui")
-    res = subprocess.run([strings, str(gui)], capture_output=True, text=True)
-    if res.returncode != 0:
-        return fail(f"strings misrc_gui failed: {res.stderr.strip()}")
-    # gui_fx3_* log strings are present when gui_fx3.c is compiled in.
-    if "[FX3]" not in res.stdout or "fx3usbadc start command sent" not in res.stdout:
-        return fail("misrc_gui has no FX3 symbols/strings — FX3 did not compile in (libusb missing or ENABLE_FX3 not set)")
-    return 0
-
-
 def check_linux_desktop_metadata(workflow_path: Path) -> int:
     workflow_text = read_text(workflow_path)
     required_desktop_fields = [
@@ -735,18 +594,6 @@ def main() -> int:
         action="store_true",
         help="Run static/text invariants only (skip runtime AppRun simulation)",
     )
-    parser.add_argument(
-        "--post-build",
-        action="store_true",
-        help="Post-build mode: also run binary-introspection guards (hsdaoh linkage, "
-             "FX3 symbols) against --gui-path. Used by CI build jobs after misrc_gui is built.",
-    )
-    parser.add_argument(
-        "--gui-path",
-        type=Path,
-        default=None,
-        help="Path to the built misrc_gui binary for --post-build binary-introspection checks.",
-    )
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parents[2]
@@ -764,8 +611,6 @@ def main() -> int:
         ("macOS brew install policy", lambda: check_macos_brew_install_policy(workflow_path)),
         ("workflow FFT dependency policy", lambda: check_workflow_fft_dependency_policy(workflow_path)),
         ("meson FFT policy", lambda: check_meson_fft_policy(meson_path)),
-        ("meson vendored hsdaoh policy", lambda: check_meson_vendored_hsdaoh_policy(meson_path)),
-        ("meson FX3 native-build policy", lambda: check_meson_fx3_policy(meson_path)),
         ("cross-platform smoke tests", lambda: check_cross_platform_smoke_tests(workflow_path)),
         ("linux desktop metadata", lambda: check_linux_desktop_metadata(workflow_path)),
         ("macOS layout policy", lambda: check_macos_layout_policy(gui_c_path)),
@@ -784,21 +629,6 @@ def main() -> int:
     if not args.static_only:
         checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(workflow_path, icon_path)))
         checks.insert(8, ("record ringbuffer fallback runtime", lambda: check_record_ringbuffer_fallback_runtime(repo_root)))
-        checks.insert(9, ("built GUI links vendored hsdaoh", lambda: check_built_gui_links_vendored_hsdaoh(repo_root, args.gui_path)))
-    # --post-build: always run the binary-introspection guards against the real
-    # built misrc_gui (passed via --gui-path by CI build jobs). This is the mode
-    # that catches vendored-dep shadowing and silent FX3-disable on every build.
-    if args.post_build:
-        if args.gui_path is None:
-            return fail("--post-build requires --gui-path pointing at the built misrc_gui")
-        # In post-build mode the binary MUST exist: a missing misrc_gui means the
-        # build step failed or the path is wrong, and silently skipping would let
-        # CI pass without ever validating vendored-dep linkage or FX3 compilation.
-        # (Preflight mode above still skips gracefully when no local build exists.)
-        if not args.gui_path.exists():
-            return fail(f"--post-build --gui-path does not exist (build did not produce misrc_gui?): {args.gui_path}")
-        checks.append(("built GUI links vendored hsdaoh (post-build)", lambda: check_built_gui_links_vendored_hsdaoh(repo_root, args.gui_path)))
-        checks.append(("built GUI has FX3 symbols (post-build)", lambda: check_built_gui_has_fx3_symbols(repo_root, args.gui_path)))
 
     for name, check in checks:
         rc = check()

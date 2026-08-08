@@ -3,7 +3,7 @@
  *
  * Real-time waveform display and capture control using raylib + Clay UI
  *
- * Copyright (C) 2023-2026 Harry Munday, AlessandroAU, Stefan O, Vrunk11, machcnz
+ * Copyright (C) 2024-2025 vrunk11, stefan_o
  * Licensed under GNU GPL v3 or later
  */
 
@@ -124,8 +124,6 @@ static const char *gui_dropout_reason_status(gui_dropout_reason_t reason) {
             return "Capture stopped: dropout (backpressure drops)";
         case GUI_DROPOUT_DISK_SPACE:
             return "Capture stopped: low disk space (dynamic guard)";
-        case GUI_DROPOUT_LOW_SIGNAL:
-            return "Capture stopped: sustained low/no signal (tape end)";
         case GUI_DROPOUT_NONE:
         default:
             return "Capture stopped: dropout detected";
@@ -595,52 +593,6 @@ int main(int argc, char **argv) {
             continue;
         }
 
-        // Level autostop: stop capture when the RF signal level stays below a
-        // configurable percentage for a configurable duration (tape-end detection).
-        // This is independent from the digital dropout (frame error/missed frame)
-        // logic above, which is unchanged. Gated only by level_autostop_enabled.
-        if (app.is_capturing && app.is_recording && app.settings.level_autostop_enabled) {
-            // Parse the configured level (percent) and sustain duration (seconds).
-            float level_pct = (float)atof(app.settings.level_autostop_level_str);
-            float sustain_s = (float)atof(app.settings.level_autostop_duration_str);
-            if (level_pct < 1.0f)   level_pct = 1.0f;
-            if (level_pct > 99.0f)  level_pct = 99.0f;
-            if (sustain_s < 0.1f)   sustain_s = 0.1f;
-
-            // Peak is stored as 0-2047 unsigned. Use the larger of pos/neg on channel A.
-            uint16_t peak_pos = (uint16_t)atomic_load(&app.peak_a_pos);
-            uint16_t peak_neg = (uint16_t)atomic_load(&app.peak_a_neg);
-            uint16_t peak = (peak_pos > peak_neg) ? peak_pos : peak_neg;
-
-            // Threshold counts = level% of 2048 full scale.
-            uint16_t threshold = (uint16_t)((level_pct / 100.0f) * 2048.0f);
-            if (threshold < 1) threshold = 1;
-
-            if (!app.low_signal_armed) {
-                // Arm once a real signal level is seen above the threshold.
-                if (peak >= threshold) {
-                    app.low_signal_armed = true;
-                    app.low_signal_time = 0.0f;
-                }
-            } else {
-                if (peak < threshold) {
-                    app.low_signal_time += dt;
-                    if (app.low_signal_time >= sustain_s) {
-                        gui_app_stop_capture(&app);
-                        app.reconnect_pending = false;
-                        app.reconnect_attempts = 0;
-                        app.low_signal_time = 0.0f;
-                        app.low_signal_armed = false;
-                        gui_app_set_status(&app, gui_dropout_reason_status(GUI_DROPOUT_LOW_SIGNAL));
-                        continue;
-                    }
-                } else {
-                    // Signal recovered - reset timer but stay armed.
-                    app.low_signal_time = 0.0f;
-                }
-            }
-        }
-
         // Auto-reconnect logic
         if (app.auto_reconnect_enabled) {
             double now = GetTime();
@@ -648,12 +600,7 @@ int main(int argc, char **argv) {
             // Detect connection loss via callback timeout (no data for 2+ seconds).
             // Keep parser-state ownership scoped to capture lifecycle boundaries
             // in gui_capture.c (stop/start paths), not timeout polling logic here.
-            // Grace period: suppress timeout for the first 5 seconds after capture
-            // starts so the MS2130 has time to complete its initial HDMI/USB sync
-            // and deliver the first data callback (first-connect on Windows can
-            // take 3-4 seconds before any data arrives).
-            if (app.is_capturing && (now - app.capture_start_time) > 5.0
-                && gui_capture_device_timeout(&app, 2000)) {
+            if (app.is_capturing && gui_capture_device_timeout(&app, 2000)) {
                 // Device was disconnected unexpectedly - clean up properly
                 fprintf(stderr, "[GUI] Device timeout detected, disconnecting...\n");
                 gui_set_reconnect_target_from_selected(&app, &reconnect_target);
@@ -744,6 +691,10 @@ int main(int argc, char **argv) {
 
         // Render
         BeginDrawing();
+
+        // Reset cursor to default at start of frame
+        // (Panels will set crosshair cursor when hovering/dragging via their render functions)
+        SetMouseCursor(MOUSE_CURSOR_DEFAULT);
         ClearBackground(COLOR_BG);
 
         // Render Clay UI (custom elements are handled via CLAY_RENDER_COMMAND_TYPE_CUSTOM)

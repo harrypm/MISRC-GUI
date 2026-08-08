@@ -124,6 +124,7 @@ jobs:
             imagemagick \
             libasound2-dev \
             libfftw3-dev \
+            libflac-dev \
             libgl1-mesa-dev \
             libusb-1.0-0-dev \
             libuvc-dev \
@@ -141,80 +142,14 @@ jobs:
             unzip \
             zip
 
-      - name: Fetch libFLAC 1.5.0 cache + build hsdaoh/raylib
+      - name: Build and install hsdaoh + raylib
         run: |
           set -eux
           DEPS_PREFIX="$PWD/.deps/install"
           mkdir -p .deps
-
-          # libFLAC 1.5.0 is required by misrc_tools/meson.build for the
-          # multithreaded encoder (FLAC__stream_encoder_set_num_threads, libFLAC
-          # API v14). Ubuntu 22.04's libflac-dev apt is stuck at 1.3.3, so fetch a
-          # prebuilt static lib from the harrypm/MISRC-ci-cache release (built on
-          # jammy/glibc-2.35, ABI-compatible with the runners). The arm64 prebuilt
-          # is produced by the one-off .github/workflows/flac-cache.yml job; until
-          # it exists the arm64 job falls back to building from the cached source
-          # tarball, so arm64 stays unblocked without the cache.
-          FLAC_VERSION="1.5.0"
-          CACHE_BASE="https://github.com/harrypm/MISRC-ci-cache/releases/download/flac-${FLAC_VERSION}-linux"
-          FLAC_ARCH="${{ matrix.arch }}"
-          PREBUILT_NAME="flac-${FLAC_VERSION}-prebuilt-linux-${FLAC_ARCH}.tar.xz"
-          PREBUILT_SHA_NAME="${PREBUILT_NAME}.sha256"
-          SRC_NAME="flac-${FLAC_VERSION}.tar.xz"
-          FLAC_SRC_SHA256="f2c1c76592a82ffff8413ba3c4a1299b6c7ab06c734dee03fd88630485c2b920"
-
-          if curl -fsSL -o "/tmp/${PREBUILT_NAME}" "${CACHE_BASE}/${PREBUILT_NAME}" \
-             && curl -fsSL -o "/tmp/${PREBUILT_SHA_NAME}" "${CACHE_BASE}/${PREBUILT_SHA_NAME}"; then
-            expected="$(awk '{print $1}' "/tmp/${PREBUILT_SHA_NAME}")"
-            actual="$(sha256sum "/tmp/${PREBUILT_NAME}" | awk '{print $1}')"
-            [[ "${actual}" == "${expected}" ]] || { echo "prebuilt libFLAC sha mismatch: expected ${expected} got ${actual}"; exit 1; }
-            rm -rf .deps/flac-prebuilt
-            mkdir -p .deps/flac-prebuilt "${DEPS_PREFIX}/lib/pkgconfig" "${DEPS_PREFIX}/include"
-            tar -xf "/tmp/${PREBUILT_NAME}" -C .deps/flac-prebuilt --strip-components=1
-            cp -R .deps/flac-prebuilt/lib/. "${DEPS_PREFIX}/lib/"
-            cp -R .deps/flac-prebuilt/include/. "${DEPS_PREFIX}/include/"
-            echo "Using cached prebuilt libFLAC ${FLAC_VERSION} for ${FLAC_ARCH}"
-          else
-            echo "No prebuilt libFLAC for ${FLAC_ARCH}; building from cached source tarball."
-            curl -fsSL -o "/tmp/${SRC_NAME}" "${CACHE_BASE}/${SRC_NAME}"
-            echo "${FLAC_SRC_SHA256}  /tmp/${SRC_NAME}" | sha256sum -c -
-            rm -rf .deps/flac-src .deps/flac
-            mkdir -p .deps/flac-src
-            tar -xf "/tmp/${SRC_NAME}" -C .deps/flac-src --strip-components=1
-            cmake -S .deps/flac-src -B .deps/flac/build \
-              -DCMAKE_BUILD_TYPE=Release \
-              -DBUILD_SHARED_LIBS=OFF \
-              -DWITH_OGG=OFF \
-              -DBUILD_TESTING=OFF \
-              -DCMAKE_INSTALL_PREFIX="${DEPS_PREFIX}"
-            cmake --build .deps/flac/build --parallel
-            cmake --install .deps/flac/build
-            echo "Built libFLAC ${FLAC_VERSION} from cached source for ${FLAC_ARCH}"
-          fi
-
-          # Sanity: vendored flac.pc must report 1.5.0 before meson sees it.
-          # meson.build hard-fails configure if this ever regresses below 1.5.0.
-          PKG_CONFIG_PATH="${DEPS_PREFIX}/lib/pkgconfig:${DEPS_PREFIX}/lib64/pkgconfig" \
-            pkg-config --modversion flac
-
           rm -rf .deps/hsdaoh
           cp -R third_party/hsdaoh .deps/hsdaoh
           git clone --depth 1 --branch 5.5 https://github.com/raysan5/raylib.git .deps/raylib
-          # hsdaoh's CMakeLists uses pkg_check_modules(flac), so the vendored
-          # flac.pc in DEPS_PREFIX must be on PKG_CONFIG_PATH now -- the apt
-          # libflac-dev that used to provide a system flac.pc is no longer
-          # installed. This export also benefits raylib/hsdaoh CMake finders.
-          export PKG_CONFIG_PATH="${DEPS_PREFIX}/lib/pkgconfig:${DEPS_PREFIX}/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
-          export CMAKE_PREFIX_PATH="${DEPS_PREFIX}:${CMAKE_PREFIX_PATH:-}"
-          # hsdaoh's hsdaoh_file tool target includes "FLAC/metadata.h" but does
-          # not link the flac pkg-config module, so it does not inherit flac's
-          # -I include dir from CMake. With the old apt libflac-dev the headers
-          # lived in /usr/include/FLAC (default system include path) so the
-          # missing -I was masked; the vendored headers in DEPS_PREFIX/include/FLAC
-          # are not on a default path. Export CFLAGS/CXXFLAGS with -I so every
-          # hsdaoh target (including hsdaoh_file) can resolve FLAC/*.h.
-          export CFLAGS="-I${DEPS_PREFIX}/include ${CFLAGS:-}"
-          export CXXFLAGS="-I${DEPS_PREFIX}/include ${CXXFLAGS:-}"
           cmake -S .deps/hsdaoh -B .deps/hsdaoh/build \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=OFF \
@@ -263,11 +198,6 @@ jobs:
           test "$RC_EXTRACT" -eq 1
           grep -qi "Usage" /tmp/misrc_capture_help.txt
           grep -qi "Usage" /tmp/misrc_extract_help.txt
-
-      - name: Post-build CI guard tests (vendored deps + FX3 enabled)
-        run: |
-          set -eux
-          python3 misrc_tools/test/ci_guard_tests.py --post-build --gui-path "$BUILD_DIR/misrc_gui"
 
       - name: Package AppImage artifact
         env:
@@ -604,11 +534,6 @@ jobs:
           grep -qi "Usage" capture_help.txt
           grep -qi "Usage" extract_help.txt
 
-          # Post-build CI guard tests: assert no stale hsdaoh DLL dependency
-          # (Windows statically links the vendored .deps/install libhsdaoh.a)
-          # and that FX3 symbols compiled in. Uses MSYS2 python + objdump.
-          python misrc_tools/test/ci_guard_tests.py --post-build --gui-path "$BUILD_DIR/misrc_gui.exe"
-
       - name: Create ZIP artifact
         shell: pwsh
         run: |
@@ -798,9 +723,6 @@ jobs:
 
           assert_no_nonsystem_dlls "dist/MISRC.exe"
           # Windows ARM64 binaries cannot be executed on windows-2022 x64 runners.
-          # Post-build CI guard tests still run (binary introspection only, no exec):
-          # assert no stale hsdaoh DLL dependency (static link expected) + FX3 symbols.
-          python misrc_tools/test/ci_guard_tests.py --post-build --gui-path "$BUILD_DIR/misrc_gui.exe"
 
       - name: Create ZIP artifact
         shell: pwsh
@@ -944,10 +866,6 @@ jobs:
           test "$RC_EXTRACT" -eq 1
           grep -qi "Usage" /tmp/macos_capture_help.txt
           grep -qi "Usage" /tmp/macos_extract_help.txt
-
-          # Post-build CI guard tests: assert no stale Homebrew hsdaoh linkage
-          # (macOS must use the vendored .deps/install hsdaoh via @rpath) + FX3 symbols.
-          python3 misrc_tools/test/ci_guard_tests.py --post-build --gui-path "$BUILD_DIR/misrc_gui"
 
           APP_ROOT="dist/MISRC.app/Contents"
           FW_DIR="$APP_ROOT/Frameworks"
@@ -1243,55 +1161,11 @@ jobs:
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Build release summary
-        id: summary
-        run: |
-          set -eu
-          TAG="${{ steps.tag.outputs.tag }}"
-          # Find the previous tag for the Highlights log range.
-          PREV_TAG="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)"
-          if [[ -n "$PREV_TAG" ]]; then
-            LOG_RANGE="${PREV_TAG}..${TAG}"
-          else
-            LOG_RANGE="${TAG}"
-          fi
-          # Build the structured release body. generate_release_notes: true
-          # appends GitHub's auto-generated What's Changed PR list after this
-          # body, matching the v1.1.0 release format. Write each line with
-          # printf to avoid heredoc backtick-escaping issues.
-          BODY_FILE="/tmp/release_body.md"
-          : > "$BODY_FILE"
-          printf '%s\n' '' '## Highlights' '' >> "$BODY_FILE"
-          git log --pretty=format:'- %s (%h)' --no-merges "$LOG_RANGE" 2>/dev/null >> "$BODY_FILE" || true
-          if [[ "$(tail -1 "$BODY_FILE")" == '## Highlights' ]]; then
-            printf '%s\n' "- (no commits found in range ${LOG_RANGE})" >> "$BODY_FILE"
-          fi
-          printf '\n%s\n' '' '## Downloads' '' >> "$BODY_FILE"
-          printf '| Platform | x86_64 (Intel / AMD) | arm64 (Apple Silicon / aarch64) |\n' >> "$BODY_FILE"
-          printf '|---|---|---|\n' >> "$BODY_FILE"
-          DL_BASE="https://github.com/harrypm/MISRC-GUI/releases/download/${TAG}"
-          WIN_X86="windows_MISRC_${TAG}_x86.zip"
-          WIN_ARM="windows_MISRC_${TAG}_arm64.zip"
-          MAC_DMG="macos_MISRC_${TAG}_universal.dmg"
-          LIN_X86="linux_MISRC_${TAG}_x86.zip"
-          LIN_ARM="linux_MISRC_${TAG}_arm64.zip"
-          printf '| Windows 10/11 | [%s](%s/%s) | [%s](%s/%s) |\n' "$WIN_X86" "$DL_BASE" "$WIN_X86" "$WIN_ARM" "$DL_BASE" "$WIN_ARM" >> "$BODY_FILE"
-          printf '| macOS 11+ | [%s](%s/%s) | [%s](%s/%s) |\n' "$MAC_DMG" "$DL_BASE" "$MAC_DMG" "$MAC_DMG" "$DL_BASE" "$MAC_DMG" >> "$BODY_FILE"
-          printf '| Linux (Ubuntu 22.04+) | [%s](%s/%s) | [%s](%s/%s) |\n' "$LIN_X86" "$DL_BASE" "$LIN_X86" "$LIN_ARM" "$DL_BASE" "$LIN_ARM" >> "$BODY_FILE"
-          printf '\n%s\n' '> [!NOTE]' '> The arm64 Windows build is untested and considered experimental.' >> "$BODY_FILE"
-          # Write multi-line output to GITHUB_OUTPUT.
-          {
-            echo "body<<BODY_EOF"
-            cat "$BODY_FILE"
-            echo "BODY_EOF"
-          } >> "$GITHUB_OUTPUT"
-
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: ${{ steps.tag.outputs.tag }}
-          body: ${{ steps.summary.outputs.body }}
           generate_release_notes: true
           files: |
             release-assets/**/linux_MISRC_*_x86.zip

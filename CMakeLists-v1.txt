@@ -1,0 +1,280 @@
+# CMakeLists.txt (version 10K2) for hsdaoh-rp2350 RP2350 - MISRC GUI (first forked from harrypm)
+cmake_minimum_required(VERSION 3.15)
+project(misrc_gui_rp2350 C)
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# Allow include(CheckCPUArch) from harrypm cmake modules
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/misrc_tools/cmake")
+
+# ========================================
+# RP2350 Configuration - Explicit Paths
+# ========================================
+set(HSDAOH_SSD_LIB "/media/cxcap/Y_SSD-Ext-CXStage/hsdaoh-master-30012026/hsdaoh-master/build/src/libhsdaoh.so.0")
+set(HSDAOH_SSD_INC "/media/cxcap/Y_SSD-Ext-CXStage/hsdaoh-master-30012026/hsdaoh-master/include")
+
+if(NOT EXISTS ${HSDAOH_SSD_LIB})
+    message(FATAL_ERROR "hsdaoh library not found at: ${HSDAOH_SSD_LIB}")
+endif()
+
+# Enable upstream mode for RP2350
+add_definitions(-DHSDAOH_UPSTREAM=1)
+
+# Build options
+option(USE_SYSTEM_RAYLIB "Use system raylib instead of downloading" OFF)
+
+# ========================================
+# Find Dependencies
+# ========================================
+find_package(PkgConfig REQUIRED)
+
+pkg_check_modules(LIBUSB REQUIRED libusb-1.0)
+pkg_check_modules(FLAC REQUIRED flac)
+pkg_check_modules(SOXR REQUIRED soxr)
+pkg_check_modules(FFTW3F REQUIRED fftw3f)
+
+# Test if FLAC library actually has threading support... we need v1.5+
+# (Version doesn't guarantee the feature - depends on build flags)
+include(CheckLibraryExists)
+set(CMAKE_REQUIRED_LIBRARIES ${FLAC_LIBRARIES})
+check_library_exists(FLAC FLAC__stream_encoder_set_num_threads "" HAVE_FLAC_THREADING)
+
+if(HAVE_FLAC_THREADING)
+    message(STATUS "FLAC threading support: YES")
+else()
+    message(STATUS "FLAC threading support: NO (library built without pthread)")
+endif()
+
+# ========================================
+# Raylib
+# ========================================
+if(USE_SYSTEM_RAYLIB)
+    find_package(raylib 5.0 REQUIRED)
+else()
+    include(FetchContent)
+    set(FETCHCONTENT_QUIET FALSE)
+    FetchContent_Declare(
+        raylib
+        GIT_REPOSITORY https://github.com/raysan5/raylib.git
+        GIT_TAG 5.0
+        GIT_PROGRESS TRUE
+    )
+    set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(BUILD_GAMES OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(raylib)
+endif()
+
+# ========================================
+# Common Sources
+# ========================================
+set(COMMON_SOURCES
+    misrc_tools/common/ringbuffer.c
+    misrc_tools/common/flac_writer.c
+    misrc_tools/common/buffer_manager.c
+    misrc_tools/common/extract.c
+    misrc_tools/common/rb_event.c
+    misrc_tools/common/file_utils.c
+    misrc_tools/common/device_enum.c
+    misrc_tools/common/ringbuffer_writer.c
+
+    # Fix unresolved sc_get_* symbols (Linux implementation)
+    misrc_tools/misrc_capture/simple_capture/simple_capture_v4l2.c
+)
+
+# Extract ASM (x86_64 optimizations) must be before add_executable 
+# to enable ASM_NASM language and avoid "No rule to make target 'extract.asm'" error. 
+# Also, check if the file exists to avoid issues on non-x86_64 platforms or if the file is missing.
+
+if(EXISTS "${CMAKE_SOURCE_DIR}/misrc_tools/common/extract.asm")
+    enable_language(ASM_NASM)
+    
+    # CRITICAL: NASM needs its own compile command, not C compiler flags
+    set(CMAKE_ASM_NASM_OBJECT_FORMAT elf64)
+    set(CMAKE_ASM_NASM_COMPILE_OBJECT "<CMAKE_ASM_NASM_COMPILER> -f elf64 -o <OBJECT> <SOURCE>")
+    
+    list(APPEND COMMON_SOURCES misrc_tools/common/extract.asm)
+endif()
+
+
+# ========================================
+# GUI Sources
+# ========================================
+file(GLOB GUI_CORE_SOURCES
+    misrc_tools/misrc_gui/core/*.c
+)
+
+set(GUI_INPUT_SOURCES
+    misrc_tools/misrc_gui/input/gui_capture.c
+    misrc_tools/misrc_gui/input/gui_simulated.c
+    misrc_tools/misrc_gui/input/gui_playback.c
+)
+
+file(GLOB GUI_OUTPUT_SOURCES
+    misrc_tools/misrc_gui/output/*.c
+)
+
+file(GLOB GUI_PROCESSING_SOURCES
+    misrc_tools/misrc_gui/processing/*.c
+)
+
+file(GLOB GUI_SIGNAL_SOURCES
+    misrc_tools/misrc_gui/signal/*.c
+)
+
+file(GLOB GUI_UI_SOURCES
+    misrc_tools/misrc_gui/ui/*.c
+)
+
+file(GLOB GUI_VIZ_SOURCES
+    misrc_tools/misrc_gui/visualization/*.c
+)
+
+set(GUI_SOURCES
+    ${GUI_CORE_SOURCES}
+    ${GUI_INPUT_SOURCES}
+    ${GUI_OUTPUT_SOURCES}
+    ${GUI_PROCESSING_SOURCES}
+    ${GUI_SIGNAL_SOURCES}
+    ${GUI_UI_SOURCES}
+    ${GUI_VIZ_SOURCES}
+)
+
+# ========================================
+# Executable
+# ========================================
+add_executable(misrc_gui_rp2350
+    ${GUI_SOURCES}
+    ${COMMON_SOURCES}
+)
+
+# ========================================
+# version.h (fix: ui/gui_ui.c includes it) + hsdaoh-rpi
+# ========================================
+configure_file(
+    ${CMAKE_SOURCE_DIR}/misrc_tools/version.h.in
+    ${CMAKE_CURRENT_BINARY_DIR}/version.h
+
+)
+
+# ========================================
+# NASM extract (fix: unresolved extract_*_sse + check_cpu_feat) --- fixes!
+# ========================================
+# Detect x86_64 without CheckCPUArch.cmake
+set(MISRC__CPU_X86_64 0)
+if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64"))
+  set(MISRC__CPU_X86_64 1)
+endif()
+
+#if(MISRC__CPU_X86_64) --- too late here... needs to be before add_executable
+#    enable_language(ASM_NASM)
+#    if(APPLE)
+#        string(APPEND CMAKE_ASM_NASM_FLAGS " --prefix _")
+#    endif()
+#    list(APPEND COMMON_SOURCES misrc_tools/common/extract.asm)
+#    target_sources(misrc_gui_rp2350 PRIVATE misrc_tools/common/extract.asm)
+#endif()
+
+
+# ========================================
+# Include Dirs
+# ========================================
+target_include_directories(misrc_gui_rp2350 PRIVATE
+    # hsdaoh
+    ${HSDAOH_SSD_INC}
+
+    # generated version.h
+    ${CMAKE_CURRENT_BINARY_DIR}
+
+    # FIX: ringbuffer.c includes "shm_anon.h" (file is at misrc_tools/shm_anon.h)
+    ${CMAKE_SOURCE_DIR}/misrc_tools
+
+    # common
+    ${CMAKE_SOURCE_DIR}/misrc_tools/common
+
+    # simple_capture headers
+    ${CMAKE_SOURCE_DIR}/misrc_tools/misrc_capture/simple_capture
+
+    # gui
+    ${CMAKE_SOURCE_DIR}/misrc_tools/misrc_gui/core
+    ${CMAKE_SOURCE_DIR}/misrc_tools/misrc_gui/input
+    ${CMAKE_SOURCE_DIR}/misrc_tools/misrc_gui/output
+    ${CMAKE_SOURCE_DIR}/misrc_tools/misrc_gui/processing
+    ${CMAKE_SOURCE_DIR}/misrc_tools/misrc_gui/signal
+    ${CMAKE_SOURCE_DIR}/misrc_tools/misrc_gui/ui
+    ${CMAKE_SOURCE_DIR}/misrc_tools/misrc_gui/visualization
+
+    # clay header root
+    ${CMAKE_SOURCE_DIR}
+
+    # deps
+    ${LIBUSB_INCLUDE_DIRS}
+    ${FLAC_INCLUDE_DIRS}
+    ${SOXR_INCLUDE_DIRS}
+)
+
+if(FFTW3F_FOUND)
+    target_include_directories(misrc_gui_rp2350 PRIVATE ${FFTW3F_INCLUDE_DIRS})
+endif()
+
+# ========================================
+# Link
+# ========================================
+target_link_libraries(misrc_gui_rp2350 PRIVATE
+    raylib
+    ${HSDAOH_SSD_LIB}
+    ${LIBUSB_LIBRARIES}
+    ${FLAC_LIBRARIES}
+    ${SOXR_LIBRARIES}
+    uvc
+    m
+    pthread
+    dl
+)
+
+if(FFTW3F_FOUND)
+    target_link_libraries(misrc_gui_rp2350 PRIVATE ${FFTW3F_LIBRARIES})
+endif()
+
+# ========================================
+# Compile defs
+# ========================================
+target_compile_definitions(misrc_gui_rp2350 PRIVATE
+    LIBSOXR_ENABLED=1
+    HSDAOH_UPSTREAM=1
+    LIBFLAC_ENABLED=1
+)
+
+# Add FLAC threading flag
+if(HAVE_FLAC_THREADING)
+    target_compile_definitions(misrc_gui_rp2350 PRIVATE HAVE_FLAC_THREADING=1)
+else()
+    target_compile_definitions(misrc_gui_rp2350 PRIVATE HAVE_FLAC_THREADING=0)
+endif()
+
+if(FFTW3F_FOUND)
+    target_compile_definitions(misrc_gui_rp2350 PRIVATE LIBFFTW_ENABLED=1)
+else()
+    target_compile_definitions(misrc_gui_rp2350 PRIVATE LIBFFTW_ENABLED=0)
+endif()
+
+# ========================================
+# Flags
+# ========================================
+target_compile_options(misrc_gui_rp2350 PRIVATE
+    -Wall
+    -Wextra
+    -Wno-unused-parameter
+    -Wno-unused-variable
+    -Wno-unused-function
+    -O2
+    $<$<CONFIG:Debug>:-g>
+    $<$<CONFIG:Debug>:-O0>
+    $<$<PLATFORM_ID:Linux>:-msse4.1>
+)
+
+target_link_options(misrc_gui_rp2350 PRIVATE
+    -Wl,-rpath,${HSDAOH_SSD_INC}/../build/src
+)
+

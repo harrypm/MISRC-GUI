@@ -89,65 +89,6 @@ int bufmgr_init(buffer_manager_t *mgr) {
     return bufmgr_init_custom(mgr, NULL);
 }
 
-#define BUFMGR_GB ((size_t)1024 * 1024 * 1024)
-#define BUFMGR_MB ((size_t)1024 * 1024)
-
-/*
- * Build per-buffer configs for a total RAM budget.
- *   RF:      min(1 GB, budget * 0.5 GB)
- *   Audio:   min(256 MB, budget * 0.125 GB)
- *   Display: min(256 MB, budget * 0.125 GB)
- *   Record A/B (lazy): remainder split evenly, floor 128 MB each.
- *
- * For budgets >= 2 GB this keeps RF/Audio/Display fixed (1 GB / 256 MB /
- * 256 MB) and splits the rest evenly across Record A/B; the 1 GB case scales
- * RF->512 MB and Audio/Display->128 MB so record buffers still get ~128 MB.
- */
-static void bufmgr_build_budget_configs(buffer_config_t *configs, uint32_t budget_gb) {
-    if (!configs) return;
-    memset(configs, 0, sizeof(buffer_config_t) * BUF_COUNT);
-
-    uint64_t budget = (uint64_t)budget_gb * BUFMGR_GB;
-    if (budget == 0) budget = (uint64_t)4 * BUFMGR_GB;
-
-    size_t rf      = (size_t)((budget / 2) < BUFMGR_GB ? (budget / 2) : BUFMGR_GB);
-    size_t audio   = (size_t)((budget / 8) < (256 * BUFMGR_MB) ? (budget / 8) : (256 * BUFMGR_MB));
-    size_t display = (size_t)((budget / 8) < (256 * BUFMGR_MB) ? (budget / 8) : (256 * BUFMGR_MB));
-    if (rf < 16 * BUFMGR_MB) rf = 16 * BUFMGR_MB;
-    if (audio < 4 * BUFMGR_MB) audio = 4 * BUFMGR_MB;
-    if (display < 4 * BUFMGR_MB) display = 4 * BUFMGR_MB;
-
-    uint64_t fixed = (uint64_t)rf + (uint64_t)audio + (uint64_t)display;
-    uint64_t remainder = (budget > fixed) ? (budget - fixed) : 0;
-    uint64_t record_each = remainder / 2;
-    if (record_each < 128 * BUFMGR_MB) record_each = 128 * BUFMGR_MB;
-    size_t record_size = (record_each > (size_t)-1) ? (size_t)-1 : (size_t)record_each;
-
-    configs[BUF_CAPTURE_RF] = (buffer_config_t){ .name = "capture_rf", .size = rf, .lazy_init = false };
-    configs[BUF_CAPTURE_AUDIO] = (buffer_config_t){ .name = "capture_audio", .size = audio, .lazy_init = false };
-    configs[BUF_RECORD_A] = (buffer_config_t){ .name = "record_a", .size = record_size, .lazy_init = true };
-    configs[BUF_RECORD_B] = (buffer_config_t){ .name = "record_b", .size = record_size, .lazy_init = true };
-    configs[BUF_DISPLAY] = (buffer_config_t){ .name = "display", .size = display, .lazy_init = false };
-}
-
-int bufmgr_init_for_budget(buffer_manager_t *mgr, uint32_t budget_gb) {
-    if (!mgr) return -1;
-    if (budget_gb == 0) budget_gb = 4;
-    if (budget_gb < 1) budget_gb = 1;
-    if (budget_gb > 16) budget_gb = 16;
-
-    buffer_config_t configs[BUF_COUNT];
-    bufmgr_build_budget_configs(configs, budget_gb);
-
-    fprintf(stderr, "[BUFMGR] Budget %u GB -> RF=%zuMB Audio=%zuMB Disp=%zuMB RecA/B=%zuMB each (lazy)\n",
-            (unsigned)budget_gb,
-            configs[BUF_CAPTURE_RF].size / BUFMGR_MB,
-            configs[BUF_CAPTURE_AUDIO].size / BUFMGR_MB,
-            configs[BUF_DISPLAY].size / BUFMGR_MB,
-            configs[BUF_RECORD_A].size / BUFMGR_MB);
-    return bufmgr_init_custom(mgr, configs);
-}
-
 int bufmgr_init_custom(buffer_manager_t *mgr, const buffer_config_t *configs) {
     if (!mgr) return -1;
 
