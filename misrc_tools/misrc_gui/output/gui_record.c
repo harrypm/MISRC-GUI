@@ -507,14 +507,6 @@ typedef struct {
 
 static gui_record_spill_channel_t s_record_spill[GUI_RECORD_SPILL_CHANNELS];
 
-// Per-channel output-file write error flags. Set by the writer threads when
-// the FLAC encoder or RAW fwrite fails (e.g. file locked by another app for
-// viewing). When set, the writer spills raw data to the temp file to protect
-// the capture, and the UI flashes the finalizing icon at capture stop.
-static atomic_bool s_record_write_error[GUI_RECORD_SPILL_CHANNELS] = {
-    ATOMIC_VAR_INIT(false), ATOMIC_VAR_INIT(false)
-};
-
 static const char *gui_record_spill_channel_name(int channel) {
     return (channel == 0) ? "A" : "B";
 }
@@ -845,17 +837,6 @@ bool gui_record_spill_is_forced(int channel) {
     return atomic_load(&s_record_spill[channel].forced_mode);
 }
 
-void gui_record_spill_clear_forced(int channel) {
-    if (!gui_record_spill_valid_channel(channel)) {
-        return;
-    }
-    // Clear the sticky flag so the extraction thread resumes direct
-    // ringbuffer writes. The spill temp file itself is recycled by the
-    // existing gui_record_spill_recycle_if_drained() path once the
-    // writer thread drains it.
-    atomic_store(&s_record_spill[channel].forced_mode, false);
-}
-
 bool gui_record_spill_enqueue(gui_app_t *app, int channel, const int16_t *samples, size_t bytes,
                               uint32_t frame_index, char *error_msg, size_t error_msg_size) {
     if (!gui_record_spill_valid_channel(channel) || !samples || bytes == 0) {
@@ -1160,7 +1141,6 @@ static int flac_writer_thread(void *ctx) {
         bool from_ringbuffer = false;
         bool encode_failed = false;
         int timeout_ms = (atomic_load(&do_exit) || !s_recording_app || !s_recording_app->is_recording) ? 0 : 10;
-
         if (!gui_record_get_next_block(wctx, len, timeout_ms, spill_i16, &in, &from_ringbuffer)) {
             if (timeout_ms == 0) {
                 break;
@@ -1218,53 +1198,17 @@ static int flac_writer_thread(void *ctx) {
             }
         }
 
-        // On encode failure (output file write callback failed, e.g. file
-        // locked by another app for viewing): do NOT abort the encoder or
-        // stop capture. Spill the raw block to the temp file to preserve the
-        // data and protect the capture path from backpressure, set the
-        // write-error flag so the UI flashes the finalize icon, and continue.
-        // The encoder stays alive; if the file becomes writable again, the
-        // next flac_writer_process call's write callback will succeed and
-        // encoding resumes (recovery detected below).
-        if (encode_failed) {
-            atomic_store(&s_record_write_error[wctx->channel], true);
-            if (from_ringbuffer && wctx->app) {
-                // Spill the raw block before marking it consumed (the
-                // ringbuffer memory is still valid here). Blocks that came
-                // from the spill are not re-spilled (already preserved).
-                char spill_err[256] = {0};
-                if (!gui_record_spill_enqueue(wctx->app, wctx->channel,
-                                              in, len, 0, spill_err, sizeof(spill_err))) {
-                    if (spill_err[0]) {
-                        gui_record_log_capture_event(wctx->app, "ERROR", spill_err,
-                                                     GUI_ERROR_CLASS_SYSTEM, 1);
-                    }
-                }
-            }
-            // Mark ringbuffer blocks as consumed; spill blocks are consumed by file read offset.
-            if (from_ringbuffer) {
-                bufmgr_read_end(wctx->bufmgr, wctx->buf_id, len);
-            }
-            continue;
-        }
-
-        // Encode succeeded. If we were previously in a write-error state,
-        // clear the flag and log recovery so the UI stops flashing.
-        if (atomic_load(&s_record_write_error[wctx->channel])) {
-            atomic_store(&s_record_write_error[wctx->channel], false);
-            flac_encoder_error_logged = false;
-            fprintf(stderr, "[FLAC] Channel %c write recovered\n",
-                    wctx->channel == 0 ? 'A' : 'B');
-            if (wctx->app) {
-                gui_record_log_capture_event(wctx->app, "INFO",
-                    "FLAC output file write recovered",
-                    GUI_ERROR_CLASS_NONE, 0);
-            }
-        }
-
         // Mark ringbuffer blocks as consumed; spill blocks are consumed by file read offset.
         if (from_ringbuffer) {
             bufmgr_read_end(wctx->bufmgr, wctx->buf_id, len);
+        }
+
+        if (encode_failed) {
+            if (wctx && wctx->app && !atomic_load(&wctx->app->dropout_stop_requested)) {
+                atomic_store(&wctx->app->dropout_stop_reason, GUI_DROPOUT_DEVICE_ERROR);
+                atomic_store(&wctx->app->dropout_stop_requested, true);
+            }
+            break;
         }
 
         if (s_recording_app) {
@@ -1349,81 +1293,10 @@ static int raw_writer_thread(void *ctx) {
 
     fprintf(stderr, "[RAW] Writer thread %c started\n", wctx->channel == 0 ? 'A' : 'B');
 
-    bool write_error = false;
-    double last_retry_time = 0.0;
-    uint64_t raw_write_err_count = 0;
-
     while (1) {
         const int16_t *in = NULL;
         bool from_ringbuffer = false;
         int timeout_ms = (atomic_load(&do_exit) || !s_recording_app || !s_recording_app->is_recording) ? 0 : 10;
-
-        // When in write-error state (output file locked by another app),
-        // drain the ringbuffer to the spill temp file to protect the capture
-        // from backpressure. Don't read from the spill (leave it for when the
-        // output recovers). Periodically retry the output file; if the retry
-        // write succeeds, resume normal operation (which will drain the spill
-        // via gui_record_get_next_block).
-        if (write_error) {
-            void *rb_buf = bufmgr_read_begin(wctx->bufmgr, wctx->buf_id, in_len, timeout_ms);
-            if (!rb_buf) {
-                if (timeout_ms == 0) {
-                    break;
-                }
-                continue;
-            }
-
-            // Throttle retry attempts to every ~2 seconds.
-            double now = GetTime();
-            bool should_retry = (last_retry_time == 0.0) || (now - last_retry_time >= 2.0);
-            if (should_retry) {
-                last_retry_time = now;
-                clearerr(wctx->file);
-                // Seek to end so we append after any previously-written data.
-                GUI_RECORD_FSEEK(wctx->file, 0, SEEK_END);
-                size_t retry_out_n = GUI_RECORD_WRITER_BLOCK_SAMPLES;
-                convert_i16_to_raw_bytes(tmp_out, (const int16_t *)rb_buf, retry_out_n, wctx->rf_bits);
-                size_t retry_bytes = retry_out_n * bps;
-                size_t written = fwrite(tmp_out, 1, retry_bytes, wctx->file);
-                if (written == retry_bytes && !ferror(wctx->file)) {
-                    // Write recovered — resume normal operation.
-                    write_error = false;
-                    atomic_store(&s_record_write_error[wctx->channel], false);
-                    fprintf(stderr, "[RAW] Channel %c write recovered\n",
-                            wctx->channel == 0 ? 'A' : 'B');
-                    if (wctx->app) {
-                        gui_record_log_capture_event(wctx->app, "INFO",
-                            "RAW output file write recovered",
-                            GUI_ERROR_CLASS_NONE, 0);
-                    }
-                    bufmgr_read_end(wctx->bufmgr, wctx->buf_id, in_len);
-                    if (s_recording_app) {
-                        atomic_fetch_add(&s_recording_app->recording_bytes, in_len);
-                        if (wctx->channel == 0) {
-                            atomic_fetch_add(&s_recording_app->recording_raw_a, in_len);
-                        } else {
-                            atomic_fetch_add(&s_recording_app->recording_raw_b, in_len);
-                        }
-                    }
-                    continue;
-                }
-                clearerr(wctx->file);
-            }
-
-            // Spill the block to the temp file (preserve the data).
-            char spill_err[256] = {0};
-            if (!gui_record_spill_enqueue(wctx->app, wctx->channel,
-                                          (const int16_t *)rb_buf, in_len,
-                                          0, spill_err, sizeof(spill_err))) {
-                if (spill_err[0] && wctx->app) {
-                    gui_record_log_capture_event(wctx->app, "ERROR", spill_err,
-                                                 GUI_ERROR_CLASS_SYSTEM, 1);
-                }
-            }
-            bufmgr_read_end(wctx->bufmgr, wctx->buf_id, in_len);
-            continue;
-        }
-
         if (!gui_record_get_next_block(wctx, in_len, timeout_ms, spill_i16, &in, &from_ringbuffer)) {
             if (timeout_ms == 0) {
                 break;
@@ -1432,8 +1305,6 @@ static int raw_writer_thread(void *ctx) {
         }
         size_t out_n = GUI_RECORD_WRITER_BLOCK_SAMPLES;
         bool wrote_block = false;
-        bool write_ok = false;
-        size_t write_bytes = 0;
 
 #if LIBSOXR_ENABLED
         if (wctx->enable_resample &&
@@ -1447,7 +1318,7 @@ static int raw_writer_thread(void *ctx) {
                 if (!err && out_done > 0) {
                     out_n = out_done;
                     convert_i16_to_raw_bytes(tmp_out, tmp_i16, out_n, wctx->rf_bits);
-                    write_bytes = out_n * bps;
+                    fwrite(tmp_out, 1, out_n * bps, wctx->file);
                     wrote_block = true;
                 }
             }
@@ -1455,44 +1326,11 @@ static int raw_writer_thread(void *ctx) {
 #endif
         if (!wrote_block) {
             convert_i16_to_raw_bytes(tmp_out, in, out_n, wctx->rf_bits);
-            write_bytes = out_n * bps;
-        }
-
-        if (write_bytes > 0) {
-            size_t written = fwrite(tmp_out, 1, write_bytes, wctx->file);
-            write_ok = (written == write_bytes && !ferror(wctx->file));
+            fwrite(tmp_out, 1, out_n * bps, wctx->file);
         }
 
         if (from_ringbuffer) {
             bufmgr_read_end(wctx->bufmgr, wctx->buf_id, in_len);
-        }
-
-        if (!write_ok) {
-            // Output file write failed (e.g. locked by another app for
-            // viewing). Enter write-error state, spill the block to the
-            // temp file to preserve the data, and keep the capture running.
-            write_error = true;
-            atomic_store(&s_record_write_error[wctx->channel], true);
-            clearerr(wctx->file);
-            raw_write_err_count++;
-            if (raw_write_err_count <= 5 || (raw_write_err_count % 1000) == 0) {
-                char msg[160];
-                snprintf(msg, sizeof(msg),
-                         "RAW write error on channel %c (#%llu): output file may be locked",
-                         wctx->channel == 0 ? 'A' : 'B',
-                         (unsigned long long)raw_write_err_count);
-                fprintf(stderr, "[RAW] %s\n", msg);
-                if (wctx->app) {
-                    gui_record_log_capture_event(wctx->app, "ERROR", msg,
-                                                 GUI_ERROR_CLASS_SYSTEM, 1);
-                }
-            }
-            if (from_ringbuffer && wctx->app) {
-                char spill_err[256] = {0};
-                gui_record_spill_enqueue(wctx->app, wctx->channel, in, in_len,
-                                         0, spill_err, sizeof(spill_err));
-            }
-            continue;
         }
 
         if (s_recording_app) {
@@ -1546,16 +1384,6 @@ void gui_record_cleanup(void) {
 // Check if recording is active
 bool gui_record_is_active(void) {
     return s_recording_app != NULL && s_recording_app->is_recording;
-}
-
-// Check if any recording channel has a persistent output-file write error.
-bool gui_record_has_write_error(void) {
-    for (int i = 0; i < GUI_RECORD_SPILL_CHANNELS; i++) {
-        if (atomic_load(&s_record_write_error[i])) {
-            return true;
-        }
-    }
-    return false;
 }
 
 // Check if waiting for popup confirmation
@@ -2430,10 +2258,6 @@ static int gui_record_start_confirmed(gui_app_t *app) {
     atomic_store(&app->recording_compressed_b, 0);
     app->last_recording_duration_s = 0.0;
     gui_record_spill_reset_all();
-    // Clear per-channel write-error flags for the new recording session.
-    for (int i = 0; i < GUI_RECORD_SPILL_CHANNELS; i++) {
-        atomic_store(&s_record_write_error[i], false);
-    }
 
     // Reset record buffers before starting
     gui_extract_reset_record_rbs(app);
@@ -2788,17 +2612,6 @@ static void gui_record_finalize_stop_sync(gui_app_t *app, double stop_request_ti
         s_writer_threads_running = false;
     }
     gui_record_spill_reset_all();
-
-    // Alert the user if a persistent output-file write error was active
-    // during recording (e.g. file locked by another app for viewing). The
-    // UI flashes the finalize icon red while this flag is set.
-    if (gui_record_has_write_error()) {
-        gui_record_log_writef("ERROR",
-            "Output file write error during recording: one or more channels could not write to the output file (it may have been locked by another application). Some recorded data may be incomplete.");
-        if (app) {
-            gui_app_set_status(app, "Recording write error: output file was locked by another app (data may be incomplete)");
-        }
-    }
 
 #if LIBFLAC_ENABLED == 1
     uint64_t flac_samples_a = 0;

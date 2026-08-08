@@ -175,29 +175,29 @@ static int extraction_thread(void *ctx) {
                 bool want_b = s_b_present && s_extract_app->settings.capture_b;
                 int16_t *write_a = NULL;
                 int16_t *write_b = NULL;
+                bool attempted_ring_a = false;
+                bool attempted_ring_b = false;
                 bool drop_a = false;
                 bool drop_b = false;
                 char spill_error_a[256] = {0};
                 char spill_error_b[256] = {0};
 
-                // Always attempt the in-memory record ringbuffer first so the
-                // normal recording path is extraction -> ringbuffer -> FLAC
-                // writer (direct encode, no temp file). The spill temp file is
-                // only a per-block fallback when bufmgr_write_begin returns NULL
-                // (genuine transient backpressure), not a sticky mode. This
-                // prevents a single backpressure blip from permanently routing
-                // recording through a rolling disk temp file.
                 if (want_a) {
-                    write_a = (int16_t *)bufmgr_write_begin(&s_extract_app->buffers,
-                                                            BUF_RECORD_A,
-                                                            sample_bytes,
-                                                            &s_record_write_policy);
+                    if (!gui_record_spill_is_forced(0)) {
+                        attempted_ring_a = true;
+                        write_a = (int16_t *)bufmgr_write_begin(&s_extract_app->buffers,
+                                                                BUF_RECORD_A,
+                                                                sample_bytes,
+                                                                &s_record_write_policy);
+                    }
                     if (!write_a) {
                         if (gui_record_spill_enqueue(s_extract_app, 0, mapped_a, sample_bytes,
                                                      frame_count, spill_error_a, sizeof(spill_error_a))) {
-                            uint32_t drops_now = atomic_load(&s_extract_app->buffers.stats[BUF_RECORD_A].write_drops);
-                            if (drops_now > 0) {
-                                atomic_fetch_sub(&s_extract_app->buffers.stats[BUF_RECORD_A].write_drops, 1);
+                            if (attempted_ring_a) {
+                                uint32_t drops_now = atomic_load(&s_extract_app->buffers.stats[BUF_RECORD_A].write_drops);
+                                if (drops_now > 0) {
+                                    atomic_fetch_sub(&s_extract_app->buffers.stats[BUF_RECORD_A].write_drops, 1);
+                                }
                             }
                         } else {
                             drop_a = true;
@@ -206,16 +206,21 @@ static int extraction_thread(void *ctx) {
                 }
 
                 if (want_b) {
-                    write_b = (int16_t *)bufmgr_write_begin(&s_extract_app->buffers,
-                                                            BUF_RECORD_B,
-                                                            sample_bytes,
-                                                            &s_record_write_policy);
+                    if (!gui_record_spill_is_forced(1)) {
+                        attempted_ring_b = true;
+                        write_b = (int16_t *)bufmgr_write_begin(&s_extract_app->buffers,
+                                                                BUF_RECORD_B,
+                                                                sample_bytes,
+                                                                &s_record_write_policy);
+                    }
                     if (!write_b) {
                         if (gui_record_spill_enqueue(s_extract_app, 1, mapped_b, sample_bytes,
                                                      frame_count, spill_error_b, sizeof(spill_error_b))) {
-                            uint32_t drops_now = atomic_load(&s_extract_app->buffers.stats[BUF_RECORD_B].write_drops);
-                            if (drops_now > 0) {
-                                atomic_fetch_sub(&s_extract_app->buffers.stats[BUF_RECORD_B].write_drops, 1);
+                            if (attempted_ring_b) {
+                                uint32_t drops_now = atomic_load(&s_extract_app->buffers.stats[BUF_RECORD_B].write_drops);
+                                if (drops_now > 0) {
+                                    atomic_fetch_sub(&s_extract_app->buffers.stats[BUF_RECORD_B].write_drops, 1);
+                                }
                             }
                         } else {
                             drop_b = true;
@@ -227,13 +232,6 @@ static int extraction_thread(void *ctx) {
                     if (write_a) {
                         memcpy(write_a, mapped_a, sample_bytes);
                         bufmgr_write_end(&s_extract_app->buffers, BUF_RECORD_A, sample_bytes);
-                        // Ringbuffer write succeeded: clear any stale sticky
-                        // spill-forced flag so the WARN can re-fire if
-                        // backpressure recurs and the spill temp file is
-                        // recycled promptly by the drain path.
-                        if (gui_record_spill_is_forced(0)) {
-                            gui_record_spill_clear_forced(0);
-                        }
                     } else if (drop_a) {
                         char drop_msg[320];
                         if (spill_error_a[0]) {
@@ -256,9 +254,6 @@ static int extraction_thread(void *ctx) {
                     if (write_b) {
                         memcpy(write_b, mapped_b, sample_bytes);
                         bufmgr_write_end(&s_extract_app->buffers, BUF_RECORD_B, sample_bytes);
-                        if (gui_record_spill_is_forced(1)) {
-                            gui_record_spill_clear_forced(1);
-                        }
                     } else if (drop_b) {
                         char drop_msg[320];
                         if (spill_error_b[0]) {

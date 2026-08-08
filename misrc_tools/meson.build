@@ -340,7 +340,6 @@ if raylib_dep.found()
     'misrc_gui/signal/gui_headswitch_lock.c',
     'misrc_gui/signal/gui_trigger.c',
     'misrc_gui/signal/gui_cvbs.c',
-    'misrc_gui/signal/gui_vhs_fm.c',
     'misrc_gui/signal/gui_histogram.c',
     # Visualization
     'misrc_gui/visualization/gui_oscilloscope.c',

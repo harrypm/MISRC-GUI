@@ -276,12 +276,6 @@ typedef struct {
     // Advanced settings visibility: show/hide core-pinning controls in Settings.
     bool show_core_pinning_in_settings;
 
-    // Max total capture/playback buffer RAM budget in GB (1-16). Applied at
-    // buffer-manager init and re-applied on change when idle. Default 4 GB
-    // mirrors the older code's ~4 GB target. Record A/B get the remainder
-    // after fixed RF/Audio/Display allocations; record buffers stay lazy.
-    uint32_t memory_budget_gb;
-
     // Playback settings
     char playback_file_a[MAX_FILENAME_LEN];   // FLAC file for channel A playback
     char playback_file_b[MAX_FILENAME_LEN];   // FLAC file for channel B playback

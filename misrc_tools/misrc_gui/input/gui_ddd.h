@@ -92,13 +92,6 @@ void gui_ddd_stop(gui_app_t *app);
 // Check if DdD capture is running
 bool gui_ddd_is_running(gui_app_t *app);
 
-// Enable/disable FPGA test mode for the next/current capture. When enabled,
-// the capture thread verifies the 10-bit sample ramp and fails the capture
-// (VerificationError) on mismatch. Mirrors the original DdD app's test mode.
-// Must be called before gui_ddd_start() to take effect for that session.
-void gui_ddd_set_test_mode(bool enabled);
-bool gui_ddd_get_test_mode(void);
-
 // Open DdD device by index
 // Returns 0 on success, -1 on error
 int gui_ddd_open(gui_app_t *app, int device_index);

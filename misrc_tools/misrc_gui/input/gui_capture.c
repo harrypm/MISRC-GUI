@@ -376,22 +376,9 @@ static inline void gui_capture_update_backpressure_counters(gui_app_t *app)
     s_capture_last_drop_count = drops;
 }
 
-void gui_capture_request_dropout_stop(gui_app_t *app, gui_dropout_reason_t reason)
+static inline void gui_capture_request_dropout_stop(gui_app_t *app, gui_dropout_reason_t reason)
 {
     if (!app || !app->settings.stop_on_dropout) return;
-    atomic_store(&app->dropout_stop_reason, (uint32_t)reason);
-    atomic_store(&app->dropout_stop_requested, true);
-}
-
-// Request a capture stop unconditionally, bypassing the stop_on_dropout
-// toggle. Used for frame-level errors that are always dropout-worthy
-// (parser frame-error bursts and persistent missed-frame bursts) so they
-// halt capture even when the user has not enabled stop-on-dropout. Other
-// dropout events (callback gap, device error, backpressure) keep using
-// the gated gui_capture_request_dropout_stop() helper.
-static void gui_capture_force_dropout_stop(gui_app_t *app, gui_dropout_reason_t reason)
-{
-    if (!app) return;
     atomic_store(&app->dropout_stop_reason, (uint32_t)reason);
     atomic_store(&app->dropout_stop_requested, true);
 }
@@ -619,13 +606,9 @@ static void gui_sync_event_cb(void *user_ctx, frame_sync_result_t result,
                 !s_capture_missed_burst_reported) {
                 atomic_fetch_add(&app->missed_frame_count, 1);
                 s_capture_missed_burst_reported = true;
-                // Log as ERROR (not WARN) so the burst increments
-                // system_error_count + error_count via gui_record_log_capture_event,
-                // and force a dropout stop so missed-frame bursts always halt
-                // capture regardless of the stop_on_dropout toggle.
-                gui_record_log_capture_event(app, "ERROR", "Persistent missed-frame burst detected",
+                gui_record_log_capture_event(app, "WARN", "Persistent missed-frame burst detected",
                                              GUI_ERROR_CLASS_SYSTEM, 1);
-                gui_capture_force_dropout_stop(app, GUI_DROPOUT_MISSED_FRAME);
+                gui_capture_request_dropout_stop(app, GUI_DROPOUT_MISSED_FRAME);
             }
             break;
         case FRAME_SYNC_ACQUIRED:
@@ -773,12 +756,9 @@ void gui_capture_callback(void *data_info_ptr) {
             fprintf(stderr, "[CB] %d frame errors, %u frames since last error\n",
                     result.error_count, s_capture_handler.frame_state.frames_since_error);
         }
-        // Frame errors are always dropout-worthy: force a stop regardless of
-        // the stop_on_dropout toggle so parser frame-error bursts always halt
-        // capture (the user explicitly wants frame errors to count and stop).
-        // Tolerated CRC-only frames (report_errors == false) are still not
-        // counted/dropped, per the MISRC frame-mode tolerated-frame rule.
-        gui_capture_force_dropout_stop(app, GUI_DROPOUT_FRAME_ERROR);
+        if (app->settings.stop_on_dropout) {
+            gui_capture_request_dropout_stop(app, GUI_DROPOUT_FRAME_ERROR);
+        }
         return;  // Discard frame with errors
     }
 
@@ -1020,12 +1000,9 @@ void gui_app_init(gui_app_t *app) {
     gui_capture_configure_handler(app, true);
 
 
-    // Initialize centralized buffer manager with the configured RAM budget
-    // (1-16 GB, default 4 GB). Per-buffer sizes are derived from the budget;
-    // record buffers stay lazy and keep their rb_init fallback chain.
-    if (bufmgr_init_for_budget(&app->buffers, app->settings.memory_budget_gb) != 0) {
-        fprintf(stderr, "Failed to initialize buffer manager (budget=%u GB)\n",
-                (unsigned)app->settings.memory_budget_gb);
+    // Initialize centralized buffer manager
+    if (bufmgr_init(&app->buffers) != 0) {
+        fprintf(stderr, "Failed to initialize buffer manager\n");
     }
 
     // Initialize display thread (allocated, started on capture start)

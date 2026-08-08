@@ -240,52 +240,6 @@ void Clay_Raylib_Render(Clay_RenderCommandArray renderCommands, Font* fonts)
                                    2.0f, col);
                         break;
                     }
-                    case CUSTOM_LAYOUT_ELEMENT_TYPE_LOOP_ICON: {
-                        // Circular repeat arrow icon (playback loop toggle).
-                        // Styled to match a classic thick loop arrow with
-                        // a left-side head and rounded tail.
-                        float cx = boundingBox.x + boundingBox.width * 0.5f;
-                        float cy = boundingBox.y + boundingBox.height * 0.5f;
-                        float size = (boundingBox.width < boundingBox.height ? boundingBox.width : boundingBox.height);
-                        float ring_outer = size * 0.46f;
-                        float ring_stroke = fmaxf(2.2f, size * 0.22f);
-                        float ring_inner = fmaxf(0.5f, ring_outer - ring_stroke);
-                        Color col = COLOR_TEXT;
-                        // Draw two arc segments so the intentional gap lands on the left,
-                        // where the arrowhead will sit.
-                        DrawRing((Vector2){cx, cy}, ring_inner, ring_outer,
-                                 228.0f, 360.0f, 56, col);
-                        DrawRing((Vector2){cx, cy}, ring_inner, ring_outer,
-                                 0.0f, 150.0f, 56, col);
-
-                        // Rounded tail cap at lower-left.
-                        float tail_ang = 228.0f * DEG2RAD;
-                        float mid_r = (ring_inner + ring_outer) * 0.5f;
-                        Vector2 tail = {
-                            cx + cosf(tail_ang) * mid_r,
-                            cy + sinf(tail_ang) * mid_r
-                        };
-                        DrawCircle((int)roundf(tail.x), (int)roundf(tail.y), ring_stroke * 0.52f, col);
-
-                        // Filled arrowhead on the left side.
-                        float tip_ang = 188.0f * DEG2RAD;
-                        Vector2 tip = {
-                            cx + cosf(tip_ang) * (ring_outer + ring_stroke * 0.30f),
-                            cy + sinf(tip_ang) * (ring_outer + ring_stroke * 0.30f)
-                        };
-                        float wing_radius = ring_outer - ring_stroke * 0.18f;
-                        float wing_offset = 0.72f;
-                        Vector2 wing_a = {
-                            cx + cosf(tip_ang + wing_offset) * wing_radius,
-                            cy + sinf(tip_ang + wing_offset) * wing_radius
-                        };
-                        Vector2 wing_b = {
-                            cx + cosf(tip_ang - wing_offset) * wing_radius,
-                            cy + sinf(tip_ang - wing_offset) * wing_radius
-                        };
-                        DrawTriangle(tip, wing_a, wing_b, col);
-                        break;
-                    }
                     case CUSTOM_LAYOUT_ELEMENT_TYPE_VERSION_ICON: {
                         // Fixed left-side "i" info badge with a capture-state accent ring.
                         // Font-free (primitives only) so layout width is constant on every platform.
