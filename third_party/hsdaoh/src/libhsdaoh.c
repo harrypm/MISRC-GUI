@@ -708,7 +708,7 @@ int hsdaoh_check_idle_cnt(uint16_t *idle_cnt, uint16_t *buf, size_t length)
 	return idle_counter_errors;
 }
 
-static inline uint16_t crc16_simple(uint8_t *buf, unsigned int len)
+inline uint16_t crc16_simple(uint8_t *buf, unsigned int len)
 {
 #if HAVE_CRCFAST
 	return (uint16_t)crc_fast_checksum(Crc16Ibm3740, (const char *)buf, len);

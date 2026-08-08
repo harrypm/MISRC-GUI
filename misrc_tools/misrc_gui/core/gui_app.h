@@ -238,7 +238,6 @@ typedef struct {
     bool audio_monitor_playback;               // If true, play monitored audio to system output
     bool audio_monitor_ch34;                   // If true, monitor CH3/4; if false, monitor CH1/2
     bool misrc_mode;                           // If true, MISRC mode (default) with A/B channel swap
-    bool misrc_v15_v25_ab_swap;               // If true, invert MISRC A/B mapping for V1.5/V2.5 hardware swap variants
     bool stop_on_dropout;                      // If true, automatically stop capture when stream dropout is detected
 
     // Level autostop: stop capture/recording when signal level stays below a
@@ -275,12 +274,6 @@ typedef struct {
     bool discover_simple_capture;
     // Advanced settings visibility: show/hide core-pinning controls in Settings.
     bool show_core_pinning_in_settings;
-
-    // Max total capture/playback buffer RAM budget in GB (1-16). Applied at
-    // buffer-manager init and re-applied on change when idle. Default 4 GB
-    // mirrors the older code's ~4 GB target. Record A/B get the remainder
-    // after fixed RF/Audio/Display allocations; record buffers stay lazy.
-    uint32_t memory_budget_gb;
 
     // Playback settings
     char playback_file_a[MAX_FILENAME_LEN];   // FLAC file for channel A playback
@@ -331,8 +324,6 @@ typedef struct gui_app {
     bool is_recording;
     bool user_capture_mode_misrc;      // Authoritative user-selected mode (changes only via mode toggle)
     bool capture_mode_runtime_misrc;   // Mode latched at recording start (stable for recording session)
-    bool capture_backend_upstream;     // Active backend for current capture session (true=upstream callback)
-    bool capture_has_channel_b;        // Runtime capability flag used by extraction/display mapping
 
     // Device enumeration
     device_info_t devices[MAX_DEVICES];

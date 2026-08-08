@@ -46,25 +46,12 @@
 // Cypress FX3 USB VID/PID for MISRC firmware
 #define FX3_VID              0x04B4      // Cypress VID
 #define FX3_PID_BOOTLOADER   0x00F3      // FX3 bootloader mode
-#define FX3_PID_FX3USBADC    0x00F1      // fx3usbadc runtime firmware
 #define FX3_PID_MISRC        0x1234      // MISRC custom firmware (adjust as needed)
-// fx3usbadc endpoint for data streaming
-#define FX3USBADC_EP_BULK_IN 0x81
 
 // USB transfer parameters
 #define FX3_TRANSFER_SIZE    (FX3_BUFFER_SIZE * 4)  // 4 bytes per sample (32-bit packed)
 #define FX3_TRANSFER_TIMEOUT 1000                    // 1 second timeout
-#define FX3_CTRL_TIMEOUT     1000                    // Control transfer timeout (ms) — must be >=1s for fx3usbadc 0x91 start
-
-// fx3usbadc command defaults (verified against fx3usbadc firmware README + live 100 MSPS test):
-// wValue = gain control word [0:HighGain(1):GainCode(7)], default 0x94.
-// wIndex = [bit15 sample16][bit14 external_clock][bits7:0 clkConfig]:
-//   0xC010 = 16-bit + external NB3N3020 clock + config 16 => 100 MSPS.
-//   (Previous 0x800C was 64 MHz internal clock — wrong for the fx3usbadc board.)
-#define FX3USBADC_CMD_START                  0x91
-#define FX3USBADC_DEFAULT_GAIN_CONTROL_WORD  ((uint16_t)0x94)
-#define FX3USBADC_DEFAULT_START_WINDEX       ((uint16_t)0xC010)
-#define FX3USBADC_SAMPLE_RATE_HZ             (100000000u)
+#define FX3_CTRL_TIMEOUT     100                     // Control transfer timeout (ms)
 
 //-----------------------------------------------------------------------------
 // Platform-specific USB abstraction
@@ -106,58 +93,6 @@ static void fx3_usb_exit(void) {
 static fx3_handle_t s_fx3_handle = NULL;
 static int s_fx3_interface = 0;
 static atomic_bool s_fx3_transfer_ready = false;  // Set when capture thread is ready for data
-typedef enum {
-    FX3_PROTOCOL_UNKNOWN = 0,
-    FX3_PROTOCOL_SIGROK,
-    FX3_PROTOCOL_FX3USBADC,
-} fx3_protocol_t;
-static fx3_protocol_t s_fx3_protocol = FX3_PROTOCOL_UNKNOWN;
-static uint8_t s_fx3_bulk_ep = FX3_EP_BULK_IN;
-
-static fx3_protocol_t fx3_protocol_from_pid(uint16_t pid)
-{
-    if (pid == FX3_PID_FX3USBADC) {
-        return FX3_PROTOCOL_FX3USBADC;
-    }
-    return FX3_PROTOCOL_SIGROK;
-}
-
-static const char *fx3_protocol_name(fx3_protocol_t protocol)
-{
-    switch (protocol) {
-        case FX3_PROTOCOL_FX3USBADC:
-            return "fx3usbadc";
-        case FX3_PROTOCOL_SIGROK:
-            return "sigrok-compatible";
-        default:
-            return "unknown";
-    }
-}
-
-static uint32_t fx3_protocol_sample_rate_hz(fx3_protocol_t protocol)
-{
-    if (protocol == FX3_PROTOCOL_FX3USBADC) {
-        return FX3USBADC_SAMPLE_RATE_HZ;
-    }
-    return FX3_SAMPLE_RATE;
-}
-
-static uint32_t fx3_active_sample_rate_hz(void)
-{
-    return fx3_protocol_sample_rate_hz(s_fx3_protocol);
-}
-
-static uint32_t fx3usbadc_pack_signed10_from_sample16(int16_t sample16)
-{
-    // fx3usbadc 16-bit mode packs signed 10-bit samples left-shifted by 6.
-    // Convert to 10-bit unsigned and then polarity-compensate into MISRC's
-    // 12-bit slot so extract-pad reproduces the original signed sample scale.
-    int32_t sample10 = ((int32_t)sample16) >> 6;
-    if (sample10 < -512) sample10 = -512;
-    if (sample10 > 511) sample10 = 511;
-    uint32_t u10 = (uint32_t)(sample10 + 512);
-    return (uint32_t)(4095u - (u10 << 2));
-}
 
 //-----------------------------------------------------------------------------
 // FX3 Vendor Commands (from sigrok cypress-fx3 driver)
@@ -165,14 +100,14 @@ static uint32_t fx3usbadc_pack_signed10_from_sample16(int16_t sample16)
 
 // Structure for start acquisition command (must be packed)
 #pragma pack(push, 1)
-struct fx3_cmd_start_acquisition_sigrok {
+struct fx3_cmd_start_acquisition {
     uint16_t sampling_factor;  // PIB_CLOCK / sample_rate
 };
 #pragma pack(pop)
 
 // Send vendor command to get firmware version
 static int fx3_cmd_get_fw_version(uint8_t *major, uint8_t *minor) {
-    if (!s_fx3_handle || s_fx3_protocol != FX3_PROTOCOL_SIGROK) return -1;
+    if (!s_fx3_handle) return -1;
 
     uint8_t version[2] = {0, 0};
     int ret = libusb_control_transfer(s_fx3_handle,
@@ -195,10 +130,10 @@ static int fx3_cmd_get_fw_version(uint8_t *major, uint8_t *minor) {
 }
 
 // Send vendor command to start acquisition
-static int fx3_cmd_start_acquisition_sigrok(uint32_t sample_rate) {
+static int fx3_cmd_start_acquisition(uint32_t sample_rate) {
     if (!s_fx3_handle) return -1;
 
-    struct fx3_cmd_start_acquisition_sigrok cmd;
+    struct fx3_cmd_start_acquisition cmd;
     cmd.sampling_factor = (uint16_t)(FX3_PIB_CLOCK / sample_rate);
 
     fprintf(stderr, "[FX3] Starting acquisition: sample_rate=%u, sampling_factor=%u\n",
@@ -219,38 +154,6 @@ static int fx3_cmd_start_acquisition_sigrok(uint32_t sample_rate) {
 
     fprintf(stderr, "[FX3] Start command sent successfully\n");
     return 0;
-}
-
-// Send fx3usbadc start command (0x91).
-static int fx3_cmd_start_acquisition_fx3usbadc(void)
-{
-    if (!s_fx3_handle) return -1;
-
-    int ret = libusb_control_transfer(s_fx3_handle,
-        LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_ENDPOINT_OUT,
-        FX3USBADC_CMD_START,
-        FX3USBADC_DEFAULT_GAIN_CONTROL_WORD,
-        FX3USBADC_DEFAULT_START_WINDEX,
-        NULL, 0,
-        FX3_CTRL_TIMEOUT);
-
-    if (ret < 0) {
-        fprintf(stderr, "[FX3] fx3usbadc start command failed: %s%c",
-                libusb_error_name(ret), 10);
-        return -1;
-    }
-    fprintf(stderr, "[FX3] fx3usbadc start command sent (wValue=0x%04X, wIndex=0x%04X)%c",
-            FX3USBADC_DEFAULT_GAIN_CONTROL_WORD, FX3USBADC_DEFAULT_START_WINDEX, 10);
-    return 0;
-}
-
-// Send the active protocol's start-acquisition command.
-static int fx3_cmd_start_acquisition(uint32_t sample_rate)
-{
-    if (s_fx3_protocol == FX3_PROTOCOL_FX3USBADC) {
-        return fx3_cmd_start_acquisition_fx3usbadc();
-    }
-    return fx3_cmd_start_acquisition_sigrok(sample_rate);
 }
 
 //-----------------------------------------------------------------------------
@@ -423,9 +326,7 @@ int gui_fx3_enumerate(fx3_device_info_t *devices, int max_devices) {
         if (libusb_get_device_descriptor(libusb_get_device(h), &desc) == 0) {
             // Check for FX3 VID and known PIDs
             if (desc.idVendor == FX3_VID &&
-                (desc.idProduct == FX3_PID_MISRC ||
-                 desc.idProduct == FX3_PID_FX3USBADC ||
-                 desc.idProduct == FX3_PID_BOOTLOADER)) {
+                (desc.idProduct == FX3_PID_MISRC || desc.idProduct == FX3_PID_BOOTLOADER)) {
 
                 devices[count].bus = libusb_get_bus_number(libusb_get_device(h));
                 devices[count].address = libusb_get_device_address(libusb_get_device(h));
@@ -440,16 +341,10 @@ int gui_fx3_enumerate(fx3_device_info_t *devices, int max_devices) {
                                  "%s", serial);
                     }
                 }
-                const char *fx3_name = "Cypress FX3";
-                if (desc.idProduct == FX3_PID_FX3USBADC) {
-                    fx3_name = "FX3 USB ADC";
-                } else if (desc.idProduct == FX3_PID_BOOTLOADER) {
-                    fx3_name = "Cypress FX3 Bootloader";
-                }
 
                 snprintf(devices[count].name, sizeof(devices[count].name),
-                         "%s (Bus %d, Addr %d)",
-                         fx3_name, devices[count].bus, devices[count].address);
+                         "Cypress FX3 (Bus %d, Addr %d)",
+                         devices[count].bus, devices[count].address);
 
                 count++;
             }
@@ -472,23 +367,15 @@ int gui_fx3_enumerate(fx3_device_info_t *devices, int max_devices) {
         if (libusb_get_device_descriptor(devlist[i], &desc) == 0) {
             // Check for FX3 VID and known PIDs
             if (desc.idVendor == FX3_VID &&
-                (desc.idProduct == FX3_PID_MISRC ||
-                 desc.idProduct == FX3_PID_FX3USBADC ||
-                 desc.idProduct == FX3_PID_BOOTLOADER)) {
+                (desc.idProduct == FX3_PID_MISRC || desc.idProduct == FX3_PID_BOOTLOADER)) {
 
                 devices[count].bus = libusb_get_bus_number(devlist[i]);
                 devices[count].address = libusb_get_device_address(devlist[i]);
                 devices[count].serial[0] = '\0';
-                const char *fx3_name = "Cypress FX3";
-                if (desc.idProduct == FX3_PID_FX3USBADC) {
-                    fx3_name = "FX3 USB ADC";
-                } else if (desc.idProduct == FX3_PID_BOOTLOADER) {
-                    fx3_name = "Cypress FX3 Bootloader";
-                }
 
                 snprintf(devices[count].name, sizeof(devices[count].name),
-                         "%s (Bus %d, Addr %d)",
-                         fx3_name, devices[count].bus, devices[count].address);
+                         "Cypress FX3 (Bus %d, Addr %d)",
+                         devices[count].bus, devices[count].address);
 
                 count++;
             }
@@ -505,38 +392,6 @@ int gui_fx3_enumerate(fx3_device_info_t *devices, int max_devices) {
 //-----------------------------------------------------------------------------
 // FX3 Device Open/Close
 //-----------------------------------------------------------------------------
-#ifdef __linux__
-typedef struct {
-    cyusb_handle *handle;
-    uint16_t pid;
-    int fx3_index;
-} fx3_linux_runtime_candidate_t;
-
-static int fx3_open_linux_runtime_candidate(const fx3_linux_runtime_candidate_t *candidate)
-{
-    if (!candidate || !candidate->handle) return -1;
-
-    s_fx3_handle = candidate->handle;
-    s_fx3_protocol = fx3_protocol_from_pid(candidate->pid);
-    s_fx3_bulk_ep = (s_fx3_protocol == FX3_PROTOCOL_FX3USBADC)
-                    ? FX3USBADC_EP_BULK_IN
-                    : FX3_EP_BULK_IN;
-
-    int r = fx3_usb_claim(s_fx3_handle, s_fx3_interface);
-    if (r < 0) {
-        fprintf(stderr, "[FX3] Failed to claim interface on FX3 index %d (PID=0x%04X): %d\n",
-                candidate->fx3_index, candidate->pid, r);
-        s_fx3_handle = NULL;
-        s_fx3_protocol = FX3_PROTOCOL_UNKNOWN;
-        s_fx3_bulk_ep = FX3_EP_BULK_IN;
-        return -1;
-    }
-
-    fprintf(stderr, "[FX3] Opened FX3 index %d (PID=0x%04X, protocol=%s, EP=0x%02X)%c",
-            candidate->fx3_index, candidate->pid, fx3_protocol_name(s_fx3_protocol), s_fx3_bulk_ep, 10);
-    return 0;
-}
-#endif
 
 int gui_fx3_open(gui_app_t *app, int device_index) {
     (void)app;
@@ -547,21 +402,9 @@ int gui_fx3_open(gui_app_t *app, int device_index) {
         fprintf(stderr, "[FX3] No FX3 devices found\n");
         return -1;
     }
-    fx3_linux_runtime_candidate_t *runtime_candidates =
-        (fx3_linux_runtime_candidate_t *)calloc((size_t)num_devices, sizeof(*runtime_candidates));
-    if (!runtime_candidates) {
-        fprintf(stderr, "[FX3] Out of memory while enumerating FX3 devices\n");
-        cyusb_close();
-        return -1;
-    }
 
-    // Collect all FX3 devices and runtime-openable candidates.
     // Find the device by index (counting only FX3 devices)
     int fx3_count = 0;
-    int runtime_count = 0;
-    int selected_runtime_candidate = -1;
-    bool selected_found = false;
-    bool selected_is_bootloader = false;
     for (int i = 0; i < num_devices; i++) {
         cyusb_handle *h = cyusb_gethandle(i);
         if (!h) continue;
@@ -569,77 +412,29 @@ int gui_fx3_open(gui_app_t *app, int device_index) {
         struct libusb_device_descriptor desc;
         if (libusb_get_device_descriptor(libusb_get_device(h), &desc) == 0) {
             if (desc.idVendor == FX3_VID &&
-                (desc.idProduct == FX3_PID_MISRC ||
-                 desc.idProduct == FX3_PID_FX3USBADC ||
-                 desc.idProduct == FX3_PID_BOOTLOADER)) {
-
-                bool is_bootloader = (desc.idProduct == FX3_PID_BOOTLOADER);
+                (desc.idProduct == FX3_PID_MISRC || desc.idProduct == FX3_PID_BOOTLOADER)) {
                 if (fx3_count == device_index) {
-                    selected_found = true;
-                    selected_is_bootloader = is_bootloader;
-                }
+                    s_fx3_handle = h;
 
-                if (!is_bootloader && runtime_count < num_devices) {
-                    runtime_candidates[runtime_count].handle = h;
-                    runtime_candidates[runtime_count].pid = desc.idProduct;
-                    runtime_candidates[runtime_count].fx3_index = fx3_count;
-                    if (fx3_count == device_index) {
-                        selected_runtime_candidate = runtime_count;
+                    // Claim interface
+                    int r = fx3_usb_claim(s_fx3_handle, s_fx3_interface);
+                    if (r < 0) {
+                        fprintf(stderr, "[FX3] Failed to claim interface: %d\n", r);
+                        cyusb_close();
+                        s_fx3_handle = NULL;
+                        return -1;
                     }
-                    runtime_count++;
+
+                    fprintf(stderr, "[FX3] Opened device index %d\n", device_index);
+                    return 0;
                 }
                 fx3_count++;
             }
         }
     }
 
-    if (!selected_found) {
-        fprintf(stderr, "[FX3] Device index %d not found (found %d FX3 devices)\n",
-                device_index, fx3_count);
-        free(runtime_candidates);
-        cyusb_close();
-        return -1;
-    }
-
-    bool selected_runtime_failed = false;
-    if (selected_runtime_candidate >= 0) {
-        if (fx3_open_linux_runtime_candidate(&runtime_candidates[selected_runtime_candidate]) == 0) {
-            free(runtime_candidates);
-            return 0;
-        }
-        selected_runtime_failed = true;
-    } else if (selected_is_bootloader) {
-        fprintf(stderr, "[FX3] Selected FX3 index %d is bootloader mode (PID=0x%04X); searching for runtime FX3 device...%c",
-                device_index, FX3_PID_BOOTLOADER, 10);
-    }
-
-    if (selected_runtime_failed) {
-        fprintf(stderr, "[FX3] Selected FX3 index %d could not be opened; trying other runtime FX3 devices...%c",
-                device_index, 10);
-    }
-
-    for (int i = 0; i < runtime_count; i++) {
-        if (i == selected_runtime_candidate) continue;
-        if (fx3_open_linux_runtime_candidate(&runtime_candidates[i]) == 0) {
-            fprintf(stderr, "[FX3] Using fallback runtime FX3 index %d for capture%c",
-                    runtime_candidates[i].fx3_index, 10);
-            free(runtime_candidates);
-            return 0;
-        }
-    }
-
-    if (runtime_count == 0) {
-        fprintf(stderr, "[FX3] No runtime FX3 device found. Flash firmware and reconnect as PID=0x%04X.%c",
-                FX3_PID_FX3USBADC, 10);
-    } else {
-        fprintf(stderr, "[FX3] Found %d runtime FX3 device(s), but none could be opened.%c",
-                runtime_count, 10);
-    }
-
-    free(runtime_candidates);
-    s_fx3_handle = NULL;
-    s_fx3_protocol = FX3_PROTOCOL_UNKNOWN;
-    s_fx3_bulk_ep = FX3_EP_BULK_IN;
+    fprintf(stderr, "[FX3] Device index %d not found (found %d FX3 devices)\n",
+            device_index, fx3_count);
     cyusb_close();
     return -1;
 #else
@@ -672,9 +467,7 @@ retry_after_firmware:;
         struct libusb_device_descriptor desc;
         if (libusb_get_device_descriptor(devlist[i], &desc) == 0) {
             if (desc.idVendor == FX3_VID &&
-                (desc.idProduct == FX3_PID_MISRC ||
-                 desc.idProduct == FX3_PID_FX3USBADC ||
-                 desc.idProduct == FX3_PID_BOOTLOADER)) {
+                (desc.idProduct == FX3_PID_MISRC || desc.idProduct == FX3_PID_BOOTLOADER)) {
                 if (fx3_count == device_index) {
                     // Found the device, open it
                     int r = libusb_open(devlist[i], &s_fx3_handle);
@@ -684,20 +477,13 @@ retry_after_firmware:;
                         fx3_usb_exit();
                         return -1;
                     }
-                    s_fx3_protocol = fx3_protocol_from_pid(desc.idProduct);
-                    s_fx3_bulk_ep = (s_fx3_protocol == FX3_PROTOCOL_FX3USBADC)
-                                    ? FX3USBADC_EP_BULK_IN
-                                    : FX3_EP_BULK_IN;
-                    fprintf(stderr, "[FX3] Selected protocol=%s for PID=0x%04X (default EP=0x%02X)%c",
-                            fx3_protocol_name(s_fx3_protocol), desc.idProduct, s_fx3_bulk_ep, 10);
 
-                    if (s_fx3_protocol == FX3_PROTOCOL_SIGROK) {
-                        // Check if firmware is loaded by reading USB manufacturer/product strings.
-                        // Sigrok firmware sets manufacturer="sigrok", product="cypress-fx3".
-                        // If these don't match, we need to upload firmware (even with PID 0x1234).
-                        bool needs_firmware = false;
-                        char manufacturer[64] = {0};
-                        char product[64] = {0};
+                    // Check if firmware is loaded by reading USB manufacturer/product strings
+                    // Sigrok firmware sets manufacturer="sigrok", product="cypress-fx3"
+                    // If these don't match, we need to upload firmware (even with PID 0x1234)
+                    bool needs_firmware = false;
+                    char manufacturer[64] = {0};
+                    char product[64] = {0};
 
                     if (desc.iManufacturer) {
                         libusb_get_string_descriptor_ascii(s_fx3_handle, desc.iManufacturer,
@@ -825,10 +611,6 @@ retry_after_firmware:;
                         return -1;
                     }
 
-                    } else {
-                        fprintf(stderr, "[FX3] Using fx3usbadc protocol; skipping sigrok firmware checks%c", 10);
-                    }
-
                     // Device has firmware loaded, proceed normally
                     fprintf(stderr, "[FX3] Opened device index %d (VID=%04X PID=%04X)\n",
                             device_index, desc.idVendor, desc.idProduct);
@@ -919,10 +701,8 @@ retry_after_firmware:;
                         } else {
                             fprintf(stderr, "[FX3] Set alternate setting %d successfully\n", best_alt);
                         }
-                        s_fx3_bulk_ep = (uint8_t)bulk_ep_found;
                     } else if (bulk_ep_found) {
                         fprintf(stderr, "[FX3] Using default alt setting 0 with bulk EP 0x%02X\n", bulk_ep_found);
-                        s_fx3_bulk_ep = (uint8_t)bulk_ep_found;
                     } else {
                         fprintf(stderr, "[FX3] Warning: No bulk IN endpoint found!\n");
                         fprintf(stderr, "[FX3] Device may need power cycle. Please:\n");
@@ -962,8 +742,6 @@ void gui_fx3_close(gui_app_t *app) {
 #endif
         s_fx3_handle = NULL;
     }
-    s_fx3_protocol = FX3_PROTOCOL_UNKNOWN;
-    s_fx3_bulk_ep = FX3_EP_BULK_IN;
 }
 
 //-----------------------------------------------------------------------------
@@ -973,8 +751,6 @@ void gui_fx3_close(gui_app_t *app) {
 static int fx3_capture_thread(void *ctx) {
     gui_app_t *app = (gui_app_t *)ctx;
     thrd_set_priority(THRD_PRIORITY_CRITICAL);
-    fx3_protocol_t active_protocol = s_fx3_protocol;
-    uint32_t active_sample_rate_hz = fx3_active_sample_rate_hz();
 
     // Allocate transfer buffer
     uint8_t *transfer_buf = (uint8_t *)malloc(FX3_TRANSFER_SIZE);
@@ -982,19 +758,22 @@ static int fx3_capture_thread(void *ctx) {
         fprintf(stderr, "[FX3] Failed to allocate transfer buffer\n");
         return -1;
     }
-    fprintf(stderr, "[FX3] Capture thread started (%s) at %u MSPS%c",
-            fx3_protocol_name(active_protocol), active_sample_rate_hz / 1000000, 10);
 
-    // Clear any stale data from endpoint. NOTE: do NOT issue a bulk read here
-    // before the 0x91 start command is sent. fx3usbadc sends no data until 0x91,
-    // and a pre-start read times out and can leave the endpoint in a stalled
-    // state that breaks the subsequent streaming. The 0x91 command is sent by
-    // gui_fx3_start() AFTER this thread signals s_fx3_transfer_ready.
-    fprintf(stderr, "[FX3] Clearing endpoint 0x%02X...%c", s_fx3_bulk_ep, 10);
-    libusb_clear_halt(s_fx3_handle, s_fx3_bulk_ep);
+    fprintf(stderr, "[FX3] Capture thread started at %d MSPS\n", FX3_SAMPLE_RATE / 1000000);
+
+    // Clear any stale data from endpoint
+    fprintf(stderr, "[FX3] Clearing endpoint 0x%02X...\n", FX3_EP_BULK_IN);
+    libusb_clear_halt(s_fx3_handle, FX3_EP_BULK_IN);
+
+    // Diagnostic: Try a quick read BEFORE CMD_START to check endpoint status
+    int diag_len = 0;
+    int diag_ret = libusb_bulk_transfer(s_fx3_handle, FX3_EP_BULK_IN,
+                                         transfer_buf, 1024, &diag_len, 100);
+    fprintf(stderr, "[FX3] Pre-CMD_START test read: ret=%d (%s), len=%d\n",
+            diag_ret, libusb_error_name(diag_ret), diag_len);
 
     atomic_store(&app->stream_synced, true);
-    atomic_store(&app->sample_rate, active_sample_rate_hz);
+    atomic_store(&app->sample_rate, FX3_SAMPLE_RATE);
 
     uint64_t batch_count = 0;
     uint64_t timeout_count = 0;
@@ -1003,22 +782,11 @@ static int fx3_capture_thread(void *ctx) {
     // Signal that we're about to start the first transfer
     fprintf(stderr, "[FX3] Capture thread signaling ready for transfers\n");
     fprintf(stderr, "[FX3] Transfer params: EP=0x%02X, size=%d, timeout=%dms\n",
-            s_fx3_bulk_ep, FX3_TRANSFER_SIZE, FX3_TRANSFER_TIMEOUT);
+            FX3_EP_BULK_IN, FX3_TRANSFER_SIZE, FX3_TRANSFER_TIMEOUT);
     atomic_store(&s_fx3_transfer_ready, true);
 
-    // Try configured endpoint first, then other bulk IN endpoints.
-    // NOTE: the multi-endpoint fallback is for the sigrok cypress-fx3 firmware
-    // (PID 0x1234), whose bulk IN endpoint can vary. fx3usbadc (PID 0x00F1)
-    // has exactly one bulk IN endpoint (0x81) and no others; switching to
-    // 0x82/0x83 produces LIBUSB_ERROR_IO spam. So for fx3usbadc only try EP 0x81.
-    uint8_t endpoints_to_try[4];
-    int endpoint_count = 0;
-    endpoints_to_try[endpoint_count++] = s_fx3_bulk_ep;
-    if (active_protocol != FX3_PROTOCOL_FX3USBADC) {
-        if (s_fx3_bulk_ep != 0x81) endpoints_to_try[endpoint_count++] = 0x81;
-        if (s_fx3_bulk_ep != 0x82) endpoints_to_try[endpoint_count++] = 0x82;
-        if (s_fx3_bulk_ep != 0x83) endpoints_to_try[endpoint_count++] = 0x83;
-    }
+    // Try configured endpoint first, then other bulk IN endpoints
+    uint8_t endpoints_to_try[] = {FX3_EP_BULK_IN, 0x81, 0x83};
     int current_ep_idx = 0;
     uint8_t current_ep = endpoints_to_try[0];
 
@@ -1036,7 +804,7 @@ static int fx3_capture_thread(void *ctx) {
                             (unsigned long long)timeout_count, current_ep);
                 }
                 // After 3 timeouts on current endpoint, try next one
-                if (timeout_count == 3 && current_ep_idx < (endpoint_count - 1)) {
+                if (timeout_count == 3 && current_ep_idx < 2) {
                     current_ep_idx++;
                     current_ep = endpoints_to_try[current_ep_idx];
                     fprintf(stderr, "[FX3] Switching to endpoint 0x%02X\n", current_ep);
@@ -1045,31 +813,9 @@ static int fx3_capture_thread(void *ctx) {
                 }
                 continue;
             }
-            // Fatal errors: the device/handle is gone. Break out of the loop
-            // instead of spinning and spamming hundreds of thousands of errors
-            // (verified: LIBUSB_ERROR_NO_DEVICE spammed 432684x when the FX3
-            // dropped mid-stream because bulk_transfer returns instantly).
-            if (r == LIBUSB_ERROR_NO_DEVICE ||
-                r == LIBUSB_ERROR_NOT_FOUND ||
-                r == LIBUSB_ERROR_NO_MEM ||
-                r == LIBUSB_ERROR_ACCESS) {
-                fprintf(stderr, "[FX3] Fatal USB error on EP 0x%02X: %s (%d) - stopping capture\n",
-                        current_ep, libusb_error_name(r), r);
-                gui_app_count_system_errors(app, 1);
-                atomic_store(&app->stream_synced, false);
-                break;
-            }
-            // Transient errors (PIPE, OVERFLOW, BABBLE, INTERRUPTED): log once,
-            // count, and continue. Rate-limit to avoid log flooding.
-            static uint64_t transient_err_count = 0;
-            transient_err_count++;
-            if (transient_err_count <= 5 || (transient_err_count % 1000) == 0) {
-                fprintf(stderr, "[FX3] Bulk transfer error #%llu on EP 0x%02X: %s (%d)\n",
-                        (unsigned long long)transient_err_count,
-                        current_ep, libusb_error_name(r), r);
-            }
+            fprintf(stderr, "[FX3] Bulk transfer error on EP 0x%02X: %s (%d)\n",
+                    current_ep, libusb_error_name(r), r);
             gui_app_count_system_errors(app, 1);
-            libusb_clear_halt(s_fx3_handle, current_ep);
             continue;
         }
 
@@ -1083,31 +829,16 @@ static int fx3_capture_thread(void *ctx) {
             fprintf(stderr, "[FX3] First data received: %d bytes\n", actual_length);
         }
 
-        size_t num_samples = 0;
-        size_t write_bytes = 0;
-        if (active_protocol == FX3_PROTOCOL_FX3USBADC) {
-            num_samples = (size_t)actual_length / sizeof(int16_t);
-            write_bytes = num_samples * sizeof(uint32_t);
-        } else {
-            num_samples = (size_t)actual_length / sizeof(uint32_t);
-            write_bytes = (size_t)actual_length;
-        }
+        // Write raw data directly to ringbuffer
+        // FX3 data is already in the correct 32-bit packed format:
+        // Bits 0-11:  Channel A (12-bit)
+        // Bits 12-19: AUX data (8 bits)
+        // Bits 20-31: Channel B (12-bit)
         uint8_t *buf_out = bufmgr_write_begin(&app->buffers, BUF_CAPTURE_RF,
-                                               write_bytes, NULL);
+                                               actual_length, NULL);
         if (buf_out) {
-            if (active_protocol == FX3_PROTOCOL_FX3USBADC) {
-                const int16_t *samples_in = (const int16_t *)transfer_buf;
-                uint32_t *packed_out = (uint32_t *)buf_out;
-                for (size_t i = 0; i < num_samples; i++) {
-                    packed_out[i] = fx3usbadc_pack_signed10_from_sample16(samples_in[i]);
-                }
-            } else {
-                // Legacy FX3 data is already in the correct 32-bit packed format:
-                // Bits 0-11: Channel A (12-bit), Bits 12-19: AUX (8-bit),
-                // Bits 20-31: Channel B (12-bit).
-                memcpy(buf_out, transfer_buf, write_bytes);
-            }
-            bufmgr_write_end(&app->buffers, BUF_CAPTURE_RF, write_bytes);
+            memcpy(buf_out, transfer_buf, actual_length);
+            bufmgr_write_end(&app->buffers, BUF_CAPTURE_RF, actual_length);
             bufmgr_signal_data(&app->buffers, BUF_CAPTURE_RF);
         } else {
             // Buffer full - drop data
@@ -1118,10 +849,8 @@ static int fx3_capture_thread(void *ctx) {
         }
 
         // Update statistics
+        size_t num_samples = actual_length / 4;  // 4 bytes per sample
         atomic_fetch_add(&app->total_samples, num_samples);
-        if (active_protocol == FX3_PROTOCOL_FX3USBADC) {
-            atomic_fetch_add(&app->samples_a, num_samples);
-        }
         atomic_store(&app->last_callback_time_ms, get_time_ms());
 
         batch_count++;
@@ -1141,27 +870,17 @@ static int fx3_capture_thread(void *ctx) {
 int gui_fx3_start(gui_app_t *app) {
     fprintf(stderr, "[FX3] Starting FX3 capture\n");
 
-    if (s_fx3_protocol == FX3_PROTOCOL_SIGROK) {
-        // Check firmware version first (optional but helpful for diagnostics)
-        uint8_t fw_major = 0, fw_minor = 0;
-        if (fx3_cmd_get_fw_version(&fw_major, &fw_minor) == 0) {
-            fprintf(stderr, "[FX3] Connected to FX3 firmware v%d.%d%c", fw_major, fw_minor, 10);
-        } else {
-            fprintf(stderr, "[FX3] Warning: Could not read firmware version (may be OK)%c", 10);
-        }
+    // Check firmware version first (optional but helpful for diagnostics)
+    uint8_t fw_major = 0, fw_minor = 0;
+    if (fx3_cmd_get_fw_version(&fw_major, &fw_minor) == 0) {
+        fprintf(stderr, "[FX3] Connected to FX3 firmware v%d.%d\n", fw_major, fw_minor);
     } else {
-        fprintf(stderr, "[FX3] Using protocol %s%c", fx3_protocol_name(s_fx3_protocol), 10);
+        fprintf(stderr, "[FX3] Warning: Could not read firmware version (may be OK)\n");
     }
 
-    // Start-acquisition ordering differs by protocol:
-    //  - sigrok cypress-fx3 (PID 0x1234): USB transfers must be pending BEFORE
-    //    CMD_START, so 0x91 is sent after the capture thread is reading.
-    //  - fx3usbadc (PID 0x00F1): the reference app (BulkTransfer.cpp) sends 0x91
-    //    and waits for it to complete BEFORE submitting bulk reads. Sending 0x91
-    //    while a bulk read is already pending on EP 0x81 causes that read to
-    //    time out (verified: 3x timeout then endpoint-switch spam). So for
-    //    fx3usbadc we send 0x91 before launching the capture thread.
-    const bool fx3_start_before_thread = (s_fx3_protocol == FX3_PROTOCOL_FX3USBADC);
+    // NOTE: Start acquisition command is sent AFTER the capture thread starts.
+    // This matches sigrok's behavior - USB transfers must be pending BEFORE
+    // CMD_START, otherwise data is lost because FX3 sends immediately.
 
     bufmgr_reset_stats(&app->buffers, BUF_COUNT);
 
@@ -1183,7 +902,7 @@ int gui_fx3_start(gui_app_t *app) {
     atomic_store(&app->rb_wait_count, 0);
     atomic_store(&app->rb_drop_count, 0);
     atomic_store(&app->stream_synced, false);
-    atomic_store(&app->sample_rate, fx3_active_sample_rate_hz());
+    atomic_store(&app->sample_rate, FX3_SAMPLE_RATE);
     atomic_store(&app->last_callback_time_ms, get_time_ms());
 
     // Reset display buffers
@@ -1220,25 +939,6 @@ int gui_fx3_start(gui_app_t *app) {
         }
     }
 
-
-    // For fx3usbadc: send 0x91 NOW, before the capture thread reads EP 0x81.
-    // The extraction + display threads are already running and will drain the
-    // ringbuffer once the capture thread starts filling it.
-    if (fx3_start_before_thread) {
-        if (fx3_cmd_start_acquisition(fx3_active_sample_rate_hz()) != 0) {
-            fprintf(stderr, "[FX3] Failed to start acquisition\n");
-            gui_app_set_status(app, "FX3: Failed to start acquisition");
-            gui_extract_stop();
-            if (app->display_thread) {
-                gui_display_thread_stop(app->display_thread);
-            }
-            atomic_store(&app->fx3_running, false);
-            app->is_capturing = false;
-            return -1;
-        }
-    }
-
-    atomic_store(&s_fx3_transfer_ready, false);
     // Start FX3 capture thread
     thrd_t thread;
     if (thrd_create_with_priority(&thread,
@@ -1256,34 +956,40 @@ int gui_fx3_start(gui_app_t *app) {
     }
     app->fx3_thread = (void *)(uintptr_t)thread;
 
-    if (!fx3_start_before_thread) {
-        // sigrok ordering: wait for the capture thread to be reading, then send 0x91.
-        fprintf(stderr, "[FX3] Waiting for capture thread to be ready...\n");
-        for (int i = 0; i < 100; i++) {  // Max 1 second wait
-            if (atomic_load(&s_fx3_transfer_ready)) {
-                fprintf(stderr, "[FX3] Capture thread ready after %d ms\n", i * 10);
-                break;
-            }
-            thrd_sleep_ms(10);
+    // Wait for capture thread to signal it's ready (about to call bulk transfer)
+    atomic_store(&s_fx3_transfer_ready, false);
+    fprintf(stderr, "[FX3] Waiting for capture thread to be ready...\n");
+    for (int i = 0; i < 100; i++) {  // Max 1 second wait
+        if (atomic_load(&s_fx3_transfer_ready)) {
+            fprintf(stderr, "[FX3] Capture thread ready after %d ms\n", i * 10);
+            break;
         }
-        if (!atomic_load(&s_fx3_transfer_ready)) {
-            fprintf(stderr, "[FX3] Warning: Capture thread did not signal ready\n");
+        thrd_sleep_ms(10);
+    }
+    if (!atomic_load(&s_fx3_transfer_ready)) {
+        fprintf(stderr, "[FX3] Warning: Capture thread did not signal ready\n");
+    }
+
+    // Additional delay to ensure bulk transfer is actually pending in libusb
+    // The capture thread signals "ready" just before calling bulk_transfer,
+    // but we need to ensure the USB transfer is actually submitted
+    thrd_sleep_ms(100);
+    fprintf(stderr, "[FX3] Waited additional 100ms for bulk transfer to be pending\n");
+
+    // NOW send start acquisition command - capture thread is listening
+    if (fx3_cmd_start_acquisition(FX3_SAMPLE_RATE) != 0) {
+        fprintf(stderr, "[FX3] Failed to start acquisition\n");
+        gui_app_set_status(app, "FX3: Failed to start acquisition");
+        // Stop all threads we started
+        atomic_store(&app->fx3_running, false);
+        thrd_join(thread, NULL);
+        app->fx3_thread = NULL;
+        gui_extract_stop();
+        if (app->display_thread) {
+            gui_display_thread_stop(app->display_thread);
         }
-        thrd_sleep_ms(100);
-        fprintf(stderr, "[FX3] Waited additional 100ms for bulk transfer to be pending\n");
-        if (fx3_cmd_start_acquisition(fx3_active_sample_rate_hz()) != 0) {
-            fprintf(stderr, "[FX3] Failed to start acquisition\n");
-            gui_app_set_status(app, "FX3: Failed to start acquisition");
-            atomic_store(&app->fx3_running, false);
-            thrd_join(thread, NULL);
-            app->fx3_thread = NULL;
-            gui_extract_stop();
-            if (app->display_thread) {
-                gui_display_thread_stop(app->display_thread);
-            }
-            app->is_capturing = false;
-            return -1;
-        }
+        app->is_capturing = false;
+        return -1;
     }
 
     gui_app_set_status(app, "FX3 capture running");

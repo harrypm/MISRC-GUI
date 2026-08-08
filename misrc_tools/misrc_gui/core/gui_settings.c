@@ -424,7 +424,6 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     settings->audio_monitor_playback = false;
     settings->audio_monitor_ch34 = false;  // Default to CH1/2
     settings->misrc_mode = true;           // Default to MISRC mode (A/B swapped)
-    settings->misrc_v15_v25_ab_swap = false;
     settings->stop_on_dropout = false;
 
     // Level autostop defaults (tape-end detection). Disabled by default.
@@ -442,9 +441,6 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     settings->discover_simple_capture = false;
     // Core-pinning controls are hidden by default; users can enable from info page.
     settings->show_core_pinning_in_settings = false;
-    // Max total buffer RAM budget (1-16 GB). Default 4 GB mirrors the older
-    // code's ~4 GB target. Clamped on load; applied at buffer-manager init.
-    settings->memory_budget_gb = 4;
 
     // Keep derived filenames coherent with default auto-naming state.
     gui_settings_refresh_auto_names(settings);
@@ -506,7 +502,6 @@ void gui_settings_save(const gui_settings_t *settings) {
     fprintf(f, "  \"audio_monitor_playback\": %s,\n", settings->audio_monitor_playback ? "true" : "false");
     fprintf(f, "  \"audio_monitor_ch34\": %s,\n", settings->audio_monitor_ch34 ? "true" : "false");
     fprintf(f, "  \"misrc_mode\": %s,\n", settings->misrc_mode ? "true" : "false");
-    fprintf(f, "  \"misrc_v15_v25_ab_swap\": %s,\n", settings->misrc_v15_v25_ab_swap ? "true" : "false");
     fprintf(f, "  \"stop_on_dropout\": %s,\n", settings->stop_on_dropout ? "true" : "false");
     fprintf(f, "  \"level_autostop_enabled\": %s,\n", settings->level_autostop_enabled ? "true" : "false");
     fprintf(f, "  \"level_autostop_level_str\": \"%s\",\n", settings->level_autostop_level_str);
@@ -560,7 +555,6 @@ void gui_settings_save(const gui_settings_t *settings) {
     fprintf(f, "  \"amplitude_scale\": %.2f,\n", settings->amplitude_scale);
     fprintf(f, "  \"discover_simple_capture\": %s,\n", settings->discover_simple_capture ? "true" : "false");
     fprintf(f, "  \"show_core_pinning_in_settings\": %s,\n", settings->show_core_pinning_in_settings ? "true" : "false");
-    fprintf(f, "  \"memory_budget_gb\": %u,\n", (unsigned)settings->memory_budget_gb);
     fprintf(f, "  \"playback_file_a\": \"%s\",\n", settings->playback_file_a);
     fprintf(f, "  \"playback_file_b\": \"%s\"\n", settings->playback_file_b);
     fprintf(f, "}\n");
@@ -955,12 +949,6 @@ void gui_settings_load(gui_settings_t *settings) {
     if ((value = find_value(content, "show_core_pinning_in_settings")) != NULL) {
         settings->show_core_pinning_in_settings = (strcmp(value, "true") == 0);
     }
-    if ((value = find_value(content, "memory_budget_gb")) != NULL) {
-        long gb = atol(value);
-        if (gb < 1) gb = 4;
-        if (gb > 16) gb = 16;
-        settings->memory_budget_gb = (uint32_t)gb;
-    }
 
     if ((value = find_value(content, "reduce_8bit_a")) != NULL) {
         settings->reduce_8bit_a = (strcmp(value, "true") == 0);
@@ -1046,9 +1034,6 @@ void gui_settings_load(gui_settings_t *settings) {
     }
     if ((value = find_value(content, "misrc_mode")) != NULL) {
         settings->misrc_mode = (strcmp(value, "true") == 0);
-    }
-    if ((value = find_value(content, "misrc_v15_v25_ab_swap")) != NULL) {
-        settings->misrc_v15_v25_ab_swap = (strcmp(value, "true") == 0);
     }
     if ((value = find_value(content, "stop_on_dropout")) != NULL) {
         settings->stop_on_dropout = (strcmp(value, "true") == 0);

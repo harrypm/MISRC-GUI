@@ -90,11 +90,9 @@ void gui_playback_toggle_pause(gui_app_t *app);
 // Seek to position (0.0 to 1.0 normalized, or absolute sample position)
 void gui_playback_seek_normalized(gui_app_t *app, double position);
 void gui_playback_seek_sample(gui_app_t *app, uint64_t sample);
-void gui_playback_seek_sample_channel(gui_app_t *app, int channel, uint64_t sample); // channel: 0=A, 1=B
 
 // Get current position
 uint64_t gui_playback_get_position_samples(gui_app_t *app);
-uint64_t gui_playback_get_position_samples_channel(gui_app_t *app, int channel); // channel: 0=A, 1=B
 double gui_playback_get_position_normalized(gui_app_t *app);
 double gui_playback_get_position_seconds(gui_app_t *app);
 

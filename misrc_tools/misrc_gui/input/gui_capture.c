@@ -49,9 +49,11 @@
 #undef Rectangle
 #endif
 
-// Runtime-selectable backends need both parser and upstream paths compiled.
+#ifndef HSDAOH_UPSTREAM
+// Frame-based mode only (MISRC)
 #include <hsdaoh_raw.h>
 #include "../../common/frame_parser.h"
+#endif
 
 #include "../../common/extract.h"
 #include "../../common/ringbuffer.h"
@@ -86,77 +88,13 @@
 #define DEFAULT_AUDIO_SAMPLE_RATE 78125U
 
 // Note: All capture buffers now managed by buffer manager (BUF_CAPTURE_RF, BUF_CAPTURE_AUDIO)
-// Capture handler context (parser/raw backend) and upstream audio gate.
+// Capture handler context (includes frame parser state)
+#ifndef HSDAOH_UPSTREAM
 static capture_handler_ctx_t s_capture_handler;
+#else
+// Upstream mode audio enable/disable (used by gui_capture_set_audio_capture + upstream callback)
 static atomic_bool s_upstream_capture_audio = ATOMIC_VAR_INIT(true);
-
-// --- Upstream dual-ADC Channel B pairing state ---
-// hsdaoh delivers stream_id=0 (Ch A) and stream_id=1 (Ch B) as separate
-// callbacks for dual-ADC hardware (PIO_12BIT_DUAL / PIO_DUALCHAN_12BIT /
-// FPGA_12BIT_DUAL). We buffer whichever arrives first and merge when the
-// matching frame arrives, packing into the uint32_t format the extraction
-// layer expects: bits[11:0]=A, bits[31:20]=B.
-// For single-ADC hardware, stream_id=1 never arrives and this buffer stays
-// unused - the existing A-only packing path runs unchanged.
-#define UPSTREAM_CHB_MAX_SAMPLES (1920 * 1080)  // max frame payload
-static uint16_t *s_upstream_chb_buf = NULL;     // allocated on first stream_id=1
-static size_t    s_upstream_chb_count = 0;      // samples buffered
-static bool      s_upstream_chb_ready = false;  // true = buffer holds valid B frame
-static bool      s_upstream_dual_detected = false; // latched on first stream_id=1
-
-#define UPSTREAM_AUDIO_QUEUE_DEPTH 8
-#define UPSTREAM_AUDIO_STEREO_MAX_BYTES ((1920 * 3) / 2)
-
-typedef struct {
-    uint8_t data[UPSTREAM_AUDIO_STEREO_MAX_BYTES];
-    size_t len;
-} upstream_audio_block_t;
-
-typedef struct {
-    upstream_audio_block_t blocks[UPSTREAM_AUDIO_QUEUE_DEPTH];
-    size_t head;
-    size_t tail;
-    size_t count;
-} upstream_audio_queue_t;
-
-static upstream_audio_queue_t s_upstream_audio1_queue;
-static upstream_audio_queue_t s_upstream_audio2_queue;
-
-static void gui_capture_reset_upstream_audio_queues(void)
-{
-    memset(&s_upstream_audio1_queue, 0, sizeof(s_upstream_audio1_queue));
-    memset(&s_upstream_audio2_queue, 0, sizeof(s_upstream_audio2_queue));
-}
-
-static bool gui_capture_queue_upstream_audio(upstream_audio_queue_t *queue,
-                                             const uint8_t *data,
-                                             size_t len)
-{
-    if (!queue || !data || len == 0 || len > UPSTREAM_AUDIO_STEREO_MAX_BYTES ||
-        queue->count >= UPSTREAM_AUDIO_QUEUE_DEPTH) {
-        return false;
-    }
-
-    upstream_audio_block_t *block = &queue->blocks[queue->head];
-    memcpy(block->data, data, len);
-    block->len = len;
-    queue->head = (queue->head + 1) % UPSTREAM_AUDIO_QUEUE_DEPTH;
-    queue->count++;
-    return true;
-}
-
-static upstream_audio_block_t *gui_capture_peek_upstream_audio(upstream_audio_queue_t *queue)
-{
-    if (!queue || queue->count == 0) return NULL;
-    return &queue->blocks[queue->tail];
-}
-
-static void gui_capture_pop_upstream_audio(upstream_audio_queue_t *queue)
-{
-    if (!queue || queue->count == 0) return;
-    queue->tail = (queue->tail + 1) % UPSTREAM_AUDIO_QUEUE_DEPTH;
-    queue->count--;
-}
+#endif
 
 #if defined(__APPLE__)
 static IOPMAssertionID s_idle_sleep_assertion_id = kIOPMNullAssertionID;
@@ -204,6 +142,7 @@ static void gui_capture_release_power_assertions(void) {}
 
 // Message callback for hsdaoh
 // Enable with hsdaoh change to support callbacks
+#ifdef HSDAOH_UPSTREAM
 static void gui_hsdaoh_cache_message(gui_app_t *app, enum hsdaoh_msg_level level, const char *msg)
 {
     // try-lock: never block the hsdaoh thread
@@ -218,6 +157,7 @@ static void gui_hsdaoh_cache_message(gui_app_t *app, enum hsdaoh_msg_level level
 
     atomic_flag_clear(&app->hs_msg_lock);
 }
+#endif
 
 
 static bool gui_message_is_data_damaging(enum hsdaoh_msg_level level, const char *message)
@@ -242,6 +182,7 @@ static bool gui_message_is_data_damaging(enum hsdaoh_msg_level level, const char
            strstr(message, "corrupted frames") != NULL;
 }
 
+// #ifndef HSDAOH_UPSTREAM
 static void gui_message_callback(void *ctx, enum hsdaoh_msg_level level, const char *format, ...) {
     gui_app_t *app = (gui_app_t *)ctx;
     if (!app) return;
@@ -268,37 +209,52 @@ static void gui_message_callback(void *ctx, enum hsdaoh_msg_level level, const c
         gui_record_log_capture_event(app, level_str, buffer, GUI_ERROR_CLASS_SYSTEM, 1);
     }
     
-    if (app->capture_backend_upstream) {
-        /* Upstream backend: translate messages into counters and cache for UI poll. */
-        if (strstr(buffer, "Lost sync to HDMI input stream")) {
-            atomic_store(&app->stream_synced, false);
-        } else if (strstr(buffer, "Synchronized to HDMI input stream")) {
-            atomic_store(&app->stream_synced, true);
-        } else if (strstr(buffer, "Missed at least one frame")) {
-            if (atomic_load(&app->stream_synced))
-                atomic_fetch_add(&app->missed_frame_count, 1);
-        } else if (strstr(buffer, "frame errors")) {
-            if (!level_is_error) {
-                int n = 0;
-                if (sscanf(buffer, "%d frame errors", &n) == 1 && n > 0)
-                    gui_app_count_parser_errors(app, (uint32_t)n);
-                else
-                    gui_app_count_parser_errors(app, 1);
-            }
-        } else if (strstr(buffer, "Buffer dropped due to overrun")) {
-            atomic_fetch_add(&app->rb_drop_count, 1);
+#ifdef HSDAOH_UPSTREAM
+    /*
+     * Upstream mode: do NOT push GUI updates from this callback.
+     * Just translate hsdaoh stderr-style messages into app state/counters.    
+    */
+    if (strstr(buffer, "Lost sync to HDMI input stream")) {
+        atomic_store(&app->stream_synced, false);
+    } else if (strstr(buffer, "Synchronized to HDMI input stream")) {
+        atomic_store(&app->stream_synced, true);
+    } else if (strstr(buffer, "Missed at least one frame")) {
+        /* only count missed frames once we were already synced */
+        if (atomic_load(&app->stream_synced))
+            atomic_fetch_add(&app->missed_frame_count, 1);
+    } else if (strstr(buffer, "frame errors")) {
+        if (!level_is_error) {
+            int n = 0;
+            if (sscanf(buffer, "%d frame errors", &n) == 1 && n > 0)
+                gui_app_count_parser_errors(app, (uint32_t)n);
+            else
+                gui_app_count_parser_errors(app, 1);
         }
-        gui_hsdaoh_cache_message(app, level, buffer);
-    } else {
-        /* Raw/parser backend: keep status updates for severe errors only. */
-        if (level_is_error) {
-            gui_app_set_status(app, buffer);
-        }
+    } else if (strstr(buffer, "Buffer dropped due to overrun")) {
+        atomic_fetch_add(&app->rb_drop_count, 1);
     }
+    // 2) Cache the last message for the UI thread to apply (no GUI mutation here)
+    gui_hsdaoh_cache_message(app, level, buffer);
+   
+    // Print to console only when debug enabled, except always show ERROR/CRITICAL
+
+    if (level_is_error || misrc_debug_enabled()){
+        fprintf(stderr, "[%s] %s", level_str, buffer);
+    }
+#else
+    /*
+     * Frame mode (Stefan/MISRC): keep original behaviour.
+     * Status is only pushed to GUI for ERROR/CRITICAL.
+     */
+    if (level_is_error) {
+        gui_app_set_status(app, buffer);
+    }
+
 
     if (level_is_error || misrc_debug_enabled()) {
         fprintf(stderr, "[%s] %s", level_str, buffer);
     }
+#endif
 }
 
 // Debug counter
@@ -309,6 +265,7 @@ static uint32_t s_capture_last_logged_drop_total = 0;
 static uint32_t s_capture_missed_streak = 0;
 static bool s_capture_missed_burst_reported = false;
 static uint64_t s_capture_prev_callback_time_ms = 0;
+#ifdef HSDAOH_UPSTREAM
 static uint64_t s_diag_last_emit_ms = 0;
 static uint32_t s_diag_last_frame_count = 0;
 static uint32_t s_diag_last_error_count = 0;
@@ -317,6 +274,7 @@ static uint32_t s_diag_last_system_error_count = 0;
 static uint32_t s_diag_last_missed_count = 0;
 static uint32_t s_diag_last_wait_count = 0;
 static uint32_t s_diag_last_drop_count = 0;
+#endif
 #if defined(_MSC_VER) && !defined(__clang__)
 #define MISRC_THREAD_LOCAL __declspec(thread)
 #else
@@ -376,22 +334,9 @@ static inline void gui_capture_update_backpressure_counters(gui_app_t *app)
     s_capture_last_drop_count = drops;
 }
 
-void gui_capture_request_dropout_stop(gui_app_t *app, gui_dropout_reason_t reason)
+static inline void gui_capture_request_dropout_stop(gui_app_t *app, gui_dropout_reason_t reason)
 {
     if (!app || !app->settings.stop_on_dropout) return;
-    atomic_store(&app->dropout_stop_reason, (uint32_t)reason);
-    atomic_store(&app->dropout_stop_requested, true);
-}
-
-// Request a capture stop unconditionally, bypassing the stop_on_dropout
-// toggle. Used for frame-level errors that are always dropout-worthy
-// (parser frame-error bursts and persistent missed-frame bursts) so they
-// halt capture even when the user has not enabled stop-on-dropout. Other
-// dropout events (callback gap, device error, backpressure) keep using
-// the gated gui_capture_request_dropout_stop() helper.
-static void gui_capture_force_dropout_stop(gui_app_t *app, gui_dropout_reason_t reason)
-{
-    if (!app) return;
     atomic_store(&app->dropout_stop_reason, (uint32_t)reason);
     atomic_store(&app->dropout_stop_requested, true);
 }
@@ -405,6 +350,7 @@ static inline void gui_capture_promote_callback_priority_once(void)
         s_capture_callback_thread_priority_set = true;
     }
 }
+#ifdef HSDAOH_UPSTREAM
 static inline void gui_capture_reset_realtime_diag_state(void)
 {
     s_diag_last_emit_ms = 0;
@@ -493,16 +439,22 @@ static void gui_capture_emit_realtime_diag(gui_app_t *app, uint64_t now_ms)
     s_diag_last_wait_count = wait_count;
     s_diag_last_drop_count = drop_count;
 }
+#endif
 
 void gui_capture_set_audio_capture(bool enabled)
 {
+#ifdef HSDAOH_UPSTREAM 
     atomic_store(&s_upstream_capture_audio, enabled);
+
+#else   
+    // MISRC frame-based mode: audio capture is part of the capture handler 
     atomic_store(&s_capture_handler.capture_audio, enabled);
 
     if (enabled) {
         // Ensure clean audio sync ramp when enabling audio mid-capture.
         capture_handler_reset_audio_sync(&s_capture_handler);
     }
+#endif
 }
 
 static void gui_capture_apply_cxadc_profile(gui_app_t *app, int card_count)
@@ -585,6 +537,7 @@ static void gui_capture_apply_cxadc_profile(gui_app_t *app, int card_count)
 /*-----------------------------------------------------------------------------
  * GUI-Specific Capture Handler Callbacks
  *-----------------------------------------------------------------------------*/
+#ifndef HSDAOH_UPSTREAM
 static void gui_sync_event_cb(void *user_ctx, frame_sync_result_t result,
                                const metadata_t *meta, bool was_synced)
 {
@@ -619,13 +572,9 @@ static void gui_sync_event_cb(void *user_ctx, frame_sync_result_t result,
                 !s_capture_missed_burst_reported) {
                 atomic_fetch_add(&app->missed_frame_count, 1);
                 s_capture_missed_burst_reported = true;
-                // Log as ERROR (not WARN) so the burst increments
-                // system_error_count + error_count via gui_record_log_capture_event,
-                // and force a dropout stop so missed-frame bursts always halt
-                // capture regardless of the stop_on_dropout toggle.
-                gui_record_log_capture_event(app, "ERROR", "Persistent missed-frame burst detected",
+                gui_record_log_capture_event(app, "WARN", "Persistent missed-frame burst detected",
                                              GUI_ERROR_CLASS_SYSTEM, 1);
-                gui_capture_force_dropout_stop(app, GUI_DROPOUT_MISSED_FRAME);
+                gui_capture_request_dropout_stop(app, GUI_DROPOUT_MISSED_FRAME);
             }
             break;
         case FRAME_SYNC_ACQUIRED:
@@ -773,12 +722,9 @@ void gui_capture_callback(void *data_info_ptr) {
             fprintf(stderr, "[CB] %d frame errors, %u frames since last error\n",
                     result.error_count, s_capture_handler.frame_state.frames_since_error);
         }
-        // Frame errors are always dropout-worthy: force a stop regardless of
-        // the stop_on_dropout toggle so parser frame-error bursts always halt
-        // capture (the user explicitly wants frame errors to count and stop).
-        // Tolerated CRC-only frames (report_errors == false) are still not
-        // counted/dropped, per the MISRC frame-mode tolerated-frame rule.
-        gui_capture_force_dropout_stop(app, GUI_DROPOUT_FRAME_ERROR);
+        if (app->settings.stop_on_dropout) {
+            gui_capture_request_dropout_stop(app, GUI_DROPOUT_FRAME_ERROR);
+        }
         return;  // Discard frame with errors
     }
 
@@ -863,21 +809,20 @@ static void gui_simple_capture_callback(sc_data_info_t *sc_data_info)
 
     gui_capture_callback(&hs_data_info);
 }
-
+//#endif /* HSDAOH_UPSTREAM */
+#else /* HSDAOH_UPSTREAM */
 /*-----------------------------------------------------------------------------
  * Upstream helpers (rp2350 / upstream path)
  *-----------------------------------------------------------------------------*/
-static bool s_upstream_first_data_logged = false;
-
-static inline void gui_upstream_mark_synced(gui_app_t *app)
-{
-    atomic_store(&app->stream_synced, true);
-    if (!s_upstream_first_data_logged) {
-        s_upstream_first_data_logged = true;
-        fprintf(stderr, "[CB] Upstream stream active (%s)\n",
-                s_upstream_dual_detected ? "dual-ADC" : "single-ADC");
+    static inline void gui_upstream_mark_synced(gui_app_t *app)
+    {
+        bool was = atomic_exchange(&app->stream_synced, true);
+        if (!was && misrc_debug_enabled()) {
+            fprintf(stderr, "[CB] Upstream stream active\n");
+        }
     }
-}
+
+#endif /* HSDAOH_UPSTREAM */
 
 
 // Initialize application
@@ -932,8 +877,6 @@ void gui_app_init(gui_app_t *app) {
     app->vu_b.peak_hold_time_neg = 0;
     app->user_capture_mode_misrc = app->settings.misrc_mode;
     app->capture_mode_runtime_misrc = app->user_capture_mode_misrc;
-    app->capture_backend_upstream = false;
-    app->capture_has_channel_b = true;
     app->settings.misrc_mode = app->user_capture_mode_misrc;
 
     strcpy(app->status_message, "Initializing...");
@@ -1017,15 +960,14 @@ void gui_app_init(gui_app_t *app) {
     // by buffer manager automatically on first use
 
     // Initialize parser/capture-handler baseline once at app init.
+#ifndef HSDAOH_UPSTREAM   // MISRC mode only
     gui_capture_configure_handler(app, true);
+#endif
 
 
-    // Initialize centralized buffer manager with the configured RAM budget
-    // (1-16 GB, default 4 GB). Per-buffer sizes are derived from the budget;
-    // record buffers stay lazy and keep their rb_init fallback chain.
-    if (bufmgr_init_for_budget(&app->buffers, app->settings.memory_budget_gb) != 0) {
-        fprintf(stderr, "Failed to initialize buffer manager (budget=%u GB)\n",
-                (unsigned)app->settings.memory_budget_gb);
+    // Initialize centralized buffer manager
+    if (bufmgr_init(&app->buffers) != 0) {
+        fprintf(stderr, "Failed to initialize buffer manager\n");
     }
 
     // Initialize display thread (allocated, started on capture start)
@@ -1046,12 +988,6 @@ void gui_app_init(gui_app_t *app) {
 void gui_app_cleanup(gui_app_t *app) {
     if (app->is_capturing) {
         gui_app_stop_capture(app);
-    }
-
-    // Free upstream dual-ADC pairing buffer
-    if (s_upstream_chb_buf) {
-        free(s_upstream_chb_buf);
-        s_upstream_chb_buf = NULL;
     }
 
     // Note: All buffers now managed by buffer manager (cleanup via bufmgr_cleanup)
@@ -1204,41 +1140,7 @@ void gui_app_enumerate_devices(gui_app_t *app) {
     }
 }
 
-static void gui_capture_flush_upstream_audio_pairs(gui_app_t *app)
-{
-    while (s_upstream_audio1_queue.count > 0 && s_upstream_audio2_queue.count > 0) {
-        upstream_audio_block_t *audio1 = gui_capture_peek_upstream_audio(&s_upstream_audio1_queue);
-        upstream_audio_block_t *audio2 = gui_capture_peek_upstream_audio(&s_upstream_audio2_queue);
-        size_t frames1 = audio1->len / 6;
-        size_t frames2 = audio2->len / 6;
-
-        if (frames1 != frames2) {
-            fprintf(stderr, "[AUDIO] PCM1802 block mismatch: #1=%zu frames #2=%zu frames\n",
-                    frames1, frames2);
-            gui_capture_reset_upstream_audio_queues();
-            return;
-        }
-
-        size_t interleaved_len = frames1 * 12;
-        uint8_t *out = bufmgr_write_begin(&app->buffers, BUF_CAPTURE_AUDIO, interleaved_len,
-                                          &s_capture_audio_write_policy);
-        if (out) {
-            for (size_t i = 0; i < frames1; i++) {
-                memcpy(out + i*12, audio1->data + i*6, 6);
-                memcpy(out + i*12 + 6, audio2->data + i*6, 6);
-            }
-            bufmgr_write_end(&app->buffers, BUF_CAPTURE_AUDIO, interleaved_len);
-            bufmgr_signal_data(&app->buffers, BUF_CAPTURE_AUDIO);
-        }
-
-        gui_capture_pop_upstream_audio(&s_upstream_audio1_queue);
-        gui_capture_pop_upstream_audio(&s_upstream_audio2_queue);
-    }
-}
-
-// Upstream mode callback - writes raw data to ringbuffer (like reference implementation)
-// Supports both single-ADC (stream_id=0 only) and dual-ADC hardware
-// (stream_id=0 + stream_id=1 paired into packed AB format).
+#ifdef HSDAOH_UPSTREAM // Upstream mode callback - writes raw data to ringbuffer (like reference implementation)
 static void gui_capture_upstream_callback(hsdaoh_data_info_t *data_info) //
 {
     if (!data_info || !data_info->ctx) return;
@@ -1249,102 +1151,14 @@ static void gui_capture_upstream_callback(hsdaoh_data_info_t *data_info) //
 
     atomic_store(&app->last_callback_time_ms, get_time_ms());
 
-    // --- Stream ID 1: Channel B RF (dual-ADC hardware only) ---
-    // The format converter delivers stream_id=0 (A) THEN stream_id=1 (B) back-
-    // to-back from the same frame. So when stream_id=1 arrives, the A data from
-    // stream_id=0 is already buffered. Merge and write the packed AB frame now.
-    if (data_info->stream_id == 1) {
-        const uint16_t *samples_b = (const uint16_t *)data_info->buf;
-        size_t b_count = data_info->len / sizeof(uint16_t);
-
-        // First-time detection of dual-ADC hardware
-        if (!s_upstream_dual_detected) {
-            s_upstream_dual_detected = true;
-            app->capture_has_channel_b = true;
-            fprintf(stderr, "[CB] Dual-ADC hardware detected (stream_id=1 received)\n");
-        }
-
-        // If we have buffered A data, merge and write
-        if (s_upstream_chb_ready && s_upstream_chb_buf) {
-            size_t a_count = s_upstream_chb_count;
-            size_t sample_count = (a_count > b_count) ? a_count : b_count;
-            size_t packed_bytes = sample_count * sizeof(uint32_t);
-
-            uint8_t *out = bufmgr_write_begin(&app->buffers, BUF_CAPTURE_RF, packed_bytes, &s_capture_rf_write_policy);
-            gui_capture_update_backpressure_counters(app);
-            if (!out) {
-                uint32_t total_drops = atomic_load(&app->rb_drop_count);
-                uint32_t delta_drops = (total_drops > s_capture_last_logged_drop_total)
-                                         ? (total_drops - s_capture_last_logged_drop_total)
-                                         : 1;
-                s_capture_last_logged_drop_total = total_drops;
-                uint32_t current_frame = atomic_load(&app->frame_count);
-                char drop_msg[192];
-                snprintf(drop_msg, sizeof(drop_msg),
-                         "Capture RF backpressure drop: +%u (total=%u) frame=%u",
-                         delta_drops, total_drops, current_frame);
-                gui_record_log_capture_event(app, "ERROR", drop_msg, GUI_ERROR_CLASS_SYSTEM, delta_drops);
-                if (misrc_debug_enabled()) {
-                    fprintf(stderr, "[CB] %s\n", drop_msg);
-                }
-                if (app->settings.stop_on_dropout) {
-                    gui_capture_request_dropout_stop(app, GUI_DROPOUT_BACKPRESSURE);
-                }
-                s_upstream_chb_ready = false;
-                return;
-            }
-
-            uint32_t *packed = (uint32_t *)out;
-            // bits[11:0] = A, bits[31:20] = B (matches MISRC extract masks)
-            for (size_t i = 0; i < sample_count; i++) {
-                uint32_t a = (i < a_count) ? (uint32_t)(s_upstream_chb_buf[i] & 0x0FFF) : 0;
-                uint32_t b = (i < b_count) ? (uint32_t)(samples_b[i] & 0x0FFF) : 0;
-                packed[i] = a | (b << 20);
-            }
-
-            bufmgr_write_end(&app->buffers, BUF_CAPTURE_RF, packed_bytes);
-            bufmgr_signal_data(&app->buffers, BUF_CAPTURE_RF);
-            atomic_fetch_add(&app->frame_count, 1);
-            s_upstream_chb_ready = false;
-        }
-        // If no A buffered (shouldn't happen normally), discard this B
-        return;
-    }
-
-    // --- Stream ID 0: Channel A RF (always present) ---
+    // We are receiving valid upstream data -> consider link synced
+    //atomic_store(&app->stream_synced, true);    
+     
     if (data_info->stream_id == 0) {
-        gui_upstream_mark_synced(app);
+        gui_upstream_mark_synced(app); //UPDATE 2 - hsdaoh - status from metadata only - Update 3 put it back ---delete ****
         const uint16_t *samples = (const uint16_t *)data_info->buf;
         size_t sample_count = data_info->len / sizeof(uint16_t);
 
-        // If dual-ADC detected, buffer A and wait for stream_id=1 (B)
-        if (s_upstream_dual_detected) {
-            if (!s_upstream_chb_buf) {
-                s_upstream_chb_buf = (uint16_t *)malloc(UPSTREAM_CHB_MAX_SAMPLES * sizeof(uint16_t));
-                if (!s_upstream_chb_buf) {
-                    fprintf(stderr, "[CB] Failed to allocate Channel A pairing buffer\n");
-                    return;
-                }
-            }
-            if (sample_count > UPSTREAM_CHB_MAX_SAMPLES) {
-                fprintf(stderr, "[CB] WARNING: A sample count %zu exceeds pairing buffer max %d, truncating\n",
-                        sample_count, UPSTREAM_CHB_MAX_SAMPLES);
-                sample_count = UPSTREAM_CHB_MAX_SAMPLES;
-            }
-            memcpy(s_upstream_chb_buf, samples, sample_count * sizeof(uint16_t));
-            s_upstream_chb_count = sample_count;
-            s_upstream_chb_ready = true;
-
-            if (data_info->srate > 0) {
-                uint32_t sample_rate_hz = gui_capture_normalize_sample_rate_hz(data_info->srate);
-                if (sample_rate_hz > 0) {
-                    atomic_store(&app->sample_rate, sample_rate_hz);
-                }
-            }
-            return;
-        }
-
-        // Single-ADC: write A-only immediately (no B expected)
         size_t packed_bytes = sample_count * sizeof(uint32_t);
         uint8_t *out = bufmgr_write_begin(&app->buffers, BUF_CAPTURE_RF, packed_bytes, &s_capture_rf_write_policy);
         gui_capture_update_backpressure_counters(app);
@@ -1389,49 +1203,38 @@ static void gui_capture_upstream_callback(hsdaoh_data_info_t *data_info) //
         return;
     }
 
-    // --- Stream ID 2: PCM1802 Audio #1 (always present when audio hardware exists) ---
     if (data_info->stream_id == 2) {
         if (!atomic_load(&s_upstream_capture_audio)) return;
 
-        if (data_info->len < 6 || (data_info->len % 6) != 0) {
-            fprintf(stderr, "[AUDIO] Invalid PCM1802 #1 block length: %zu bytes\n", data_info->len);
+        if (data_info->len < 6) return;
+        
+        size_t frames = data_info->len / 6;
+        if (frames == 0) return;
+        
+        if (frames > SIZE_MAX / 12) {
+            fprintf(stderr, "[AUDIO] Frame count overflow\n");
             return;
         }
-
-        if (s_upstream_dual_detected) {
-            if (!gui_capture_queue_upstream_audio(&s_upstream_audio1_queue,
-                                                  data_info->buf, data_info->len)) {
-                fprintf(stderr, "[AUDIO] PCM1802 #1 pairing queue overflow or invalid block\n");
-                gui_capture_reset_upstream_audio_queues();
-                return;
-            }
-            gui_capture_flush_upstream_audio_pairs(app);
-        } else {
-            size_t frames = data_info->len / 6;
-            if (frames > SIZE_MAX / 12) {
-                fprintf(stderr, "[AUDIO] Frame count overflow\n");
-                return;
-            }
-
-            size_t padded_len = frames * 12;
-            uint8_t *out = bufmgr_write_begin(&app->buffers, BUF_CAPTURE_AUDIO, padded_len,
-                                              &s_capture_audio_write_policy);
-            if (!out) return;
-
-            memset(out, 0, padded_len);
-            const uint8_t *src = data_info->buf;
-            for (size_t i = 0; i < frames; i++) {
-                memcpy(out + i*12, src + i*6, 6);
-            }
-
-            bufmgr_write_end(&app->buffers, BUF_CAPTURE_AUDIO, padded_len);
-            bufmgr_signal_data(&app->buffers, BUF_CAPTURE_AUDIO);
+        
+        size_t padded_len = frames * 12;
+        
+        uint8_t *out = bufmgr_write_begin(&app->buffers, BUF_CAPTURE_AUDIO, padded_len, &s_capture_audio_write_policy);
+        if (!out) return;
+        
+        memset(out, 0, padded_len);
+        
+        const uint8_t *src = data_info->buf;
+        for (size_t i = 0; i < frames; i++) {
+            memcpy(out + i*12, src + i*6, 6);
         }
+        
+        bufmgr_write_end(&app->buffers, BUF_CAPTURE_AUDIO, padded_len);
+        bufmgr_signal_data(&app->buffers, BUF_CAPTURE_AUDIO);
         
         if (data_info->srate > 0) {
             static int rate_logged = 0;
             if (!rate_logged) {
-                fprintf(stderr, "[AUDIO] PCM1802 #1 sample rate: %u Hz\n", data_info->srate);
+                fprintf(stderr, "[AUDIO] Sample rate: %u Hz\n", data_info->srate);
                 rate_logged = 1;
             }
         }
@@ -1439,36 +1242,8 @@ static void gui_capture_upstream_callback(hsdaoh_data_info_t *data_info) //
         return;
     }
 
-    // --- Stream ID 3: PCM1802 Audio #2 (dual PCM1802 hardware only) ---
-    if (data_info->stream_id == 3) {
-        if (!atomic_load(&s_upstream_capture_audio)) return;
-        if (!s_upstream_dual_detected) return;
-
-        if (data_info->len < 6 || (data_info->len % 6) != 0) {
-            fprintf(stderr, "[AUDIO] Invalid PCM1802 #2 block length: %zu bytes\n", data_info->len);
-            return;
-        }
-
-        if (!gui_capture_queue_upstream_audio(&s_upstream_audio2_queue,
-                                              data_info->buf, data_info->len)) {
-            fprintf(stderr, "[AUDIO] PCM1802 #2 pairing queue overflow or invalid block\n");
-            gui_capture_reset_upstream_audio_queues();
-            return;
-        }
-        gui_capture_flush_upstream_audio_pairs(app);
-
-        if (data_info->srate > 0) {
-            static int rate_logged_3 = 0;
-            if (!rate_logged_3) {
-                fprintf(stderr, "[AUDIO] PCM1802 #2 sample rate: %u Hz\n", data_info->srate);
-                rate_logged_3 = 1;
-            }
-        }
-
-        return;
-    }
-
 }
+#endif /* HSDAOH_UPSTREAM */
 
 
 // Start capture (+60ln from orig adding upstream callbk)
@@ -1487,7 +1262,6 @@ int gui_app_start_capture(gui_app_t *app) {
     }
 
     device_info_t *dev = &app->devices[app->selected_device];
-    bool use_upstream_backend = (dev->type == DEVICE_TYPE_HSDAOH) && (!app->user_capture_mode_misrc);
     fprintf(stderr, "[GUI] Selected device: %s (type %d, index %d)\n", dev->name, dev->type, dev->index);
 
     // Handle simulated device separately
@@ -1521,8 +1295,6 @@ int gui_app_start_capture(gui_app_t *app) {
         gui_capture_apply_cxadc_profile(app, cxadc_cards);
         int cxadc_rc = gui_cxadc_start(app, cxadc_cards);
         if (cxadc_rc == 0) {
-            app->capture_backend_upstream = false;
-            app->capture_has_channel_b = (cxadc_cards > 1);
             bool prev_runtime_mode = app->capture_mode_runtime_misrc;
             app->capture_mode_runtime_misrc = app->user_capture_mode_misrc;
             TraceLog(LOG_INFO,
@@ -1568,29 +1340,6 @@ int gui_app_start_capture(gui_app_t *app) {
         }
         int fx3_rc = gui_fx3_start(app);
         if (fx3_rc == 0) {
-            // Set capture-start time + timestamp + clear reconnect state so the
-            // auto-reconnect watchdog (misrc_gui.c) does not immediately fire.
-            // FX3 (fx3usbadc) does not deliver data until the 0x91 start command
-            // is sent (done inside gui_fx3_start), so the 5s grace period must
-            // begin here, not at app init. Without this, capture_start_time stays
-            // 0 and the watchdog reaps the session within 2s -> connect loop.
-            app->capture_start_time = GetTime();
-            app->reconnect_pending = false;
-            app->reconnect_attempts = 0;
-            app->capture_backend_upstream = false;
-            app->capture_has_channel_b = false;  // fx3usbadc is single-channel (ADC A only)
-            {
-                time_t t = time(NULL);
-                struct tm tmv;
-#if defined(_WIN32) || defined(_WIN64)
-                localtime_s(&tmv, &t);
-#else
-                localtime_r(&t, &tmv);
-#endif
-                snprintf(app->capture_timestamp, sizeof(app->capture_timestamp), "%04d.%02d.%02d_%02d.%02d.%02d",
-                         (tmv.tm_year + 1900), (tmv.tm_mon + 1), (tmv.tm_mday),
-                         (tmv.tm_hour), (tmv.tm_min), (tmv.tm_sec));
-            }
             gui_capture_hold_power_assertions();
         } else {
             proc_set_priority(PROC_PRIORITY_NORMAL);
@@ -1613,26 +1362,6 @@ int gui_app_start_capture(gui_app_t *app) {
         }
         int ddd_rc = gui_ddd_start(app);
         if (ddd_rc == 0) {
-            // Same watchdog fix as FX3: capture_start_time must be set here or
-            // the auto-reconnect watchdog fires within 2s (DdD streams
-            // immediately on bulk submit, but the grace baseline still matters).
-            app->capture_start_time = GetTime();
-            app->reconnect_pending = false;
-            app->reconnect_attempts = 0;
-            app->capture_backend_upstream = false;
-            app->capture_has_channel_b = false;  // DdD is single-channel (ADC A only)
-            {
-                time_t t = time(NULL);
-                struct tm tmv;
-#if defined(_WIN32) || defined(_WIN64)
-                localtime_s(&tmv, &t);
-#else
-                localtime_r(&t, &tmv);
-#endif
-                snprintf(app->capture_timestamp, sizeof(app->capture_timestamp), "%04d.%02d.%02d_%02d.%02d.%02d",
-                         (tmv.tm_year + 1900), (tmv.tm_mon + 1), (tmv.tm_mday),
-                         (tmv.tm_hour), (tmv.tm_min), (tmv.tm_sec));
-            }
             gui_capture_hold_power_assertions();
         } else {
             proc_set_priority(PROC_PRIORITY_NORMAL);
@@ -1686,12 +1415,6 @@ int gui_app_start_capture(gui_app_t *app) {
     s_capture_missed_streak = 0;
     s_capture_missed_burst_reported = false;
     s_capture_prev_callback_time_ms = 0;
-    // Reset upstream dual-ADC pairing state for a fresh capture session.
-    s_upstream_chb_ready = false;
-    s_upstream_chb_count = 0;
-    s_upstream_dual_detected = false;
-    gui_capture_reset_upstream_audio_queues();
-    s_upstream_first_data_logged = false;
 
     // Reset display buffers (per-channel)
     app->display_samples_available_a = 0;
@@ -1706,6 +1429,10 @@ int gui_app_start_capture(gui_app_t *app) {
     app->sc_dev = NULL;
 
     if (dev->type == DEVICE_TYPE_SIMPLE_CAPTURE) {
+#ifdef HSDAOH_UPSTREAM
+        gui_app_set_status(app, "Simple-capture unavailable in HSDAOH_UPSTREAM build");
+        return -1;
+#else
         fprintf(stderr, "[GUI] Opening %s device %s...\n", sc_get_impl_name(), dev->serial);
         proc_set_priority(PROC_PRIORITY_ABOVE);
         thrd_set_priority(THRD_PRIORITY_CRITICAL);
@@ -1718,11 +1445,30 @@ int gui_app_start_capture(gui_app_t *app) {
             proc_set_priority(PROC_PRIORITY_NORMAL);
             return -1;
         }
-        app->capture_backend_upstream = false;
-        app->capture_has_channel_b = true;
+#endif
     } else {
-        fprintf(stderr, "[GUI] Opening hsdaoh device (backend=%s)...\n",
-                use_upstream_backend ? "upstream" : "raw-parser");
+#ifdef HSDAOH_UPSTREAM
+        fprintf(stderr, "[GUI] Opening device index %d (HSDAOH_UPSTREAM)...\n", dev->index);
+        proc_set_priority(PROC_PRIORITY_ABOVE);
+        thrd_set_priority(THRD_PRIORITY_CRITICAL);
+
+        r = hsdaoh_open(&app->hs_dev, dev->index);
+        if (r < 0 || !app->hs_dev) {
+            fprintf(stderr, "[GUI] RP-hsdaoh_open failed: %d\n", r);
+            if (r == -3) {
+                gui_app_set_status(app, "Permission denied opening MS2130 via libusb; run misrc_gui with sudo");
+                proc_set_priority(PROC_PRIORITY_NORMAL);
+                return -3;
+            } else {
+                gui_app_set_status(app, "Failed to open device");
+            }
+            app->hs_dev = NULL;
+            proc_set_priority(PROC_PRIORITY_NORMAL);
+            return -1;
+        }
+        hsdaoh_set_msg_callback(app->hs_dev, gui_message_callback, app);
+#else
+        fprintf(stderr, "[GUI] Opening hsdaoh device...\n");
         proc_set_priority(PROC_PRIORITY_ABOVE);
         thrd_set_priority(THRD_PRIORITY_CRITICAL);
         r = hsdaoh_open(&app->hs_dev, dev->index);
@@ -1741,16 +1487,16 @@ int gui_app_start_capture(gui_app_t *app) {
         }
 
         hsdaoh_set_msg_callback(app->hs_dev, gui_message_callback, app);
-        if (!use_upstream_backend) {
-            hsdaoh_raw_callback(app->hs_dev, true);
-        }
+        hsdaoh_raw_callback(app->hs_dev, true);
+#endif
 
         fprintf(stderr, "[GUI] Starting stream...\n");
 
-        hsdaoh_read_cb_t stream_cb = use_upstream_backend
-                         ? (hsdaoh_read_cb_t)gui_capture_upstream_callback
-                         : (hsdaoh_read_cb_t)gui_capture_callback;
-        r = MISRC_HSDAOH_START_STREAM(app->hs_dev, stream_cb, app);
+#ifdef HSDAOH_UPSTREAM
+        r = MISRC_HSDAOH_START_STREAM(app->hs_dev, gui_capture_upstream_callback, app);
+#else
+        r = MISRC_HSDAOH_START_STREAM(app->hs_dev, (hsdaoh_read_cb_t)gui_capture_callback, app);
+#endif
 
         if (r < 0) {
             fprintf(stderr, "[GUI] hsdaoh_start_stream failed: %d\n", r);
@@ -1760,20 +1506,13 @@ int gui_app_start_capture(gui_app_t *app) {
             proc_set_priority(PROC_PRIORITY_NORMAL);
             return -1;
         }
-
-        app->capture_backend_upstream = use_upstream_backend;
-        app->capture_has_channel_b = !use_upstream_backend;
-        fprintf(stderr, "[GUI] Connected: %s (index=%d) backend=%s channels=%s\n",
-                dev->name, dev->index,
-                use_upstream_backend ? "upstream" : "raw-parser",
-                use_upstream_backend ? "A (B auto-detect)" : "A+B");
     }
 
+#ifndef HSDAOH_UPSTREAM
     // Capture lifecycle boundary: keep parser setup/reset work after stream
     // startup succeeds, not on pre-open or failed-start paths.
-    if (!app->capture_backend_upstream) {
-        gui_capture_configure_handler(app, true);
-    }
+    gui_capture_configure_handler(app, true);
+#endif
 
         bool prev_runtime_mode = app->capture_mode_runtime_misrc;
         app->capture_mode_runtime_misrc = app->user_capture_mode_misrc;
@@ -1782,12 +1521,6 @@ int gui_app_start_capture(gui_app_t *app) {
                  prev_runtime_mode ? "MISRC" : "HSDAOH",
                  app->capture_mode_runtime_misrc ? "MISRC" : "HSDAOH",
                  app->user_capture_mode_misrc ? "MISRC" : "HSDAOH");
-        // Reset heartbeat baseline so the 2-second device-timeout in the main
-        // loop starts from *now* (after the potentially slow hsdaoh_open /
-        // start_stream sequence), not from the earlier stats-reset timestamp.
-        // Without this, a first-connect USB claim that takes >2 s causes an
-        // immediate false timeout -> disconnect -> reconnect cycle.
-        atomic_store(&app->last_callback_time_ms, get_time_ms());
         app->is_capturing = true;
         app->capture_start_time = GetTime();
         app->reconnect_pending = false;
@@ -1945,19 +1678,11 @@ void gui_app_stop_capture(gui_app_t *app) {
     s_capture_missed_burst_reported = false;
     s_capture_prev_callback_time_ms = 0;
     s_capture_last_logged_drop_total = 0;
-    // Reset upstream dual-ADC pairing state so reconnects start clean.
-    s_upstream_chb_ready = false;
-    s_upstream_chb_count = 0;
-    s_upstream_dual_detected = false;
-    gui_capture_reset_upstream_audio_queues();
-    s_upstream_first_data_logged = false;
+#ifndef HSDAOH_UPSTREAM
     // Capture lifecycle boundary: keep parser teardown/reset work in stop
     // cleanup so reconnects begin from a clean baseline.
-    if (!app->capture_backend_upstream) {
-        gui_capture_configure_handler(app, true);
-    }
-    app->capture_backend_upstream = false;
-    app->capture_has_channel_b = true;
+    gui_capture_configure_handler(app, true);
+#endif
 
     // Print capture summary with backpressure stats
     uint32_t frames = atomic_load(&app->frame_count);
@@ -2097,9 +1822,9 @@ void gui_capture_poll_hsdaoh_status(gui_app_t *app)
     if (!app) return;
 
     uint64_t now = get_time_ms();
-    if (app->capture_backend_upstream) {
-        gui_capture_emit_realtime_diag(app, now);
-    }
+#ifdef HSDAOH_UPSTREAM
+    gui_capture_emit_realtime_diag(app, now);
+#endif
 
     // Poll rate: 2 seconds (non-realtime, as requested)
     if (app->hs_ui_last_poll_ms != 0 && (now - app->hs_ui_last_poll_ms) < 2000) {

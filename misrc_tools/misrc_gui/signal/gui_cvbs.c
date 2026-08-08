@@ -7,7 +7,6 @@
 
 #include "gui_cvbs.h"
 #include "gui_trigger.h"
-#include "gui_vhs_fm.h"
 #include "../visualization/gui_text.h"
 #include "../../common/threading.h"
 #include <stdlib.h>
@@ -2200,8 +2199,7 @@ static void render_cvbs_system_overlay(cvbs_decoder_t *decoder,
 //=============================================================================
 typedef enum {
     VIDEO_PLUGIN_CVBS = 0,
-    VIDEO_PLUGIN_TAPE_DECODE = 1,
-    VIDEO_PLUGIN_VHS_FM = 2
+    VIDEO_PLUGIN_TAPE_DECODE = 1
 } video_plugin_kind_t;
 
 typedef struct {
@@ -2213,40 +2211,22 @@ typedef struct {
     char active_profile[32];
     float active_frequency_mhz;
 } video_tape_plugin_t;
-typedef struct {
-    vhs_fm_decoder_t decoder;
-} video_vhs_fm_plugin_t;
 
 typedef struct {
     video_cvbs_plugin_t cvbs;
     video_tape_plugin_t tape_decode;
-    video_vhs_fm_plugin_t vhs_fm;
     video_plugin_kind_t active_plugin;
 } video_panel_state_t;
 
 static const char *video_plugin_name(video_plugin_kind_t plugin) {
-    switch (plugin) {
-        case VIDEO_PLUGIN_TAPE_DECODE: return "Tape Decode";
-        case VIDEO_PLUGIN_VHS_FM:      return "VHS FM";
-        case VIDEO_PLUGIN_CVBS:
-        default:                       return "CVBS";
-    }
-}
-
-static inline video_plugin_kind_t video_panel_next_plugin(video_plugin_kind_t plugin) {
-    switch (plugin) {
-        case VIDEO_PLUGIN_CVBS:        return VIDEO_PLUGIN_TAPE_DECODE;
-        case VIDEO_PLUGIN_TAPE_DECODE: return VIDEO_PLUGIN_VHS_FM;
-        case VIDEO_PLUGIN_VHS_FM:
-        default:                       return VIDEO_PLUGIN_CVBS;
-    }
+    return (plugin == VIDEO_PLUGIN_TAPE_DECODE) ? "Tape Decode" : "CVBS";
 }
 
 static inline cvbs_decoder_t *video_panel_decoder(video_panel_state_t *panel, video_plugin_kind_t plugin) {
     if (!panel) return NULL;
-    if (plugin == VIDEO_PLUGIN_TAPE_DECODE) return &panel->tape_decode.decoder;
-    if (plugin == VIDEO_PLUGIN_CVBS) return &panel->cvbs.decoder;
-    return NULL;
+    return (plugin == VIDEO_PLUGIN_TAPE_DECODE)
+        ? &panel->tape_decode.decoder
+        : &panel->cvbs.decoder;
 }
 
 static inline cvbs_decoder_t *video_panel_active_decoder(video_panel_state_t *panel) {
@@ -2283,15 +2263,6 @@ static bool video_panel_init_decoder_common(cvbs_decoder_t *decoder,
 static bool video_cvbs_plugin_init(video_cvbs_plugin_t *plugin) {
     if (!plugin) return false;
     return video_panel_init_decoder_common(&plugin->decoder, CVBS_DECODER_MODE_CVBS, "create_plugin_cvbs");
-}
-
-static bool video_vhs_fm_plugin_init(video_vhs_fm_plugin_t *plugin) {
-    if (!plugin) return false;
-    if (!gui_vhs_fm_init(&plugin->decoder)) return false;
-    gui_vhs_fm_set_format(&plugin->decoder, 0);
-    plugin->decoder.overlay.is_visible = false;
-    plugin->decoder.overlay.dropdown_open = false;
-    return true;
 }
 
 static const char *video_tape_profile_from_selection(const video_tape_plugin_t *plugin) {
@@ -2391,19 +2362,6 @@ static void video_tape_apply_runtime_args(video_tape_plugin_t *plugin, const cha
              arg_ire0_adjust);
 }
 
-static void video_vhs_fm_plugin_process(video_vhs_fm_plugin_t *plugin,
-                                        const int16_t *samples,
-                                        size_t count,
-                                        uint32_t sample_rate) {
-    if (!plugin || !samples || count == 0) return;
-    vhs_fm_decoder_t *decoder = &plugin->decoder;
-    if (sample_rate == 0) sample_rate = DEFAULT_SAMPLE_RATE;
-    if (decoder->preview_sample_rate_hz != sample_rate) {
-        gui_vhs_fm_set_sample_rate(decoder, sample_rate);
-    }
-    gui_vhs_fm_process_buffer(decoder, samples, count);
-}
-
 static bool video_tape_plugin_init(video_tape_plugin_t *plugin) {
     if (!plugin) return false;
     if (!video_panel_init_decoder_common(&plugin->decoder, CVBS_DECODER_MODE_TAPE, "create_plugin_tape_decode")) {
@@ -2419,15 +2377,12 @@ static void video_panel_close_all_dropdowns(video_panel_state_t *panel) {
     if (!panel) return;
     cvbs_decoder_t *cvbs = &panel->cvbs.decoder;
     cvbs_decoder_t *tape = &panel->tape_decode.decoder;
-    vhs_fm_decoder_t *vhs = &panel->vhs_fm.decoder;
     cvbs->overlay.system_dropdown_open = false;
     cvbs->overlay.tape_dropdown_open = false;
     cvbs->overlay.tape_format_dropdown_open = false;
     tape->overlay.system_dropdown_open = false;
     tape->overlay.tape_dropdown_open = false;
     tape->overlay.tape_format_dropdown_open = false;
-    vhs->overlay.dropdown_open = false;
-    vhs->overlay.is_visible = false;
 }
 
 static void video_panel_activate_plugin(video_panel_state_t *panel, video_plugin_kind_t plugin) {
@@ -2459,12 +2414,6 @@ static void *cvbs_vtable_create(void) {
         free(panel);
         return NULL;
     }
-    if (!video_vhs_fm_plugin_init(&panel->vhs_fm)) {
-        gui_cvbs_cleanup(&panel->tape_decode.decoder);
-        gui_cvbs_cleanup(&panel->cvbs.decoder);
-        free(panel);
-        return NULL;
-    }
 
     panel->active_plugin = VIDEO_PLUGIN_CVBS;
     return panel;
@@ -2475,7 +2424,6 @@ static void cvbs_vtable_destroy(void *state) {
     video_panel_state_t *panel = (video_panel_state_t *)state;
     gui_cvbs_cleanup(&panel->cvbs.decoder);
     gui_cvbs_cleanup(&panel->tape_decode.decoder);
-    gui_vhs_fm_cleanup(&panel->vhs_fm.decoder);
     free(panel);
 }
 
@@ -2484,7 +2432,6 @@ static void cvbs_vtable_clear(void *state) {
     video_panel_state_t *panel = (video_panel_state_t *)state;
     gui_cvbs_reset(&panel->cvbs.decoder);
     gui_cvbs_reset(&panel->tape_decode.decoder);
-    gui_vhs_fm_reset(&panel->vhs_fm.decoder);
     video_tape_apply_runtime_args(&panel->tape_decode, "clear");
     panel->active_plugin = VIDEO_PLUGIN_CVBS;
     video_panel_close_all_dropdowns(panel);
@@ -2517,38 +2464,16 @@ static void video_tape_plugin_process(video_tape_plugin_t *plugin,
 }
 
 static void cvbs_vtable_process(void *state, const int16_t *samples, size_t count, uint32_t sample_rate) {
+    (void)sample_rate;  // CVBS uses its own sample rate detection
     if (!state || !samples || count == 0) return;
     video_panel_state_t *panel = (video_panel_state_t *)state;
     video_cvbs_plugin_process(&panel->cvbs, samples, count);
     video_tape_plugin_process(&panel->tape_decode, samples, count);
-    video_vhs_fm_plugin_process(&panel->vhs_fm, samples, count, sample_rate);
 }
 
 //-----------------------------------------------------------------------------
 // Rendering Functions
 //-----------------------------------------------------------------------------
-
-static void render_vhs_decoder_overlay(video_panel_state_t *panel, Rectangle bounds) {
-    if (!panel) return;
-    vhs_fm_decoder_t *decoder = &panel->vhs_fm.decoder;
-    decoder->overlay.is_visible = true;
-
-    const float btn_h = 18.0f;
-    const char *label = "Decoder: VHS FM";
-    float text_w = (float)gui_text_measure(label, FONT_SIZE_DROPDOWN_OPT);
-    float btn_w = text_w + 16.0f;
-    if (btn_w < 128.0f) btn_w = 128.0f;
-
-    float x_right = bounds.x + bounds.width - 8.0f;
-    float btn_x = x_right - btn_w;
-    float btn_y = bounds.y + 8.0f;
-    decoder->overlay.button_rect = (Rectangle){btn_x, btn_y, btn_w, btn_h};
-
-    DrawRectangleRounded(decoder->overlay.button_rect, 0.15f, 4, COLOR_BUTTON_HOVER);
-    float text_x = btn_x + (btn_w - text_w) * 0.5f;
-    float text_y = btn_y + (btn_h - FONT_SIZE_DROPDOWN_OPT) * 0.5f;
-    gui_text_draw(label, text_x, text_y, FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
-}
 
 static void cvbs_vtable_render(void *state, gui_app_t *app, int channel,
                                 Rectangle bounds, Color channel_color) {
@@ -2557,21 +2482,10 @@ static void cvbs_vtable_render(void *state, gui_app_t *app, int channel,
     (void)channel_color;
 
     video_panel_state_t *panel = (video_panel_state_t *)state;
-    if (!panel) return;
-
-    // Keep all decoders updated while preserving independent state.
-    gui_cvbs_swap_buffers(&panel->cvbs.decoder);
-    gui_cvbs_swap_buffers(&panel->tape_decode.decoder);
-    gui_vhs_fm_swap_buffers(&panel->vhs_fm.decoder);
-
-    if (panel->active_plugin == VIDEO_PLUGIN_VHS_FM) {
-        gui_vhs_fm_render_frame(&panel->vhs_fm.decoder, bounds.x, bounds.y, bounds.width, bounds.height);
-        render_vhs_decoder_overlay(panel, bounds);
-        return;
-    }
-
     cvbs_decoder_t *decoder = video_panel_active_decoder(panel);
+
     if (!decoder) {
+        // No decoder state - show message
         const char *msg = "Video Decoder Not Available";
         int w = MeasureText(msg, 12);
         DrawRectangleRec(bounds, (Color){20, 20, 20, 255});
@@ -2580,7 +2494,14 @@ static void cvbs_vtable_render(void *state, gui_app_t *app, int channel,
         return;
     }
 
+    // Swap buffers for both plugin decoders to keep independent feeds fresh.
+    gui_cvbs_swap_buffers(&panel->cvbs.decoder);
+    gui_cvbs_swap_buffers(&panel->tape_decode.decoder);
+
+    // Render the decoded frame
     gui_cvbs_render_frame(decoder, bounds.x, bounds.y, bounds.width, bounds.height);
+
+    // Render the system selector overlay (uses decoder->overlay for state)
     render_cvbs_system_overlay(decoder, bounds.x, bounds.y, bounds.width);
 }
 
@@ -2592,35 +2513,19 @@ static bool cvbs_vtable_handle_click(void *state, gui_app_t *app, int channel,
                                       Vector2 mouse_pos, Rectangle bounds) {
     (void)app;
     (void)channel;
+    (void)bounds;
     video_panel_state_t *panel = (video_panel_state_t *)state;
     if (!panel) return false;
-
-    if (panel->active_plugin == VIDEO_PLUGIN_VHS_FM) {
-        vhs_fm_decoder_t *vhs = &panel->vhs_fm.decoder;
-        if (!CheckCollisionPointRec(mouse_pos, bounds)) return false;
-
-        if (vhs->overlay.is_visible && CheckCollisionPointRec(mouse_pos, vhs->overlay.button_rect)) {
-            video_panel_activate_plugin(panel, video_panel_next_plugin(panel->active_plugin));
-            return true;
-        }
-
-        // Keep the existing VHS FM debug interaction: Ctrl+click toggles scope mode.
-        if (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) {
-            vhs->display_mode = (vhs->display_mode == VHS_FM_DISPLAY_VIDEO)
-                ? VHS_FM_DISPLAY_SCOPE
-                : VHS_FM_DISPLAY_VIDEO;
-            return true;
-        }
-        return false;
-    }
     cvbs_decoder_t *decoder = video_panel_active_decoder(panel);
     if (!decoder) return false;
     if (!decoder->overlay.is_visible) return false;
     bool tape_ui = (panel->active_plugin == VIDEO_PLUGIN_TAPE_DECODE);
     video_tape_plugin_t *tape_plugin = &panel->tape_decode;
-    // Decoder button: cycle between independent plugin decoders.
+    // Decoder button: switch between independent plugin decoders (CVBS/Tape).
     if (CheckCollisionPointRec(mouse_pos, decoder->overlay.decoder_btn_rect)) {
-        video_plugin_kind_t next = video_panel_next_plugin(panel->active_plugin);
+        video_plugin_kind_t next = (panel->active_plugin == VIDEO_PLUGIN_CVBS)
+            ? VIDEO_PLUGIN_TAPE_DECODE
+            : VIDEO_PLUGIN_CVBS;
         video_panel_activate_plugin(panel, next);
         decoder = video_panel_active_decoder(panel);
         if (decoder) {
