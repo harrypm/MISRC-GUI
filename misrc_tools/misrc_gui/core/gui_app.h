@@ -88,17 +88,9 @@ typedef enum {
 typedef enum {
     TRIGGER_MODE_RISING,      // Rising edge crossing level
     TRIGGER_MODE_FALLING,     // Falling edge crossing level
-    TRIGGER_MODE_SYNC,        // Sync-locked trigger (CH3 headswitch phase lock)
     TRIGGER_MODE_CVBS_HSYNC,  // CVBS horizontal sync (auto PAL/NTSC)
     TRIGGER_MODE_COUNT
 } trigger_mode_t;
-// Trigger source selection (absolute channels)
-typedef enum {
-    TRIGGER_SOURCE_CH1,       // RF channel 1 / Channel A
-    TRIGGER_SOURCE_CH2,       // RF channel 2 / Channel B
-    TRIGGER_SOURCE_CH3,       // Clockgen headswitch channel
-    TRIGGER_SOURCE_COUNT
-} trigger_source_t;
 
 // Per-channel trigger configuration and state
 typedef struct {
@@ -109,7 +101,6 @@ typedef struct {
     atomic_int display_width;  // Actual pixel width of oscilloscope display (updated by renderer, read by extraction thread)
     scope_display_mode_t scope_mode;       // Display mode for this channel (line or phosphor)
     trigger_mode_t trigger_mode;           // Trigger mode (rising edge, falling edge, CVBS)
-    trigger_source_t trigger_source;       // Trigger source channel (CH1/CH2/CH3)
     phosphor_color_mode_t phosphor_color;  // Phosphor color mode (heatmap or opacity)
 
     // Resampler state (managed by gui_oscilloscope.c)
@@ -140,10 +131,7 @@ typedef enum {
     DEVICE_TYPE_SIMULATED,      // Simulated device for testing
     DEVICE_TYPE_PLAYBACK,       // Playback from recorded FLAC files
 #ifdef ENABLE_FX3
-    DEVICE_TYPE_FX3,            // Cypress FX3 USB device
-#endif
-#ifdef ENABLE_DDD
-    DEVICE_TYPE_DDD,            // DomesdayDuplicator USB device
+    DEVICE_TYPE_FX3             // Cypress FX3 USB device
 #endif
 } device_type_t;
 
@@ -238,7 +226,6 @@ typedef struct {
     bool audio_monitor_playback;               // If true, play monitored audio to system output
     bool audio_monitor_ch34;                   // If true, monitor CH3/4; if false, monitor CH1/2
     bool misrc_mode;                           // If true, MISRC mode (default) with A/B channel swap
-    bool misrc_v15_v25_ab_swap;               // If true, invert MISRC A/B mapping for V1.5/V2.5 hardware swap variants
     bool stop_on_dropout;                      // If true, automatically stop capture when stream dropout is detected
 
     // Level autostop: stop capture/recording when signal level stays below a
@@ -252,35 +239,11 @@ typedef struct {
     char audio_1ch_labels[4][32];
     // Optional tags for non-mono audio outputs: [0]=4ch, [1]=stereo ch1/2, [2]=stereo ch3/4
     char audio_output_tags[3][32];
-    // Ingest metadata (saved to settings and written to capture log at record start)
-    char ingest_project[128];
-    char ingest_tape_id[128];
-    char ingest_tape_format[128];
-    char ingest_tape_size[128];
-    char ingest_tape_speed[128];
-    char ingest_tape_condition[128];
-    char ingest_operator[128];
-    char ingest_location[128];
-    char ingest_notes[256];
 
     // Display settings (existing)
     bool show_grid;
     float time_scale;         // Time per division (ms)
     float amplitude_scale;    // Amplitude scale factor
-
-    // Device discovery: V4L2/simple_capture device enumeration is opt-in.
-    // Disabled by default since most users use hsdaoh/CXADC/DdD/FX3 backends;
-    // enabling it lists OS video capture devices (e.g. MS2130 HDMI capture)
-    // in the device dropdown.
-    bool discover_simple_capture;
-    // Advanced settings visibility: show/hide core-pinning controls in Settings.
-    bool show_core_pinning_in_settings;
-
-    // Max total capture/playback buffer RAM budget in GB (1-16). Applied at
-    // buffer-manager init and re-applied on change when idle. Default 4 GB
-    // mirrors the older code's ~4 GB target. Record A/B get the remainder
-    // after fixed RF/Audio/Display allocations; record buffers stay lazy.
-    uint32_t memory_budget_gb;
 
     // Playback settings
     char playback_file_a[MAX_FILENAME_LEN];   // FLAC file for channel A playback
@@ -319,20 +282,11 @@ typedef struct gui_app {
     atomic_bool fx3_running;       // Flag for FX3 capture mode
 #endif
 
-#ifdef ENABLE_DDD
-    // DdD device state
-    void *ddd_dev;                 // DdD device handle (libusb_device_handle *)
-    void *ddd_thread;              // DdD capture thread handle
-    atomic_bool ddd_running;       // Flag for DdD capture mode
-#endif
-
     // Capture state
     bool is_capturing;
     bool is_recording;
     bool user_capture_mode_misrc;      // Authoritative user-selected mode (changes only via mode toggle)
     bool capture_mode_runtime_misrc;   // Mode latched at recording start (stable for recording session)
-    bool capture_backend_upstream;     // Active backend for current capture session (true=upstream callback)
-    bool capture_has_channel_b;        // Runtime capability flag used by extraction/display mapping
 
     // Device enumeration
     device_info_t devices[MAX_DEVICES];

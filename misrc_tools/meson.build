@@ -17,15 +17,7 @@ cflags = warnings + [
   # glibc default feature set (needed for endian helpers like le16toh)
   '-D_DEFAULT_SOURCE',
 ]
-# HSDAOH_UPSTREAM selects the upstream-hsdaoh reference capture path in
-# gui_capture.c (hsdaoh_data_info_t structured callback, stream_id routing).
-# That path is incomplete for MISRC: it hard-disables simple-capture (MISRC
-# mode) at gui_capture.c:~1407 and has no stream_id==1 (ChB) handler, so it
-# drops channel B and skips gui_capture_configure_handler. It is therefore
-# NOT used for Linux/macOS, which rely on the complete MISRC raw-callback +
-# frame-parser path (both channels). Windows keeps HSDAOH_UPSTREAM=1 to
-# preserve PR #12's (@machcnz) Windows HSDAOH connect fix (added alongside
-# the -lavrt/-lksuser GUI linker flags below). See the Windows block.
+cflags += ['-DHSDAOH_UPSTREAM=1']
 
 ldflags = [
 ]
@@ -149,8 +141,6 @@ else
           'Build third_party/hsdaoh into .deps/install (see .github/workflows/build.yml) to mirror CI.')
 endif
 deps = [ hsdaoh_dep ]
-libusb_common_dep = dependency('libusb-1.0', required : false, static: windows_static_deps)
-libusb_common_dep_added = false
 
 flac_dep =  dependency('flac', required : false, static: windows_static_deps)
 if flac_dep.found()
@@ -218,54 +208,29 @@ else
   message('FFTW3 not found; misrc_gui requires fftw3f and will fail to configure until it is installed')
 endif
 
-# FX3 support: build the vendored cyusb compatibility shim from source on
-# ALL platforms (Linux, Windows, macOS) when libusb-1.0 is present. The real
-# Cypress cyusb library is Linux-only and not packaged by distros; the previous
-# external libcyusb pkg-config lookup had no package and was faked via an
-# ephemeral /tmp cwrap that broke the build after reboot. Building the shim
-# from source in-tree makes FX3 native on every platform: no external
-# libcyusb package needed anywhere, no system libcyusb can shadow a vendored
-# copy (the dep is built in-tree), and local == CI. The shim is a faithful
-# drop-in: cyusb_handle aliases libusb_device_handle, matching the existing
-# call sites in gui_fx3.c which pass handles directly to libusb_* functions.
-# The shim uses LIBUSB_API_VERSION + __has_include so it builds on every OS.
+# FX3 support (optional, Linux uses cyusb, others use libusb)
 fx3_enabled = false
-if libusb_common_dep.found()
-  if not libusb_common_dep_added
-    deps += [ libusb_common_dep ]
-    libusb_common_dep_added = true
+if host_system == 'linux'
+  cyusb_dep = dependency('libcyusb', required : false)
+  if cyusb_dep.found()
+    deps += [ cyusb_dep ]
+    cflags += ['-DENABLE_FX3=1']
+    fx3_enabled = true
+    message('libcyusb found, building with FX3 support')
+  else
+    message('libcyusb not found, building without FX3 support')
   endif
-  cyusb_inc = include_directories('../third_party/cyusb')
-  cyusb_compat_lib = static_library('cyusb_compat',
-    '../third_party/cyusb/cyusb.c',
-    include_directories: cyusb_inc,
-    dependencies: [ libusb_common_dep ],
-  )
-  cyusb_dep = declare_dependency(
-    link_with: cyusb_compat_lib,
-    include_directories: cyusb_inc,
-    dependencies: [ libusb_common_dep ],
-  )
-  deps += [ cyusb_dep ]
-  cflags += ['-DENABLE_FX3=1']
-  fx3_enabled = true
-  message('Vendored cyusb shim + libusb-1.0 found, building with FX3 support')
 else
-  message('libusb-1.0 not found, building without FX3 support')
-endif
-
-# DdD (DomesdayDuplicator) support (optional, uses libusb on all platforms)
-ddd_enabled = false
-if libusb_common_dep.found()
-  if not libusb_common_dep_added
-    deps += [ libusb_common_dep ]
-    libusb_common_dep_added = true
+  # On non-Linux platforms, use libusb for FX3
+  libusb_dep = dependency('libusb-1.0', required : false, static: windows_static_deps)
+  if libusb_dep.found()
+    deps += [ libusb_dep ]
+    cflags += ['-DENABLE_FX3=1']
+    fx3_enabled = true
+    message('libusb found, building with FX3 support')
+  else
+    message('libusb not found, building without FX3 support')
   endif
-  cflags += ['-DENABLE_DDD=1']
-  ddd_enabled = true
-  message('libusb-1.0 found, building with DdD support')
-else
-  message('libusb-1.0 not found, building without DdD support')
 endif
 
 
@@ -275,15 +240,6 @@ if host_system == 'windows' or host_system == 'cygwin'
     sources_capture += [ 'getopt/getopt.c' ]
   endif
   cflags += [ '-DNTDDI_VERSION=NTDDI_WIN10_RS4', '-D_WIN32_WINNT=_WIN32_WINNT_WIN10' ]
-  # The below line must be included to build HSDAOH 
-  # Windows keeps HSDAOH_UPSTREAM=1 to use the upstream-hsdaoh reference capture
-  # path which includes PR #12's (@machcnz) Windows HSDAOH connect fix via
-  # libusb/WinUSB. Without this define, hsdaoh_open() fails to claim the MS2130
-  # USB interface on Windows and the device cannot connect. The MISRC raw-callback
-  # + frame-parser path (used on Linux/macOS for both channels) does not have the
-  # Windows-specific USB claim sequence needed for the MS2130.
-  # The -lavrt/-lksuser GUI linker flags below are also part of PR #12's fix.
-  cflags += [ '-DHSDAOH_UPSTREAM=1' ]
   ldflags += [ '-static', '-static-libgcc' ]
   if meson.get_compiler('c').get_id() == 'gcc'
     ldflags += [ '-lgomp' ]
@@ -337,10 +293,8 @@ if raylib_dep.found()
     'misrc_gui/processing/gui_extract.c',
     'misrc_gui/processing/gui_display_thread.c',
     # Signal
-    'misrc_gui/signal/gui_headswitch_lock.c',
     'misrc_gui/signal/gui_trigger.c',
     'misrc_gui/signal/gui_cvbs.c',
-    'misrc_gui/signal/gui_vhs_fm.c',
     'misrc_gui/signal/gui_histogram.c',
     # Visualization
     'misrc_gui/visualization/gui_oscilloscope.c',
@@ -380,11 +334,6 @@ if raylib_dep.found()
     sources_gui += 'misrc_gui/input/gui_fx3.c'
   endif
 
-  # Add DdD support to GUI if available
-  if ddd_enabled
-    sources_gui += 'misrc_gui/input/gui_ddd.c'
-  endif
-
   gui_deps = deps + [ raylib_dep, fftw3f_dep ]
 
   gui_cflags = cflags + [
@@ -403,7 +352,7 @@ if raylib_dep.found()
     gui_ldflags += ['-lmincore']
     # simple_capture for device enumeration
     sources_gui += 'misrc_capture/simple_capture/simple_capture_mediafoundation.c'
-    gui_ldflags += ['-lmf', '-lmfplat', '-lmfuuid', '-lmfreadwrite', '-lole32', '-lavrt', '-lksuser', '-luuid', '-lshell32']
+    gui_ldflags += ['-lmf', '-lmfplat', '-lmfuuid', '-lmfreadwrite', '-lole32', '-lavrt', '-lksuser']
   elif host_system == 'linux'
     gui_ldflags += ['-lGL', '-lm', '-lpthread', '-ldl', '-lrt', '-lX11']
     sources_gui += 'misrc_capture/simple_capture/simple_capture_v4l2.c'

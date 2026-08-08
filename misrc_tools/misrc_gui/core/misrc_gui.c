@@ -648,12 +648,7 @@ int main(int argc, char **argv) {
             // Detect connection loss via callback timeout (no data for 2+ seconds).
             // Keep parser-state ownership scoped to capture lifecycle boundaries
             // in gui_capture.c (stop/start paths), not timeout polling logic here.
-            // Grace period: suppress timeout for the first 5 seconds after capture
-            // starts so the MS2130 has time to complete its initial HDMI/USB sync
-            // and deliver the first data callback (first-connect on Windows can
-            // take 3-4 seconds before any data arrives).
-            if (app.is_capturing && (now - app.capture_start_time) > 5.0
-                && gui_capture_device_timeout(&app, 2000)) {
+            if (app.is_capturing && gui_capture_device_timeout(&app, 2000)) {
                 // Device was disconnected unexpectedly - clean up properly
                 fprintf(stderr, "[GUI] Device timeout detected, disconnecting...\n");
                 gui_set_reconnect_target_from_selected(&app, &reconnect_target);
@@ -744,6 +739,10 @@ int main(int argc, char **argv) {
 
         // Render
         BeginDrawing();
+
+        // Reset cursor to default at start of frame
+        // (Panels will set crosshair cursor when hovering/dragging via their render functions)
+        SetMouseCursor(MOUSE_CURSOR_DEFAULT);
         ClearBackground(COLOR_BG);
 
         // Render Clay UI (custom elements are handled via CLAY_RENDER_COMMAND_TYPE_CUSTOM)

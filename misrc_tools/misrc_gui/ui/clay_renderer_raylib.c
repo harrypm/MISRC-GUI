@@ -240,52 +240,6 @@ void Clay_Raylib_Render(Clay_RenderCommandArray renderCommands, Font* fonts)
                                    2.0f, col);
                         break;
                     }
-                    case CUSTOM_LAYOUT_ELEMENT_TYPE_LOOP_ICON: {
-                        // Circular repeat arrow icon (playback loop toggle).
-                        // Styled to match a classic thick loop arrow with
-                        // a left-side head and rounded tail.
-                        float cx = boundingBox.x + boundingBox.width * 0.5f;
-                        float cy = boundingBox.y + boundingBox.height * 0.5f;
-                        float size = (boundingBox.width < boundingBox.height ? boundingBox.width : boundingBox.height);
-                        float ring_outer = size * 0.46f;
-                        float ring_stroke = fmaxf(2.2f, size * 0.22f);
-                        float ring_inner = fmaxf(0.5f, ring_outer - ring_stroke);
-                        Color col = COLOR_TEXT;
-                        // Draw two arc segments so the intentional gap lands on the left,
-                        // where the arrowhead will sit.
-                        DrawRing((Vector2){cx, cy}, ring_inner, ring_outer,
-                                 228.0f, 360.0f, 56, col);
-                        DrawRing((Vector2){cx, cy}, ring_inner, ring_outer,
-                                 0.0f, 150.0f, 56, col);
-
-                        // Rounded tail cap at lower-left.
-                        float tail_ang = 228.0f * DEG2RAD;
-                        float mid_r = (ring_inner + ring_outer) * 0.5f;
-                        Vector2 tail = {
-                            cx + cosf(tail_ang) * mid_r,
-                            cy + sinf(tail_ang) * mid_r
-                        };
-                        DrawCircle((int)roundf(tail.x), (int)roundf(tail.y), ring_stroke * 0.52f, col);
-
-                        // Filled arrowhead on the left side.
-                        float tip_ang = 188.0f * DEG2RAD;
-                        Vector2 tip = {
-                            cx + cosf(tip_ang) * (ring_outer + ring_stroke * 0.30f),
-                            cy + sinf(tip_ang) * (ring_outer + ring_stroke * 0.30f)
-                        };
-                        float wing_radius = ring_outer - ring_stroke * 0.18f;
-                        float wing_offset = 0.72f;
-                        Vector2 wing_a = {
-                            cx + cosf(tip_ang + wing_offset) * wing_radius,
-                            cy + sinf(tip_ang + wing_offset) * wing_radius
-                        };
-                        Vector2 wing_b = {
-                            cx + cosf(tip_ang - wing_offset) * wing_radius,
-                            cy + sinf(tip_ang - wing_offset) * wing_radius
-                        };
-                        DrawTriangle(tip, wing_a, wing_b, col);
-                        break;
-                    }
                     case CUSTOM_LAYOUT_ELEMENT_TYPE_VERSION_ICON: {
                         // Fixed left-side "i" info badge with a capture-state accent ring.
                         // Font-free (primitives only) so layout width is constant on every platform.
@@ -320,41 +274,6 @@ void Clay_Raylib_Render(Clay_RenderCommandArray renderCommands, Font* fonts)
                         // Round the stem ends so it reads as a clean "i"
                         DrawCircle((int)roundf(cx), (int)roundf(stem_top), stem_w * 0.5f, glyph);
                         DrawCircle((int)roundf(cx), (int)roundf(stem_bot), stem_w * 0.5f, glyph);
-                        break;
-                    }
-                    case CUSTOM_LAYOUT_ELEMENT_TYPE_SCROLL_ICON: {
-                        // Compact white line-only scroll icon aligned with toolbar icon style.
-                        float cx = boundingBox.x + boundingBox.width * 0.5f;
-                        float cy = boundingBox.y + boundingBox.height * 0.5f;
-                        float s = (boundingBox.width < boundingBox.height ? boundingBox.width : boundingBox.height);
-                        Color glyph = COLOR_TEXT;
-                        float body_w = s * 0.56f;
-                        float body_h = s * 0.66f;
-                        float body_x = cx - body_w * 0.5f;
-                        float body_y = cy - body_h * 0.50f;
-                        float body_r = s * 0.085f;
-                        float stroke = 1.8f;
-                        float left = body_x;
-                        float right = body_x + body_w;
-                        float top = body_y;
-                        float bottom = body_y + body_h;
-
-                        // Outer parchment contour
-                        DrawLineEx((Vector2){left + body_r, top}, (Vector2){right - body_r, top}, stroke, glyph);
-                        DrawLineEx((Vector2){left, top + body_r}, (Vector2){left, bottom - body_r}, stroke, glyph);
-                        DrawLineEx((Vector2){left + body_r, bottom}, (Vector2){right - body_r, bottom}, stroke, glyph);
-                        DrawLineEx((Vector2){right, top + body_r}, (Vector2){right, bottom - body_r}, stroke, glyph);
-
-                        // Parchment rolled corners
-                        float curl_r = s * 0.07f;
-                        DrawCircleLines((int)roundf(right - body_r * 0.9f), (int)roundf(top + body_r * 0.9f), curl_r, glyph);
-                        DrawCircleLines((int)roundf(left + body_r * 0.9f), (int)roundf(bottom - body_r * 0.9f), curl_r, glyph);
-
-                        // Internal text lines
-                        float line_l = body_x + body_w * 0.24f;
-                        float line_r = body_x + body_w * 0.76f;
-                        DrawLineEx((Vector2){line_l, body_y + body_h * 0.44f}, (Vector2){line_r, body_y + body_h * 0.44f}, 1.3f, glyph);
-                        DrawLineEx((Vector2){line_l, body_y + body_h * 0.60f}, (Vector2){line_r, body_y + body_h * 0.60f}, 1.3f, glyph);
                         break;
                     }
                     default: break;

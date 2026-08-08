@@ -95,14 +95,4 @@ ssize_t trigger_find_all_cvbs_hsyncs(const int16_t *buf, size_t count,
 ssize_t trigger_find_from_config(const int16_t *buf, size_t count,
                                   const channel_trigger_t *trig, size_t min_index);
 
-// Find trigger point with explicit trigger-source routing.
-// buf_ch1/buf_ch2 are RF buffers for absolute CH1/CH2 source selection.
-// rf_sample_rate_hz is used for CH3 headswitch phase prediction.
-ssize_t trigger_find_from_config_multi(const int16_t *buf_ch1,
-                                       const int16_t *buf_ch2,
-                                       size_t count,
-                                       const channel_trigger_t *trig,
-                                       size_t min_index,
-                                       uint32_t rf_sample_rate_hz);
-
 #endif // GUI_TRIGGER_H

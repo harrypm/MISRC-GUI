@@ -30,19 +30,7 @@
 static const char *s_trigger_mode_labels[] = {
     [TRIGGER_MODE_RISING] = "Rising",
     [TRIGGER_MODE_FALLING] = "Falling",
-    [TRIGGER_MODE_SYNC] = "Sync",
     [TRIGGER_MODE_CVBS_HSYNC] = "CVBS",
-};
-static const char *s_trigger_mode_short_labels[] = {
-    [TRIGGER_MODE_RISING] = "Rise",
-    [TRIGGER_MODE_FALLING] = "Fall",
-    [TRIGGER_MODE_SYNC] = "Sync",
-    [TRIGGER_MODE_CVBS_HSYNC] = "CVBS",
-};
-static const char *s_trigger_source_labels[] = {
-    [TRIGGER_SOURCE_CH1] = "Ch1",
-    [TRIGGER_SOURCE_CH2] = "Ch2",
-    [TRIGGER_SOURCE_CH3] = "Ch3",
 };
 
 static const char *s_render_mode_labels[] = {
@@ -62,7 +50,6 @@ typedef struct {
     bool trigger_enabled;
     int16_t trigger_level;
     trigger_mode_t trigger_mode;
-    trigger_source_t trigger_source;
     float zoom_scale;
     int trigger_display_pos;
 
@@ -87,8 +74,7 @@ typedef struct {
     bool render_mode_dropdown_open;
 
     Rectangle trigger_btn_rect;
-    Rectangle trigger_mode_opts_rect[TRIGGER_MODE_COUNT + 1];        // +1 for \"Off\"
-    Rectangle trigger_source_opts_rect[TRIGGER_SOURCE_COUNT];
+    Rectangle trigger_opts_rect[TRIGGER_MODE_COUNT + 1];  // +1 for "Off"
     bool trigger_dropdown_open;
 
     panel_menu_item_t menu_items[TRIGGER_MODE_COUNT];
@@ -113,8 +99,7 @@ static size_t waveform_resample_to_buffer(waveform_panel_state_t *state,
                                            size_t start_idx, float decimation,
                                            size_t target_width);
 static bool waveform_process_display(waveform_panel_state_t *state,
-                                      const int16_t *buf, size_t num_samples,
-                                      uint32_t sample_rate_hz);
+                                      const int16_t *buf, size_t num_samples);
 
 //-----------------------------------------------------------------------------
 // Grid Settings
@@ -130,19 +115,6 @@ static bool waveform_process_display(waveform_panel_state_t *state,
 
 void gui_oscilloscope_cleanup(void) {
     // No static resources - per-panel cleanup handled by vtable destroy()
-}
-
-static const int16_t *s_trigger_src_ch1 = NULL;
-static const int16_t *s_trigger_src_ch2 = NULL;
-static size_t s_trigger_src_count = 0;
-
-void gui_waveform_set_trigger_source_buffers(const int16_t *samples_ch1,
-                                             const int16_t *samples_ch2,
-                                             size_t count)
-{
-    s_trigger_src_ch1 = samples_ch1;
-    s_trigger_src_ch2 = samples_ch2;
-    s_trigger_src_count = count;
 }
 
 //-----------------------------------------------------------------------------
@@ -367,16 +339,6 @@ static void draw_panel_trigger_markers(float x, float y, float w, float h,
         if (state->trigger_display_pos >= 0 && state->trigger_display_pos < (int)w) {
             float trigger_x = x + (float)state->trigger_display_pos;
             Color marker_color = { color.r, color.g, color.b, 80 };
-            DrawLineEx((Vector2){trigger_x, y}, (Vector2){trigger_x, y + h}, 1.0f, marker_color);
-        }
-        return;
-    }
-
-    // Sync mode: phase-lock marker only (no manual trigger-level line).
-    if (state->trigger_mode == TRIGGER_MODE_SYNC) {
-        if (state->trigger_display_pos >= 0 && state->trigger_display_pos < (int)w) {
-            float trigger_x = x + (float)state->trigger_display_pos;
-            Color marker_color = { color.r, color.g, color.b, 120 };
             DrawLineEx((Vector2){trigger_x, y}, (Vector2){trigger_x, y + h}, 1.0f, marker_color);
         }
         return;
@@ -717,33 +679,24 @@ static size_t waveform_resample_to_buffer(waveform_panel_state_t *state,
 // Find trigger point using panel's trigger configuration
 static ssize_t waveform_find_trigger_from(const int16_t *buf, size_t count,
                                            const waveform_panel_state_t *state,
-                                           size_t min_index,
-                                           uint32_t sample_rate_hz) {
+                                           size_t min_index) {
     if (!state->trigger_enabled) return -1;
     if (count < 2 || min_index >= count) return -1;
 
-    // Use the gui_trigger module for source-aware trigger detection.
+    // Use the gui_trigger module for actual trigger detection
+    // Create a temporary channel_trigger_t to use with existing trigger code
     channel_trigger_t temp_trig = {
         .enabled = state->trigger_enabled,
         .level = state->trigger_level,
         .trigger_mode = state->trigger_mode,
-        .trigger_source = state->trigger_source,
     };
-    const int16_t *src_ch1 = s_trigger_src_ch1 ? s_trigger_src_ch1 : buf;
-    const int16_t *src_ch2 = s_trigger_src_ch2 ? s_trigger_src_ch2 : buf;
-    size_t src_count = count;
-    if (s_trigger_src_count > 0 && s_trigger_src_count < src_count) {
-        src_count = s_trigger_src_count;
-    }
-    if (min_index >= src_count) return -1;
-    return trigger_find_from_config_multi(src_ch1, src_ch2, src_count,
-                                          &temp_trig, min_index, sample_rate_hz);
+
+    return trigger_find_from_config(buf, count, &temp_trig, min_index);
 }
 
 // Process raw samples and update panel's display buffer
 static bool waveform_process_display(waveform_panel_state_t *state,
-                                      const int16_t *buf, size_t num_samples,
-                                      uint32_t sample_rate_hz) {
+                                      const int16_t *buf, size_t num_samples) {
     if (!state || !buf || num_samples == 0) return false;
 
     // Get display width (set by renderer, defaults to DISPLAY_BUFFER_SIZE)
@@ -795,8 +748,7 @@ static bool waveform_process_display(waveform_panel_state_t *state,
     }
 
     // Find trigger point starting from minimum valid position
-    ssize_t trig_pos = waveform_find_trigger_from(buf, max_trig_pos, state,
-                                                  min_trig_pos, sample_rate_hz);
+    ssize_t trig_pos = waveform_find_trigger_from(buf, max_trig_pos, state, min_trig_pos);
 
     if (trig_pos < 0) {
         // No trigger found - hold previous display
@@ -814,6 +766,7 @@ static bool waveform_process_display(waveform_panel_state_t *state,
 // Vtable process function (called from display thread via panel_process_all)
 static void waveform_vtable_process(void *state_ptr, const int16_t *samples,
                                      size_t count, uint32_t sample_rate) {
+    (void)sample_rate;  // Currently unused but available for future use
     if (!state_ptr || !samples || count == 0) return;
 
     waveform_panel_state_t *state = (waveform_panel_state_t *)state_ptr;
@@ -834,7 +787,7 @@ static void waveform_vtable_process(void *state_ptr, const int16_t *samples,
         state->cvbs_levels_valid = false;
     }
 
-    waveform_process_display(state, samples, count, sample_rate);
+    waveform_process_display(state, samples, count);
 }
 
 //-----------------------------------------------------------------------------
@@ -852,7 +805,6 @@ static void *waveform_create(void) {
     state->trigger_enabled = false;
     state->trigger_level = 0;
     state->trigger_mode = TRIGGER_MODE_RISING;
-    state->trigger_source = TRIGGER_SOURCE_CH1;
     state->zoom_scale = ZOOM_SCALE_DEFAULT;
     state->trigger_display_pos = -1;
 
@@ -954,7 +906,7 @@ static void waveform_render_overlay(void *state_ptr, Rectangle bounds) {
     Vector2 mouse = GetMousePosition();
 
     // Button widths
-    float trig_btn_w = 98;
+    float trig_btn_w = 65;
     float render_btn_w = 85;  // Larger for render mode with label
 
     //-------------------------------------------------------------------------
@@ -970,31 +922,21 @@ static void waveform_render_overlay(void *state_ptr, Rectangle bounds) {
                   btn_y + (btn_h - FONT_SIZE_DROPDOWN_OPT) / 2,
                   FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT_DIM);
 
-    char trig_label_buf[24];
-    const char *trig_label = "Off";
-    if (state->trigger_enabled) {
-        snprintf(trig_label_buf, sizeof(trig_label_buf), "%s/%s",
-                 s_trigger_mode_short_labels[state->trigger_mode],
-                 s_trigger_source_labels[state->trigger_source]);
-        trig_label = trig_label_buf;
-    }
+    const char *trig_label = state->trigger_enabled ? s_trigger_mode_labels[state->trigger_mode] : "Off";
     draw_dropdown_button(state->trigger_btn_rect, trig_label, state->trigger_dropdown_open);
 
     // Draw trigger dropdown options if open
     if (state->trigger_dropdown_open) {
         float opt_y = btn_y + btn_h;
         float opt_h = 20;
-        int mode_rows = TRIGGER_MODE_COUNT + 1;  // +1 for \"Off\"
-        int header_rows = 1;                     // \"Channel\" section header
-        int source_rows = TRIGGER_SOURCE_COUNT;
-        int total_rows = mode_rows + header_rows + source_rows;
+        int num_options = TRIGGER_MODE_COUNT + 1;  // +1 for "Off"
 
-        DrawRectangleRounded((Rectangle){trig_btn_x, opt_y, trig_btn_w, opt_h * total_rows},
+        DrawRectangleRounded((Rectangle){trig_btn_x, opt_y, trig_btn_w, opt_h * num_options},
                              0.1f, 4, COLOR_PANEL_BG);
 
         // Option 0: Off
         Rectangle off_rect = {trig_btn_x, opt_y, trig_btn_w, opt_h};
-        state->trigger_mode_opts_rect[0] = off_rect;
+        state->trigger_opts_rect[0] = off_rect;
 
         bool is_off = !state->trigger_enabled;
         bool hover_off = CheckCollisionPointRec(mouse, off_rect);
@@ -1009,7 +951,7 @@ static void waveform_render_overlay(void *state_ptr, Rectangle bounds) {
         // Options 1..N: Trigger modes
         for (int i = 0; i < TRIGGER_MODE_COUNT; i++) {
             Rectangle opt_rect = {trig_btn_x, opt_y + (i + 1) * opt_h, trig_btn_w, opt_h};
-            state->trigger_mode_opts_rect[i + 1] = opt_rect;
+            state->trigger_opts_rect[i + 1] = opt_rect;
 
             bool is_selected = state->trigger_enabled && (state->trigger_mode == (trigger_mode_t)i);
             bool hover = CheckCollisionPointRec(mouse, opt_rect);
@@ -1020,33 +962,6 @@ static void waveform_render_overlay(void *state_ptr, Rectangle bounds) {
             int opt_w = gui_text_measure(opt_label, FONT_SIZE_DROPDOWN_OPT);
             gui_text_draw(opt_label, trig_btn_x + trig_btn_w/2 - opt_w/2,
                           opt_y + (i + 1) * opt_h + (opt_h - FONT_SIZE_DROPDOWN_OPT) / 2,
-                          FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
-        }
-
-        // Section header: Channel
-        int channel_header_row = mode_rows;
-        float header_y = opt_y + (channel_header_row * opt_h);
-        DrawRectangleRec((Rectangle){trig_btn_x, header_y, trig_btn_w, opt_h}, COLOR_PANEL_BG);
-        const char *header = "Channel";
-        int header_w = gui_text_measure(header, FONT_SIZE_DROPDOWN_OPT);
-        gui_text_draw(header, trig_btn_x + trig_btn_w/2 - header_w/2,
-                      header_y + (opt_h - FONT_SIZE_DROPDOWN_OPT) / 2,
-                      FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT_DIM);
-
-        // Source options: CH1 / CH2 / CH3
-        for (int i = 0; i < TRIGGER_SOURCE_COUNT; i++) {
-            int row = mode_rows + 1 + i;
-            Rectangle src_rect = {trig_btn_x, opt_y + row * opt_h, trig_btn_w, opt_h};
-            state->trigger_source_opts_rect[i] = src_rect;
-
-            bool is_selected = (state->trigger_source == (trigger_source_t)i);
-            bool hover = CheckCollisionPointRec(mouse, src_rect);
-            DrawRectangleRec(src_rect, gui_dropdown_option_color(is_selected, hover));
-
-            const char *src_label = s_trigger_source_labels[i];
-            int src_w = gui_text_measure(src_label, FONT_SIZE_DROPDOWN_OPT);
-            gui_text_draw(src_label, trig_btn_x + trig_btn_w/2 - src_w/2,
-                          src_rect.y + (opt_h - FONT_SIZE_DROPDOWN_OPT) / 2,
                           FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
         }
     }
@@ -1140,8 +1055,10 @@ static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, in
     }
 
     if (state->trigger_dropdown_open) {
-        // Check \"Off\" option
-        Rectangle off_rect = state->trigger_mode_opts_rect[0];
+        // Check "Off" option
+        Rectangle off_rect = {state->trigger_btn_rect.x,
+                              state->trigger_btn_rect.y + state->trigger_btn_rect.height,
+                              state->trigger_btn_rect.width, 20};
         if (CheckCollisionPointRec(click, off_rect)) {
             state->trigger_enabled = false;
             state->trigger_dropdown_open = false;
@@ -1150,20 +1067,12 @@ static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, in
 
         // Check trigger mode options
         for (int i = 0; i < TRIGGER_MODE_COUNT; i++) {
-            Rectangle opt_rect = state->trigger_mode_opts_rect[i + 1];
+            Rectangle opt_rect = {state->trigger_btn_rect.x,
+                                  state->trigger_btn_rect.y + state->trigger_btn_rect.height + (i + 1) * 20,
+                                  state->trigger_btn_rect.width, 20};
             if (CheckCollisionPointRec(click, opt_rect)) {
                 state->trigger_enabled = true;
                 state->trigger_mode = (trigger_mode_t)i;
-                state->trigger_dropdown_open = false;
-                return true;
-            }
-        }
-
-        // Check trigger source options
-        for (int i = 0; i < TRIGGER_SOURCE_COUNT; i++) {
-            Rectangle src_rect = state->trigger_source_opts_rect[i];
-            if (CheckCollisionPointRec(click, src_rect)) {
-                state->trigger_source = (trigger_source_t)i;
                 state->trigger_dropdown_open = false;
                 return true;
             }
@@ -1181,11 +1090,8 @@ static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, in
         return false;
     }
 
-    // Don't allow trigger level drag in CVBS/Sync modes (auto trigger)
-    // or CH3 headswitch mode (phase predictor ignores manual level).
-    if (state->trigger_mode == TRIGGER_MODE_CVBS_HSYNC ||
-        state->trigger_mode == TRIGGER_MODE_SYNC ||
-        state->trigger_source == TRIGGER_SOURCE_CH3) {
+    // Don't allow trigger level drag in CVBS mode (level is auto-detected)
+    if (state->trigger_mode == TRIGGER_MODE_CVBS_HSYNC) {
         return false;
     }
 
@@ -1279,6 +1185,13 @@ static void waveform_render(void *state_ptr, gui_app_t *app, int channel,
     // Update drag state for trigger level (continuous while mouse is held)
     waveform_panel_update_drag(state, app, bounds);
 
+    // Set cursor when hovering over waveform panel or dragging
+    Vector2 mouse = GetMousePosition();
+    if (!gui_popup_is_open()) {
+        if (CheckCollisionPointRec(mouse, bounds) || state->dragging) {
+            SetMouseCursor(MOUSE_CURSOR_CROSSHAIR);
+        }
+    }
 
     // Dispatch based on render mode
     if (state->render_mode == WAVEFORM_MODE_PHOSPHOR) {

@@ -38,7 +38,7 @@ static uint8_t *s_buf_aux = NULL;
 static conv_function_t s_extract_fn = NULL;
 static bool s_initialized = false;
 
-static bool s_b_present = true; // Runtime capability set at capture start
+static bool s_b_present = true; // Assume B channel present by default; adjust based on mode (frame vs upstream) in gui_extract_init
 
 // Scratch buffers for recording conversions
 static int8_t *s_tmp8_a = NULL;
@@ -118,10 +118,6 @@ static int extraction_thread(void *ctx) {
         }
 
         // Extract samples (always - this is the core work)
-        // Re-read capture_has_channel_b each iteration so upstream dual-ADC
-        // auto-detection (sets flag on first stream_id=1 callback) is picked
-        // up without restarting the extraction thread.
-        s_b_present = (s_extract_app && s_extract_app->capture_has_channel_b);
         s_extract_fn((uint32_t*)buf, BUFFER_READ_SIZE, clip, s_buf_aux, s_buf_a, s_buf_b, peak);
         if (!s_b_present) {
             // Prevent stale/uninitialized data from driving CH-B meters/display
@@ -132,13 +128,6 @@ static int extraction_thread(void *ctx) {
             swap_channels = s_extract_app->is_recording
                             ? s_extract_app->capture_mode_runtime_misrc
                             : s_extract_app->user_capture_mode_misrc;
-            // Hardware-variant override: some MISRC V1.5/V2.5 setups have the
-            // analog channels wired opposite to the default MISRC mapping.
-            // In that case, invert MISRC swap behavior so GUI/record channels
-            // match the physical A/B inputs.
-            if (swap_channels && s_extract_app->settings.misrc_v15_v25_ab_swap) {
-                swap_channels = false;
-            }
         }
         if (s_b_present && swap_channels) {
             mapped_a = s_buf_b;
@@ -175,29 +164,29 @@ static int extraction_thread(void *ctx) {
                 bool want_b = s_b_present && s_extract_app->settings.capture_b;
                 int16_t *write_a = NULL;
                 int16_t *write_b = NULL;
+                bool attempted_ring_a = false;
+                bool attempted_ring_b = false;
                 bool drop_a = false;
                 bool drop_b = false;
                 char spill_error_a[256] = {0};
                 char spill_error_b[256] = {0};
 
-                // Always attempt the in-memory record ringbuffer first so the
-                // normal recording path is extraction -> ringbuffer -> FLAC
-                // writer (direct encode, no temp file). The spill temp file is
-                // only a per-block fallback when bufmgr_write_begin returns NULL
-                // (genuine transient backpressure), not a sticky mode. This
-                // prevents a single backpressure blip from permanently routing
-                // recording through a rolling disk temp file.
                 if (want_a) {
-                    write_a = (int16_t *)bufmgr_write_begin(&s_extract_app->buffers,
-                                                            BUF_RECORD_A,
-                                                            sample_bytes,
-                                                            &s_record_write_policy);
+                    if (!gui_record_spill_is_forced(0)) {
+                        attempted_ring_a = true;
+                        write_a = (int16_t *)bufmgr_write_begin(&s_extract_app->buffers,
+                                                                BUF_RECORD_A,
+                                                                sample_bytes,
+                                                                &s_record_write_policy);
+                    }
                     if (!write_a) {
                         if (gui_record_spill_enqueue(s_extract_app, 0, mapped_a, sample_bytes,
                                                      frame_count, spill_error_a, sizeof(spill_error_a))) {
-                            uint32_t drops_now = atomic_load(&s_extract_app->buffers.stats[BUF_RECORD_A].write_drops);
-                            if (drops_now > 0) {
-                                atomic_fetch_sub(&s_extract_app->buffers.stats[BUF_RECORD_A].write_drops, 1);
+                            if (attempted_ring_a) {
+                                uint32_t drops_now = atomic_load(&s_extract_app->buffers.stats[BUF_RECORD_A].write_drops);
+                                if (drops_now > 0) {
+                                    atomic_fetch_sub(&s_extract_app->buffers.stats[BUF_RECORD_A].write_drops, 1);
+                                }
                             }
                         } else {
                             drop_a = true;
@@ -206,16 +195,21 @@ static int extraction_thread(void *ctx) {
                 }
 
                 if (want_b) {
-                    write_b = (int16_t *)bufmgr_write_begin(&s_extract_app->buffers,
-                                                            BUF_RECORD_B,
-                                                            sample_bytes,
-                                                            &s_record_write_policy);
+                    if (!gui_record_spill_is_forced(1)) {
+                        attempted_ring_b = true;
+                        write_b = (int16_t *)bufmgr_write_begin(&s_extract_app->buffers,
+                                                                BUF_RECORD_B,
+                                                                sample_bytes,
+                                                                &s_record_write_policy);
+                    }
                     if (!write_b) {
                         if (gui_record_spill_enqueue(s_extract_app, 1, mapped_b, sample_bytes,
                                                      frame_count, spill_error_b, sizeof(spill_error_b))) {
-                            uint32_t drops_now = atomic_load(&s_extract_app->buffers.stats[BUF_RECORD_B].write_drops);
-                            if (drops_now > 0) {
-                                atomic_fetch_sub(&s_extract_app->buffers.stats[BUF_RECORD_B].write_drops, 1);
+                            if (attempted_ring_b) {
+                                uint32_t drops_now = atomic_load(&s_extract_app->buffers.stats[BUF_RECORD_B].write_drops);
+                                if (drops_now > 0) {
+                                    atomic_fetch_sub(&s_extract_app->buffers.stats[BUF_RECORD_B].write_drops, 1);
+                                }
                             }
                         } else {
                             drop_b = true;
@@ -227,13 +221,6 @@ static int extraction_thread(void *ctx) {
                     if (write_a) {
                         memcpy(write_a, mapped_a, sample_bytes);
                         bufmgr_write_end(&s_extract_app->buffers, BUF_RECORD_A, sample_bytes);
-                        // Ringbuffer write succeeded: clear any stale sticky
-                        // spill-forced flag so the WARN can re-fire if
-                        // backpressure recurs and the spill temp file is
-                        // recycled promptly by the drain path.
-                        if (gui_record_spill_is_forced(0)) {
-                            gui_record_spill_clear_forced(0);
-                        }
                     } else if (drop_a) {
                         char drop_msg[320];
                         if (spill_error_a[0]) {
@@ -256,9 +243,6 @@ static int extraction_thread(void *ctx) {
                     if (write_b) {
                         memcpy(write_b, mapped_b, sample_bytes);
                         bufmgr_write_end(&s_extract_app->buffers, BUF_RECORD_B, sample_bytes);
-                        if (gui_record_spill_is_forced(1)) {
-                            gui_record_spill_clear_forced(1);
-                        }
                     } else if (drop_b) {
                         char drop_msg[320];
                         if (spill_error_b[0]) {
@@ -391,10 +375,27 @@ void gui_extract_init(void) {
     s_conv_16to8 = get_16to8_function();
     s_conv_16to8to32 = get_16to8to32_function();
 
-    // Startup default only. gui_extract_start() always overwrites this from
-    // runtime capability; this does not imply Channel B exists in upstream mode.
+//    // Get extraction function (AB mode)
+//#ifdef HSDAOH_UPSTREAM
+//    // Upstream mode: A-only extraction (B channel is not present, so pass NULL to get_conv_function)
+//    s_extract_fn = get_conv_function(0, 0, 0, 0, (void*)1, NULL);
+//    fprintf(stderr, "[EXTRACT] Using A-only extraction for upstream mode\n");
+//#else
+//    // Frame mode: AB dual channel extraction 
+//    s_extract_fn = get_conv_function(0, 0, 0, 0, (void*)1, (void*)1);
+// #endif
+
+// Get extraction function
+#ifdef HSDAOH_UPSTREAM
+    // Upstream mode: currently A-only extraction
+    s_extract_fn = get_conv_function(0, 0, 0, 0, (void*)1, NULL);
+    s_b_present = false;
+    fprintf(stderr, "[EXTRACT] Using A-only extraction for upstream mode\n");
+#else
+    // Frame mode: AB dual channel extraction
     s_extract_fn = get_conv_function(0, 0, 0, 0, (void*)1, (void*)1);
     s_b_present = true;
+#endif
 
 
 
@@ -467,20 +468,6 @@ int gui_extract_start(gui_app_t *app) {
 
     // Initialize extraction if needed
     gui_extract_init();
-
-    // Configure extraction path from runtime capture capability.
-    // For upstream backend, always use the AB extraction function so that
-    // dual-ADC hardware (auto-detected via stream_id=1 mid-capture) has its
-    // Channel B data unpacked correctly. When B is not present (single ADC),
-    // bits[31:20] are zero and the extraction loop memsets s_buf_b to zero,
-    // so display/recording are unaffected.
-    bool upstream = (app && app->capture_backend_upstream);
-    s_b_present = (app && app->capture_has_channel_b);
-    bool use_ab_fn = s_b_present || upstream;
-    s_extract_fn = get_conv_function(0, 0, 0, 0, (void*)1, use_ab_fn ? (void*)1 : NULL);
-    if (!s_b_present && misrc_debug_enabled()) {
-        fprintf(stderr, "[EXTRACT] Runtime A-only extraction enabled (upstream=%d)\n", upstream);
-    }
 
     // Store context (uses app->buffers for capture ringbuffer via buffer manager)
     s_extract_app = app;

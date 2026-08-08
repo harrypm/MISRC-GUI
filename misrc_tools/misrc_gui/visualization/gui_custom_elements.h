@@ -24,9 +24,7 @@ typedef enum {
     CUSTOM_LAYOUT_ELEMENT_TYPE_VU_METER,
     CUSTOM_LAYOUT_ELEMENT_TYPE_SETTINGS_ICON,
     CUSTOM_LAYOUT_ELEMENT_TYPE_CLOCK_ICON,
-    CUSTOM_LAYOUT_ELEMENT_TYPE_LOOP_ICON,
-    CUSTOM_LAYOUT_ELEMENT_TYPE_VERSION_ICON,    // Fixed left-side badge showing MISRC capture state
-    CUSTOM_LAYOUT_ELEMENT_TYPE_SCROLL_ICON      // Metadata page icon
+    CUSTOM_LAYOUT_ELEMENT_TYPE_VERSION_ICON     // Fixed left-side badge showing MISRC capture state
 } CustomLayoutElementType;
 
 //-----------------------------------------------------------------------------

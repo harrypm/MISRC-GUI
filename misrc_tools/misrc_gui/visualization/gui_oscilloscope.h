@@ -52,9 +52,4 @@ void draw_channel_grid(float x, float y, float width, float height,
 ssize_t find_trigger_point(const int16_t *buf, size_t count,
                            const channel_trigger_t *trig);
 
-// Register the latest CH1/CH2 RF buffers for source-selectable trigger evaluation.
-void gui_waveform_set_trigger_source_buffers(const int16_t *samples_ch1,
-                                             const int16_t *samples_ch2,
-                                             size_t count);
-
 #endif // GUI_OSCILLOSCOPE_H
