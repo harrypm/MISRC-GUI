@@ -475,7 +475,7 @@ void gui_fft_swap_buffers(fft_state_t *state) {
 
 // Grid settings for FFT (matching oscilloscope style)
 #define FFT_GRID_MIN_SPACING_PX 80   // Minimum pixels between frequency grid lines
-#define FFT_GRID_MAX_DIVISIONS 24    // Maximum number of frequency divisions
+#define FFT_GRID_MAX_DIVISIONS 12    // Maximum number of frequency divisions
 
 // Peak detection settings
 #define FFT_PEAK_SEARCH_RADIUS_PX 30   // Pixels around mouse to search for peaks

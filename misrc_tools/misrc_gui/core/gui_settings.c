@@ -15,16 +15,6 @@
 #include <unistd.h>
 #else
 #include <direct.h>
-#define COBJMACROS
-#define INITGUID
-#define Rectangle Win32_Rectangle
-#define CloseWindow Win32_CloseWindow
-#define ShowCursor Win32_ShowCursor
-#include <shlobj.h>
-#include <shobjidl.h> 
-#undef ShowCursor
-#undef CloseWindow
-#undef Rectangle
 #endif
 
 #ifdef __APPLE__
@@ -366,15 +356,6 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     for (int i = 0; i < 3; i++) {
         settings->audio_output_tags[i][0] = '\0';
     }
-    settings->ingest_project[0] = '\0';
-    settings->ingest_tape_id[0] = '\0';
-    settings->ingest_tape_format[0] = '\0';
-    settings->ingest_tape_size[0] = '\0';
-    settings->ingest_tape_speed[0] = '\0';
-    settings->ingest_tape_condition[0] = '\0';
-    settings->ingest_operator[0] = '\0';
-    settings->ingest_location[0] = '\0';
-    settings->ingest_notes[0] = '\0';
     // Optional per-channel RF tags
     for (int i = 0; i < 2; i++) {
         settings->rf_channel_tags[i][0] = '\0';
@@ -424,27 +405,12 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     settings->audio_monitor_playback = false;
     settings->audio_monitor_ch34 = false;  // Default to CH1/2
     settings->misrc_mode = true;           // Default to MISRC mode (A/B swapped)
-    settings->misrc_v15_v25_ab_swap = false;
     settings->stop_on_dropout = false;
-
-    // Level autostop defaults (tape-end detection). Disabled by default.
-    // Defaults mirror PR #11: 33% threshold, 5.0s sustain.
-    settings->level_autostop_enabled = false;
-    strcpy(settings->level_autostop_level_str, "33");
-    strcpy(settings->level_autostop_duration_str, "5.0");
     
     // Display settings
     settings->show_grid = true;
     settings->time_scale = 1.0f;
     settings->amplitude_scale = 1.0f;
-
-    // V4L2/simple_capture device discovery is opt-in (disabled by default).
-    settings->discover_simple_capture = false;
-    // Core-pinning controls are hidden by default; users can enable from info page.
-    settings->show_core_pinning_in_settings = false;
-    // Max total buffer RAM budget (1-16 GB). Default 4 GB mirrors the older
-    // code's ~4 GB target. Clamped on load; applied at buffer-manager init.
-    settings->memory_budget_gb = 4;
 
     // Keep derived filenames coherent with default auto-naming state.
     gui_settings_refresh_auto_names(settings);
@@ -506,20 +472,7 @@ void gui_settings_save(const gui_settings_t *settings) {
     fprintf(f, "  \"audio_monitor_playback\": %s,\n", settings->audio_monitor_playback ? "true" : "false");
     fprintf(f, "  \"audio_monitor_ch34\": %s,\n", settings->audio_monitor_ch34 ? "true" : "false");
     fprintf(f, "  \"misrc_mode\": %s,\n", settings->misrc_mode ? "true" : "false");
-    fprintf(f, "  \"misrc_v15_v25_ab_swap\": %s,\n", settings->misrc_v15_v25_ab_swap ? "true" : "false");
     fprintf(f, "  \"stop_on_dropout\": %s,\n", settings->stop_on_dropout ? "true" : "false");
-    fprintf(f, "  \"level_autostop_enabled\": %s,\n", settings->level_autostop_enabled ? "true" : "false");
-    fprintf(f, "  \"level_autostop_level_str\": \"%s\",\n", settings->level_autostop_level_str);
-    fprintf(f, "  \"level_autostop_duration_str\": \"%s\",\n", settings->level_autostop_duration_str);
-    fprintf(f, "  \"ingest_project\": \"%s\",\n", settings->ingest_project);
-    fprintf(f, "  \"ingest_tape_id\": \"%s\",\n", settings->ingest_tape_id);
-    fprintf(f, "  \"ingest_tape_format\": \"%s\",\n", settings->ingest_tape_format);
-    fprintf(f, "  \"ingest_tape_size\": \"%s\",\n", settings->ingest_tape_size);
-    fprintf(f, "  \"ingest_tape_speed\": \"%s\",\n", settings->ingest_tape_speed);
-    fprintf(f, "  \"ingest_tape_condition\": \"%s\",\n", settings->ingest_tape_condition);
-    fprintf(f, "  \"ingest_operator\": \"%s\",\n", settings->ingest_operator);
-    fprintf(f, "  \"ingest_location\": \"%s\",\n", settings->ingest_location);
-    fprintf(f, "  \"ingest_notes\": \"%s\",\n", settings->ingest_notes);
     fprintf(f, "  \"enable_audio_1ch_1\": %s,\n", settings->enable_audio_1ch[0] ? "true" : "false");
     fprintf(f, "  \"enable_audio_1ch_2\": %s,\n", settings->enable_audio_1ch[1] ? "true" : "false");
     fprintf(f, "  \"enable_audio_1ch_3\": %s,\n", settings->enable_audio_1ch[2] ? "true" : "false");
@@ -558,9 +511,6 @@ void gui_settings_save(const gui_settings_t *settings) {
     fprintf(f, "  \"show_grid\": %s,\n", settings->show_grid ? "true" : "false");
     fprintf(f, "  \"time_scale\": %.2f,\n", settings->time_scale);
     fprintf(f, "  \"amplitude_scale\": %.2f,\n", settings->amplitude_scale);
-    fprintf(f, "  \"discover_simple_capture\": %s,\n", settings->discover_simple_capture ? "true" : "false");
-    fprintf(f, "  \"show_core_pinning_in_settings\": %s,\n", settings->show_core_pinning_in_settings ? "true" : "false");
-    fprintf(f, "  \"memory_budget_gb\": %u,\n", (unsigned)settings->memory_budget_gb);
     fprintf(f, "  \"playback_file_a\": \"%s\",\n", settings->playback_file_a);
     fprintf(f, "  \"playback_file_b\": \"%s\"\n", settings->playback_file_b);
     fprintf(f, "}\n");
@@ -665,17 +615,19 @@ bool gui_settings_choose_output_folder(gui_settings_t *settings) {
     }
     (void)pclose(fp);
 #elif defined(_WIN32) || defined(_WIN64)
-    // Native Win32 folder picker - uses GUI subsystem without console or powershell
-    HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-    BROWSEINFOA bi = {0};
-    bi.lpszTitle = "Select output folder for MISRC captures";
-    bi.ulFlags = BIF_RETURNONLYFSDIRS;
-    LPITEMIDLIST pidl = SHBrowseForFolderA(&bi);
-    if (pidl) {
-        SHGetPathFromIDListA(pidl, picked);
-        CoTaskMemFree(pidl);
+    // PowerShell folder picker (requires Windows Forms)
+    const char *cmd =
+        "powershell -NoProfile -Command "
+        "\"Add-Type -AssemblyName System.Windows.Forms; "
+        "$f=New-Object System.Windows.Forms.FolderBrowserDialog; "
+        "if($f.ShowDialog() -eq 'OK'){ $f.SelectedPath }\"";
+    FILE *fp = popen(cmd, "r");
+    if (!fp) return false;
+    if (!fgets(picked, sizeof(picked), fp)) {
+        pclose(fp);
+        return false;
     }
-    if (hr == S_OK) CoUninitialize();
+    (void)pclose(fp);
 #else
     // Linux/BSD: try zenity first, then kdialog.
     const char *cmd =
@@ -731,28 +683,20 @@ bool gui_settings_choose_playback_file(gui_settings_t *settings, int channel) {
     (void)pclose(fp);
     trim_newlines(picked);
 #elif defined(_WIN32) || defined(_WIN64)
-    // Native Win32 file picker using IFileOpenDialog
-    HRESULT hr2 = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-    IFileOpenDialog *pfd = NULL;
-    if (SUCCEEDED(CoCreateInstance(&CLSID_FileOpenDialog, NULL, CLSCTX_INPROC_SERVER,
-                                    &IID_IFileOpenDialog, (void **)&pfd))) {
-        COMDLG_FILTERSPEC filter = { L"FLAC files", L"*.flac" };
-        IFileOpenDialog_SetFileTypes(pfd, 1, &filter);
-        IFileOpenDialog_SetTitle(pfd, L"Select FLAC playback file");
-        if (SUCCEEDED(IFileOpenDialog_Show(pfd, NULL))) {
-            IShellItem *psi = NULL;
-            if (SUCCEEDED(IFileOpenDialog_GetResult(pfd, &psi))) {
-                PWSTR wpath = NULL;
-                if (SUCCEEDED(IShellItem_GetDisplayName(psi, SIGDN_FILESYSPATH, &wpath))) {
-                    WideCharToMultiByte(CP_UTF8, 0, wpath, -1, picked, sizeof(picked), NULL, NULL);
-                    CoTaskMemFree(wpath);
-                }
-                IShellItem_Release(psi);
-            }
-        }
-        IFileOpenDialog_Release(pfd);
+    // PowerShell OpenFileDialog (requires Windows Forms)
+    const char *cmd =
+        "powershell -NoProfile -Command "
+        "\"Add-Type -AssemblyName System.Windows.Forms; "
+        "$f=New-Object System.Windows.Forms.OpenFileDialog; "
+        "$f.Filter='FLAC files (*.flac)|*.flac|All files (*.*)|*.*'; "
+        "if($f.ShowDialog() -eq 'OK'){ $f.FileName }\"";
+    FILE *fp = popen(cmd, "r");
+    if (!fp) return false;
+    if (!fgets(picked, sizeof(picked), fp)) {
+        pclose(fp);
+        return false;
     }
-    if (hr2 == S_OK) CoUninitialize();
+    (void)pclose(fp);
     trim_newlines(picked);
 #else
     // Linux/BSD: try zenity first, then kdialog.
@@ -949,18 +893,6 @@ void gui_settings_load(gui_settings_t *settings) {
     if ((value = find_value(content, "amplitude_scale")) != NULL) {
         settings->amplitude_scale = (float)atof(value);
     }
-    if ((value = find_value(content, "discover_simple_capture")) != NULL) {
-        settings->discover_simple_capture = (strcmp(value, "true") == 0);
-    }
-    if ((value = find_value(content, "show_core_pinning_in_settings")) != NULL) {
-        settings->show_core_pinning_in_settings = (strcmp(value, "true") == 0);
-    }
-    if ((value = find_value(content, "memory_budget_gb")) != NULL) {
-        long gb = atol(value);
-        if (gb < 1) gb = 4;
-        if (gb > 16) gb = 16;
-        settings->memory_budget_gb = (uint32_t)gb;
-    }
 
     if ((value = find_value(content, "reduce_8bit_a")) != NULL) {
         settings->reduce_8bit_a = (strcmp(value, "true") == 0);
@@ -1047,58 +979,8 @@ void gui_settings_load(gui_settings_t *settings) {
     if ((value = find_value(content, "misrc_mode")) != NULL) {
         settings->misrc_mode = (strcmp(value, "true") == 0);
     }
-    if ((value = find_value(content, "misrc_v15_v25_ab_swap")) != NULL) {
-        settings->misrc_v15_v25_ab_swap = (strcmp(value, "true") == 0);
-    }
     if ((value = find_value(content, "stop_on_dropout")) != NULL) {
         settings->stop_on_dropout = (strcmp(value, "true") == 0);
-    }
-    if ((value = find_value(content, "level_autostop_enabled")) != NULL) {
-        settings->level_autostop_enabled = (strcmp(value, "true") == 0);
-    }
-    if ((value = find_value(content, "level_autostop_level_str")) != NULL) {
-        strncpy(settings->level_autostop_level_str, value, sizeof(settings->level_autostop_level_str) - 1);
-        settings->level_autostop_level_str[sizeof(settings->level_autostop_level_str) - 1] = '\0';
-    }
-    if ((value = find_value(content, "level_autostop_duration_str")) != NULL) {
-        strncpy(settings->level_autostop_duration_str, value, sizeof(settings->level_autostop_duration_str) - 1);
-        settings->level_autostop_duration_str[sizeof(settings->level_autostop_duration_str) - 1] = '\0';
-    }
-    if ((value = find_value(content, "ingest_project")) != NULL) {
-        strncpy(settings->ingest_project, value, sizeof(settings->ingest_project) - 1);
-        settings->ingest_project[sizeof(settings->ingest_project) - 1] = '\0';
-    }
-    if ((value = find_value(content, "ingest_tape_id")) != NULL) {
-        strncpy(settings->ingest_tape_id, value, sizeof(settings->ingest_tape_id) - 1);
-        settings->ingest_tape_id[sizeof(settings->ingest_tape_id) - 1] = '\0';
-    }
-    if ((value = find_value(content, "ingest_tape_format")) != NULL) {
-        strncpy(settings->ingest_tape_format, value, sizeof(settings->ingest_tape_format) - 1);
-        settings->ingest_tape_format[sizeof(settings->ingest_tape_format) - 1] = '\0';
-    }
-    if ((value = find_value(content, "ingest_tape_size")) != NULL) {
-        strncpy(settings->ingest_tape_size, value, sizeof(settings->ingest_tape_size) - 1);
-        settings->ingest_tape_size[sizeof(settings->ingest_tape_size) - 1] = '\0';
-    }
-    if ((value = find_value(content, "ingest_tape_speed")) != NULL) {
-        strncpy(settings->ingest_tape_speed, value, sizeof(settings->ingest_tape_speed) - 1);
-        settings->ingest_tape_speed[sizeof(settings->ingest_tape_speed) - 1] = '\0';
-    }
-    if ((value = find_value(content, "ingest_tape_condition")) != NULL) {
-        strncpy(settings->ingest_tape_condition, value, sizeof(settings->ingest_tape_condition) - 1);
-        settings->ingest_tape_condition[sizeof(settings->ingest_tape_condition) - 1] = '\0';
-    }
-    if ((value = find_value(content, "ingest_operator")) != NULL) {
-        strncpy(settings->ingest_operator, value, sizeof(settings->ingest_operator) - 1);
-        settings->ingest_operator[sizeof(settings->ingest_operator) - 1] = '\0';
-    }
-    if ((value = find_value(content, "ingest_location")) != NULL) {
-        strncpy(settings->ingest_location, value, sizeof(settings->ingest_location) - 1);
-        settings->ingest_location[sizeof(settings->ingest_location) - 1] = '\0';
-    }
-    if ((value = find_value(content, "ingest_notes")) != NULL) {
-        strncpy(settings->ingest_notes, value, sizeof(settings->ingest_notes) - 1);
-        settings->ingest_notes[sizeof(settings->ingest_notes) - 1] = '\0';
     }
     if ((value = find_value(content, "enable_audio_1ch_1")) != NULL) {
         settings->enable_audio_1ch[0] = (strcmp(value, "true") == 0);

@@ -54,7 +54,6 @@ static int display_thread_func(void *ctx) {
          * This handles histogram, FFT, CVBS, and any other panel types that process raw samples.
          */
         uint32_t sample_rate = atomic_load(&app->sample_rate);
-        gui_waveform_set_trigger_source_buffers(samples_a, samples_b, DISPLAY_FRAME_SAMPLES);
         panel_process_all(app, samples_a, samples_b, DISPLAY_FRAME_SAMPLES, sample_rate);
 
         /* Copy samples to output buffer for render thread */

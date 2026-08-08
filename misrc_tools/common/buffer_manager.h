@@ -118,26 +118,6 @@ int bufmgr_init(buffer_manager_t *mgr);
 int bufmgr_init_custom(buffer_manager_t *mgr, const buffer_config_t *configs);
 
 /*
- * Initialize with a total RAM budget (1-16 GB).
- *
- * Builds per-buffer configs from the budget and calls bufmgr_init_custom:
- *   - RF:       min(1 GB, budget * 0.5 GB)
- *   - Audio:    min(256 MB, budget * 0.125 GB)
- *   - Display:  min(256 MB, budget * 0.125 GB)
- *   - Record A/B (lazy): the remainder split evenly, floor 128 MB each
- *
- * For budgets >= 2 GB this keeps RF/Audio/Display fixed and splits the rest
- * across Record A/B; the 1 GB case scales RF->512 MB and Audio/Display->128 MB
- * so record buffers still get meaningful space. The existing rb_init fallback
- * chain in bufmgr_ensure_init is preserved for record allocations.
- *
- * @param mgr       Buffer manager instance
- * @param budget_gb Total RAM budget in GB (clamped to 1-16; 0 -> default 4)
- * @return 0 on success, negative on error
- */
-int bufmgr_init_for_budget(buffer_manager_t *mgr, uint32_t budget_gb);
-
-/*
  * Cleanup all buffers and events
  *
  * @param mgr       Buffer manager instance

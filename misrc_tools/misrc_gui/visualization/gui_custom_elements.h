@@ -23,10 +23,7 @@ typedef enum {
     CUSTOM_LAYOUT_ELEMENT_TYPE_CHANNEL_PANEL,  // Channel panel area (waveform, FFT, histogram, etc.)
     CUSTOM_LAYOUT_ELEMENT_TYPE_VU_METER,
     CUSTOM_LAYOUT_ELEMENT_TYPE_SETTINGS_ICON,
-    CUSTOM_LAYOUT_ELEMENT_TYPE_CLOCK_ICON,
-    CUSTOM_LAYOUT_ELEMENT_TYPE_LOOP_ICON,
-    CUSTOM_LAYOUT_ELEMENT_TYPE_VERSION_ICON,    // Fixed left-side badge showing MISRC capture state
-    CUSTOM_LAYOUT_ELEMENT_TYPE_SCROLL_ICON      // Metadata page icon
+    CUSTOM_LAYOUT_ELEMENT_TYPE_CLOCK_ICON
 } CustomLayoutElementType;
 
 //-----------------------------------------------------------------------------
@@ -46,23 +43,11 @@ typedef struct {
     Color channel_color;
 } CustomLayoutElement_VUMeter;
 
-// Capture state conveyed by the version/status badge color.
-typedef enum {
-    GUI_VERSION_ICON_IDLE,      // not capturing (dim)
-    GUI_VERSION_ICON_CAPTURING, // live capture, not recording (green)
-    GUI_VERSION_ICON_RECORDING  // recording to disk (red)
-} gui_version_icon_state_t;
-
-typedef struct {
-    gui_version_icon_state_t state;
-} CustomLayoutElement_VersionIcon;
-
 typedef struct {
     CustomLayoutElementType type;
     union {
         CustomLayoutElement_ChannelPanel channel_panel;
         CustomLayoutElement_VUMeter vu_meter;
-        CustomLayoutElement_VersionIcon version_icon;
     } customData;
 } CustomLayoutElement;
 

@@ -5,7 +5,6 @@
  */
 
 #include "gui_trigger.h"
-#include "gui_headswitch_lock.h"
 
 //-----------------------------------------------------------------------------
 // CVBS Signal Level Analysis (Histogram-Based)
@@ -269,55 +268,18 @@ ssize_t trigger_find_all_cvbs_hsyncs(const int16_t *buf, size_t count,
 // Main Trigger Dispatch
 //-----------------------------------------------------------------------------
 
-ssize_t trigger_find_from_config_multi(const int16_t *buf_ch1,
-                                       const int16_t *buf_ch2,
-                                       size_t count,
-                                       const channel_trigger_t *trig,
-                                       size_t min_index,
-                                       uint32_t rf_sample_rate_hz)
-{
-    if (!trig || !trig->enabled || count < 2) return -1;
+ssize_t trigger_find_from_config(const int16_t *buf, size_t count,
+                                  const channel_trigger_t *trig, size_t min_index) {
+    if (!trig || !trig->enabled || !buf || count < 2) return -1;
 
     switch (trig->trigger_mode) {
-        case TRIGGER_MODE_SYNC: {
-            if (trig->trigger_source == TRIGGER_SOURCE_CH3) {
-                // Headswitch phase-lock trigger prediction path.
-                size_t trig_idx = 0;
-                if (!gui_headswitch_lock_predict_trigger(count, rf_sample_rate_hz, min_index, &trig_idx)) {
-                    return -1;
-                }
-                return (ssize_t)trig_idx;
-            }
-            // Non-CH3 sync fallback: zero-crossing style rising sync.
-            const int16_t *src_sync = (trig->trigger_source == TRIGGER_SOURCE_CH2) ? buf_ch2 : buf_ch1;
-            if (!src_sync) return -1;
-            return trigger_find_rising_edge(src_sync, count, 0, min_index);
-        }
         case TRIGGER_MODE_RISING:
-            if (trig->trigger_source == TRIGGER_SOURCE_CH3) return -1;
-            return trigger_find_rising_edge(
-                (trig->trigger_source == TRIGGER_SOURCE_CH2) ? buf_ch2 : buf_ch1,
-                count, trig->level, min_index);
+            return trigger_find_rising_edge(buf, count, trig->level, min_index);
         case TRIGGER_MODE_FALLING:
-            if (trig->trigger_source == TRIGGER_SOURCE_CH3) return -1;
-            return trigger_find_falling_edge(
-                (trig->trigger_source == TRIGGER_SOURCE_CH2) ? buf_ch2 : buf_ch1,
-                count, trig->level, min_index);
+            return trigger_find_falling_edge(buf, count, trig->level, min_index);
         case TRIGGER_MODE_CVBS_HSYNC:
-            if (trig->trigger_source == TRIGGER_SOURCE_CH3) return -1;
-            return trigger_find_cvbs_hsync(
-                (trig->trigger_source == TRIGGER_SOURCE_CH2) ? buf_ch2 : buf_ch1,
-                count, min_index);
+            return trigger_find_cvbs_hsync(buf, count, min_index);
         default:
-            if (trig->trigger_source == TRIGGER_SOURCE_CH3) return -1;
-            return trigger_find_rising_edge(
-                (trig->trigger_source == TRIGGER_SOURCE_CH2) ? buf_ch2 : buf_ch1,
-                count, trig->level, min_index);
+            return trigger_find_rising_edge(buf, count, trig->level, min_index);
     }
-}
-
-ssize_t trigger_find_from_config(const int16_t *buf, size_t count,
-                                  const channel_trigger_t *trig, size_t min_index)
-{
-    return trigger_find_from_config_multi(buf, NULL, count, trig, min_index, DEFAULT_SAMPLE_RATE);
 }
