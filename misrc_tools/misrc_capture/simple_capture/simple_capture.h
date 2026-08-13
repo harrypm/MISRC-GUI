@@ -20,7 +20,22 @@
 #define SIMPLE_CAPTURE_H
 #include <stdint.h>
 
-#if defined(__linux__)
+#if defined(__ANDROID__)
+	/* Android has no V4L2/MediaFoundation/AVFoundation. The simple_capture
+	 * API is satisfied by simple_capture_android.c, a no-device stub (CXADC /
+	 * V4L2 capture is out of scope for the basic Android release, which is
+	 * simulated-device only). Check this BEFORE __linux__ because the NDK
+	 * clang defines both __ANDROID__ and __linux__. */
+	typedef uint32_t sc_codec_t;
+	#define SC_CODEC_GREY  0x59455659  /* 'GREY' FourCC-style placeholders */
+	#define SC_CODEC_RGB24 0x52474224
+	#define SC_CODEC_BGR24 0x42475224
+	#define SC_CODEC_MJPEG 0x4d4a5047
+	#define SC_CODEC_YUYV  0x59555956
+	#define SC_CODEC_UYVY  0x55595659
+	#define SC_CODEC_EQUAL(a,b) (a==b)
+	#define SC_CODEC_SET(a,b) (a=b)
+#elif defined(__linux__)
 	/* linux/videodev2.h depends on struct timeval/timespec; ensure they're declared first. */
 	#include <sys/time.h>
 	#include <time.h>

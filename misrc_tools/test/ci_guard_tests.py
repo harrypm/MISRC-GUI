@@ -60,10 +60,12 @@ def check_cross_platform_workflow_coverage(workflow_path: Path) -> int:
         "runner: macos-14",
         "runner: macos-15-intel",
         "macos-app-universal:",
+        "android-apk:",
         "release:",
         "- linux-appimage",
         "- windows-exe",
         "- macos-app-universal",
+        "- android-apk",
     ]
     for snippet in required_snippets:
         if snippet not in workflow_text:
@@ -579,6 +581,41 @@ def check_windows_packaging_assertions(workflow_path: Path) -> int:
             return fail(f"Workflow is missing required Windows packaging assertion: {snippet}")
     return 0
 
+def check_android_packaging_assertions(workflow_path: Path) -> int:
+    """Assert the android-apk CI job verifies the APK the same way local build-apk.sh does:
+    - apksigner verify (signature integrity)
+    - aapt2 dump badging sdkVersion:'30' + targetSdkVersion:'34' + package dev.misrc.gui
+    - lib/arm64-v8a/libmisrc_gui.so present in the APK
+    - libmisrc_gui.so is ARM aarch64 (not x86_64 host leak)
+    - no host /usr/lib/x86_64 or /usr/local/lib leaked into the cross .so
+    These mirror the local verification in android/build-apk.sh + the manual
+    checks performed during the android-support branch development."""
+    workflow_text = read_text(workflow_path)
+    required_snippets = [
+        "bash android/build-deps-android.sh",
+        "bash android/gen-cross-file.sh",
+        "meson setup --cross-file android/aarch64-linux-android.ini",
+        "meson compile -C build-android misrc_gui",
+        "test -f build-android/libmisrc_gui.so",
+        "bash android/build-apk.sh",
+        # The CI job invokes tools via $ANDROID_HOME variable-prefixed paths,
+        # so assert on the tool-name substrings rather than bare "apksigner verify".
+        "34.0.0/apksigner",
+        "verify \"$APK\"",
+        "34.0.0/aapt2",
+        "dump badging",
+        "sdkVersion:'30'",
+        "targetSdkVersion:'34'",
+        "package: name='dev.misrc.gui'",
+        "lib/arm64-v8a/libmisrc_gui.so",
+        "ARM aarch64",
+        "/usr/lib/x86_64|/usr/local/lib",
+    ]
+    for snippet in required_snippets:
+        if snippet not in workflow_text:
+            return fail(f"Workflow is missing required Android packaging assertion: {snippet}")
+    return 0
+
 def check_release_artifact_naming_contract(workflow_path: Path) -> int:
     workflow_text = read_text(workflow_path)
     required_snippets = [
@@ -596,6 +633,7 @@ def check_release_artifact_naming_contract(workflow_path: Path) -> int:
         "release-assets/**/linux_MISRC_*_arm64.zip",
         "release-assets/**/windows_MISRC_*_x86.zip",
         "release-assets/**/macos_MISRC_*_universal.dmg",
+        "release-assets/**/misrc_gui-*-android-arm64.apk",
     ]
     forbidden_snippets = [
         "misrc_gui-*-windows-x86_64.zip",
@@ -636,6 +674,7 @@ def check_build_workflow_entrypoint_contract(build_workflow_path: Path) -> int:
         "linux-appimage:",
         "windows-exe:",
         "macos-app-universal:",
+        "android-apk:",
         "release:",
     ]
     for snippet in required_snippets:
@@ -776,6 +815,7 @@ def main() -> int:
         ("FLAC large-file offsets contract", lambda: check_flac_large_file_offsets_contract(flac_writer_c_path)),
         ("AppRun static contract", lambda: check_apprun_static_contract(workflow_path)),
         ("Windows packaging assertions", lambda: check_windows_packaging_assertions(workflow_path)),
+        ("Android packaging assertions", lambda: check_android_packaging_assertions(workflow_path)),
         ("release artifact naming contract", lambda: check_release_artifact_naming_contract(workflow_path)),
         ("build workflow entrypoint contract", lambda: check_build_workflow_entrypoint_contract(workflow_path)),
         ("legacy release-sanity workflow removed", lambda: check_no_legacy_release_sanity_workflow(legacy_workflow_path)),

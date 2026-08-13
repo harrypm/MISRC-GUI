@@ -443,7 +443,7 @@ flac_writer_error_t flac_writer_apply_thread_affinity(flac_writer_t *writer) {
         return FLAC_WRITER_OK;
     }
 
-#if defined(__linux__)
+#if defined(__linux__) && !defined(__ANDROID__)
     cpu_set_t target_set;
     char parse_err[256];
     if (!flac_writer_parse_affinity_cpu_list_linux(

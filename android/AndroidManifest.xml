@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="dev.misrc.gui"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <!-- MISRC GUI requires OpenGL ES 3.0 (raylib rcore_android + rlgl ES3 paths) -->
+    <uses-feature android:glEsVersion="0x00030000" android:required="true" />
+
+    <!-- Touchscreen is required (the GUI is touch-compatible) -->
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+
+    <!-- USB Host (for future hsdaoh/FX3/DdD USB capture; not used in basic release) -->
+    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
+
+    <uses-sdk android:minSdkVersion="30" android:targetSdkVersion="34" />
+
+    <application
+        android:label="MISRC"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:allowBackup="false"
+        android:supportsRtl="true"
+        android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
+
+        <!-- NativeActivity: Android loads libmisrc_gui.so and calls
+             ANativeActivity_onCreate (provided by raylib rcore_android.c),
+             which sets up EGL/ANativeWindow and calls the app's main(). -->
+        <activity
+            android:name="android.app.NativeActivity"
+            android:label="MISRC"
+            android:configChanges="orientation|keyboardHidden|screenSize|screenLayout|fontScale|uiMode|navigation"
+            android:screenOrientation="landscape"
+            android:launchMode="singleTask"
+            android:exported="true">
+
+            <!-- Tell NativeActivity which .so to load (without the lib prefix / .so suffix) -->
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="misrc_gui" />
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

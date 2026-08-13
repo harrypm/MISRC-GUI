@@ -1,5 +1,6 @@
 # Build output dirs
 /build/
+/build-android/
 /build-gha/
 /builddir/
 /dist/
@@ -13,3 +14,6 @@
 
 # Scratch
 /.tmp/
+
+# Android debug keystore (generated, never committed)
+/android/debug.keystore

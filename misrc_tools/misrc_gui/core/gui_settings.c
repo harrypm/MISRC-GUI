@@ -87,7 +87,13 @@ static const char* get_settings_file_path(void) {
     static bool initialized = false;
     
     if (!initialized) {
-#if defined(__APPLE__)
+#if defined(__ANDROID__)
+        // Android has no HOME env var or Desktop. Use the app's external files
+        // dir (exempt from scoped storage on API 30+). A future version can pass
+        // the exact getExternalFilesDir() from Java via JNI; this static path is
+        // the standard location and works for the basic release.
+        strcpy(settings_path, "/sdcard/Android/data/dev.misrc.gui/files/misrc_gui_settings.json");
+#elif defined(__APPLE__)
         // Use ~/Library/Preferences on macOS
         const char* home = getenv("HOME");
         if (home) {
@@ -141,7 +147,11 @@ const char* gui_settings_get_desktop_path(void) {
     static bool initialized = false;
     
     if (!initialized) {
-#if defined(__APPLE__)
+#if defined(__ANDROID__)
+        // Android: no Desktop. Default capture output to the app's external
+        // files dir (user-accessible, no special permissions on API 30+).
+        strcpy(desktop_path, "/sdcard/Android/data/dev.misrc.gui/files");
+#elif defined(__APPLE__)
         const char* home = getenv("HOME");
         if (home) {
             snprintf(desktop_path, sizeof(desktop_path), "%s/Desktop", home);

@@ -35,7 +35,11 @@
 #undef IMPL_SHM_MKSTEMP
 #undef IMPL_UNLINK_OR_CLOSE
 
-#if defined(__linux__)
+#if defined(__ANDROID__)
+/* Android bionic provides memfd_create() natively in <sys/mman.h> (declared
+ * since API 30, which is our minSdkVersion). No shim needed — defining our
+ * own would conflict with bionic's non-static declaration. */
+#elif defined(__linux__)
 #if __GLIBC__ < 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ < 27)
 #include <sys/syscall.h>
 static inline int memfd_create(const char *name, unsigned int flags) {
