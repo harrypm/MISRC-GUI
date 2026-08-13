@@ -88,11 +88,19 @@ static const char* get_settings_file_path(void) {
     
     if (!initialized) {
 #if defined(__ANDROID__)
-        // Android has no HOME env var or Desktop. Use the app's external files
-        // dir (exempt from scoped storage on API 30+). A future version can pass
-        // the exact getExternalFilesDir() from Java via JNI; this static path is
-        // the standard location and works for the basic release.
-        strcpy(settings_path, "/sdcard/Android/data/dev.misrc.gui/files/misrc_gui_settings.json");
+        // Android 11+ scoped storage blocks native fopen() on /sdcard/... .
+        // MainActivity.onCreate calls nativeSetStoragePath(getExternalFilesDir)
+        // before main() runs, so android_get_storage_path() returns the real,
+        // scoped-storage-exempt, writable app-external files dir. Fall back to
+        // the static path only if the JNI handoff hasn't happened yet.
+        extern const char *android_get_storage_path(void);
+        const char *ext = android_get_storage_path();
+        if (ext && ext[0]) {
+            snprintf(settings_path, sizeof(settings_path),
+                    "%s/misrc_gui_settings.json", ext);
+        } else {
+            strcpy(settings_path, "/sdcard/Android/data/dev.misrc.gui/files/misrc_gui_settings.json");
+        }
 #elif defined(__APPLE__)
         // Use ~/Library/Preferences on macOS
         const char* home = getenv("HOME");
@@ -148,9 +156,17 @@ const char* gui_settings_get_desktop_path(void) {
     
     if (!initialized) {
 #if defined(__ANDROID__)
-        // Android: no Desktop. Default capture output to the app's external
-        // files dir (user-accessible, no special permissions on API 30+).
-        strcpy(desktop_path, "/sdcard/Android/data/dev.misrc.gui/files");
+        // Android 11+: use the scoped-storage-exempt external files dir handed
+        // in from Java (getExternalFilesDir), so native fopen() can write
+        // capture logs/FLAC here and the user can adb pull them. Fall back to
+        // the static path only if the JNI handoff hasn't happened yet.
+        extern const char *android_get_storage_path(void);
+        const char *ext = android_get_storage_path();
+        if (ext && ext[0]) {
+            snprintf(desktop_path, sizeof(desktop_path), "%s", ext);
+        } else {
+            strcpy(desktop_path, "/sdcard/Android/data/dev.misrc.gui/files");
+        }
 #elif defined(__APPLE__)
         const char* home = getenv("HOME");
         if (home) {

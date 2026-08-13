@@ -4,14 +4,25 @@
     android:versionCode="1"
     android:versionName="1.0">
 
+    <!-- CAMERA permission: REQUIRED for USB Host access to UVC-class devices
+         (the MS2130/MS2131 are USB Video Class devices). On Android API 28+
+         (we target 34), UsbManager.requestPermission() for a USB_CLASS_VIDEO
+         device silently refuses to show any dialog unless the app also holds
+         android.permission.CAMERA. CAMERA is a dangerous (runtime) permission
+         on API 23+, so MainActivity requests it at runtime before requesting
+         USB permission. Without this, no USB permission prompt ever appears. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+
     <!-- MISRC GUI requires OpenGL ES 3.0 (raylib rcore_android + rlgl ES3 paths) -->
     <uses-feature android:glEsVersion="0x00030000" android:required="true" />
 
     <!-- Touchscreen is required (the GUI is touch-compatible) -->
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
 
-    <!-- USB Host (for future hsdaoh/FX3/DdD USB capture; not used in basic release) -->
-    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
+    <!-- USB Host for hsdaoh/MS2130 RF capture. Required=true so the APK is only
+         offered to devices with USB host (the capture hardware needs it); this
+         also gates Google Play visibility. The fd-grant flow is in MainActivity. -->
+    <uses-feature android:name="android.hardware.usb.host" android:required="true" />
 
     <uses-sdk android:minSdkVersion="30" android:targetSdkVersion="34" />
 
@@ -47,6 +58,16 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+
+            <!-- Launch MISRC when a known hsdaoh USB device is plugged in, and
+                 surface the permission dialog. device_filter.xml lists the
+                 MS2130/MS2131 VID/PID. -->
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+            <meta-data
+                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                android:resource="@xml/device_filter" />
         </activity>
     </application>
 </manifest>

@@ -236,6 +236,129 @@ else
   # vendored original (mirrors the CI Windows job's libuvc sed-patch).
   sed -i 's/if(APPLE OR CMAKE_SYSTEM MATCHES "OpenBSD")/if(APPLE OR ANDROID OR CMAKE_SYSTEM MATCHES "OpenBSD")/' \
     "$DEPS_SRC_DIR/hsdaoh/src/CMakeLists.txt"
+  # Android: libusb cannot enumerate/open /dev/bus/usb/* without root, so
+  # hsdaoh_open's libusb_get_device_list path fails. Patch _hsdaoh_open_uvc_device
+  # to, on Android, wrap the file descriptor granted by Java UsbManager (stored
+  # via android_usb_jni.c's android_usb_get_fd()) with uvc_wrap() instead of
+  # uvc_find_device()+uvc_open(). uvc_wrap() uses libusb_wrap_sys_device(). We
+  # create a private libusb context with LIBUSB_OPTION_NO_DEVICE_DISCOVERY and
+  # hand it to uvc_init so libusb never touches /dev/bus/usb. If no fd has been
+  # granted yet (permission dialog pending/declined), return LIBUSB_ERROR_ACCESS
+  # so gui_capture surfaces a clear "permission" status.
+  #
+  # uvc_wrap is exported by libuvc.a but not in its public header, so declare it.
+  HSDAOH_C="$DEPS_SRC_DIR/hsdaoh/src/libhsdaoh.c"
+  python3 - "$HSDAOH_C" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+if 'android_usb_get_fd' in s:
+    sys.exit(0)  # already patched (idempotent)
+
+# (1) Declare externs + uvc_wrap prototype + Android fd-based open helper,
+#     inserted just before _hsdaoh_open_uvc_device. uvc_wrap is exported by
+#     libuvc.a but not in its public header, so we declare it here.
+#
+#     Also patch hsdaoh_get_device_count()/hsdaoh_get_device_name() to
+#     short-circuit on Android: both use libusb_get_device_list (root-only on
+#     Android), so they return 0/empty and the device NEVER appears in the GUI
+#     dropdown — meaning the user can't select it to press connect, and the
+#     permission+fd path is unreachable. On Android, report 1 device ("MS2130")
+#     so it shows in the dropdown; the real VID/PID/open is deferred to the
+#     permission+fd path in hsdaoh_open's android_opened branch.
+decl = r'''
+#if defined(__ANDROID__)
+#include <libusb-1.0/libusb.h>
+/* Weak fallback so hsdaoh-internal targets (hsdaoh_file/test/tcp) link
+ * during the hsdaoh build. The REAL definition in android_usb_jni.c (linked
+ * into libmisrc_gui.so) overrides this weak one at the GUI link, so the
+ * Java-granted fd is used at runtime. */
+__attribute__((weak)) int android_usb_get_fd(void) { return -1; }
+extern uvc_error_t uvc_wrap(int sys_dev, uvc_context_t *context, uvc_device_handle_t **devh);
+static uvc_error_t _hsdaoh_open_android_fd(hsdaoh_dev_t *dev)
+{
+    uvc_error_t r;
+    libusb_context *usb_ctx = NULL;
+    int fd = android_usb_get_fd();
+    if (fd < 0)
+        return UVC_ERROR_ACCESS;  /* permission not granted yet */
+    if (libusb_init(&usb_ctx) != 0)
+        return UVC_ERROR_IO;
+    libusb_set_option(usb_ctx, LIBUSB_OPTION_NO_DEVICE_DISCOVERY);
+    r = uvc_init(&dev->uvc_ctx, usb_ctx);
+    if (r < 0) { libusb_exit(usb_ctx); return r; }
+    r = uvc_wrap(fd, dev->uvc_ctx, &dev->uvc_devh);
+    if (r < 0) { uvc_exit(dev->uvc_ctx); libusb_exit(usb_ctx); dev->uvc_ctx = NULL; }
+    return r;
+}
+#endif
+'''
+marker = 'int _hsdaoh_open_uvc_device(hsdaoh_dev_t *dev)'
+s = s.replace(marker, decl + '\n' + marker, 1)
+
+# (2) Inside _hsdaoh_open_uvc_device, short-circuit to the fd path on Android.
+old = 'int _hsdaoh_open_uvc_device(hsdaoh_dev_t *dev)\n{\n\tuvc_error_t r;\n\n\t/* Initialize UVC context */\n\tr = uvc_init(&dev->uvc_ctx, NULL);'
+new = ('int _hsdaoh_open_uvc_device(hsdaoh_dev_t *dev)\n'
+       '{\n\tuvc_error_t r;\n'
+       '#if defined(__ANDROID__)\n\tr = _hsdaoh_open_android_fd(dev);\n\treturn (int)r;\n#endif\n'
+       '\n\t/* Initialize UVC context */\n\tr = uvc_init(&dev->uvc_ctx, NULL);')
+s = s.replace(old, new, 1)
+
+# (3) In hsdaoh_open, skip the libusb_get_device_list enumerate on Android
+#     (it fails without root, so the open is never reached). Free the
+#     enumerate-only libusb ctx and jump straight to _hsdaoh_open_uvc_device,
+#     then to the post-open setup (devh/claim/...). Insert an android_opened
+#     label right before dev->devh = uvc_get_libusb_handle(...).
+s = s.replace(
+    '\tdev->dev_lost = 1;\n\n\tcnt = libusb_get_device_list(dev->ctx, &list);',
+    ('\tdev->dev_lost = 1;\n'
+     '#if defined(__ANDROID__)\n'
+     '\t/* No /dev/bus/usb enumerate without root; use the Java-granted fd. */\n'
+     '\tlibusb_exit(dev->ctx);\n'
+     '\tdev->ctx = NULL;\n'
+     '\tdev->vid = known_devices[0].vid;\n'
+     '\tdev->pid = known_devices[0].pid;\n'
+     '\tr = _hsdaoh_open_uvc_device(dev);\n'
+     '\tif (r < 0) goto err;\n'
+     '\tgoto android_opened;\n'
+     '#endif\n\n'
+     '\tcnt = libusb_get_device_list(dev->ctx, &list);'),
+    1)
+s = s.replace(
+    '\tdev->devh = uvc_get_libusb_handle(dev->uvc_devh);',
+    'android_opened:\n\tdev->devh = uvc_get_libusb_handle(dev->uvc_devh);',
+    1)
+
+# (4) Patch hsdaoh_get_device_count() and hsdaoh_get_device_name() on Android
+#     to short-circuit the root-only libusb_get_device_list path: report 1
+#     device (the first known_devices entry, e.g. "MS2130") so it appears in
+#     the GUI dropdown without root. Insert the android short-circuit right
+#     after each function's opening brace.
+s = s.replace(
+    'uint32_t hsdaoh_get_device_count(void)\n{\n\tint i,r;\n\tlibusb_context *ctx;\n\tlibusb_device **list;\n\tuint32_t device_count = 0;\n\tstruct libusb_device_descriptor dd;\n\tssize_t cnt;\n',
+    ('uint32_t hsdaoh_get_device_count(void)\n{\n'
+     '#if defined(__ANDROID__)\n'
+     '\t/* No rootless libusb enumerate on Android; report 1 known device so it\n'
+     '\t * shows in the GUI dropdown. Real open is deferred to the fd path. */\n'
+     '\treturn 1;\n'
+     '#endif\n'
+     '\tint i,r;\n\tlibusb_context *ctx;\n\tlibusb_device **list;\n\tuint32_t device_count = 0;\n\tstruct libusb_device_descriptor dd;\n\tssize_t cnt;\n'),
+    1)
+s = s.replace(
+    'const char *hsdaoh_get_device_name(uint32_t index)\n{\n\tint i,r;\n\tlibusb_context *ctx;\n\tlibusb_device **list;\n\tstruct libusb_device_descriptor dd;\n\thsdaoh_adapter_t *device = NULL;\n\tuint32_t device_count = 0;\n\tssize_t cnt;\n',
+    ('const char *hsdaoh_get_device_name(uint32_t index)\n{\n'
+     '#if defined(__ANDROID__)\n'
+     '\t/* No rootless libusb enumerate on Android; return the first known\n'
+     '\t * device name so the dropdown shows something meaningful. */\n'
+     '\t(void)index;\n'
+     '\treturn known_devices[0].name;\n'
+     '#endif\n'
+     '\tint i,r;\n\tlibusb_context *ctx;\n\tlibusb_device **list;\n\tstruct libusb_device_descriptor dd;\n\thsdaoh_adapter_t *device = NULL;\n\tuint32_t device_count = 0;\n\tssize_t cnt;\n'),
+    1)
+
+open(p, 'w').write(s)
+PY
+  log "patched hsdaoh_open + _hsdaoh_open_uvc_device + get_device_count/name for Android fd-based uvc_wrap"
   # hsdaoh uses pkg_check_modules(flac) + libusb; DEPS_PREFIX is on
   # PKG_CONFIG_PATH/CMAKE_FIND_ROOT_PATH so the cross flac/libusb resolve.
   # CFLAGS -I adds the vendored FLAC include dir for hsdaoh_file (mirrors CI).

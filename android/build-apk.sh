@@ -32,7 +32,11 @@ BT="$ANDROID_HOME/build-tools/34.0.0"
 AAPT2="$BT/aapt2"
 ZIPALIGN="$BT/zipalign"
 APKSIGNER="$BT/apksigner"
-ANDROID_JAR="$ANDROID_HOME/platforms/android-30/android.jar"
+# Compile Java/dex against the targetSdk jar (android-34) so API 31+/33+ symbols
+# like PendingIntent.FLAG_MUTABLE and Context.RECEIVER_NOT_EXPORTED resolve.
+# minSdk stays 30 (set in the manifest + aapt2 --min-sdk-version); runtime
+# guards (Build.VERSION.SDK_INT >= N) gate the newer-API calls.
+ANDROID_JAR="$ANDROID_HOME/platforms/android-34/android.jar"
 
 log() { printf '[android-apk] %s\n' "$*"; }
 fail() { printf '[android-apk] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -58,10 +62,15 @@ log "Building MISRC GUI APK version=$VERSION"
 
 # --- 1. Prepare resources (icon) ---
 RES_DIR="$WORK/res"
-mkdir -p "$RES_DIR/mipmap-xxhdpi"
+mkdir -p "$RES_DIR/mipmap-xxhdpi" "$RES_DIR/xml"
 ICON_SRC="$REPO_ROOT/assets/Icons/MISRC_Icon.png"
 [[ -f "$ICON_SRC" ]] || fail "Icon not found: $ICON_SRC"
 cp "$ICON_SRC" "$RES_DIR/mipmap-xxhdpi/ic_launcher.png"
+# USB device filter: maps MS2130/MS2131 VID/PID so plugging one launches MISRC
+# (manifest USB_DEVICE_ATTACHED intent-filter references @xml/device_filter).
+FILTER_SRC="$SCRIPT_DIR/res/xml/device_filter.xml"
+[[ -f "$FILTER_SRC" ]] || fail "device_filter.xml not found: $FILTER_SRC"
+cp "$FILTER_SRC" "$RES_DIR/xml/device_filter.xml"
 
 # --- 2. Compile resources ---
 log "compiling resources..."

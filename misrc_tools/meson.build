@@ -435,6 +435,9 @@ if raylib_dep.found()
     # no separate libpthread; -lpthread fails to link). -ldl is a bionic stub.
     gui_ldflags += ['-lEGL', '-lGLESv2', '-lGLESv3', '-landroid', '-llog', '-lOpenSLES', '-lm', '-ldl']
     sources_gui += 'misrc_capture/simple_capture/simple_capture_android.c'
+    # JNI bridge: MainActivity.nativeSetUsbFd -> android_usb_get_fd() so the
+    # hsdaoh capture path can wrap the Java-granted USB fd with uvc_wrap().
+    sources_gui += 'misrc_gui/input/android_usb_jni.c'
   elif host_system == 'darwin'
     gui_ldflags += ['-Wl,-framework,OpenGL', '-Wl,-framework,Cocoa', '-Wl,-framework,IOKit', '-Wl,-framework,CoreAudio', '-Wl,-framework,CoreVideo']
     gui_ldflags += ['-Wl,-framework,AVFoundation', '-Wl,-framework,CoreMedia', '-Wl,-framework,Security']

@@ -1725,11 +1725,33 @@ int gui_app_start_capture(gui_app_t *app) {
                 use_upstream_backend ? "upstream" : "raw-parser");
         proc_set_priority(PROC_PRIORITY_ABOVE);
         thrd_set_priority(THRD_PRIORITY_CRITICAL);
+#if defined(__ANDROID__)
+        /* Android: libusb cannot open /dev/bus/usb/* without root. Ask Java
+         * (MainActivity, via android_usb_jni.c) to show the USB Host permission
+         * dialog and hand us the device fd. This blocks the capture thread
+         * until the user grants/denies (up to 30 s). hsdaoh_open's Android
+         * branch then wraps the granted fd with uvc_wrap(). */
+        extern int android_request_usb_permission(int timeout_seconds);
+        extern int android_usb_has_fd(void);
+        if (!android_usb_has_fd()) {
+            gui_app_set_status(app, "Requesting USB permission...");
+            if (!android_request_usb_permission(30)) {
+                fprintf(stderr, "[GUI] USB permission denied or timed out\n");
+                gui_app_set_status(app, "USB permission denied");
+                proc_set_priority(PROC_PRIORITY_NORMAL);
+                return -3;
+            }
+        }
+#endif
         r = hsdaoh_open(&app->hs_dev, dev->index);
         if (r < 0 || !app->hs_dev) {
             fprintf(stderr, "[GUI] hsdaoh_open failed: %d\n", r);
             if (r == -3) {
+#if defined(__ANDROID__)
+                gui_app_set_status(app, "USB permission denied or device not granted");
+#else
                 gui_app_set_status(app, "Permission denied opening MS2130 via libusb; run misrc_gui with sudo");
+#endif
                 proc_set_priority(PROC_PRIORITY_NORMAL);
                 return -3;
             } else {
