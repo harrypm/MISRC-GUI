@@ -77,6 +77,24 @@ log "linking manifest + resources..."
   -o "$WORK/base.apk" \
   "$WORK/resources.zip"
 
+# --- 3b. Compile Java stub -> classes.dex ---
+# A classes.dex is REQUIRED even for a pure-NativeActivity app: Android's
+# installer rejects APKs with no dex ("package appears to be invalid"). The
+# stub dev.misrc.gui.MainActivity extends android.app.NativeActivity and adds
+# no logic; it exists to produce a valid dex and to be the future JNI hook.
+log "compiling Java stub -> classes.dex..."
+JAVA_SRC="$SCRIPT_DIR/java/dev/misrc/gui/MainActivity.java"
+[[ -f "$JAVA_SRC" ]] || fail "MainActivity.java not found at $JAVA_SRC"
+CLASSES_DIR="$WORK/classes"
+mkdir -p "$CLASSES_DIR"
+javac --release 8 -d "$CLASSES_DIR" -classpath "$ANDROID_JAR" "$JAVA_SRC"
+mkdir -p "$WORK/dex"
+"$BT/d8" --output "$WORK/dex" --lib "$ANDROID_JAR" \
+  $(find "$CLASSES_DIR" -name '*.class')
+test -f "$WORK/dex/classes.dex"
+# Add classes.dex at APK root (required location).
+( cd "$WORK/dex" && zip -j0 "$WORK/base.apk" classes.dex )
+
 # --- 4. Add native libraries (libmisrc_gui.so + libhsdaoh.so) ---
 log "adding native libs..."
 mkdir -p "$WORK/libdir/lib/arm64-v8a"

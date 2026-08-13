@@ -23,11 +23,15 @@
         android:supportsRtl="true"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
 
-        <!-- NativeActivity: Android loads libmisrc_gui.so and calls
-             ANativeActivity_onCreate (provided by raylib rcore_android.c),
-             which sets up EGL/ANativeWindow and calls the app's main(). -->
+        <!-- MainActivity (dev.misrc.gui) extends android.app.NativeActivity.
+             Android loads libmisrc_gui.so and calls ANativeActivity_onCreate
+             (provided by raylib rcore_android.c), which sets up
+             EGL/ANativeWindow and calls the app's main(). A concrete Java
+             subclass (not the bare framework NativeActivity) ensures the APK
+             ships a classes.dex so the installer accepts it, and is the future
+             JNI hook for storage/USB. -->
         <activity
-            android:name="android.app.NativeActivity"
+            android:name="dev.misrc.gui.MainActivity"
             android:label="MISRC"
             android:configChanges="orientation|keyboardHidden|screenSize|screenLayout|fontScale|uiMode|navigation"
             android:screenOrientation="landscape"
