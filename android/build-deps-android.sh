@@ -252,7 +252,7 @@ else
 import sys
 p = sys.argv[1]
 s = open(p).read()
-if 'android_usb_get_fd' in s:
+if 'hsdaoh_set_android_usb_fd' in s:
     sys.exit(0)  # already patched (idempotent)
 
 # (1) Declare externs + uvc_wrap prototype + Android fd-based open helper,
@@ -269,17 +269,23 @@ if 'android_usb_get_fd' in s:
 decl = r'''
 #if defined(__ANDROID__)
 #include <libusb-1.0/libusb.h>
-/* Weak fallback so hsdaoh-internal targets (hsdaoh_file/test/tcp) link
- * during the hsdaoh build. The REAL definition in android_usb_jni.c (linked
- * into libmisrc_gui.so) overrides this weak one at the GUI link, so the
- * Java-granted fd is used at runtime. */
-__attribute__((weak)) int android_usb_get_fd(void) { return -1; }
+/* Optional runtime provider from libmisrc_gui.so (android_usb_jni.c). */
+extern int android_usb_get_fd(void) __attribute__((weak));
+/* Explicit fd handoff from JNI to avoid relying on weak-symbol interposition. */
+static int s_android_usb_fd = -1;
+void hsdaoh_set_android_usb_fd(int fd) { s_android_usb_fd = fd; }
+static int hsdaoh_get_android_usb_fd(void)
+{
+    if (s_android_usb_fd >= 0) return s_android_usb_fd;
+    if (android_usb_get_fd) return android_usb_get_fd();
+    return -1;
+}
 extern uvc_error_t uvc_wrap(int sys_dev, uvc_context_t *context, uvc_device_handle_t **devh);
 static uvc_error_t _hsdaoh_open_android_fd(hsdaoh_dev_t *dev)
 {
     uvc_error_t r;
     libusb_context *usb_ctx = NULL;
-    int fd = android_usb_get_fd();
+    int fd = hsdaoh_get_android_usb_fd();
     if (fd < 0)
         return UVC_ERROR_ACCESS;  /* permission not granted yet */
     if (libusb_init(&usb_ctx) != 0)

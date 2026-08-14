@@ -24,6 +24,9 @@
 #include <ctype.h>
 #include <math.h>
 #include <time.h>
+#if defined(__ANDROID__)
+extern void android_set_keyboard_visible(int visible);
+#endif
 
 #ifndef MIRSC_TOOLS_VERSION
 #define MIRSC_TOOLS_VERSION "dev"
@@ -229,6 +232,19 @@ static double s_record_limit_deadline_s = 0.0;
 #define RECORD_LIMIT_TIMECODE_SCALE 1.30f
 #define RECORD_LIMIT_TIMECODE_BORDER_X 5
 #define RECORD_LIMIT_TIMECODE_BORDER_Y 3
+#if defined(__ANDROID__)
+static bool s_android_keyboard_visible = false;
+#endif
+
+void gui_ui_sync_android_keyboard_state(void) {
+#if defined(__ANDROID__)
+    bool want_visible = (s_active_text_field != UI_TEXT_FIELD_NONE) || s_record_limit_timecode_edit;
+    if (want_visible != s_android_keyboard_visible) {
+        android_set_keyboard_visible(want_visible ? 1 : 0);
+        s_android_keyboard_visible = want_visible;
+    }
+#endif
+}
 
 
 bool gui_ui_click_consumed(void) {

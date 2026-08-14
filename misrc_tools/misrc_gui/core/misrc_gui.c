@@ -732,6 +732,7 @@ int main(int argc, char **argv) {
 
         // Handle Clay interactions
         gui_handle_interactions(&app);
+        gui_ui_sync_android_keyboard_state();
         if (!was_capturing && app.is_capturing) {
             gui_set_reconnect_target_from_selected(&app, &reconnect_target);
         }

@@ -24,6 +24,8 @@
 #include <stdatomic.h>
 #include <pthread.h>
 #include <time.h>
+#include <stdio.h>
+#include <string.h>
 #include <jni.h>
 
 #ifdef __ANDROID__
@@ -34,6 +36,8 @@
 #define LOGI(...) ((void)0)
 #define LOGE(...) ((void)0)
 #endif
+/* Optional Android hsdaoh fd setter exported by patched libhsdaoh.so. */
+extern void hsdaoh_set_android_usb_fd(int fd) __attribute__((weak));
 
 /* ---- state ---- */
 static atomic_int  s_usb_fd = -1;          /* granted fd, -1 = none */
@@ -50,6 +54,19 @@ static char s_storage_path[512] = "";
 static pthread_mutex_t  s_perm_mtx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t   s_perm_cv  = PTHREAD_COND_INITIALIZER;
 static atomic_int       s_perm_result = -1; /* -1=pending, 0=denied, 1=granted */
+
+/* Android settings picker (folder/file) request signaling. */
+enum {
+    ANDROID_PICKER_KIND_OUTPUT_DIR = 1,
+    ANDROID_PICKER_KIND_PLAYBACK_A = 2,
+    ANDROID_PICKER_KIND_PLAYBACK_B = 3,
+};
+static pthread_mutex_t s_picker_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  s_picker_cv  = PTHREAD_COND_INITIALIZER;
+static int             s_picker_wait_kind = 0;
+static int             s_picker_done = 0;
+static int             s_picker_ok = 0;
+static char            s_picker_path[1024] = "";
 
 /* ---- JNI_OnLoad: cache the JavaVM so native threads can attach ---- */
 JNIEXPORT jint JNICALL
@@ -88,6 +105,9 @@ Java_dev_misrc_gui_MainActivity_nativeSetUsbFd(JNIEnv *env, jobject thiz, jint f
 {
     (void)env; (void)thiz;
     atomic_store(&s_usb_fd, (int)fd);
+    if (hsdaoh_set_android_usb_fd) {
+        hsdaoh_set_android_usb_fd((int)fd);
+    }
     LOGI("nativeSetUsbFd: fd=%d", (int)fd);
 }
 
@@ -119,11 +139,47 @@ Java_dev_misrc_gui_MainActivity_nativeUsbPermissionResult(JNIEnv *env, jobject t
     LOGI("nativeUsbPermissionResult: granted=%d", granted ? 1 : 0);
 }
 
+/* MainActivity.nativePickerResult(int kind, boolean accepted, String path) */
+JNIEXPORT void JNICALL
+Java_dev_misrc_gui_MainActivity_nativePickerResult(JNIEnv *env, jobject thiz, jint kind, jboolean accepted, jstring path)
+{
+    (void)thiz;
+    const char *cpath = path ? (*env)->GetStringUTFChars(env, path, NULL) : NULL;
+
+    pthread_mutex_lock(&s_picker_mtx);
+    if (s_picker_wait_kind != 0 && kind == s_picker_wait_kind) {
+        s_picker_ok = accepted ? 1 : 0;
+        s_picker_done = 1;
+        if (cpath) {
+            snprintf(s_picker_path, sizeof(s_picker_path), "%s", cpath);
+        } else {
+            s_picker_path[0] = '\0';
+        }
+        pthread_cond_signal(&s_picker_cv);
+        LOGI("nativePickerResult: kind=%d accepted=%d path=%s",
+             (int)kind, accepted ? 1 : 0, cpath ? cpath : "(null)");
+    } else {
+        LOGI("nativePickerResult: dropping unexpected callback kind=%d wait_kind=%d",
+             (int)kind, s_picker_wait_kind);
+    }
+    pthread_mutex_unlock(&s_picker_mtx);
+
+    if (cpath) {
+        (*env)->ReleaseStringUTFChars(env, path, cpath);
+    }
+}
+
 /* ---- C API used by the native capture path (gui_capture.c / hsdaoh) ---- */
 
 int android_usb_get_fd(void) { return atomic_load(&s_usb_fd); }
 int android_usb_has_fd(void) { return atomic_load(&s_usb_fd) >= 0; }
-void android_usb_clear_fd(void) { atomic_store(&s_usb_fd, -1); }
+void android_usb_clear_fd(void)
+{
+    atomic_store(&s_usb_fd, -1);
+    if (hsdaoh_set_android_usb_fd) {
+        hsdaoh_set_android_usb_fd(-1);
+    }
+}
 
 /* Returns the Java-provided external files dir (scoped-storage-exempt,
  * writable, no permission). Empty string if nativeSetStoragePath() hasn't
@@ -160,6 +216,128 @@ static jobject find_current_activity(JNIEnv *env)
     (*env)->DeleteLocalRef(env, at);
     if (act) LOGI("android_request_usb_permission: found Activity via ActivityThread fallback");
     return act;
+}
+
+/* Show/hide Android soft keyboard from native text-edit state. */
+void android_set_keyboard_visible(int visible)
+{
+    if (!s_jvm) return;
+
+    JNIEnv *env = NULL;
+    jint rc = (*s_jvm)->AttachCurrentThread(s_jvm, &env, NULL);
+    if (rc != JNI_OK || !env) return;
+
+    jobject activity = find_current_activity(env);
+    if (!activity) {
+        (*s_jvm)->DetachCurrentThread(s_jvm);
+        return;
+    }
+
+    jclass cls = (*env)->GetObjectClass(env, activity);
+    jmethodID mid = cls ? (*env)->GetMethodID(env, cls, "setKeyboardVisibleFromNative", "(Z)V") : NULL;
+    if (mid) {
+        (*env)->CallVoidMethod(env, activity, mid, visible ? JNI_TRUE : JNI_FALSE);
+    } else {
+        LOGE("android_set_keyboard_visible: method not found");
+    }
+
+    if (cls) (*env)->DeleteLocalRef(env, cls);
+    (*env)->DeleteLocalRef(env, activity);
+    (*s_jvm)->DetachCurrentThread(s_jvm);
+}
+
+static int android_request_picker_internal(int picker_kind,
+                                           int playback_channel,
+                                           char *out_path,
+                                           size_t out_path_len,
+                                           int timeout_seconds)
+{
+    if (out_path && out_path_len > 0) out_path[0] = '\0';
+    if (!s_jvm) return 0;
+
+    JNIEnv *env = NULL;
+    jint rc = (*s_jvm)->AttachCurrentThread(s_jvm, &env, NULL);
+    if (rc != JNI_OK || !env) {
+        LOGE("android_request_picker_internal: AttachCurrentThread failed: %d", rc);
+        return 0;
+    }
+
+    jobject activity = find_current_activity(env);
+    if (!activity) {
+        LOGE("android_request_picker_internal: no Activity available");
+        (*s_jvm)->DetachCurrentThread(s_jvm);
+        return 0;
+    }
+
+    jclass cls = (*env)->GetObjectClass(env, activity);
+    jmethodID mid = NULL;
+    if (picker_kind == ANDROID_PICKER_KIND_OUTPUT_DIR) {
+        mid = cls ? (*env)->GetMethodID(env, cls, "requestOutputFolderFromNative", "()V") : NULL;
+    } else {
+        mid = cls ? (*env)->GetMethodID(env, cls, "requestPlaybackFileFromNative", "(I)V") : NULL;
+    }
+    if (!mid) {
+        LOGE("android_request_picker_internal: picker method not found (kind=%d)", picker_kind);
+        if (cls) (*env)->DeleteLocalRef(env, cls);
+        (*env)->DeleteLocalRef(env, activity);
+        (*s_jvm)->DetachCurrentThread(s_jvm);
+        return 0;
+    }
+
+    pthread_mutex_lock(&s_picker_mtx);
+    s_picker_wait_kind = picker_kind;
+    s_picker_done = 0;
+    s_picker_ok = 0;
+    s_picker_path[0] = '\0';
+    pthread_mutex_unlock(&s_picker_mtx);
+
+    if (picker_kind == ANDROID_PICKER_KIND_OUTPUT_DIR) {
+        (*env)->CallVoidMethod(env, activity, mid);
+    } else {
+        (*env)->CallVoidMethod(env, activity, mid, (jint)playback_channel);
+    }
+
+    if (cls) (*env)->DeleteLocalRef(env, cls);
+    (*env)->DeleteLocalRef(env, activity);
+    (*s_jvm)->DetachCurrentThread(s_jvm);
+
+    int ok = 0;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += (timeout_seconds > 0 ? timeout_seconds : 60);
+
+    pthread_mutex_lock(&s_picker_mtx);
+    while (!s_picker_done) {
+        if (pthread_cond_timedwait(&s_picker_cv, &s_picker_mtx, &ts) != 0) {
+            break;
+        }
+    }
+    if (s_picker_done && s_picker_ok && s_picker_path[0]) {
+        ok = 1;
+        if (out_path && out_path_len > 0) {
+            snprintf(out_path, out_path_len, "%s", s_picker_path);
+        }
+    }
+    s_picker_wait_kind = 0;
+    s_picker_done = 0;
+    s_picker_ok = 0;
+    s_picker_path[0] = '\0';
+    pthread_mutex_unlock(&s_picker_mtx);
+    return ok;
+}
+
+/* Blocking Android output-folder picker for gui_settings_choose_output_folder(). */
+int android_pick_output_folder(char *out_path, size_t out_path_len, int timeout_seconds)
+{
+    return android_request_picker_internal(ANDROID_PICKER_KIND_OUTPUT_DIR,
+                                           0, out_path, out_path_len, timeout_seconds);
+}
+
+/* Blocking Android playback-file picker for gui_settings_choose_playback_file(). */
+int android_pick_playback_file(int channel, char *out_path, size_t out_path_len, int timeout_seconds)
+{
+    int kind = (channel == 1) ? ANDROID_PICKER_KIND_PLAYBACK_B : ANDROID_PICKER_KIND_PLAYBACK_A;
+    return android_request_picker_internal(kind, channel, out_path, out_path_len, timeout_seconds);
 }
 
 /* Ask Java (MainActivity) to show the USB permission dialog for the known

@@ -12,6 +12,9 @@
          on API 23+, so MainActivity requests it at runtime before requesting
          USB permission. Without this, no USB permission prompt ever appears. -->
     <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
 
     <!-- MISRC GUI requires OpenGL ES 3.0 (raylib rcore_android + rlgl ES3 paths) -->
     <uses-feature android:glEsVersion="0x00030000" android:required="true" />

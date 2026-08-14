@@ -674,14 +674,17 @@ static void strip_timestamp_prefix_inplace(char *s) {
     }
 }
 
-// macOS folder picker using osascript. Returns true if output_path changed.
+// Output-folder picker. Returns true if output_path changed.
 bool gui_settings_choose_output_folder(gui_settings_t *settings) {
     if (!settings) return false;
     char picked[512] = {0};
-
-#ifdef __APPLE__
+#if defined(__ANDROID__)
+    extern int android_pick_output_folder(char *out_path, size_t out_path_len, int timeout_seconds);
+    if (!android_pick_output_folder(picked, sizeof(picked), 90)) {
+        return false;
+    }
+#elif defined(__APPLE__)
     // Use AppleScript choose folder dialog and return POSIX path.
-    // Note: This will prompt the user and block until a selection is made.
     const char *cmd = "osascript -e 'POSIX path of (choose folder with prompt \"Select output folder for MISRC captures\")'";
     FILE *fp = popen(cmd, "r");
     if (!fp) return false;
@@ -691,7 +694,7 @@ bool gui_settings_choose_output_folder(gui_settings_t *settings) {
     }
     (void)pclose(fp);
 #elif defined(_WIN32) || defined(_WIN64)
-    // Native Win32 folder picker - uses GUI subsystem without console or powershell
+    // Native Win32 folder picker.
     HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     BROWSEINFOA bi = {0};
     bi.lpszTitle = "Select output folder for MISRC captures";
@@ -719,20 +722,17 @@ bool gui_settings_choose_output_folder(gui_settings_t *settings) {
     }
     (void)pclose(fp);
 #endif
-
     trim_newlines(picked);
     if (picked[0] == '\0') return false;
 
-    // Remove trailing slash/backslash
     size_t len = strlen(picked);
     while (len > 1 && (picked[len - 1] == '/' || picked[len - 1] == '\\')) {
         picked[--len] = '\0';
     }
 
     if (strncmp(settings->output_path, picked, MAX_FILENAME_LEN) == 0) {
-        return false; // no change
+        return false;
     }
-
     strncpy(settings->output_path, picked, MAX_FILENAME_LEN - 1);
     settings->output_path[MAX_FILENAME_LEN - 1] = '\0';
     return true;
@@ -744,8 +744,13 @@ bool gui_settings_choose_playback_file(gui_settings_t *settings, int channel) {
     if (channel != 0 && channel != 1) return false;
 
     char picked[512] = {0};
-
-#if defined(__APPLE__)
+#if defined(__ANDROID__)
+    extern int android_pick_playback_file(int channel, char *out_path, size_t out_path_len, int timeout_seconds);
+    if (!android_pick_playback_file(channel, picked, sizeof(picked), 120)) {
+        return false;
+    }
+    trim_newlines(picked);
+#elif defined(__APPLE__)
     // choose file, return POSIX path
     const char *cmd = "osascript -e 'POSIX path of (choose file with prompt \"Select FLAC playback file\")'";
     FILE *fp = popen(cmd, "r");
@@ -800,12 +805,10 @@ bool gui_settings_choose_playback_file(gui_settings_t *settings, int channel) {
 #endif
 
     if (picked[0] == '\0') return false;
-
     char *dst = (channel == 0) ? settings->playback_file_a : settings->playback_file_b;
     if (strncmp(dst, picked, MAX_FILENAME_LEN) == 0) {
         return false;
     }
-
     strncpy(dst, picked, MAX_FILENAME_LEN - 1);
     dst[MAX_FILENAME_LEN - 1] = '\0';
     return true;

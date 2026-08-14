@@ -44,6 +44,7 @@
 // UI Layout functions
 void gui_render_layout(gui_app_t *app);
 void gui_handle_interactions(gui_app_t *app);
+void gui_ui_sync_android_keyboard_state(void);
 
 // Check if UI consumed the current frame's click (prevents click-through to oscilloscope)
 bool gui_ui_click_consumed(void);
