@@ -14,7 +14,10 @@
 #include "../input/gui_cxadc.h"
 #ifdef ENABLE_DDD
 #include "../input/gui_ddd_clockgen.h"
+#include "../input/gui_ddd_v1.h"
+#include "gui_ddd_fifo_status.h"
 #endif
+#include "gui_device_buffer_status.h"
 #include "../output/gui_audio.h"
 #include "../output/gui_record.h"
 #include "../input/gui_capture.h" // Support hsdoah-rp2350 Error & stats
@@ -302,6 +305,39 @@ static bool gui_ui_selected_device_is_ddd_clockgen(const gui_app_t *app)
     return gui_ddd_clockgen_device_mode(&app->devices[app->selected_device]);
 }
 #endif
+
+/* Translate the active backend's telemetry into one device-neutral status-bar
+ * view. Unsupported devices return false and do not consume any UI space. */
+static bool gui_ui_get_device_buffer_view(
+    gui_app_t *app,
+    gui_device_buffer_layout_t layout,
+    gui_device_buffer_view_t *view)
+{
+    if (!app || !view) return false;
+    memset(view, 0, sizeof(*view));
+    (void)layout;
+
+#ifdef ENABLE_DDD
+    if (gui_ui_selected_device_is_ddd_v1(app)) {
+        gui_ddd_v1_fifo_snapshot_t snapshot;
+        bool capture_active = atomic_load(&app->ddd_running);
+        bool telemetry_present = capture_active &&
+            gui_ddd_v1_get_fifo_snapshot(&snapshot);
+        ddd_device_profile_t profile =
+            app->devices[app->selected_device].ddd_profile;
+
+        if (!gui_ddd_fifo_status_visible(profile, capture_active,
+                                         telemetry_present)) {
+            return false;
+        }
+        gui_ddd_fifo_make_buffer_view(&snapshot.latest, &snapshot.totals,
+                                     layout, view);
+        return view->visible;
+    }
+#endif
+
+    return false;
+}
 
 #ifdef ENABLE_FX3
 // FX3 is a distinct USB backend; showing its name as the mode label avoids
@@ -1163,6 +1199,7 @@ static char status_aud_buf_display[16];
 static char status_free_space_display[120];
 static char status_message_display[192];
 static char status_record_timer_display[16];
+static gui_device_buffer_view_t status_device_buffer_view;
 static char record_limit_state_display[96];
 static char record_limit_timecode_display[20];
 static bool s_status_free_space_valid = false;
@@ -6027,6 +6064,16 @@ static void render_status_bar(gui_app_t *app) {
     bool show_frame_count = !status_tiny;
     bool show_missed_count = !status_tiny;
     bool show_error_count = !status_tiny;
+    bool status_compact = status_layout != GUI_UI_STATUS_LAYOUT_FULL_SINGLE;
+    bool device_buffer_tiny = status_tiny || status_minimal ||
+        status_width < GUI_UI_STATUS_RECORDING_NARROW_BREAKPOINT;
+    gui_device_buffer_layout_t device_buffer_layout = device_buffer_tiny
+        ? GUI_DEVICE_BUFFER_LAYOUT_TINY
+        : (status_compact
+            ? GUI_DEVICE_BUFFER_LAYOUT_COMPACT
+            : GUI_DEVICE_BUFFER_LAYOUT_FULL);
+    bool show_device_buffer_status = gui_ui_get_device_buffer_view(
+        app, device_buffer_layout, &status_device_buffer_view);
     // Detect an error/denied/failed or critical capture-stop status so the bar can
     // yield space to it: when an error is being shown, hide the free-space
     // readout (and widen the message budget) so the actual error text isn't
@@ -6837,6 +6884,66 @@ static void render_status_bar(gui_app_t *app) {
                     }
                 }
 
+                /* Device-side hardware-buffer health is separate from the host RF
+                 * and audio rings below. Backends that cannot report it return no
+                 * view, so this slot consumes no space for those devices. */
+                if (show_device_buffer_status) {
+                    const char *device_buffer_label =
+                        device_buffer_layout == GUI_DEVICE_BUFFER_LAYOUT_FULL
+                            ? "HW Buffer:"
+                            : "HW:";
+                    int device_buffer_bar_width = device_buffer_tiny
+                        ? 20
+                        : (status_compact ? 36 : 48);
+                    int device_buffer_percent =
+                        status_device_buffer_view.meter_percent;
+                    if (device_buffer_percent < 0) device_buffer_percent = 0;
+                    if (device_buffer_percent > 100) device_buffer_percent = 100;
+                    int device_buffer_fill_width =
+                        device_buffer_bar_width * device_buffer_percent / 100;
+                    Color device_buffer_color = COLOR_SYNC_GREEN;
+                    if (status_device_buffer_view.severity ==
+                        GUI_DEVICE_BUFFER_ERROR) {
+                        device_buffer_color = COLOR_CLIP_RED;
+                    } else if (status_device_buffer_view.severity ==
+                               GUI_DEVICE_BUFFER_WARNING) {
+                        device_buffer_color = COLOR_METER_YELLOW;
+                    }
+
+                    CLAY(CLAY_ID("DeviceBufferStatus"), {
+                        .layout = {
+                            .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) },
+                            .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                            .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
+                            .childGap = device_buffer_tiny ? 2 : 4
+                        }
+                    }) {
+                        CLAY_TEXT(make_string(device_buffer_label),
+                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .textColor = to_clay_color(COLOR_TEXT_DIM), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                        CLAY(CLAY_ID("DeviceBufferMeter"), {
+                            .layout = {
+                                .sizing = { CLAY_SIZING_FIXED(device_buffer_bar_width), CLAY_SIZING_FIXED(10) },
+                                .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                                .childGap = 0
+                            },
+                            .backgroundColor = to_clay_color(COLOR_METER_BG),
+                            .cornerRadius = CLAY_CORNER_RADIUS(2)
+                        }) {
+                            if (device_buffer_fill_width > 0) {
+                                CLAY(CLAY_ID("DeviceBufferMeterFill"), {
+                                    .layout = {
+                                        .sizing = { CLAY_SIZING_FIXED(device_buffer_fill_width), CLAY_SIZING_GROW(0) }
+                                    },
+                                    .backgroundColor = to_clay_color(device_buffer_color),
+                                    .cornerRadius = CLAY_CORNER_RADIUS(2)
+                                }) {}
+                            }
+                        }
+                        CLAY_TEXT(make_string(status_device_buffer_view.caption),
+                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(device_buffer_color), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                    }
+                }
+
                 /* RF buffer readout formatted before the budget loop. */
                 int rf_pct = status_rf_pct;
                 CLAY(CLAY_ID("RFBufStatus"), {
@@ -6955,7 +7062,7 @@ void gui_render_layout(gui_app_t *app) {
     }) {
         // Apply cached hsdaoh status/errors at a low rate (2s)
         gui_capture_poll_hsdaoh_status(app);
-        
+
         // Toolbar
         render_toolbar(app);
 
@@ -7992,7 +8099,7 @@ void gui_handle_interactions(gui_app_t *app) {
                     : "Audio monitoring disabled");
             }
         }
-        
+
         // Audio channel select toggle
         if (Clay_PointerOver(CLAY_ID("AudioChannelToggle"))) {
             app->settings.audio_monitor_ch34 = !app->settings.audio_monitor_ch34;

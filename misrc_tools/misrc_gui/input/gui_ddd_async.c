@@ -5,8 +5,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 
 #include "../../common/libusb_compat.h"
+#include "../../common/ddd_protocol.h"
 #include "../../common/threading.h"
 #include "gui_ddd_async.h"
 
@@ -44,6 +46,13 @@ struct gui_ddd_async_orphan {
     size_t submitted_count;
     atomic_size_t in_flight;
     atomic_size_t callbacks_active;
+    struct libusb_transfer *telemetry_transfer;
+    uint8_t *telemetry_buffer;
+    atomic_bool telemetry_in_flight;
+    uint64_t telemetry_due_ms;
+    unsigned telemetry_failures;
+    bool telemetry_primed;
+    bool telemetry_cancel_requested;
     uint64_t cancel_deadline_ms;
     bool accepting_submissions;
     bool stopping;
@@ -74,7 +83,8 @@ static bool gui_ddd_async_engine_has_pending(
 {
     if (!engine) return false;
     return gui_ddd_async_policy_has_pending(
-        atomic_load(&engine->in_flight),
+        atomic_load(&engine->in_flight) +
+            (atomic_load(&engine->telemetry_in_flight) ? 1u : 0u),
         atomic_load(&engine->callbacks_active));
 }
 
@@ -210,6 +220,144 @@ static int gui_ddd_async_submit_slot(gui_ddd_async_engine_t *engine,
     return 0;
 }
 
+static void gui_ddd_async_note_telemetry_failure(
+    gui_ddd_async_engine_t *engine)
+{
+    if (!engine) return;
+    if (engine->telemetry_failures < UINT_MAX) {
+        engine->telemetry_failures++;
+    }
+    if (engine->result.telemetry_failures < UINT_MAX) {
+        engine->result.telemetry_failures++;
+    }
+    if (engine->telemetry_failures ==
+            GUI_DDD_ASYNC_TELEMETRY_MAX_FAILURES &&
+        !engine->stopping && engine->config->telemetry) {
+        /* Remove a stale instrument after the bounded retry budget. The
+         * backend callback is deliberately parse/publish-only, so this cannot
+         * stall the USB event pump. */
+        engine->config->telemetry(engine->config->telemetry_context, NULL, 0);
+    }
+}
+
+static void LIBUSB_CALL gui_ddd_async_telemetry_callback(
+    struct libusb_transfer *transfer)
+{
+    gui_ddd_async_engine_t *engine;
+    ddd_fifo_telemetry_t validated;
+    const uint8_t *data;
+
+    if (!transfer || !transfer->user_data) return;
+    engine = (gui_ddd_async_engine_t *)transfer->user_data;
+    atomic_fetch_add(&engine->callbacks_active, 1);
+    atomic_store(&engine->telemetry_in_flight, false);
+
+    if (transfer->status == LIBUSB_TRANSFER_COMPLETED) {
+        if (transfer->actual_length < (int)DDD_FIFO_TELEMETRY_LENGTH) {
+            gui_ddd_async_note_telemetry_failure(engine);
+        } else {
+            data = libusb_control_transfer_get_data(transfer);
+            if (!ddd_fifo_telemetry_parse(
+                    data, (size_t)transfer->actual_length, &validated)) {
+                /* Older or incompatible protocol-v1 firmware may return a
+                 * full-length placeholder for an unknown register. Count it
+                 * against the same bounded retry budget as a refused read. */
+                gui_ddd_async_note_telemetry_failure(engine);
+            } else {
+                engine->result.telemetry_readings++;
+                if (!engine->stopping && engine->config->telemetry &&
+                    gui_ddd_async_policy_telemetry_should_publish(
+                        &engine->telemetry_primed)) {
+                    engine->config->telemetry(
+                        engine->config->telemetry_context,
+                        data, DDD_FIFO_TELEMETRY_LENGTH);
+                }
+            }
+        }
+    } else if (transfer->status != LIBUSB_TRANSFER_CANCELLED) {
+        /* Telemetry is diagnostic. A refusal disables only the instrument
+         * after the bounded retry count; it never fails the RF queue. */
+        gui_ddd_async_note_telemetry_failure(engine);
+    }
+
+    atomic_fetch_sub(&engine->callbacks_active, 1);
+}
+
+static void gui_ddd_async_maybe_submit_telemetry(
+    gui_ddd_async_engine_t *engine,
+    uint64_t now_ms)
+{
+    int rc;
+    bool enabled;
+
+    if (!engine) return;
+    enabled = engine->config->telemetry != NULL &&
+              engine->telemetry_transfer != NULL &&
+              engine->telemetry_buffer != NULL &&
+              !engine->stopping && !engine->failed;
+    if (!gui_ddd_async_policy_telemetry_should_submit(
+            enabled,
+            atomic_load(&engine->telemetry_in_flight),
+            engine->telemetry_failures,
+            now_ms,
+            engine->telemetry_due_ms)) {
+        return;
+    }
+    engine->telemetry_due_ms =
+        now_ms + GUI_DDD_ASYNC_TELEMETRY_INTERVAL_MS;
+    engine->telemetry_cancel_requested = false;
+
+    libusb_fill_control_setup(
+        engine->telemetry_buffer,
+        DDD_USB_REQUEST_VENDOR_IN,
+        DDD_REQUEST_REGISTER_READ,
+        DDD_REGISTER_FIFO_TELEMETRY,
+        0,
+        DDD_FIFO_TELEMETRY_LENGTH);
+    libusb_fill_control_transfer(
+        engine->telemetry_transfer,
+        engine->config->device_handle,
+        engine->telemetry_buffer,
+        gui_ddd_async_telemetry_callback,
+        engine,
+        GUI_DDD_ASYNC_TELEMETRY_TIMEOUT_MS);
+
+    if (engine->config->submit_override) {
+        rc = engine->config->submit_override(
+            engine->config->submit_context,
+            engine->telemetry_transfer);
+    } else {
+        rc = libusb_submit_transfer(engine->telemetry_transfer);
+    }
+    if (rc < 0) {
+        gui_ddd_async_note_telemetry_failure(engine);
+        return;
+    }
+    atomic_store(&engine->telemetry_in_flight, true);
+}
+
+static void gui_ddd_async_cancel_telemetry(
+    gui_ddd_async_engine_t *engine)
+{
+    int rc;
+
+    if (!engine || !atomic_load(&engine->telemetry_in_flight) ||
+        engine->telemetry_cancel_requested) {
+        return;
+    }
+    engine->telemetry_cancel_requested = true;
+    if (engine->config->cancel_override) {
+        rc = engine->config->cancel_override(
+            engine->config->cancel_context,
+            engine->telemetry_transfer);
+    } else {
+        rc = libusb_cancel_transfer(engine->telemetry_transfer);
+    }
+    /* NOT_FOUND means completion won the race. Other errors remain bounded by
+     * the same orphan deadline as the RF transfers. */
+    (void)rc;
+}
+
 static void gui_ddd_async_cancel_in_flight(gui_ddd_async_engine_t *engine)
 {
     size_t i;
@@ -219,6 +367,7 @@ static void gui_ddd_async_cancel_in_flight(gui_ddd_async_engine_t *engine)
     engine->cancel_deadline_ms = gui_ddd_async_now_ms(engine) +
         GUI_DDD_ASYNC_CANCEL_REAP_TIMEOUT_MS;
     engine->accepting_submissions = false;
+    gui_ddd_async_cancel_telemetry(engine);
     for (i = 0; i < GUI_DDD_ASYNC_TRANSFER_COUNT; i++) {
         gui_ddd_async_slot_t *slot = &engine->slots[i];
         gui_ddd_async_policy_slot_t *policy_slot =
@@ -351,6 +500,24 @@ static int gui_ddd_async_allocate(gui_ddd_async_engine_t *engine)
             return -1;
         }
     }
+
+    if (engine->config->telemetry) {
+        engine->telemetry_transfer = libusb_alloc_transfer(0);
+        engine->telemetry_buffer = (uint8_t *)calloc(
+            1, LIBUSB_CONTROL_SETUP_SIZE + DDD_FIFO_TELEMETRY_LENGTH);
+        if (!engine->telemetry_transfer || !engine->telemetry_buffer) {
+            if (engine->telemetry_transfer) {
+                libusb_free_transfer(engine->telemetry_transfer);
+            }
+            free(engine->telemetry_buffer);
+            engine->telemetry_transfer = NULL;
+            engine->telemetry_buffer = NULL;
+            engine->telemetry_failures =
+                GUI_DDD_ASYNC_TELEMETRY_MAX_FAILURES;
+            engine->result.telemetry_failures =
+                GUI_DDD_ASYNC_TELEMETRY_MAX_FAILURES;
+        }
+    }
     return 0;
 }
 
@@ -360,8 +527,7 @@ static void gui_ddd_async_destroy(gui_ddd_async_engine_t *engine)
 
     if (!engine) return;
     /* Never release transfer/user-data storage while a callback is pending. */
-    if (atomic_load(&engine->in_flight) != 0 ||
-        atomic_load(&engine->callbacks_active) != 0) return;
+    if (gui_ddd_async_engine_has_pending(engine)) return;
     if (engine->slots) {
         for (i = 0; i < GUI_DDD_ASYNC_TRANSFER_COUNT; i++) {
             if (engine->slots[i].transfer) {
@@ -371,8 +537,14 @@ static void gui_ddd_async_destroy(gui_ddd_async_engine_t *engine)
     }
     free(engine->buffer_pool);
     free(engine->slots);
+    if (engine->telemetry_transfer) {
+        libusb_free_transfer(engine->telemetry_transfer);
+    }
+    free(engine->telemetry_buffer);
     engine->buffer_pool = NULL;
     engine->slots = NULL;
+    engine->telemetry_transfer = NULL;
+    engine->telemetry_buffer = NULL;
     free(engine);
 }
 
@@ -417,6 +589,7 @@ int gui_ddd_async_run(const gui_ddd_async_config_t *config,
     engine->accepting_submissions = true;
     atomic_init(&engine->in_flight, 0);
     atomic_init(&engine->callbacks_active, 0);
+    atomic_init(&engine->telemetry_in_flight, false);
     gui_ddd_async_order_policy_init(&engine->order,
                                     GUI_DDD_ASYNC_TRANSFER_COUNT);
 
@@ -444,12 +617,19 @@ int gui_ddd_async_run(const gui_ddd_async_config_t *config,
         bool capture_running = atomic_load(config->capture_running);
         uint64_t now_ms = gui_ddd_async_now_ms(engine);
         size_t in_flight;
+        size_t total_in_flight;
+        bool telemetry_in_flight;
 
         if (!capture_running && !engine->stopping) {
             engine->stopping = true;
             engine->accepting_submissions = false;
             stop_deadline_ms = now_ms +
                 GUI_DDD_ASYNC_STOP_DRAIN_TIMEOUT_MS;
+            gui_ddd_async_cancel_telemetry(engine);
+        }
+
+        if (capture_running) {
+            gui_ddd_async_maybe_submit_telemetry(engine, now_ms);
         }
 
         if (!engine->failed &&
@@ -458,9 +638,11 @@ int gui_ddd_async_run(const gui_ddd_async_config_t *config,
         }
 
         in_flight = atomic_load(&engine->in_flight);
+        telemetry_in_flight = atomic_load(&engine->telemetry_in_flight);
+        total_in_flight = in_flight + (telemetry_in_flight ? 1u : 0u);
         if (engine->failed) {
             gui_ddd_async_cancel_in_flight(engine);
-        } else if (engine->stopping && in_flight > 0 &&
+        } else if (engine->stopping && total_in_flight > 0 &&
                    now_ms >= stop_deadline_ms) {
             gui_ddd_async_latch_failure(
                 engine, GUI_DDD_ASYNC_RESULT_DRAIN_TIMEOUT, 0, 0, 0,
@@ -469,19 +651,22 @@ int gui_ddd_async_run(const gui_ddd_async_config_t *config,
         }
 
         in_flight = atomic_load(&engine->in_flight);
-        if (engine->failed && in_flight == 0) break;
+        telemetry_in_flight = atomic_load(&engine->telemetry_in_flight);
+        total_in_flight = in_flight + (telemetry_in_flight ? 1u : 0u);
+        if (engine->failed && total_in_flight == 0) break;
         if (!engine->failed &&
             gui_ddd_async_policy_stop_drain_complete(
                 capture_running, in_flight,
                 engine->result.completed_transfers,
-                engine->result.consumed_transfers)) {
+                engine->result.consumed_transfers) &&
+            !telemetry_in_flight) {
             break;
         }
         if (gui_ddd_async_policy_reap_action(
                 engine->cancel_issued,
                 now_ms,
                 engine->cancel_deadline_ms,
-                in_flight) == GUI_DDD_ASYNC_REAP_ORPHAN) {
+                total_in_flight) == GUI_DDD_ASYNC_REAP_ORPHAN) {
             break;
         }
         if (!engine->failed && capture_running && in_flight == 0) {
@@ -503,7 +688,8 @@ finished:
     if (gui_ddd_async_engine_has_pending(engine)) {
         engine->result.transfers_unreaped = true;
         engine->result.unreaped_transfers =
-            atomic_load(&engine->in_flight);
+            atomic_load(&engine->in_flight) +
+            (atomic_load(&engine->telemetry_in_flight) ? 1u : 0u);
         engine->result.active_callbacks =
             atomic_load(&engine->callbacks_active);
         engine->result.orphan = engine;
@@ -528,8 +714,7 @@ bool gui_ddd_async_orphan_has_unreaped(
 
 bool gui_ddd_async_orphan_try_reclaim(gui_ddd_async_orphan_t *orphan)
 {
-    if (!orphan || atomic_load(&orphan->in_flight) != 0 ||
-        atomic_load(&orphan->callbacks_active) != 0) return false;
+    if (!orphan || gui_ddd_async_engine_has_pending(orphan)) return false;
     gui_ddd_async_destroy(orphan);
     return true;
 }

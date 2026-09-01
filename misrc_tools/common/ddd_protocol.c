@@ -53,6 +53,13 @@ static bool ddd_read_register(const ddd_control_ops_t *ops,
     return ddd_control_in(ops, DDD_REQUEST_REGISTER_READ, address, value, 1);
 }
 
+static uint16_t ddd_read_little_endian_word(const uint8_t *block,
+                                             size_t offset)
+{
+    return (uint16_t)(block[offset] |
+                      ((uint16_t)block[offset + 1u] << 8));
+}
+
 bool ddd_is_known_device_id(uint16_t vendor_id, uint16_t product_id)
 {
     return (vendor_id == DDD_LEGACY_VENDOR_ID &&
@@ -349,6 +356,143 @@ void ddd_collection_state_init(ddd_collection_state_t *state)
     if (!state) return;
     memset(state, 0, sizeof(*state));
     state->profile = DDD_DEVICE_NOT_DDD;
+}
+
+void ddd_fifo_telemetry_init(ddd_fifo_telemetry_t *telemetry)
+{
+    if (telemetry) memset(telemetry, 0, sizeof(*telemetry));
+}
+
+bool ddd_fifo_telemetry_parse(const uint8_t *block,
+                              size_t block_length,
+                              ddd_fifo_telemetry_t *telemetry)
+{
+    uint8_t status;
+    uint8_t format;
+    uint16_t depth;
+    uint16_t packet;
+
+    if (!telemetry) return false;
+    ddd_fifo_telemetry_init(telemetry);
+    if (!block || block_length < DDD_FIFO_TELEMETRY_LENGTH ||
+        block[0] != DDD_FIFO_TELEMETRY_ID) {
+        return false;
+    }
+
+    status = block[DDD_FIFO_OFFSET_STATUS];
+    format = status & DDD_FIFO_TELEMETRY_FORMAT_MASK;
+    if (format != DDD_FIFO_TELEMETRY_FORMAT) return false;
+
+    depth = ddd_read_little_endian_word(block, DDD_FIFO_OFFSET_DEPTH);
+    packet = ddd_read_little_endian_word(
+        block, DDD_FIFO_OFFSET_PACKET_WORDS);
+    if (packet == 0 || depth <= packet) return false;
+
+    telemetry->present = true;
+    telemetry->format = format;
+    telemetry->overflow_seen =
+        (status & DDD_FIFO_FLAG_OVERFLOW_SEEN) != 0;
+    telemetry->saturated = (status & DDD_FIFO_FLAG_SATURATED) != 0;
+    telemetry->latch_count = block[DDD_FIFO_OFFSET_LATCH_COUNT];
+    telemetry->used_now = ddd_read_little_endian_word(
+        block, DDD_FIFO_OFFSET_USED_NOW);
+    telemetry->peak = ddd_read_little_endian_word(
+        block, DDD_FIFO_OFFSET_PEAK);
+    telemetry->peak_since_open = ddd_read_little_endian_word(
+        block, DDD_FIFO_OFFSET_PEAK_LIFETIME);
+    telemetry->overflow_events = ddd_read_little_endian_word(
+        block, DDD_FIFO_OFFSET_OVERFLOWS);
+    telemetry->dropped_words = ddd_read_little_endian_word(
+        block, DDD_FIFO_OFFSET_DROPPED);
+    telemetry->packets_read = ddd_read_little_endian_word(
+        block, DDD_FIFO_OFFSET_PACKETS);
+    telemetry->near_full_units = ddd_read_little_endian_word(
+        block, DDD_FIFO_OFFSET_NEAR_FULL);
+    telemetry->depth_words = depth;
+    telemetry->packet_words = packet;
+    telemetry->near_full_words = ddd_read_little_endian_word(
+        block, DDD_FIFO_OFFSET_NEAR_FULL_WORDS);
+    return true;
+}
+
+int ddd_fifo_backpressure_percent(const ddd_fifo_telemetry_t *telemetry)
+{
+    int headroom;
+    int excursion;
+    int percent;
+
+    if (!telemetry || !telemetry->present) return 0;
+    if (telemetry->overflow_events > 0) return 100;
+    if (telemetry->peak <= telemetry->packet_words) return 0;
+
+    headroom = (int)telemetry->depth_words - (int)telemetry->packet_words;
+    if (headroom <= 0) return 0;
+    excursion = (int)telemetry->peak - (int)telemetry->packet_words;
+    percent = excursion * 100 / headroom;
+    if (percent < 0) return 0;
+    return percent > 100 ? 100 : percent;
+}
+
+int ddd_fifo_peak_percent(const ddd_fifo_telemetry_t *telemetry)
+{
+    int percent;
+    if (!telemetry || !telemetry->present || telemetry->depth_words == 0) {
+        return 0;
+    }
+    percent = (int)telemetry->peak * 100 / (int)telemetry->depth_words;
+    if (percent < 0) return 0;
+    return percent > 100 ? 100 : percent;
+}
+
+int ddd_fifo_used_percent(const ddd_fifo_telemetry_t *telemetry)
+{
+    int percent;
+    if (!telemetry || !telemetry->present || telemetry->depth_words == 0) {
+        return 0;
+    }
+    percent = (int)telemetry->used_now * 100 /
+        (int)telemetry->depth_words;
+    if (percent < 0) return 0;
+    return percent > 100 ? 100 : percent;
+}
+
+void ddd_fifo_telemetry_totals_init(
+    ddd_fifo_telemetry_totals_t *totals)
+{
+    if (!totals) return;
+    memset(totals, 0, sizeof(*totals));
+    totals->interval_coverage_complete = true;
+}
+
+bool ddd_fifo_telemetry_totals_add(
+    ddd_fifo_telemetry_totals_t *totals,
+    const ddd_fifo_telemetry_t *telemetry)
+{
+    uint8_t latch_delta;
+    int backpressure;
+
+    if (!totals || !telemetry || !telemetry->present) return false;
+    if (totals->latch_seen) {
+        latch_delta = (uint8_t)(telemetry->latch_count -
+                                totals->last_latch_count);
+        if (latch_delta == 0) return false;
+        if (latch_delta != 1) totals->interval_coverage_complete = false;
+    }
+
+    totals->latch_seen = true;
+    totals->last_latch_count = telemetry->latch_count;
+    totals->saturated = totals->saturated || telemetry->saturated;
+    totals->overflow_events += telemetry->overflow_events;
+    totals->dropped_words += telemetry->dropped_words;
+    totals->near_full_units += telemetry->near_full_units;
+    if (telemetry->peak > totals->peak_words) {
+        totals->peak_words = telemetry->peak;
+    }
+    backpressure = ddd_fifo_backpressure_percent(telemetry);
+    if (backpressure > totals->peak_backpressure_percent) {
+        totals->peak_backpressure_percent = backpressure;
+    }
+    return true;
 }
 
 static ddd_protocol_result_t ddd_restore_safe_defaults(

@@ -13,6 +13,7 @@
 int main(void)
 {
     gui_ddd_async_order_policy_t policy;
+    bool telemetry_primed = false;
     gui_ddd_async_policy_slot_t slots[2] = {
         {.submission_id = 0, .state = GUI_DDD_ASYNC_SLOT_COMPLETE},
         {.submission_id = 1, .state = GUI_DDD_ASYNC_SLOT_SUBMITTED}
@@ -39,6 +40,21 @@ int main(void)
         GUI_DDD_ASYNC_TRANSFER_BYTES));
     CHECK(!gui_ddd_async_policy_exact_length(
         GUI_DDD_ASYNC_TRANSFER_BYTES - 1));
+    CHECK(gui_ddd_async_policy_telemetry_should_submit(
+        true, false, 0, 1000, 1000));
+    CHECK(!gui_ddd_async_policy_telemetry_should_submit(
+        true, true, 0, 1000, 1000));
+    CHECK(!gui_ddd_async_policy_telemetry_should_submit(
+        true, false, 0, 999, 1000));
+    CHECK(!gui_ddd_async_policy_telemetry_should_submit(
+        true, false, GUI_DDD_ASYNC_TELEMETRY_MAX_FAILURES,
+        1000, 1000));
+    CHECK(!gui_ddd_async_policy_telemetry_should_publish(
+        &telemetry_primed));
+    CHECK(telemetry_primed);
+    CHECK(gui_ddd_async_policy_telemetry_should_publish(
+        &telemetry_primed));
+    CHECK(!gui_ddd_async_policy_telemetry_should_publish(NULL));
     CHECK(gui_ddd_async_policy_abandon_slot_available(0));
     CHECK(!gui_ddd_async_policy_abandon_slot_available(
         GUI_DDD_ASYNC_ABANDONED_CAPACITY));

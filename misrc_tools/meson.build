@@ -440,6 +440,7 @@ if raylib_dep.found()
     sources_gui += 'misrc_gui/input/gui_ddd_v1.c'
     sources_gui += 'misrc_gui/input/gui_ddd_async.c'
     sources_gui += 'misrc_gui/input/gui_ddd_clockgen.c'
+    sources_gui += 'misrc_gui/ui/gui_ddd_fifo_status.c'
   endif
 
   # Add RTL-SDR support to GUI if available
@@ -573,6 +574,15 @@ ddd_protocol_test = executable('ddd_protocol_test',
 )
 test('ddd_protocol', ddd_protocol_test)
 
+ddd_fifo_status_test = executable('gui_ddd_fifo_status_test',
+  ['test/gui_ddd_fifo_status_test.c',
+   'misrc_gui/ui/gui_ddd_fifo_status.c',
+   'common/ddd_protocol.c'],
+  dependencies: [],
+  c_args: cflags,
+)
+test('gui_ddd_fifo_status', ddd_fifo_status_test)
+
 ddd_async_policy_test = executable('gui_ddd_async_policy_test',
   'test/gui_ddd_async_policy_test.c',
   dependencies: [],
@@ -583,7 +593,8 @@ test('gui_ddd_async_policy', ddd_async_policy_test)
 if ddd_enabled
   ddd_async_fault_test = executable('gui_ddd_async_fault_test',
     ['test/gui_ddd_async_fault_test.c',
-     'misrc_gui/input/gui_ddd_async.c'],
+     'misrc_gui/input/gui_ddd_async.c',
+     'common/ddd_protocol.c'],
     dependencies: [libusb_common_dep],
     c_args: cflags,
   )
