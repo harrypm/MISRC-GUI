@@ -27,6 +27,9 @@ struct libusb_transfer;
 #define GUI_DDD_ASYNC_STOP_DRAIN_TIMEOUT_MS UINT64_C(1000)
 #define GUI_DDD_ASYNC_CANCEL_REAP_TIMEOUT_MS UINT64_C(1000)
 #define GUI_DDD_ASYNC_ABANDONED_CAPACITY 1u
+#define GUI_DDD_ASYNC_TELEMETRY_INTERVAL_MS UINT64_C(250)
+#define GUI_DDD_ASYNC_TELEMETRY_TIMEOUT_MS 1000u
+#define GUI_DDD_ASYNC_TELEMETRY_MAX_FAILURES 2u
 
 typedef struct gui_ddd_async_orphan gui_ddd_async_orphan_t;
 
@@ -164,6 +167,30 @@ static inline bool gui_ddd_async_policy_has_pending(
     return in_flight != 0 || callbacks_active != 0;
 }
 
+static inline bool gui_ddd_async_policy_telemetry_should_submit(
+    bool enabled,
+    bool in_flight,
+    unsigned failures,
+    uint64_t now_ms,
+    uint64_t due_ms)
+{
+    return enabled && !in_flight &&
+           failures < GUI_DDD_ASYNC_TELEMETRY_MAX_FAILURES &&
+           now_ms >= due_ms;
+}
+
+/* The first successful read only establishes the start of this capture's
+ * interval. The read itself clears the gateware's interval counters. */
+static inline bool gui_ddd_async_policy_telemetry_should_publish(bool *primed)
+{
+    if (!primed) return false;
+    if (!*primed) {
+        *primed = true;
+        return false;
+    }
+    return true;
+}
+
 /* A synchronous libusb control transfer also depends on the context event
  * pump. Once an async queue has timed out with callbacks still pending, a
  * synchronous B5/rollback may wait forever and must not be attempted. */
@@ -184,6 +211,11 @@ typedef enum {
 } gui_ddd_async_consume_result_t;
 
 typedef gui_ddd_async_consume_result_t (*gui_ddd_async_consume_fn)(
+    void *context,
+    const uint8_t *data,
+    size_t size);
+
+typedef void (*gui_ddd_async_telemetry_fn)(
     void *context,
     const uint8_t *data,
     size_t size);
@@ -219,6 +251,8 @@ typedef struct {
     uint64_t submission_id;
     uint64_t completed_transfers;
     uint64_t consumed_transfers;
+    uint64_t telemetry_readings;
+    unsigned telemetry_failures;
     bool ready_signalled;
     bool transfers_unreaped;
     size_t unreaped_transfers;
@@ -235,6 +269,11 @@ typedef struct {
     atomic_bool *startup_failed;
     gui_ddd_async_consume_fn consume;
     void *consume_context;
+    /* Optional DdD FIFO instrument. It is driven by the same event thread as
+     * the RF queue; no second event handler or synchronous control transfer is
+     * introduced while capture is active. */
+    gui_ddd_async_telemetry_fn telemetry;
+    void *telemetry_context;
     gui_ddd_async_event_pump_fn event_pump_override;
     void *event_pump_context;
     gui_ddd_async_now_ms_fn now_ms_override;
@@ -257,6 +296,8 @@ static inline void gui_ddd_async_detach_external_context(
     config->startup_failed = NULL;
     config->consume = NULL;
     config->consume_context = NULL;
+    config->telemetry = NULL;
+    config->telemetry_context = NULL;
     config->event_pump_override = NULL;
     config->event_pump_context = NULL;
     config->now_ms_override = NULL;

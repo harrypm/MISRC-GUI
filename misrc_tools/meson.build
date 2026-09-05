@@ -404,6 +404,7 @@ if raylib_dep.found()
     # UI
     'misrc_gui/ui/gui_ui_scale.c',
     'misrc_gui/ui/gui_ui.c',
+    'misrc_gui/ui/gui_device_label.c',
     'misrc_gui/ui/gui_dropdown.c',
     'misrc_gui/ui/gui_popup.c',
     'misrc_gui/ui/clay_renderer_raylib.c',
@@ -440,6 +441,7 @@ if raylib_dep.found()
     sources_gui += 'misrc_gui/input/gui_ddd_v1.c'
     sources_gui += 'misrc_gui/input/gui_ddd_async.c'
     sources_gui += 'misrc_gui/input/gui_ddd_clockgen.c'
+    sources_gui += 'misrc_gui/ui/gui_ddd_fifo_status.c'
   endif
 
   # Add RTL-SDR support to GUI if available
@@ -559,6 +561,64 @@ if raylib_dep.found()
                 install: true)
   endif
 
+  if host_system != 'android'
+    # Exercise the real overlay layout/click code with drawing stubs, without
+    # opening a window or linking capture backends. LTO drops unrelated code
+    # from the included waveform implementation, including in debug builds.
+    overlay_test_deps = []
+    foreach dep : gui_deps
+      overlay_test_deps += dep.partial_dependency(compile_args: true, includes: true)
+    endforeach
+    overlay_test_deps += meson.get_compiler('c').find_library('m', required: false)
+    waveform_overlay_test = executable('gui_waveform_overlay_test',
+      'test/gui_waveform_overlay_harness.c',
+      dependencies: overlay_test_deps,
+      include_directories: gui_includes,
+      c_args: gui_cflags,
+      override_options: ['b_lto=true', 'optimization=2'],
+    )
+    test('gui_waveform_overlay', waveform_overlay_test)
+
+    fft_label_test = executable('gui_fft_label_test',
+      'test/gui_fft_label_harness.c',
+      dependencies: overlay_test_deps,
+      include_directories: gui_includes,
+      c_args: gui_cflags,
+      override_options: ['b_lto=true', 'optimization=2'],
+    )
+    test('gui_fft_label', fft_label_test)
+
+    # Exercise the production stats sizing with deterministic font metrics.
+    # As above, LTO drops unrelated UI/backend code from the included source.
+    stats_layout_test = executable('gui_stats_layout_test',
+      ['test/gui_stats_layout_harness.c', 'misrc_gui/ui/gui_ui_scale.c', version_target],
+      dependencies: overlay_test_deps,
+      include_directories: gui_includes,
+      c_args: gui_cflags,
+      override_options: ['b_lto=true', 'optimization=2'],
+    )
+    test('gui_stats_layout', stats_layout_test)
+
+    # Check connection-button text and padding with the same CPU-only setup.
+    toolbar_layout_test = executable('gui_toolbar_layout_test',
+      ['test/gui_toolbar_layout_harness.c', version_target],
+      dependencies: overlay_test_deps,
+      include_directories: gui_includes,
+      c_args: gui_cflags,
+      override_options: ['b_lto=true', 'optimization=2'],
+    )
+    test('gui_toolbar_layout', toolbar_layout_test)
+
+    viewport_layout_test = executable('gui_viewport_layout_test',
+      ['test/gui_viewport_layout_harness.c', version_target],
+      dependencies: overlay_test_deps,
+      include_directories: gui_includes,
+      c_args: gui_cflags,
+      override_options: ['b_lto=true', 'optimization=2'],
+    )
+    test('gui_viewport_layout', viewport_layout_test)
+  endif
+
   message('raylib found, building GUI application')
 else
   message('raylib not found, skipping GUI application')
@@ -573,6 +633,22 @@ ddd_protocol_test = executable('ddd_protocol_test',
 )
 test('ddd_protocol', ddd_protocol_test)
 
+device_label_test = executable('gui_device_label_test',
+  ['test/gui_device_label_test.c', 'misrc_gui/ui/gui_device_label.c'],
+  dependencies: [],
+  c_args: cflags,
+)
+test('gui_device_label', device_label_test)
+
+ddd_fifo_status_test = executable('gui_ddd_fifo_status_test',
+  ['test/gui_ddd_fifo_status_test.c',
+   'misrc_gui/ui/gui_ddd_fifo_status.c',
+   'common/ddd_protocol.c'],
+  dependencies: [],
+  c_args: cflags,
+)
+test('gui_ddd_fifo_status', ddd_fifo_status_test)
+
 ddd_async_policy_test = executable('gui_ddd_async_policy_test',
   'test/gui_ddd_async_policy_test.c',
   dependencies: [],
@@ -583,7 +659,8 @@ test('gui_ddd_async_policy', ddd_async_policy_test)
 if ddd_enabled
   ddd_async_fault_test = executable('gui_ddd_async_fault_test',
     ['test/gui_ddd_async_fault_test.c',
-     'misrc_gui/input/gui_ddd_async.c'],
+     'misrc_gui/input/gui_ddd_async.c',
+     'common/ddd_protocol.c'],
     dependencies: [libusb_common_dep],
     c_args: cflags,
   )

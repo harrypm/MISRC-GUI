@@ -35,7 +35,7 @@ typedef enum {
 /* Show a confirmation popup with two buttons.
  *
  * @param title      Dialog title (max 63 chars)
- * @param message    Dialog message (max 255 chars)
+ * @param message    Dialog message (max 511 chars)
  * @param yes_text   Primary button text (e.g., "Yes", "Overwrite")
  * @param no_text    Secondary button text (e.g., "No", "Cancel")
  * @param user_data  Optional context pointer, retrievable via gui_popup_get_user_data()
@@ -49,7 +49,7 @@ void gui_popup_confirm(const char *title, const char *message,
 /* Show an info popup with a single OK button.
  *
  * @param title      Dialog title (max 63 chars)
- * @param message    Dialog message (max 255 chars)
+ * @param message    Dialog message (max 511 chars)
  *
  * Non-blocking: returns immediately. Check gui_popup_get_result() on subsequent frames.
  */

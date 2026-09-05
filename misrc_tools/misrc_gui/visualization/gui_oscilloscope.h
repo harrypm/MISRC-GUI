@@ -37,11 +37,13 @@ void gui_oscilloscope_cleanup(void);
 // Grid Drawing
 //-----------------------------------------------------------------------------
 
-// Draw grid with amplitude scale ticks and time labels
+// Draw grid with amplitude scale ticks and time labels. The optional output
+// reports the time/div label for overlay placement, or an empty rectangle.
 void draw_channel_grid(float x, float y, float width, float height,
                        const char *label, Color channel_color, bool show_grid,
                        float zoom_scale, uint32_t sample_rate,
-                       bool trigger_enabled, int trigger_display_pos);
+                       bool trigger_enabled, int trigger_display_pos,
+                       Rectangle *time_div_rect);
 
 //-----------------------------------------------------------------------------
 // Trigger Detection

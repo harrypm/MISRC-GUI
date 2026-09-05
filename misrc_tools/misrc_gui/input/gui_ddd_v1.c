@@ -77,6 +77,37 @@ static ddd_v1_capture_result_t s_result = DDD_V1_RESULT_SUCCESS;
 static ddd_v1_lock_phase_t s_lock_phase;
 static char s_locked_path[DDD_STABLE_ID_MAX];
 
+typedef struct {
+    atomic_uint revision;
+    atomic_bool present;
+    atomic_uint format;
+    atomic_bool overflow_seen;
+    atomic_bool saturated;
+    atomic_uint latch_count;
+    atomic_uint used_now;
+    atomic_uint peak;
+    atomic_uint peak_since_open;
+    atomic_uint overflow_events;
+    atomic_uint dropped_words;
+    atomic_uint packets_read;
+    atomic_uint near_full_units;
+    atomic_uint depth_words;
+    atomic_uint packet_words;
+    atomic_uint near_full_words;
+    atomic_bool totals_latch_seen;
+    atomic_uint totals_last_latch_count;
+    atomic_bool interval_coverage_complete;
+    atomic_bool totals_saturated;
+    atomic_ullong total_overflow_events;
+    atomic_ullong total_dropped_words;
+    atomic_ullong total_near_full_units;
+    atomic_uint run_peak_words;
+    atomic_int peak_backpressure_percent;
+} ddd_v1_fifo_store_t;
+
+static ddd_v1_fifo_store_t s_fifo_store;
+static ddd_fifo_telemetry_totals_t s_fifo_totals;
+
 _Static_assert(GUI_DDD_ASYNC_TRANSFER_BYTES ==
                    (size_t)DDD_SEQUENCE_SAMPLES_PER_MARKER * sizeof(uint16_t),
                "DDD 3.1 transfer must contain one sequence-marker block");
@@ -109,6 +140,162 @@ static const char *ddd_v1_protocol_result_name(ddd_protocol_result_t result)
         case DDD_PROTOCOL_READBACK_MISMATCH: return "ReadbackMismatch";
     }
     return "Unknown";
+}
+
+static void ddd_v1_fifo_publish(
+    const ddd_fifo_telemetry_t *latest,
+    const ddd_fifo_telemetry_totals_t *totals)
+{
+    if (!latest || !totals) return;
+
+    /* Sequential consistency keeps a validated revision from spanning two
+     * telemetry generations while remaining non-blocking in the USB loop. */
+    atomic_fetch_add_explicit(&s_fifo_store.revision, 1,
+                              memory_order_seq_cst);
+    atomic_store_explicit(&s_fifo_store.present, latest->present,
+                          memory_order_seq_cst);
+    atomic_store_explicit(&s_fifo_store.format, latest->format,
+                          memory_order_seq_cst);
+    atomic_store_explicit(&s_fifo_store.overflow_seen,
+                          latest->overflow_seen, memory_order_seq_cst);
+    atomic_store_explicit(&s_fifo_store.saturated, latest->saturated,
+                          memory_order_seq_cst);
+    atomic_store_explicit(&s_fifo_store.latch_count, latest->latch_count,
+                          memory_order_seq_cst);
+    atomic_store_explicit(&s_fifo_store.used_now, latest->used_now,
+                          memory_order_seq_cst);
+    atomic_store_explicit(&s_fifo_store.peak, latest->peak,
+                          memory_order_seq_cst);
+    atomic_store_explicit(&s_fifo_store.peak_since_open,
+                          latest->peak_since_open, memory_order_seq_cst);
+    atomic_store_explicit(&s_fifo_store.overflow_events,
+                          latest->overflow_events, memory_order_seq_cst);
+    atomic_store_explicit(&s_fifo_store.dropped_words,
+                          latest->dropped_words, memory_order_seq_cst);
+    atomic_store_explicit(&s_fifo_store.packets_read,
+                          latest->packets_read, memory_order_seq_cst);
+    atomic_store_explicit(&s_fifo_store.near_full_units,
+                          latest->near_full_units, memory_order_seq_cst);
+    atomic_store_explicit(&s_fifo_store.depth_words, latest->depth_words,
+                          memory_order_seq_cst);
+    atomic_store_explicit(&s_fifo_store.packet_words, latest->packet_words,
+                          memory_order_seq_cst);
+    atomic_store_explicit(&s_fifo_store.near_full_words,
+                          latest->near_full_words, memory_order_seq_cst);
+
+    atomic_store_explicit(&s_fifo_store.totals_latch_seen,
+                          totals->latch_seen, memory_order_seq_cst);
+    atomic_store_explicit(&s_fifo_store.totals_last_latch_count,
+                          totals->last_latch_count, memory_order_seq_cst);
+    atomic_store_explicit(&s_fifo_store.interval_coverage_complete,
+                          totals->interval_coverage_complete,
+                          memory_order_seq_cst);
+    atomic_store_explicit(&s_fifo_store.totals_saturated,
+                          totals->saturated, memory_order_seq_cst);
+    atomic_store_explicit(&s_fifo_store.total_overflow_events,
+                          totals->overflow_events, memory_order_seq_cst);
+    atomic_store_explicit(&s_fifo_store.total_dropped_words,
+                          totals->dropped_words, memory_order_seq_cst);
+    atomic_store_explicit(&s_fifo_store.total_near_full_units,
+                          totals->near_full_units, memory_order_seq_cst);
+    atomic_store_explicit(&s_fifo_store.run_peak_words,
+                          totals->peak_words, memory_order_seq_cst);
+    atomic_store_explicit(&s_fifo_store.peak_backpressure_percent,
+                          totals->peak_backpressure_percent,
+                          memory_order_seq_cst);
+    atomic_fetch_add_explicit(&s_fifo_store.revision, 1,
+                              memory_order_seq_cst);
+}
+
+static void ddd_v1_fifo_reset(void)
+{
+    ddd_fifo_telemetry_t latest;
+
+    ddd_fifo_telemetry_init(&latest);
+    ddd_fifo_telemetry_totals_init(&s_fifo_totals);
+    ddd_v1_fifo_publish(&latest, &s_fifo_totals);
+}
+
+static void ddd_v1_fifo_receive(void *context,
+                                const uint8_t *data,
+                                size_t size)
+{
+    ddd_fifo_telemetry_t latest;
+
+    (void)context;
+
+    (void)ddd_fifo_telemetry_parse(data, size, &latest);
+    (void)ddd_fifo_telemetry_totals_add(&s_fifo_totals, &latest);
+    ddd_v1_fifo_publish(&latest, &s_fifo_totals);
+}
+
+bool gui_ddd_v1_get_fifo_snapshot(gui_ddd_v1_fifo_snapshot_t *snapshot)
+{
+    unsigned before;
+    unsigned after;
+
+    if (!snapshot) return false;
+    do {
+        before = atomic_load_explicit(&s_fifo_store.revision,
+                                      memory_order_seq_cst);
+        if ((before & 1u) != 0) continue;
+
+        snapshot->latest.present = atomic_load_explicit(
+            &s_fifo_store.present, memory_order_seq_cst);
+        snapshot->latest.format = (uint8_t)atomic_load_explicit(
+            &s_fifo_store.format, memory_order_seq_cst);
+        snapshot->latest.overflow_seen = atomic_load_explicit(
+            &s_fifo_store.overflow_seen, memory_order_seq_cst);
+        snapshot->latest.saturated = atomic_load_explicit(
+            &s_fifo_store.saturated, memory_order_seq_cst);
+        snapshot->latest.latch_count = (uint8_t)atomic_load_explicit(
+            &s_fifo_store.latch_count, memory_order_seq_cst);
+        snapshot->latest.used_now = (uint16_t)atomic_load_explicit(
+            &s_fifo_store.used_now, memory_order_seq_cst);
+        snapshot->latest.peak = (uint16_t)atomic_load_explicit(
+            &s_fifo_store.peak, memory_order_seq_cst);
+        snapshot->latest.peak_since_open = (uint16_t)atomic_load_explicit(
+            &s_fifo_store.peak_since_open, memory_order_seq_cst);
+        snapshot->latest.overflow_events = (uint16_t)atomic_load_explicit(
+            &s_fifo_store.overflow_events, memory_order_seq_cst);
+        snapshot->latest.dropped_words = (uint16_t)atomic_load_explicit(
+            &s_fifo_store.dropped_words, memory_order_seq_cst);
+        snapshot->latest.packets_read = (uint16_t)atomic_load_explicit(
+            &s_fifo_store.packets_read, memory_order_seq_cst);
+        snapshot->latest.near_full_units = (uint16_t)atomic_load_explicit(
+            &s_fifo_store.near_full_units, memory_order_seq_cst);
+        snapshot->latest.depth_words = (uint16_t)atomic_load_explicit(
+            &s_fifo_store.depth_words, memory_order_seq_cst);
+        snapshot->latest.packet_words = (uint16_t)atomic_load_explicit(
+            &s_fifo_store.packet_words, memory_order_seq_cst);
+        snapshot->latest.near_full_words = (uint16_t)atomic_load_explicit(
+            &s_fifo_store.near_full_words, memory_order_seq_cst);
+
+        snapshot->totals.latch_seen = atomic_load_explicit(
+            &s_fifo_store.totals_latch_seen, memory_order_seq_cst);
+        snapshot->totals.last_latch_count = (uint8_t)atomic_load_explicit(
+            &s_fifo_store.totals_last_latch_count, memory_order_seq_cst);
+        snapshot->totals.interval_coverage_complete = atomic_load_explicit(
+            &s_fifo_store.interval_coverage_complete,
+            memory_order_seq_cst);
+        snapshot->totals.saturated = atomic_load_explicit(
+            &s_fifo_store.totals_saturated, memory_order_seq_cst);
+        snapshot->totals.overflow_events = atomic_load_explicit(
+            &s_fifo_store.total_overflow_events, memory_order_seq_cst);
+        snapshot->totals.dropped_words = atomic_load_explicit(
+            &s_fifo_store.total_dropped_words, memory_order_seq_cst);
+        snapshot->totals.near_full_units = atomic_load_explicit(
+            &s_fifo_store.total_near_full_units, memory_order_seq_cst);
+        snapshot->totals.peak_words = (uint16_t)atomic_load_explicit(
+            &s_fifo_store.run_peak_words, memory_order_seq_cst);
+        snapshot->totals.peak_backpressure_percent = atomic_load_explicit(
+            &s_fifo_store.peak_backpressure_percent,
+            memory_order_seq_cst);
+
+        after = atomic_load_explicit(&s_fifo_store.revision,
+                                     memory_order_seq_cst);
+    } while (before != after || (after & 1u) != 0);
+    return snapshot->latest.present;
 }
 
 static bool ddd_v1_format_usb_path(libusb_device *device,
@@ -265,6 +452,7 @@ static void ddd_v1_close(void)
     s_interface_claimed = false;
     s_usb_path[0] = '\0';
     ddd_collection_state_init(&s_collection);
+    ddd_v1_fifo_reset();
 }
 
 int gui_ddd_v1_open(gui_app_t *app, const char *stable_usb_path)
@@ -478,7 +666,9 @@ static int ddd_v1_capture_thread(void *context)
         .transfer_ready = &s_queue_ready,
         .startup_failed = &s_startup_failed,
         .consume = ddd_v1_consume,
-        .consume_context = &consumer
+        .consume_context = &consumer,
+        .telemetry = ddd_v1_fifo_receive,
+        .telemetry_context = NULL
     };
     gui_ddd_async_result_t async_result = {0};
     int result;
@@ -524,6 +714,7 @@ int gui_ddd_v1_start(gui_app_t *app, uint8_t decimation, bool test_mode)
     thrd_t thread;
 
     if (!app) return -1;
+    ddd_v1_fifo_reset();
     if (!s_handle) {
         gui_app_set_status(app, "DdD device is not open");
         return -1;

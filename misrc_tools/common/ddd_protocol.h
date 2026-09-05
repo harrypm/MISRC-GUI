@@ -43,6 +43,30 @@ extern "C" {
 #define DDD_REGISTER_TEST_MODE           UINT8_C(0x10)
 #define DDD_REGISTER_DECIMATION          UINT8_C(0x12)
 
+/* Self-described FIFO telemetry block. Reading address 0x40 latches a
+ * coherent snapshot and clears the interval counters in the gateware. */
+#define DDD_REGISTER_FIFO_TELEMETRY       UINT8_C(0x40)
+#define DDD_FIFO_TELEMETRY_ID             UINT8_C(0xBD)
+#define DDD_FIFO_TELEMETRY_LENGTH         23u
+#define DDD_FIFO_TELEMETRY_FORMAT         UINT8_C(1)
+#define DDD_FIFO_TELEMETRY_FORMAT_MASK    UINT8_C(0x0F)
+#define DDD_FIFO_FLAG_OVERFLOW_SEEN       UINT8_C(0x10)
+#define DDD_FIFO_FLAG_SATURATED           UINT8_C(0x20)
+#define DDD_FIFO_NEAR_FULL_PRESCALE       256u
+
+#define DDD_FIFO_OFFSET_STATUS            1u
+#define DDD_FIFO_OFFSET_LATCH_COUNT       2u
+#define DDD_FIFO_OFFSET_USED_NOW          3u
+#define DDD_FIFO_OFFSET_PEAK              5u
+#define DDD_FIFO_OFFSET_PEAK_LIFETIME     7u
+#define DDD_FIFO_OFFSET_OVERFLOWS         9u
+#define DDD_FIFO_OFFSET_DROPPED           11u
+#define DDD_FIFO_OFFSET_PACKETS           13u
+#define DDD_FIFO_OFFSET_NEAR_FULL         15u
+#define DDD_FIFO_OFFSET_DEPTH             17u
+#define DDD_FIFO_OFFSET_PACKET_WORDS      19u
+#define DDD_FIFO_OFFSET_NEAR_FULL_WORDS   21u
+
 #define DDD_DECIMATION_FULL_RATE         UINT8_C(1)
 #define DDD_DECIMATION_HALF_RATE         UINT8_C(2)
 #define DDD_CONVERTER_SAMPLE_RATE_HZ     UINT32_C(40000000)
@@ -174,6 +198,36 @@ typedef struct ddd_control_ops {
     void *context;
 } ddd_control_ops_t;
 
+typedef struct ddd_fifo_telemetry {
+    bool present;
+    uint8_t format;
+    bool overflow_seen;
+    bool saturated;
+    uint8_t latch_count;
+    uint16_t used_now;
+    uint16_t peak;
+    uint16_t peak_since_open;
+    uint16_t overflow_events;
+    uint16_t dropped_words;
+    uint16_t packets_read;
+    uint16_t near_full_units;
+    uint16_t depth_words;
+    uint16_t packet_words;
+    uint16_t near_full_words;
+} ddd_fifo_telemetry_t;
+
+typedef struct ddd_fifo_telemetry_totals {
+    bool latch_seen;
+    uint8_t last_latch_count;
+    bool interval_coverage_complete;
+    bool saturated;
+    uint64_t overflow_events;
+    uint64_t dropped_words;
+    uint64_t near_full_units;
+    uint16_t peak_words;
+    int peak_backpressure_percent;
+} ddd_fifo_telemetry_totals_t;
+
 typedef enum ddd_protocol_result {
     DDD_PROTOCOL_OK = 0,
     DDD_PROTOCOL_INVALID_ARGUMENT,
@@ -198,6 +252,19 @@ typedef struct ddd_collection_state {
 } ddd_collection_state_t;
 
 void ddd_collection_state_init(ddd_collection_state_t *state);
+
+void ddd_fifo_telemetry_init(ddd_fifo_telemetry_t *telemetry);
+bool ddd_fifo_telemetry_parse(const uint8_t *block,
+                              size_t block_length,
+                              ddd_fifo_telemetry_t *telemetry);
+int ddd_fifo_backpressure_percent(const ddd_fifo_telemetry_t *telemetry);
+int ddd_fifo_peak_percent(const ddd_fifo_telemetry_t *telemetry);
+int ddd_fifo_used_percent(const ddd_fifo_telemetry_t *telemetry);
+void ddd_fifo_telemetry_totals_init(
+    ddd_fifo_telemetry_totals_t *totals);
+bool ddd_fifo_telemetry_totals_add(
+    ddd_fifo_telemetry_totals_t *totals,
+    const ddd_fifo_telemetry_t *telemetry);
 
 /* Protocol-v1 order: B7(identity), B8(test), B8(decimation), B7(test),
  * B7(decimation), B5(start). Every partial start is rolled back to B5(stop),

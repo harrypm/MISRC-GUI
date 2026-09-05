@@ -10,6 +10,7 @@
 #define GUI_UI_SCALE_HUD_DURATION_S 1.5
 #define GUI_UI_SCALE_HUD_FADE_S 0.3
 #define GUI_UI_MODAL_MARGIN 12
+#define GUI_UI_VU_BAR_WIDTH 35.0f
 // Compact (short-label) readouts kick in below this width. Keep this below
 // the default startup window so full labels remain visible at stock size and
 // compact labels only appear once width pressure is real.
@@ -53,6 +54,23 @@ int gui_ui_scale_parse_percent(const char *text);
 // transition and the configured scale bounds. A zero direction is a no-op.
 int gui_ui_scale_step_percent(int current_percent, int direction);
 
+// Only the channel stats panel width grows by 60% of zoom above 100%.
+// Return its width relative to the globally scaled UI; text and controls
+// keep the global scale. Zoom-out and invalid values stay unchanged.
+float gui_ui_stats_width_scale(int percent);
+
+typedef struct gui_ui_channel_spacing {
+    float vu_column_width;
+    int horizontal_gap;
+} gui_ui_channel_spacing_t;
+
+// Follow the status bar's viewport-only compact-label boundary, so live
+// values and capture state cannot resize the channel area. Compact channels
+// cap empty margins in physical pixels without shrinking the logical VU bar;
+// render_scale_x includes OS backing scale. Full labels keep the old spacing.
+gui_ui_channel_spacing_t gui_ui_get_channel_spacing(bool compact,
+                                                     float render_scale_x);
+
 // Returns the transient zoom HUD opacity from its remaining display time.
 // The HUD stays opaque until the final fade interval, then reaches zero at
 // the deadline.
@@ -84,6 +102,12 @@ bool gui_ui_status_uses_two_rows(gui_ui_status_layout_mode_t layout_mode,
 // normal compact status bar can remain on one line.
 bool gui_ui_status_shows_extended_counters(int layout_width,
                                            bool is_recording);
+
+// Nonzero stream faults still need a compact indicator when the individual
+// counters are hidden by the measured budget, not a width breakpoint.
+// Critical stop messages retain their existing priority.
+bool gui_ui_status_uses_fault_summary(bool has_missed, bool has_errors,
+                                      bool show_missed, bool show_errors);
 
 // Routes one frame of wheel input. Vertical Ctrl/Cmd+wheel is accumulated into
 // discrete scale steps and consumed so it cannot also scroll Clay or a panel.

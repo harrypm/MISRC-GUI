@@ -330,6 +330,136 @@ static bool test_lifecycle(void)
     return true;
 }
 
+static void put_word(uint8_t *block, size_t offset, uint16_t value)
+{
+    block[offset] = (uint8_t)(value & 0xffu);
+    block[offset + 1u] = (uint8_t)(value >> 8);
+}
+
+static void make_fifo_block(uint8_t *block,
+                            uint16_t peak,
+                            uint16_t overflows,
+                            uint16_t dropped)
+{
+    memset(block, 0, DDD_FIFO_TELEMETRY_LENGTH);
+    block[0] = DDD_FIFO_TELEMETRY_ID;
+    block[DDD_FIFO_OFFSET_STATUS] = DDD_FIFO_TELEMETRY_FORMAT;
+    block[DDD_FIFO_OFFSET_LATCH_COUNT] = 7;
+    put_word(block, DDD_FIFO_OFFSET_USED_NOW, 4000);
+    put_word(block, DDD_FIFO_OFFSET_PEAK, peak);
+    put_word(block, DDD_FIFO_OFFSET_PEAK_LIFETIME, 12288);
+    put_word(block, DDD_FIFO_OFFSET_OVERFLOWS, overflows);
+    put_word(block, DDD_FIFO_OFFSET_DROPPED, dropped);
+    put_word(block, DDD_FIFO_OFFSET_PACKETS, 1221);
+    put_word(block, DDD_FIFO_OFFSET_NEAR_FULL, 12);
+    put_word(block, DDD_FIFO_OFFSET_DEPTH, 16384);
+    put_word(block, DDD_FIFO_OFFSET_PACKET_WORDS, 8192);
+    put_word(block, DDD_FIFO_OFFSET_NEAR_FULL_WORDS, 12288);
+}
+
+static bool test_fifo_telemetry(void)
+{
+    uint8_t block[DDD_FIFO_TELEMETRY_LENGTH];
+    ddd_fifo_telemetry_t telemetry;
+
+    make_fifo_block(block, 12288, 0, 0);
+    block[DDD_FIFO_OFFSET_STATUS] |=
+        DDD_FIFO_FLAG_OVERFLOW_SEEN | DDD_FIFO_FLAG_SATURATED;
+    CHECK(ddd_fifo_telemetry_parse(block, sizeof(block), &telemetry));
+    CHECK(telemetry.present);
+    CHECK(telemetry.format == DDD_FIFO_TELEMETRY_FORMAT);
+    CHECK(telemetry.overflow_seen);
+    CHECK(telemetry.saturated);
+    CHECK(telemetry.latch_count == 7);
+    CHECK(telemetry.used_now == 4000);
+    CHECK(telemetry.peak == 12288);
+    CHECK(telemetry.peak_since_open == 12288);
+    CHECK(telemetry.packets_read == 1221);
+    CHECK(telemetry.near_full_units == 12);
+    CHECK(telemetry.depth_words == 16384);
+    CHECK(telemetry.packet_words == 8192);
+    CHECK(telemetry.near_full_words == 12288);
+    CHECK(ddd_fifo_backpressure_percent(&telemetry) == 50);
+    CHECK(ddd_fifo_peak_percent(&telemetry) == 75);
+    CHECK(ddd_fifo_used_percent(&telemetry) == 24);
+
+    make_fifo_block(block, 8192, 0, 0);
+    CHECK(ddd_fifo_telemetry_parse(block, sizeof(block), &telemetry));
+    CHECK(ddd_fifo_backpressure_percent(&telemetry) == 0);
+
+    make_fifo_block(block, 1000, 1, 4200);
+    CHECK(ddd_fifo_telemetry_parse(block, sizeof(block), &telemetry));
+    CHECK(ddd_fifo_backpressure_percent(&telemetry) == 100);
+    CHECK(telemetry.dropped_words == 4200);
+
+    memset(block, 0, sizeof(block));
+    CHECK(!ddd_fifo_telemetry_parse(block, sizeof(block), &telemetry));
+    CHECK(!telemetry.present);
+    memset(block, 0xff, sizeof(block));
+    CHECK(!ddd_fifo_telemetry_parse(block, sizeof(block), &telemetry));
+    make_fifo_block(block, 9000, 0, 0);
+    CHECK(!ddd_fifo_telemetry_parse(
+        block, DDD_FIFO_TELEMETRY_LENGTH - 1u, &telemetry));
+    block[DDD_FIFO_OFFSET_STATUS] = DDD_FIFO_TELEMETRY_FORMAT + 1u;
+    CHECK(!ddd_fifo_telemetry_parse(block, sizeof(block), &telemetry));
+    make_fifo_block(block, 9000, 0, 0);
+    put_word(block, DDD_FIFO_OFFSET_PACKET_WORDS, 16385);
+    CHECK(!ddd_fifo_telemetry_parse(block, sizeof(block), &telemetry));
+    make_fifo_block(block, 9000, 0, 0);
+    put_word(block, DDD_FIFO_OFFSET_PACKET_WORDS, 0);
+    CHECK(!ddd_fifo_telemetry_parse(block, sizeof(block), &telemetry));
+    make_fifo_block(block, 9000, 0, 0);
+    put_word(block, DDD_FIFO_OFFSET_PACKET_WORDS, 16384);
+    CHECK(!ddd_fifo_telemetry_parse(block, sizeof(block), &telemetry));
+
+    make_fifo_block(block, UINT16_MAX, 0, 0);
+    put_word(block, DDD_FIFO_OFFSET_USED_NOW, UINT16_MAX);
+    CHECK(ddd_fifo_telemetry_parse(block, sizeof(block), &telemetry));
+    CHECK(ddd_fifo_peak_percent(&telemetry) == 100);
+    CHECK(ddd_fifo_used_percent(&telemetry) == 100);
+    CHECK(!ddd_fifo_telemetry_parse(block, sizeof(block), NULL));
+    CHECK(!ddd_fifo_telemetry_parse(NULL, sizeof(block), &telemetry));
+    return true;
+}
+
+static bool test_fifo_telemetry_totals(void)
+{
+    uint8_t block[DDD_FIFO_TELEMETRY_LENGTH];
+    ddd_fifo_telemetry_t telemetry;
+    ddd_fifo_telemetry_totals_t totals;
+
+    ddd_fifo_telemetry_totals_init(&totals);
+    CHECK(totals.interval_coverage_complete);
+    make_fifo_block(block, 9000, 1, 100);
+    block[DDD_FIFO_OFFSET_LATCH_COUNT] = 255;
+    CHECK(ddd_fifo_telemetry_parse(block, sizeof(block), &telemetry));
+    CHECK(ddd_fifo_telemetry_totals_add(&totals, &telemetry));
+    CHECK(totals.overflow_events == 1);
+    CHECK(totals.dropped_words == 100);
+    CHECK(totals.near_full_units == 12);
+    CHECK(totals.peak_words == 9000);
+    CHECK(totals.peak_backpressure_percent == 100);
+
+    CHECK(!ddd_fifo_telemetry_totals_add(&totals, &telemetry));
+    CHECK(totals.overflow_events == 1);
+
+    make_fifo_block(block, 12288, 0, 0);
+    block[DDD_FIFO_OFFSET_LATCH_COUNT] = 0;
+    CHECK(ddd_fifo_telemetry_parse(block, sizeof(block), &telemetry));
+    CHECK(ddd_fifo_telemetry_totals_add(&totals, &telemetry));
+    CHECK(totals.interval_coverage_complete);
+    CHECK(totals.peak_words == 12288);
+
+    block[DDD_FIFO_OFFSET_LATCH_COUNT] = 2;
+    CHECK(ddd_fifo_telemetry_parse(block, sizeof(block), &telemetry));
+    CHECK(ddd_fifo_telemetry_totals_add(&totals, &telemetry));
+    CHECK(!totals.interval_coverage_complete);
+    CHECK(!ddd_fifo_telemetry_totals_add(NULL, &telemetry));
+    CHECK(!ddd_fifo_telemetry_totals_add(&totals, NULL));
+    ddd_fifo_telemetry_totals_init(NULL);
+    return true;
+}
+
 static bool test_validators(void)
 {
     ddd_sequence_validator_t sequence;
@@ -386,6 +516,8 @@ int main(void)
         !test_reconnect_path_selection() ||
         !test_topology_and_endpoint() ||
         !test_lifecycle() ||
+        !test_fifo_telemetry() ||
+        !test_fifo_telemetry_totals() ||
         !test_validators()) {
         return 1;
     }

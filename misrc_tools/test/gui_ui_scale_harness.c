@@ -62,6 +62,92 @@ int main(void)
     expect_true(gui_ui_scale_step_percent(150, 0) == 150,
                 "zero keyboard direction leaves scale unchanged");
 
+    expect_float(gui_ui_stats_width_scale(75), 1.0f,
+                 "stats preserve the existing zoom-out behavior");
+    expect_float(gui_ui_stats_width_scale(100), 1.0f,
+                 "stats preserve the default layout exactly");
+    expect_float(gui_ui_stats_width_scale(0), 1.0f,
+                 "invalid stats scale uses the default");
+    expect_float(gui_ui_stats_width_scale(137), 1.0f,
+                 "unsupported scale steps use the default");
+    expect_float(gui_ui_stats_width_scale(110) * 1.1f, 1.06f,
+                 "110 percent UI zoom gives 106 percent stats width");
+    expect_float(gui_ui_stats_width_scale(150) * 1.5f, 1.3f,
+                 "150 percent UI zoom gives 130 percent stats width");
+    expect_float(gui_ui_stats_width_scale(200) * 2.0f, 1.6f,
+                 "200 percent UI zoom gives 160 percent stats width");
+    float previous_stats_scale = 1.0f;
+    for (int percent = 110; percent <= 200; percent += 10) {
+        float scale = (float)percent / 100.0f;
+        float stats_scale = scale * gui_ui_stats_width_scale(percent);
+        expect_true(stats_scale > previous_stats_scale && stats_scale < scale,
+                    "stats width grows monotonically but slower than the main UI");
+        previous_stats_scale = stats_scale;
+    }
+
+    gui_ui_channel_spacing_t spacing = gui_ui_get_channel_spacing(false, 1.0f);
+    expect_float(spacing.vu_column_width, 70.0f,
+                 "full status labels keep the original VU column");
+    expect_true(spacing.horizontal_gap == 4,
+                "full status labels keep the original horizontal gap");
+    spacing = gui_ui_get_channel_spacing(true, 1.0f);
+    expect_float(spacing.vu_column_width, 51.0f,
+                 "compact default VU keeps a 35px bar and two 8px margins");
+    spacing = gui_ui_get_channel_spacing(true, 2.0f);
+    expect_float(spacing.vu_column_width, 43.0f,
+                 "200 percent compact VU keeps a 35 logical pixel bar");
+    expect_true(spacing.horizontal_gap == 2,
+                "200 percent compact horizontal gap caps at four physical pixels");
+    // The caller supplies the current label choice, not a guessed width or
+    // the next-frame hysteresis state. Enter and leave without a separate latch.
+    const bool compact_labels[] = { false, true, true, false, false, true };
+    for (unsigned int i = 0; i < sizeof(compact_labels) / sizeof(compact_labels[0]); i++) {
+        spacing = gui_ui_get_channel_spacing(compact_labels[i], 1.7f);
+        expect_float(spacing.vu_column_width,
+                     compact_labels[i] ? 35.0f + 16.0f / 1.7f : 70.0f,
+                     "170 percent spacing follows each frame's actual status labels");
+        expect_true(spacing.horizontal_gap == (compact_labels[i] ? 2 : 4),
+                    "horizontal gaps follow the same frame's actual status labels");
+    }
+    spacing = gui_ui_get_channel_spacing(true, 0.75f);
+    expect_float(spacing.vu_column_width, 35.0f + 16.0f / 0.75f,
+                 "compact labels also cap margins when zoomed out");
+    expect_true(spacing.horizontal_gap == 4,
+                "zoom-out never enlarges the original horizontal gap");
+    const float invalid_render_scales[] = { 0.0f, -1.0f, NAN, INFINITY };
+    for (unsigned int i = 0; i < sizeof(invalid_render_scales) / sizeof(invalid_render_scales[0]); i++) {
+        spacing = gui_ui_get_channel_spacing(true, invalid_render_scales[i]);
+        expect_float(spacing.vu_column_width, 70.0f,
+                     "invalid render scale keeps a safe VU column");
+        expect_true(spacing.horizontal_gap == 4,
+                    "invalid render scale keeps a safe horizontal gap");
+    }
+    const int spacing_percents[] = { 75, 80, 90, 100, 110, 120, 130, 140, 150, 160, 170, 180, 190, 200 };
+    const float backing_scales[] = { 1.0f, 1.5f, 2.0f };
+    for (unsigned int zoom = 0; zoom < sizeof(spacing_percents) / sizeof(spacing_percents[0]); zoom++) {
+        for (unsigned int backing = 0; backing < sizeof(backing_scales) / sizeof(backing_scales[0]); backing++) {
+            float render_scale = (float)spacing_percents[zoom] / 100.0f * backing_scales[backing];
+            for (int compact = 0; compact <= 1; compact++) {
+                spacing = gui_ui_get_channel_spacing(compact, render_scale);
+                expect_true(spacing.vu_column_width >= GUI_UI_VU_BAR_WIDTH &&
+                            spacing.vu_column_width <= 70.0f,
+                            "spacing never shrinks the VU bar or enlarges its column");
+                if (compact) {
+                    float margin_px = (spacing.vu_column_width - GUI_UI_VU_BAR_WIDTH) *
+                                      0.5f * render_scale;
+                    float gap_px = (float)spacing.horizontal_gap * render_scale;
+                    expect_true(margin_px <= 8.0001f && gap_px <= 4.0001f,
+                                "compact empty margins respect their physical pixel caps");
+                } else {
+                    expect_float(spacing.vu_column_width, 70.0f,
+                                 "full labels keep original spacing at every zoom/backing scale");
+                    expect_true(spacing.horizontal_gap == 4,
+                                "full labels keep the original gap at every zoom/backing scale");
+                }
+            }
+        }
+    }
+
     expect_float((float)GUI_UI_SCALE_HUD_DURATION_S,
                  1.5f,
                  "zoom HUD uses the requested 1.5-second lifetime");
@@ -170,6 +256,25 @@ int main(void)
     expect_true(gui_ui_status_shows_extended_counters(
                     GUI_UI_STATUS_RECORDING_NARROW_BREAKPOINT, true),
                 "recording restores extended counters at its wider breakpoint");
+
+    expect_true(gui_ui_status_uses_fault_summary(true, false, false, true),
+                "a hidden nonzero missed counter retains a summary");
+    expect_true(gui_ui_status_uses_fault_summary(false, true, true, false),
+                "a hidden nonzero error counter retains a summary");
+    expect_true(gui_ui_status_uses_fault_summary(true, true, false, false),
+                "both hidden nonzero counters retain a summary");
+    expect_true(!gui_ui_status_uses_fault_summary(false, false, false, false),
+                "hidden zero counters need no fault summary");
+    expect_true(!gui_ui_status_uses_fault_summary(true, true, true, true),
+                "visible nonzero counters do not get a duplicate summary");
+    expect_true(!gui_ui_status_uses_fault_summary(true, false, true, false),
+                "hiding a zero error count does not duplicate visible missed faults");
+    expect_true(!gui_ui_status_uses_fault_summary(false, true, false, true),
+                "hiding a zero missed count does not duplicate visible errors");
+    expect_true(gui_ui_status_uses_fault_summary(true, true, true, false),
+                "a hidden error summary survives beside the visible missed counter");
+    expect_true(gui_ui_status_uses_fault_summary(true, true, false, true),
+                "a hidden missed summary survives beside the visible error counter");
 
     gui_ui_zoom_result_t result =
         gui_ui_zoom_process(&state, 100, false, 0.25f, -0.5f);

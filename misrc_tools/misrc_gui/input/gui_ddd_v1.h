@@ -9,13 +9,20 @@
 #include <stdint.h>
 
 #include "../../common/device_enum.h"
+#include "../../common/ddd_protocol.h"
 
 typedef struct gui_app gui_app_t;
+
+typedef struct gui_ddd_v1_fifo_snapshot {
+    ddd_fifo_telemetry_t latest;
+    ddd_fifo_telemetry_totals_t totals;
+} gui_ddd_v1_fifo_snapshot_t;
 
 int gui_ddd_v1_open(gui_app_t *app, const char *stable_usb_path);
 int gui_ddd_v1_start(gui_app_t *app, uint8_t decimation, bool test_mode);
 void gui_ddd_v1_stop(gui_app_t *app);
 bool gui_ddd_v1_is_active(void);
+bool gui_ddd_v1_get_fifo_snapshot(gui_ddd_v1_fifo_snapshot_t *snapshot);
 
 /* A failed/unverified B5 cleanup locks only the exact physical DDD 3.1 path.
  * Two complete enumerations must observe disappearance followed by reappearance

@@ -82,6 +82,7 @@ typedef struct {
     phosphor_color_mode_t phosphor_color;
 
     // UI overlay state - two dropdowns: render mode and trigger mode
+    Rectangle time_div_rect;
     Rectangle render_mode_btn_rect;
     Rectangle render_mode_opts_rect[WAVEFORM_MODE_COUNT];
     bool render_mode_dropdown_open;
@@ -294,7 +295,9 @@ static void format_time_label(char *buf, size_t buf_size, double seconds) {
 void draw_channel_grid(float x, float y, float width, float height,
                        const char *label, Color channel_color, bool show_grid,
                        float zoom_scale, uint32_t sample_rate,
-                       bool trigger_enabled, int trigger_display_pos) {
+                       bool trigger_enabled, int trigger_display_pos,
+                       Rectangle *time_div_rect) {
+    if (time_div_rect) *time_div_rect = (Rectangle){0};
     // Background slightly darker than main bg
     DrawRectangle((int)x, (int)y, (int)width, (int)height, (Color){25, 25, 30, 255});
 
@@ -368,6 +371,10 @@ void draw_channel_grid(float x, float y, float width, float height,
             char div_label[48];
             snprintf(div_label, sizeof(div_label), "%s/div", time_buf);
             gui_text_draw_mono(div_label, x + 8, y + 26, FONT_SIZE_OSC_DIV, COLOR_TEXT);
+            if (time_div_rect) {
+                *time_div_rect = (Rectangle){x + 8, y + 26,
+                    gui_text_measure_mono(div_label, FONT_SIZE_OSC_DIV) + 1, FONT_SIZE_OSC_DIV};
+            }
         } else {
             // Fallback: fixed divisions when no sample rate available
             const int fixed_divisions = 10;
@@ -539,7 +546,7 @@ static void render_waveform_line_internal(waveform_panel_state_t *state,
     uint32_t sample_rate = atomic_load(&app->sample_rate);
     draw_channel_grid(x, y, w, h, label, color, app->settings.show_grid,
                       snap.zoom_scale, sample_rate,
-                      snap.trigger_enabled, snap.trigger_display_pos);
+                      snap.trigger_enabled, snap.trigger_display_pos, &state->time_div_rect);
 
     // Draw trigger level and position markers
     draw_panel_trigger_markers(x, y, w, h, &snap, app->settings.amplitude_scale, color);
@@ -590,7 +597,7 @@ static void render_waveform_phosphor_internal(waveform_panel_state_t *state,
     uint32_t sample_rate = atomic_load(&app->sample_rate);
     draw_channel_grid(x, y, w, h, label, color, app->settings.show_grid,
                       snap.zoom_scale, sample_rate,
-                      snap.trigger_enabled, snap.trigger_display_pos);
+                      snap.trigger_enabled, snap.trigger_display_pos, &state->time_div_rect);
 
     // Draw trigger level and position markers
     draw_panel_trigger_markers(x, y, w, h, &snap, app->settings.amplitude_scale, color);
@@ -1086,24 +1093,90 @@ static void waveform_render_overlay(void *state_ptr, Rectangle bounds) {
     if (!state->initialized) return;
 
     float btn_h = 18;
-    float btn_y = bounds.y + 8;
+    float render_btn_y = bounds.y + 8;
+    float trig_btn_y = render_btn_y;
     Vector2 mouse = gui_ui_get_mouse_position();
 
-    // Button widths
-    float trig_btn_w = 98;
-    float render_btn_w = 85;  // Larger for render mode with label
+    // Reserve the widest label plus arrow/padding, not just the current value.
+    // Both dropdowns keep the same width when the selection changes.
+    float button_width = 98;
+    for (int i = 0; i < WAVEFORM_MODE_COUNT; i++) {
+        button_width = fmaxf(button_width,
+            gui_text_measure(s_render_mode_labels[i], FONT_SIZE_DROPDOWN_OPT) + 24);
+    }
+    for (int i = 0; i < TRIGGER_MODE_COUNT; i++) {
+        button_width = fmaxf(button_width,
+            gui_text_measure(s_trigger_mode_labels[i], FONT_SIZE_DROPDOWN_OPT) + 12);
+        for (int source = 0; source < TRIGGER_SOURCE_COUNT; source++) {
+            char label[24];
+            snprintf(label, sizeof(label), "%s/%s",
+                     s_trigger_mode_short_labels[i], s_trigger_source_labels[source]);
+            button_width = fmaxf(button_width,
+                gui_text_measure(label, FONT_SIZE_DROPDOWN_OPT) + 24);
+        }
+    }
+    float trig_btn_w = button_width;
+    float render_btn_w = button_width;
+
+    const char *trig_prefix = "Trig:";
+    const char *mode_prefix = "Mode:";
+    int trig_prefix_w = gui_text_measure(trig_prefix, FONT_SIZE_DROPDOWN_OPT);
+    int mode_prefix_w = gui_text_measure(mode_prefix, FONT_SIZE_DROPDOWN_OPT);
+    float trig_btn_x = bounds.x + bounds.width - trig_btn_w - 8;
+    float render_btn_x = trig_btn_x - trig_prefix_w - 8 - render_btn_w - 8;
+    float mode_label_x = render_btn_x - mode_prefix_w - 4;
+    float trig_label_x = trig_btn_x - trig_prefix_w - 4;
+    float text_offset_y = (btn_h - FONT_SIZE_DROPDOWN_OPT) / 2;
+    float mode_label_y = render_btn_y + text_offset_y;
+    float trig_label_y = trig_btn_y + text_offset_y;
+    float channel_label_w = fmaxf(gui_text_measure("CH A", FONT_SIZE_OSC_LABEL),
+                                 gui_text_measure("CH B", FONT_SIZE_OSC_LABEL));
+
+    // Wrap into aligned label/button columns. Only avoid the actual time/div
+    // label, not an empty strip across the full width of the waveform.
+    if (mode_label_x < bounds.x + 8 + channel_label_w + 8) {
+        float row_gap = 2;
+        float label_width = fmaxf(mode_prefix_w, trig_prefix_w);
+        render_btn_x = bounds.x + bounds.width - render_btn_w - 8;
+        mode_label_x = render_btn_x - label_width - 4;
+        trig_label_x = mode_label_x;
+        if (mode_label_x < bounds.x + 8 + channel_label_w + 8) {
+            render_btn_y = bounds.y + 4 + FONT_SIZE_OSC_LABEL + row_gap;
+        }
+        bool labels_above = mode_label_x < bounds.x + 8;
+        float row_x = labels_above ? bounds.x + 8 : mode_label_x;
+        float row_h = labels_above ? FONT_SIZE_DROPDOWN_OPT + row_gap + btn_h : btn_h;
+        Rectangle row = {row_x, render_btn_y, bounds.x + bounds.width - 8 - row_x, row_h};
+        if (state->time_div_rect.width > 0 && CheckCollisionRecs(row, state->time_div_rect)) {
+            render_btn_y = state->time_div_rect.y + state->time_div_rect.height + row_gap;
+        }
+        mode_label_y = render_btn_y + text_offset_y;
+        if (labels_above) {
+            // Very narrow panels put the label above its dropdown as well.
+            mode_label_x = bounds.x + 8;
+            mode_label_y = render_btn_y;
+            render_btn_y += FONT_SIZE_DROPDOWN_OPT + row_gap;
+        }
+        trig_btn_y = render_btn_y + btn_h + row_gap;
+        row.y = trig_btn_y;
+        if (state->time_div_rect.width > 0 && CheckCollisionRecs(row, state->time_div_rect)) {
+            trig_btn_y = state->time_div_rect.y + state->time_div_rect.height + row_gap;
+        }
+        trig_label_y = trig_btn_y + text_offset_y;
+        if (labels_above) {
+            trig_label_x = bounds.x + 8;
+            trig_label_y = trig_btn_y;
+            trig_btn_y += FONT_SIZE_DROPDOWN_OPT + row_gap;
+        }
+    }
 
     //-------------------------------------------------------------------------
     // Trigger Mode Dropdown (top-right, rightmost)
     //-------------------------------------------------------------------------
-    float trig_btn_x = bounds.x + bounds.width - trig_btn_w - 8;
-    state->trigger_btn_rect = (Rectangle){trig_btn_x, btn_y, trig_btn_w, btn_h};
+    state->trigger_btn_rect = (Rectangle){trig_btn_x, trig_btn_y, trig_btn_w, btn_h};
 
     // Draw "Trig:" label
-    const char *trig_prefix = "Trig:";
-    int trig_prefix_w = gui_text_measure(trig_prefix, FONT_SIZE_DROPDOWN_OPT);
-    gui_text_draw(trig_prefix, trig_btn_x - trig_prefix_w - 4,
-                  btn_y + (btn_h - FONT_SIZE_DROPDOWN_OPT) / 2,
+    gui_text_draw(trig_prefix, trig_label_x, trig_label_y,
                   FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT_DIM);
 
     char trig_label_buf[24];
@@ -1116,14 +1189,25 @@ static void waveform_render_overlay(void *state_ptr, Rectangle bounds) {
     }
     draw_dropdown_button(state->trigger_btn_rect, trig_label, state->trigger_dropdown_open);
 
+    // Draw both controls before either popup so a wrapped button cannot cover
+    // an open menu. Mode is above trigger when the controls use separate rows.
+    state->render_mode_btn_rect = (Rectangle){render_btn_x, render_btn_y, render_btn_w, btn_h};
+    gui_text_draw(mode_prefix, mode_label_x, mode_label_y,
+                  FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT_DIM);
+    const char *render_label = s_render_mode_labels[state->render_mode];
+    draw_dropdown_button(state->render_mode_btn_rect, render_label, state->render_mode_dropdown_open);
+
     // Draw trigger dropdown options if open
     if (state->trigger_dropdown_open) {
-        float opt_y = btn_y + btn_h;
         float opt_h = 20;
         int mode_rows = TRIGGER_MODE_COUNT + 1;  // +1 for \"Off\"
         int header_rows = 1;                     // \"Channel\" section header
         int source_rows = TRIGGER_SOURCE_COUNT;
         int total_rows = mode_rows + header_rows + source_rows;
+        // Shift the popup up when wrapping leaves too little space below.
+        // Panel dispatch only accepts clicks inside these same bounds.
+        float opt_y = fmaxf(bounds.y, fminf(trig_btn_y + btn_h,
+                            bounds.y + bounds.height - opt_h * total_rows - 4));
 
         DrawRectangleRounded((Rectangle){trig_btn_x, opt_y, trig_btn_w, opt_h * total_rows},
                              0.1f, 4, COLOR_PANEL_BG);
@@ -1187,26 +1271,11 @@ static void waveform_render_overlay(void *state_ptr, Rectangle bounds) {
         }
     }
 
-    //-------------------------------------------------------------------------
-    // Render Mode Dropdown (to the left of trigger)
-    //-------------------------------------------------------------------------
-    float render_btn_x = trig_btn_x - trig_prefix_w - 8 - render_btn_w - 8;
-    state->render_mode_btn_rect = (Rectangle){render_btn_x, btn_y, render_btn_w, btn_h};
-
-    // Draw "Mode:" label
-    const char *mode_prefix = "Mode:";
-    int mode_prefix_w = gui_text_measure(mode_prefix, FONT_SIZE_DROPDOWN_OPT);
-    gui_text_draw(mode_prefix, render_btn_x - mode_prefix_w - 4,
-                  btn_y + (btn_h - FONT_SIZE_DROPDOWN_OPT) / 2,
-                  FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT_DIM);
-
-    const char *render_label = s_render_mode_labels[state->render_mode];
-    draw_dropdown_button(state->render_mode_btn_rect, render_label, state->render_mode_dropdown_open);
-
     // Draw render mode dropdown options if open
     if (state->render_mode_dropdown_open) {
-        float opt_y = btn_y + btn_h;
         float opt_h = 20;
+        float opt_y = fmaxf(bounds.y, fminf(render_btn_y + btn_h,
+                            bounds.y + bounds.height - opt_h * WAVEFORM_MODE_COUNT - 4));
 
         DrawRectangleRounded((Rectangle){render_btn_x, opt_y, render_btn_w, opt_h * WAVEFORM_MODE_COUNT},
                              0.1f, 4, COLOR_PANEL_BG);
@@ -1241,10 +1310,20 @@ static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, in
     waveform_panel_state_t *state = (waveform_panel_state_t *)state_ptr;
     waveform_apply_channel_trigger_source_default(state, channel);
 
+    // A popup can overlap either button after wrapping or shifting upward.
+    // Its visible rows (including the Channel header) take click priority.
+    Rectangle render_menu = state->render_mode_opts_rect[0];
+    render_menu.height = WAVEFORM_MODE_COUNT * 20;
+    Rectangle trigger_menu = state->trigger_mode_opts_rect[0];
+    trigger_menu.height = (TRIGGER_MODE_COUNT + 2 + TRIGGER_SOURCE_COUNT) * 20;
+    bool click_on_menu =
+        (state->render_mode_dropdown_open && CheckCollisionPointRec(click, render_menu)) ||
+        (state->trigger_dropdown_open && CheckCollisionPointRec(click, trigger_menu));
+
     //-------------------------------------------------------------------------
     // Render Mode Dropdown
     //-------------------------------------------------------------------------
-    if (CheckCollisionPointRec(click, state->render_mode_btn_rect)) {
+    if (!click_on_menu && CheckCollisionPointRec(click, state->render_mode_btn_rect)) {
         state->render_mode_dropdown_open = !state->render_mode_dropdown_open;
         state->trigger_dropdown_open = false;  // Close other dropdown
         return true;
@@ -1252,9 +1331,7 @@ static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, in
 
     if (state->render_mode_dropdown_open) {
         for (int i = 0; i < WAVEFORM_MODE_COUNT; i++) {
-            Rectangle opt_rect = {state->render_mode_btn_rect.x,
-                                  state->render_mode_btn_rect.y + state->render_mode_btn_rect.height + i * 20,
-                                  state->render_mode_btn_rect.width, 20};
+            Rectangle opt_rect = state->render_mode_opts_rect[i];
             if (CheckCollisionPointRec(click, opt_rect)) {
                 state->render_mode = (waveform_render_mode_t)i;
                 state->render_mode_dropdown_open = false;
@@ -1269,7 +1346,7 @@ static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, in
     //-------------------------------------------------------------------------
     // Trigger Mode Dropdown
     //-------------------------------------------------------------------------
-    if (CheckCollisionPointRec(click, state->trigger_btn_rect)) {
+    if (!click_on_menu && CheckCollisionPointRec(click, state->trigger_btn_rect)) {
         state->trigger_dropdown_open = !state->trigger_dropdown_open;
         state->render_mode_dropdown_open = false;  // Close other dropdown
         return true;
