@@ -25,6 +25,8 @@ typedef struct gui_device_buffer_view {
     int meter_percent;
     gui_device_buffer_severity_t severity;
     char caption[64];
+    /* Device-defined detail text for a click-time snapshot. */
+    char details[512];
 } gui_device_buffer_view_t;
 
 #endif /* GUI_DEVICE_BUFFER_STATUS_H */

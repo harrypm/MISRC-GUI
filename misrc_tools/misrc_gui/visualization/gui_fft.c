@@ -616,9 +616,73 @@ static void fft_draw_text_mono(Font *fonts, const char *text, float px, float py
 static int fft_measure_text(Font *fonts, const char *text, int fontSize) {
     if (fonts) {
         Vector2 size = MeasureTextEx(fonts[0], text, (float)fontSize, 1.0f);
-        return (int)size.x;
+        return (int)ceilf(size.x);
     }
     return MeasureText(text, fontSize);
+}
+
+static Vector2 fft_measure_text_mono(Font *fonts, const char *text, int fontSize) {
+    if (fonts) {
+        return MeasureTextEx(fonts[1], text, (float)fontSize, 1.0f);
+    }
+    return (Vector2){(float)MeasureText(text, fontSize), (float)fontSize};
+}
+
+// Peak values use ASCII labels. Keep the font size and shorten only when even
+// a separate dB/frequency line cannot fit; never resize the FFT panel.
+static void fft_fit_peak_line(Font *fonts, char *text, size_t text_size, float width) {
+    if (fft_measure_text_mono(fonts, text, FONT_SIZE_NORMAL).x <= width) return;
+    if (text_size < 4) {
+        if (text_size > 0) text[0] = '\0';
+        return;
+    }
+
+    size_t length = strlen(text);
+    if (length > text_size - 4) length = text_size - 4;
+    for (;;) {
+        memcpy(text + length, "...", 4);
+        if (fft_measure_text_mono(fonts, text, FONT_SIZE_NORMAL).x <= width) return;
+        if (length == 0) break;
+        length--;
+    }
+    text[0] = '\0';
+}
+
+static void fft_draw_peak_label(Font *fonts, const char *db_text, const char *freq_text,
+                                Vector2 anchor, float dot_radius, Rectangle bounds) {
+    const float padding = 2;
+    float available_width = bounds.width - 2 * padding;
+    float available_height = bounds.height - 2 * padding;
+    if (available_width <= 0 || available_height <= 0) return;
+
+    char lines[2][64];
+    snprintf(lines[0], sizeof(lines[0]), "%s %s", db_text, freq_text);
+    Vector2 size = fft_measure_text_mono(fonts, lines[0], FONT_SIZE_NORMAL);
+    if (size.y > available_height) return;
+
+    int line_count = 1;
+    float line_step = size.y + 2;
+    if (size.x > available_width && size.y + line_step <= available_height) {
+        snprintf(lines[0], sizeof(lines[0]), "%s", db_text);
+        snprintf(lines[1], sizeof(lines[1]), "%s", freq_text);
+        line_count = 2;
+    }
+
+    float label_height = size.y + (line_count - 1) * line_step;
+    float label_y = anchor.y - dot_radius - 10 - label_height;
+    if (label_y < bounds.y + padding) label_y = anchor.y + dot_radius + 4;
+    label_y = fmaxf(bounds.y + padding,
+                   fminf(label_y, bounds.y + bounds.height - padding - label_height));
+
+    for (int i = 0; i < line_count; i++) {
+        fft_fit_peak_line(fonts, lines[i], sizeof(lines[i]), available_width);
+        if (!lines[i][0]) continue;
+        float label_width = fft_measure_text_mono(fonts, lines[i], FONT_SIZE_NORMAL).x;
+        float label_x = fmaxf(bounds.x + padding,
+            fminf(anchor.x - label_width / 2, bounds.x + bounds.width - padding - label_width));
+        fft_draw_text_mono(fonts, lines[i], label_x, label_y + i * line_step,
+                          FONT_SIZE_NORMAL, COLOR_TEXT);
+    }
 }
 
 void gui_fft_render(fft_state_t *state, float x, float y,
@@ -766,7 +830,7 @@ void gui_fft_render(fft_state_t *state, float x, float y,
                 // Draw frequency label (skip if too close to edges)
                 if (line_x > x + 30 && line_x < x + width - 30) {
                     format_freq_label(freq_buf, sizeof(freq_buf), freq);
-                    int label_w = fft_measure_text(fonts, freq_buf, FONT_SIZE_OSC_SCALE);
+                    float label_w = fft_measure_text_mono(fonts, freq_buf, FONT_SIZE_OSC_SCALE).x;
                     fft_draw_text_mono(fonts, freq_buf, line_x - label_w / 2, y + height - 14, FONT_SIZE_OSC_SCALE, COLOR_TEXT_DIM);
                 }
             }
@@ -777,14 +841,14 @@ void gui_fft_render(fft_state_t *state, float x, float y,
         format_freq_label(freq_buf, sizeof(freq_buf), freq_division);
         char div_label[48];
         snprintf(div_label, sizeof(div_label), "%s/div", freq_buf);
-        int div_label_w = fft_measure_text(fonts, div_label, FONT_SIZE_OSC_DIV);
+        float div_label_w = fft_measure_text_mono(fonts, div_label, FONT_SIZE_OSC_DIV).x;
         fft_draw_text_mono(fonts, div_label, x + width - div_label_w - 8, y + 26, FONT_SIZE_OSC_DIV, COLOR_TEXT);
 
         // Show zoom level if zoomed in
         if (zoom > 1.01f) {
             char zoom_label[32];
             snprintf(zoom_label, sizeof(zoom_label), "%.1fx", zoom);
-            int zoom_label_w = fft_measure_text(fonts, zoom_label, FONT_SIZE_OSC_DIV);
+            float zoom_label_w = fft_measure_text_mono(fonts, zoom_label, FONT_SIZE_OSC_DIV).x;
             fft_draw_text_mono(fonts, zoom_label, x + width - zoom_label_w - 8, y + 42, FONT_SIZE_OSC_DIV, COLOR_TEXT_DIM);
         }
     }
@@ -943,29 +1007,9 @@ void gui_fft_render(fft_state_t *state, float x, float y,
                 char db_buf[16];
                 snprintf(db_buf, sizeof(db_buf), "%.1fdB", db);
 
-                // Combined label
-                char peak_label[64];
-                snprintf(peak_label, sizeof(peak_label), "%s %s", db_buf, freq_buf);
-
-                // Draw label with background for readability
-                // Use smoothed anchor position for label placement
-                int label_w = fft_measure_text(fonts, peak_label, FONT_SIZE_OSC_SCALE);
-                float label_x = label_anchor_x - label_w / 2;
-                float label_y = label_anchor_y - dot_radius - 10 - FONT_SIZE_OSC_SCALE;
-
-                // Keep label on screen
-                if (label_x < x + 2) label_x = x + 2;
-                if (label_x + label_w > x + width - 2) label_x = x + width - label_w - 2;
-                if (label_y < y + 2) label_y = label_anchor_y + dot_radius + 4;
-
-                // Draw background rectangle
-                // DrawRectangle((int)(label_x - 2), (int)(label_y - 1),
-                //              label_w + 4, FONT_SIZE_OSC_SCALE + 2,
-                //              (Color){0, 0, 0, 180});
-
-                // Draw label text
-                fft_draw_text_mono(fonts, peak_label, label_x, label_y,
-                                   FONT_SIZE_NORMAL, COLOR_TEXT);
+                // Use the rendered font metrics and retain the smoothed anchor.
+                fft_draw_peak_label(fonts, db_buf, freq_buf,
+                    (Vector2){label_anchor_x, label_anchor_y}, dot_radius, fft_rect);
                 }  // end if (best_score >= 0)
             } else {
                 // No peak found - deactivate label smoothing

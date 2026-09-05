@@ -124,6 +124,7 @@ void gui_popup_render(void)
         gui_ui_modal_max_extent(gui_ui_get_layout_height(), 600);
     int popup_min_width = popup_max_width < 320 ? popup_max_width : 320;
     int popup_min_height = popup_max_height < 156 ? popup_max_height : 156;
+    int popup_message_max_width = popup_max_width > 48 ? popup_max_width - 48 : 1;
 
     // Full-screen dimming overlay
     CLAY(CLAY_ID("PopupOverlay"), {
@@ -188,7 +189,7 @@ void gui_popup_render(void)
                 // Message
                 CLAY(CLAY_ID("PopupMessage"), {
                     .layout = {
-                        .sizing = { CLAY_SIZING_FIT(.max = 500), CLAY_SIZING_FIT(0) },
+                        .sizing = { CLAY_SIZING_FIT(.max = popup_message_max_width), CLAY_SIZING_FIT(0) },
                         .padding = { 0, 0, 8, 8 }
                     }
                 }) {

@@ -69,9 +69,10 @@ void render_vu_meter(float x, float y, float width, float height,
 
     float padding = 0.0f;
 
-    // Use half the available width and center the meter horizontally for a slimmer look
+    // Only the surrounding column spacing contracts in compact layouts.
+    // Keep the visible bar at its original logical width and centered.
     float available_w = width - 2 * padding;
-    float meter_width = available_w * 0.5f;
+    float meter_width = fminf(available_w, GUI_UI_VU_BAR_WIDTH);
     float meter_x = x + padding + (available_w - meter_width) * 0.5f;
     float meter_y = y + padding;
     float meter_height = height - 2 * padding;

@@ -30,56 +30,65 @@ void gui_ddd_fifo_make_buffer_view(
     view->visible = true;
     view->meter_percent = ddd_fifo_peak_percent(latest);
     backpressure_percent = ddd_fifo_backpressure_percent(latest);
-    floor_marker = !totals->interval_coverage_complete ? "+" : "";
+    floor_marker = totals->saturated || !totals->interval_coverage_complete
+        ? ">=" : "";
+
+    snprintf(view->details, sizeof(view->details),
+             "Current: %u/%u words\n"
+             "Peak (interval): %u/%u words (%d%%)\n"
+             "Peak (observed): %u words\n"
+             "BP: %d%% (observed max %d%%)\n"
+             "Normal packet threshold: %u words\n"
+             "BP = peak above this threshold,\n"
+             "scaled to remaining capacity; not time or loss rate.\n"
+             "Overflow total: %s%" PRIu64 "\n"
+             "Lost words total: %s%" PRIu64 "\n"
+             "%s%s",
+             (unsigned)latest->used_now,
+             (unsigned)latest->depth_words,
+             (unsigned)latest->peak,
+             (unsigned)latest->depth_words,
+             view->meter_percent,
+             (unsigned)totals->peak_words,
+             backpressure_percent,
+             totals->peak_backpressure_percent,
+             (unsigned)latest->packet_words,
+             floor_marker, totals->overflow_events,
+             floor_marker, totals->dropped_words,
+             totals->saturated
+                 ? "SAT: counters saturated; totals are lower bounds.\n" : "",
+             totals->interval_coverage_complete
+                 ? "Coverage complete."
+                 : "Coverage incomplete: missed intervals; totals are lower bounds.");
 
     if (totals->overflow_events > 0 || totals->dropped_words > 0) {
         view->severity = GUI_DEVICE_BUFFER_ERROR;
-        if (layout == GUI_DEVICE_BUFFER_LAYOUT_TINY) {
-            snprintf(view->caption, sizeof(view->caption),
-                     totals->saturated ? "L%" PRIu64 "%s SAT"
-                                       : "L%" PRIu64 "%s",
-                     totals->dropped_words, floor_marker);
-        } else if (layout == GUI_DEVICE_BUFFER_LAYOUT_COMPACT) {
-            snprintf(view->caption, sizeof(view->caption),
-                     totals->saturated
-                         ? "O%" PRIu64 "%s L%" PRIu64 "%s SAT"
-                         : "O%" PRIu64 "%s L%" PRIu64 "%s",
-                     totals->overflow_events, floor_marker,
-                     totals->dropped_words, floor_marker);
+        if (totals->dropped_words > 0) {
+            snprintf(view->caption, sizeof(view->caption), "%s",
+                     layout == GUI_DEVICE_BUFFER_LAYOUT_TINY ? "LOSS" : "Loss");
         } else {
-            snprintf(view->caption, sizeof(view->caption),
-                     totals->saturated
-                         ? "%" PRIu64 "%s ovf, %" PRIu64 "%s lost (sat)"
-                         : "%" PRIu64 "%s ovf, %" PRIu64 "%s lost",
-                     totals->overflow_events, floor_marker,
-                     totals->dropped_words, floor_marker);
+            snprintf(view->caption, sizeof(view->caption), "%s",
+                     layout == GUI_DEVICE_BUFFER_LAYOUT_TINY
+                         ? "OVF" : "Overflow");
         }
     } else if (latest->peak == 0 && latest->packets_read == 0) {
         snprintf(view->caption, sizeof(view->caption), "Idle");
     } else if (backpressure_percent > 0) {
         view->severity = GUI_DEVICE_BUFFER_WARNING;
         if (layout == GUI_DEVICE_BUFFER_LAYOUT_TINY) {
-            snprintf(view->caption, sizeof(view->caption), "B%d%%",
-                     backpressure_percent);
+            snprintf(view->caption, sizeof(view->caption), "BP");
         } else if (layout == GUI_DEVICE_BUFFER_LAYOUT_COMPACT) {
-            snprintf(view->caption, sizeof(view->caption), "BP %d%%",
-                     backpressure_percent);
+            snprintf(view->caption, sizeof(view->caption), "P%d%% BP",
+                     view->meter_percent);
         } else {
-            snprintf(view->caption, sizeof(view->caption), "%d%% pressure",
-                     backpressure_percent);
+            snprintf(view->caption, sizeof(view->caption), "Peak %d%% BP",
+                     view->meter_percent);
         }
-    } else if (layout == GUI_DEVICE_BUFFER_LAYOUT_TINY) {
+    } else if (layout != GUI_DEVICE_BUFFER_LAYOUT_FULL) {
         snprintf(view->caption, sizeof(view->caption), "P%d%%",
                  view->meter_percent);
-    } else if (layout == GUI_DEVICE_BUFFER_LAYOUT_COMPACT) {
-        snprintf(view->caption, sizeof(view->caption), "%u/%u peak",
-                 (unsigned)latest->peak,
-                 (unsigned)latest->depth_words);
     } else {
-        snprintf(view->caption, sizeof(view->caption),
-                 "now %u, peak %u/%u",
-                 (unsigned)latest->used_now,
-                 (unsigned)latest->peak,
-                 (unsigned)latest->depth_words);
+        snprintf(view->caption, sizeof(view->caption), "Peak %d%%",
+                 view->meter_percent);
     }
 }

@@ -53,6 +53,27 @@ int gui_ui_scale_step_percent(int current_percent, int direction)
     return next_percent;
 }
 
+float gui_ui_stats_width_scale(int percent)
+{
+    float scale = (float)gui_ui_scale_sanitize_percent(percent) / 100.0f;
+    if (scale <= 1.0f) return 1.0f;
+    return (1.0f + (scale - 1.0f) * 0.6f) / scale;
+}
+
+gui_ui_channel_spacing_t gui_ui_get_channel_spacing(bool compact,
+                                                     float render_scale_x)
+{
+    gui_ui_channel_spacing_t spacing = { GUI_UI_VU_BAR_WIDTH * 2.0f, 4 };
+    if (!compact || !isfinite(render_scale_x) || render_scale_x <= 0.0f) {
+        return spacing;
+    }
+
+    float margin = fminf(GUI_UI_VU_BAR_WIDTH * 0.5f, 8.0f / render_scale_x);
+    spacing.vu_column_width = GUI_UI_VU_BAR_WIDTH + margin * 2.0f;
+    spacing.horizontal_gap = (int)fminf(4.0f, floorf(4.0f / render_scale_x));
+    return spacing;
+}
+
 float gui_ui_scale_hud_opacity(double remaining_seconds)
 {
     if (remaining_seconds <= 0.0) return 0.0f;
@@ -109,6 +130,12 @@ bool gui_ui_status_shows_extended_counters(int layout_width,
         ? GUI_UI_STATUS_RECORDING_NARROW_BREAKPOINT
         : GUI_UI_STATUS_NARROW_BREAKPOINT;
     return layout_width >= breakpoint;
+}
+
+bool gui_ui_status_uses_fault_summary(bool has_missed, bool has_errors,
+                                      bool show_missed, bool show_errors)
+{
+    return (has_missed && !show_missed) || (has_errors && !show_errors);
 }
 
 gui_ui_zoom_result_t gui_ui_zoom_process(gui_ui_zoom_state_t *state,
