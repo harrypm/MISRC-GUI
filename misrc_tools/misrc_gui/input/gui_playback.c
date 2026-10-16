@@ -17,6 +17,7 @@
 #include "../processing/gui_extract.h"
 #include "../processing/gui_display_thread.h"
 #include "../../common/buffer_manager.h"
+#include "../../common/file_utils.h"
 #include "../../common/threading.h"
 
 #include <stdio.h>
@@ -785,7 +786,7 @@ typedef struct {
     atomic_bool inited;          // Decoders + worker ready
     atomic_bool failed;          // Could not be created (logged once)
     uint64_t total_samples;      // Worker snapshot of the latest requested total
-    char session_path[512];         // Immutable session path, copied before thread start
+    char session_path[FILE_PATH_MAX];         // Immutable session path, copied before thread start
     playback_ctx_t *owner;       // Held until analysis shutdown joins the worker
 
     // Request (render thread writes params, then bumps req_seq)
@@ -829,7 +830,7 @@ static bool gui_playback_find_audio_offset_and_size(const char *filepath, uint64
     *out_audio_offset = 0;
     *out_file_size = 0;
 
-    FILE *file = fopen(filepath, "rb");
+    FILE *file = file_open_read_utf8(filepath);
     if (!file) return false;
 
     bool ok = false;
@@ -1117,7 +1118,7 @@ static bool gui_playback_tail_samples(const char *filepath, FILE *held_source,
     io.file_size = loaded_key->file_size;
     io.tail_start = io.file_size > PLAYBACK_TAIL_MAX_BYTES
         ? io.file_size - PLAYBACK_TAIL_MAX_BYTES : 0;
-    io.file = fopen(filepath, "rb");
+    io.file = file_open_read_utf8(filepath);
     if (!io.file) return false;
     if (!gui_playback_length_cache_matches_open_file(io.file, loaded_key) ||
         !gui_playback_tail_allowed(&io)) goto done_tail;
@@ -1370,7 +1371,7 @@ static bool gui_playback_scan_samples(const char *filepath, uint64_t audio_offse
     if (!filepath || !out_samples) return false;
     *out_samples = 0;
     if (cancel && atomic_load(cancel)) return false;
-    FILE *file = fopen(filepath, "rb");
+    FILE *file = file_open_read_utf8(filepath);
     if (!file) return false;
     FLAC__StreamDecoder *decoder = NULL;
     bool initialized = false;
@@ -1534,9 +1535,11 @@ static bool gui_playback_split_path(const char *filepath,
     }
 
     const char *last_slash = strrchr(filepath, '/');
-    const char *last_backslash = strrchr(filepath, '\\');
     const char *sep = last_slash;
+#if defined(_WIN32) || defined(_WIN64)
+    const char *last_backslash = strrchr(filepath, '\\');
     if (last_backslash && (!sep || last_backslash > sep)) sep = last_backslash;
+#endif
 
     const char *filename = filepath;
     if (sep) {
@@ -1544,7 +1547,7 @@ static bool gui_playback_split_path(const char *filepath,
         if (dir_len == 0) {
             snprintf(out_dir, out_dir_size, "%c", PLAYBACK_PATH_SEPARATOR);
         } else {
-            if (dir_len >= out_dir_size) dir_len = out_dir_size - 1u;
+            if (dir_len >= out_dir_size) return false;
             memcpy(out_dir, filepath, dir_len);
             out_dir[dir_len] = '\0';
         }
@@ -1558,7 +1561,7 @@ static bool gui_playback_split_path(const char *filepath,
     if (stem_len == 0) {
         return false;
     }
-    if (stem_len >= out_stem_size) stem_len = out_stem_size - 1u;
+    if (stem_len >= out_stem_size) return false;
     memcpy(out_stem, filename, stem_len);
     out_stem[stem_len] = '\0';
     return true;
@@ -1596,7 +1599,7 @@ static bool gui_playback_parse_log_duration_text(const uint8_t *text, size_t len
 
 static bool gui_playback_read_log_duration_seconds(const char *path, double *out_seconds) {
     if (!path || !out_seconds) return false;
-    FILE *file = fopen(path, "rb");
+    FILE *file = file_open_read_utf8(path);
     if (!file) return false;
     uint8_t *buf = (uint8_t *)malloc(PLAYBACK_COMPANION_READ_LIMIT);
     if (!buf) {
@@ -1612,7 +1615,7 @@ static bool gui_playback_read_log_duration_seconds(const char *path, double *out
 
 static bool gui_playback_read_wav_duration_seconds(const char *path, double *out_seconds) {
     if (!path || !out_seconds) return false;
-    FILE *file = fopen(path, "rb");
+    FILE *file = file_open_read_utf8(path);
     if (!file) return false;
 
     uint8_t head[128];
@@ -1669,9 +1672,9 @@ static bool gui_playback_read_wav_duration_seconds(const char *path, double *out
 static bool gui_playback_try_companion_duration(const char *filepath, double *out_seconds) {
     if (!filepath || !out_seconds) return false;
 
-    char dir[512];
-    char stem[256];
-    char base[256];
+    char dir[FILE_PATH_MAX];
+    char stem[FILE_PATH_MAX];
+    char base[FILE_PATH_MAX];
     if (!gui_playback_split_path(filepath, dir, sizeof(dir), stem, sizeof(stem))) {
         return false;
     }
@@ -1679,36 +1682,36 @@ static bool gui_playback_try_companion_duration(const char *filepath, double *ou
     if (base[0] == '\0') return false;
 
 #if defined(_WIN32) || defined(_WIN64)
-    char pattern[640];
-    snprintf(pattern, sizeof(pattern), "%s\\*", dir);
-    struct _finddata_t entry;
-    intptr_t handle = _findfirst(pattern, &entry);
-    if (handle != -1) {
-        do {
-            if (entry.attrib & _A_SUBDIR) continue;
-            if (!gui_playback_filename_matches(entry.name, base, "log")) continue;
-            char candidate[640];
-            snprintf(candidate, sizeof(candidate), "%s\\%s", dir, entry.name);
-            if (gui_playback_read_log_duration_seconds(candidate, out_seconds) && *out_seconds > 0.0) {
-                _findclose(handle);
-                return true;
-            }
-        } while (_findnext(handle, &entry) == 0);
-        _findclose(handle);
+    char pattern[FILE_PATH_MAX];
+    int length = snprintf(pattern, sizeof(pattern), "%s\\*", dir);
+    wchar_t wide_pattern[FILE_PATH_MAX];
+    if (length < 0 || (size_t)length >= sizeof(pattern) ||
+        !MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, pattern, -1,
+                             wide_pattern, sizeof(wide_pattern) / sizeof(*wide_pattern))) {
+        return false;
     }
-
-    handle = _findfirst(pattern, &entry);
-    if (handle != -1) {
+    /* Keep LOG preferred over WAV, with both names and directories in UTF-8. */
+    for (unsigned int kind = 0; kind < 2; kind++) {
+        struct _wfinddata_t entry;
+        intptr_t handle = _wfindfirst(wide_pattern, &entry);
+        if (handle == -1) continue;
         do {
             if (entry.attrib & _A_SUBDIR) continue;
-            if (!gui_playback_filename_matches(entry.name, base, "wav")) continue;
-            char candidate[640];
-            snprintf(candidate, sizeof(candidate), "%s\\%s", dir, entry.name);
-            if (gui_playback_read_wav_duration_seconds(candidate, out_seconds) && *out_seconds > 0.0) {
+            char name[3 * MAX_PATH];
+            if (!WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, entry.name, -1,
+                                     name, sizeof(name), NULL, NULL)) continue;
+            if (!gui_playback_filename_matches(name, base, kind == 0 ? "log" : "wav")) continue;
+            char candidate[FILE_PATH_MAX];
+            length = snprintf(candidate, sizeof(candidate), "%s\\%s", dir, name);
+            if (length < 0 || (size_t)length >= sizeof(candidate)) continue;
+            bool found = kind == 0
+                ? gui_playback_read_log_duration_seconds(candidate, out_seconds)
+                : gui_playback_read_wav_duration_seconds(candidate, out_seconds);
+            if (found && *out_seconds > 0.0) {
                 _findclose(handle);
                 return true;
             }
-        } while (_findnext(handle, &entry) == 0);
+        } while (_wfindnext(handle, &entry) == 0);
         _findclose(handle);
     }
 #else
@@ -1717,8 +1720,9 @@ static bool gui_playback_try_companion_duration(const char *filepath, double *ou
         struct dirent *entry = NULL;
         while ((entry = readdir(dp)) != NULL) {
             if (!gui_playback_filename_matches(entry->d_name, base, "log")) continue;
-            char candidate[640];
-            snprintf(candidate, sizeof(candidate), "%s/%s", dir, entry->d_name);
+            char candidate[FILE_PATH_MAX];
+            int length = snprintf(candidate, sizeof(candidate), "%s/%s", dir, entry->d_name);
+            if (length < 0 || (size_t)length >= sizeof(candidate)) continue;
             if (gui_playback_read_log_duration_seconds(candidate, out_seconds) && *out_seconds > 0.0) {
                 closedir(dp);
                 return true;
@@ -1732,8 +1736,9 @@ static bool gui_playback_try_companion_duration(const char *filepath, double *ou
         struct dirent *entry = NULL;
         while ((entry = readdir(dp)) != NULL) {
             if (!gui_playback_filename_matches(entry->d_name, base, "wav")) continue;
-            char candidate[640];
-            snprintf(candidate, sizeof(candidate), "%s/%s", dir, entry->d_name);
+            char candidate[FILE_PATH_MAX];
+            int length = snprintf(candidate, sizeof(candidate), "%s/%s", dir, entry->d_name);
+            if (length < 0 || (size_t)length >= sizeof(candidate)) continue;
             if (gui_playback_read_wav_duration_seconds(candidate, out_seconds) && *out_seconds > 0.0) {
                 closedir(dp);
                 return true;
@@ -2177,7 +2182,8 @@ bool gui_playback_validate_file(const char *filepath, playback_file_info_t *info
     if (!filepath || !info) return false;
 
     memset(info, 0, sizeof(*info));
-    strncpy(info->filepath, filepath, sizeof(info->filepath) - 1);
+    if (strlen(filepath) >= sizeof(info->filepath)) return false;
+    strcpy(info->filepath, filepath);
 
 #if LIBFLAC_ENABLED == 1
     // Use FLAC metadata API to read stream info without full decode
@@ -2959,6 +2965,8 @@ static int gui_playback_prepare(playback_ctx_t *ctx, gui_app_t *app,
     if (file_b) fprintf(stderr, "[PLAYBACK]   Channel B: %s\n", file_b);
 
     ctx->app = app;
+    if ((file_a && strlen(file_a) >= sizeof(ctx->info_a.filepath)) ||
+        (file_b && strlen(file_b) >= sizeof(ctx->info_b.filepath))) return -1;
 
     // Allocate decode buffers (larger than output buffer to allow streaming)
     ctx->decode_buf_size = PLAYBACK_BUFFER_SIZE * 8;
@@ -2975,7 +2983,7 @@ static int gui_playback_prepare(playback_ctx_t *ctx, gui_app_t *app,
         if (file_a != ctx->info_a.filepath)
             snprintf(ctx->info_a.filepath, sizeof(ctx->info_a.filepath), "%s", file_a);
 
-        ctx->file_a = fopen(file_a, "rb");
+        ctx->file_a = file_open_read_utf8(file_a);
         if (!ctx->file_a) {
             fprintf(stderr, "[PLAYBACK] Failed to open file A: %s\n", file_a);
             return -1;
@@ -3031,7 +3039,7 @@ static int gui_playback_prepare(playback_ctx_t *ctx, gui_app_t *app,
         if (file_b != ctx->info_b.filepath)
             snprintf(ctx->info_b.filepath, sizeof(ctx->info_b.filepath), "%s", file_b);
 
-        ctx->file_b = fopen(file_b, "rb");
+        ctx->file_b = file_open_read_utf8(file_b);
         if (!ctx->file_b) {
             fprintf(stderr, "[PLAYBACK] Failed to open file B: %s\n", file_b);
             return -1;
@@ -3289,6 +3297,10 @@ bool gui_playback_is_starting(gui_app_t *app) {
 
 int gui_playback_start_async(gui_app_t *app, const char *file_a, const char *file_b) {
     if (!app || s_playback_start.pending || app->is_capturing || (!file_a && !file_b)) return -1;
+    if ((file_a && strlen(file_a) >= FILE_PATH_MAX) ||
+        (file_b && strlen(file_b) >= FILE_PATH_MAX)) {
+        gui_app_set_status(app, "Playback path is too long"); return -1;
+    }
     playback_ctx_t *ctx = calloc(1, sizeof(*ctx));
     if (!ctx) { gui_app_set_status(app, "Failed to allocate playback loader"); return -1; }
     ctx->app = app;
@@ -3585,7 +3597,7 @@ bool gui_playback_get_file_info_b(gui_app_t *app, playback_file_info_t *info) {
 // per-frame UI readout calls stay cheap. The cache does not watch for on-disk
 // changes to the same path; re-selecting the file refreshes it.
 typedef struct {
-    char path[512];
+    char path[FILE_PATH_MAX];
     playback_file_info_t info;
     bool cached;
 } playback_selected_cache_t;
@@ -4083,7 +4095,7 @@ static bool gui_playback_analysis_init(playback_analysis_t *a) {
     // Partial pools work: fewer segments = less parallelism, same result.
     for (size_t i = 0; i < PLAYBACK_ANALYSIS_DECODE_SEGMENTS; i++) {
         playback_analysis_segment_t *s = &a->segs[i];
-        s->file = fopen(path, "rb");
+        s->file = file_open_read_utf8(path);
         if (!s->file) break;
         int channel = a == &s_analysis[0] ? 0 : 1;
         if (a->owner->loaded_key_valid[channel] &&

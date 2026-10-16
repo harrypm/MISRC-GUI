@@ -9,6 +9,7 @@
 #include <time.h>
 #include "raylib.h"
 #include "../../common/buffer_manager.h"
+#include "../../common/file_utils.h"
 #ifdef ENABLE_DDD
 #include "../../common/ddd_protocol.h"
 #endif
@@ -182,7 +183,7 @@ typedef struct {
     int device_index;
     char output_filename_a[MAX_FILENAME_LEN];
     char output_filename_b[MAX_FILENAME_LEN];
-    char output_path[MAX_FILENAME_LEN];        // Default save path (Desktop)
+    char output_path[FILE_PATH_MAX];        // Default save path (Desktop)
     bool capture_a;
     bool capture_b;
 
@@ -352,8 +353,8 @@ typedef struct {
     int     demod_output_pair;            // 0 = CH1/2, 1 = CH3/4 (audio monitor output pair)
 
     // Playback settings
-    char playback_file_a[MAX_FILENAME_LEN];   // FLAC file for channel A playback
-    char playback_file_b[MAX_FILENAME_LEN];   // FLAC file for channel B playback
+    char playback_file_a[FILE_PATH_MAX];   // FLAC file for channel A playback
+    char playback_file_b[FILE_PATH_MAX];   // FLAC file for channel B playback
 
     // Server/Client networking (cxadc_vhs_server-style peer mode).
     // net_mode: 0=Local (default, no networking), 1=Server (host/master),

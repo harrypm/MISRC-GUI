@@ -181,6 +181,7 @@ set(COMMON_SOURCES
     misrc_tools/common/extract.c
     misrc_tools/common/rb_event.c
     misrc_tools/common/file_utils.c
+    misrc_tools/common/utf8_argv.c
     misrc_tools/common/device_enum.c
     misrc_tools/common/ringbuffer_writer.c
 

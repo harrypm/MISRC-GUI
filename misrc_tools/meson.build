@@ -47,6 +47,8 @@ ldflags_capture = [
 
 sources_extract = [
   'misrc_capture/misrc_extract.c',
+  'common/file_utils.c',
+  'common/utf8_argv.c',
   'common/extract.c',
   version_target
 ]
@@ -61,6 +63,7 @@ sources_capture = [
   'common/frame_parser.c',
   'common/device_enum.c',
   'common/file_utils.c',
+  'common/utf8_argv.c',
   'common/ringbuffer_writer.c',
   version_target
 ]
@@ -80,6 +83,9 @@ host_cpu_family = host_machine.cpu_family()
 
 host_system = host_machine.system()
 windows_static_deps = host_system == 'windows' or host_system == 'cygwin'
+if host_system == 'windows'
+  ldflags += ['-lshell32']
+endif
 
 if host_system == 'darwin'
   cflags += ['-D_DARWIN_C_SOURCE']
@@ -378,12 +384,22 @@ endif
 # APK has no terminal to run them, and they would only add cross-link risk.
 # The Android build target is the libmisrc_gui.so NativeActivity library below.
 if host_system != 'android'
-  executable('misrc_extract',
+  extract_exe = executable('misrc_extract',
                 sources_extract,
                 dependencies: [],
                 link_args: ldflags,
                 c_args: cflags,
                 install: true)
+
+  path_io_test = executable('path_io_test',
+    ['test/path_io_test.c', 'common/file_utils.c', 'common/utf8_argv.c'],
+    c_args: cflags, link_args: ldflags)
+  path_test_python = find_program('python3', 'python', required: false)
+  if path_test_python.found()
+    test('path_io', path_test_python,
+      args: [files('test/path_io_test.py'), path_io_test.full_path(), extract_exe.full_path()],
+      depends: [path_io_test, extract_exe])
+  endif
 
   executable('misrc_capture',
                 sources_capture,
@@ -437,6 +453,7 @@ if raylib_dep.found()
     'misrc_gui/visualization/gui_vu_meter.c',
     'misrc_gui/visualization/panel_registry.c',
     # UI
+    'misrc_gui/ui/gui_font.c',
     'misrc_gui/ui/gui_ui_scale.c',
     'misrc_gui/ui/gui_ui.c',
     'misrc_gui/ui/gui_device_label.c',
@@ -457,6 +474,7 @@ if raylib_dep.found()
     'common/frame_parser.c',
     'common/device_enum.c',
     'common/file_utils.c',
+    'common/utf8_argv.c',
     'common/ringbuffer_writer.c',
     version_target
   ]
@@ -598,6 +616,11 @@ if raylib_dep.found()
   endif
 
   if host_system != 'android'
+    font_test = executable('gui_font_test',
+      ['test/gui_font_test.c', 'common/file_utils.c'],
+      dependencies: [raylib_dep], c_args: cflags, link_args: gui_ldflags)
+    test('gui_font', font_test)
+
     # Exercise the real overlay layout/click code with drawing stubs, without
     # opening a window or linking capture backends. LTO drops unrelated code
     # from the included waveform implementation, including in debug builds.
@@ -624,10 +647,33 @@ if raylib_dep.found()
     )
     test('gui_fft_label', fft_label_test)
 
+    settings_path_ldflags = ldflags
+    if host_system == 'windows'
+      settings_path_ldflags += ['-lole32']
+    else
+      settings_path_ldflags += ['-lm']
+    endif
+    settings_paths_test = executable('gui_settings_paths_test',
+      ['test/gui_settings_paths_test.c', 'misrc_gui/ui/gui_ui_scale.c', 'common/file_utils.c',
+       'common/ddd_protocol.c'],
+      dependencies: overlay_test_deps, include_directories: gui_includes,
+      c_args: gui_cflags + ['-fwhole-program'], link_args: settings_path_ldflags,
+      override_options: ['b_lto=true', 'optimization=2'])
+    test('gui_settings_paths', settings_paths_test)
+    if flac_dep.found()
+      record_paths_test = executable('gui_record_paths_test',
+        ['test/gui_record_paths_test.c', 'common/file_utils.c', version_target],
+        dependencies: overlay_test_deps + [flac_dep], include_directories: gui_includes,
+        c_args: cflags + ['-fwhole-program'], link_args: ldflags,
+        override_options: ['b_lto=true', 'optimization=2'])
+      test('gui_record_paths', record_paths_test)
+    endif
+
     # Exercise the production stats sizing with deterministic font metrics.
     # As above, LTO drops unrelated UI/backend code from the included source.
     stats_layout_test = executable('gui_stats_layout_test',
-      ['test/gui_stats_layout_harness.c', 'misrc_gui/ui/gui_ui_scale.c', version_target],
+      ['test/gui_stats_layout_harness.c', 'misrc_gui/ui/gui_ui_scale.c',
+       'common/file_utils.c', version_target],
       dependencies: overlay_test_deps,
       include_directories: gui_includes,
       c_args: gui_cflags,
@@ -637,7 +683,7 @@ if raylib_dep.found()
 
     # Check connection-button text and padding with the same CPU-only setup.
     toolbar_layout_test = executable('gui_toolbar_layout_test',
-      ['test/gui_toolbar_layout_harness.c', version_target],
+      ['test/gui_toolbar_layout_harness.c', 'common/file_utils.c', version_target],
       dependencies: overlay_test_deps,
       include_directories: gui_includes,
       c_args: gui_cflags,
@@ -646,7 +692,7 @@ if raylib_dep.found()
     test('gui_toolbar_layout', toolbar_layout_test)
 
     viewport_layout_test = executable('gui_viewport_layout_test',
-      ['test/gui_viewport_layout_harness.c', version_target],
+      ['test/gui_viewport_layout_harness.c', 'common/file_utils.c', version_target],
       dependencies: overlay_test_deps,
       include_directories: gui_includes,
       c_args: gui_cflags,
@@ -670,7 +716,7 @@ if raylib_dep.found()
     # is linked as well.
     if flac_dep.found() and fftw3f_dep.found()
       playback_resolve_test = executable('gui_playback_resolve_test',
-        ['test/gui_playback_resolve_harness.c',
+        ['test/gui_playback_resolve_harness.c', 'common/file_utils.c',
          'misrc_gui/input/gui_playback_length_cache.c',
          'misrc_gui/visualization/gui_fft.c'],
         dependencies: overlay_test_deps + [flac_dep, fftw3f_dep, dependency('threads')],
@@ -697,7 +743,7 @@ if raylib_dep.found()
     )
     test('gui_rf_routes', rf_routes_test)
     capture_watchdog_test = executable('gui_capture_watchdog_test',
-      'test/gui_capture_watchdog_test.c',
+      ['test/gui_capture_watchdog_test.c', 'common/file_utils.c'],
       dependencies: overlay_test_deps + [dependency('threads')],
       include_directories: gui_includes,
       c_args: gui_cflags,
@@ -707,7 +753,8 @@ if raylib_dep.found()
     test('gui_capture_watchdog', capture_watchdog_test)
     if flac_dep.found()
       rf_seek_test = executable('gui_rf_playback_seek_test',
-        ['test/gui_rf_playback_seek_test.c', 'misrc_gui/input/gui_playback_length_cache.c',
+        ['test/gui_rf_playback_seek_test.c', 'common/file_utils.c',
+         'misrc_gui/input/gui_playback_length_cache.c',
          'misrc_gui/visualization/gui_fft.c'],
         dependencies: overlay_test_deps + [flac_dep, fftw3f_dep],
         include_directories: gui_includes,
@@ -717,7 +764,8 @@ if raylib_dep.found()
       )
       test('gui_rf_playback_seek', rf_seek_test)
       rf_start_test = executable('gui_rf_playback_start_test',
-        ['test/gui_rf_playback_start_test.c', 'misrc_gui/input/gui_playback_length_cache.c',
+        ['test/gui_rf_playback_start_test.c', 'common/file_utils.c',
+         'misrc_gui/input/gui_playback_length_cache.c',
          'misrc_gui/visualization/gui_fft.c'],
         dependencies: overlay_test_deps + [flac_dep, fftw3f_dep, dependency('threads')],
         include_directories: gui_includes,
@@ -730,7 +778,7 @@ if raylib_dep.found()
       # Manual exact-media integration: requires one second of 20 MHz NTSC
       # s16le RF and an output directory, so it is not a default CI test.
       rf_reconnect_sources = [
-        'test/gui_rf_playback_reconnect_test.c',
+        'test/gui_rf_playback_reconnect_test.c', 'common/file_utils.c',
         'misrc_gui/input/gui_playback_length_cache.c',
         'misrc_gui/visualization/gui_fft.c',
         'common/extract.c', 'common/ringbuffer.c',
@@ -917,3 +965,6 @@ if ddd_enabled
   )
   test('gui_ddd_async_fault', ddd_async_fault_test)
 endif
+
+gui_text_edit_test = executable('gui_text_edit_test', 'test/gui_text_edit_test.c', c_args: cflags)
+test('gui_text_edit', gui_text_edit_test)

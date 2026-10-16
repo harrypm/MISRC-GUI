@@ -10,6 +10,7 @@
 #include "../visualization/gui_panel.h"
 #include "../visualization/gui_vu_meter.h"
 #include "gui_ui.h"
+#include "gui_font.h"
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
@@ -21,15 +22,6 @@
 
 
 Clay_Dimensions Raylib_MeasureText(Clay_StringSlice text, Clay_TextElementConfig *config, void *userData) {
-    // Measure string size for Font
-    Clay_Dimensions textSize = { 0 };
-
-    float maxTextWidth = 0.0f;
-    float lineTextWidth = 0;
-    int maxLineCharCount = 0;
-    int lineCharCount = 0;
-
-    float textHeight = config->fontSize;
     Font* fonts = (Font*)userData;
     Font fontToUse = fonts[config->fontId];
     // Font failed to load, likely the fonts are in the wrong place relative to the execution dir.
@@ -38,29 +30,11 @@ Clay_Dimensions Raylib_MeasureText(Clay_StringSlice text, Clay_TextElementConfig
         fontToUse = GetFontDefault();
     }
 
-    float scaleFactor = config->fontSize/(float)fontToUse.baseSize;
-
-    for (int i = 0; i < text.length; ++i, lineCharCount++)
-    {
-        if (text.chars[i] == '\n') {
-            maxTextWidth = fmax(maxTextWidth, lineTextWidth);
-            maxLineCharCount = maxLineCharCount > lineCharCount ? maxLineCharCount : lineCharCount;
-            lineTextWidth = 0;
-            lineCharCount = 0;
-            continue;
-        }
-        int index = text.chars[i] - 32;
-        if (fontToUse.glyphs[index].advanceX != 0) lineTextWidth += fontToUse.glyphs[index].advanceX;
-        else lineTextWidth += (fontToUse.recs[index].width + fontToUse.glyphs[index].offsetX);
-    }
-
-    maxTextWidth = fmax(maxTextWidth, lineTextWidth);
-    maxLineCharCount = maxLineCharCount > lineCharCount ? maxLineCharCount : lineCharCount;
-
-    textSize.width = maxTextWidth * scaleFactor + (lineCharCount * config->letterSpacing);
-    textSize.height = textHeight;
-
-    return textSize;
+    Vector2 size = gui_font_measure_text_n(fontToUse, text.chars,
+        text.length > 0 ? (size_t)text.length : 0,
+        (float)config->fontSize, (float)config->letterSpacing);
+    // Clay handles line layout itself and expects the height of one line.
+    return (Clay_Dimensions){size.x, (float)config->fontSize};
 }
 
 void Clay_Raylib_Initialize(int width, int height, const char *title, unsigned int flags) {
@@ -111,7 +85,7 @@ void Clay_Raylib_Render(Clay_RenderCommandArray renderCommands, Font* fonts)
                 // Raylib uses standard C strings so isn't compatible with cheap slices, we need to clone the string to append null terminator
                 memcpy(temp_render_buffer, textData->stringContents.chars, textData->stringContents.length);
                 temp_render_buffer[textData->stringContents.length] = '\0';
-                DrawTextEx(fontToUse, temp_render_buffer, (Vector2){boundingBox.x, boundingBox.y}, (float)textData->fontSize, (float)textData->letterSpacing, CLAY_COLOR_TO_RAYLIB_COLOR(textData->textColor));
+                gui_font_draw_text(fontToUse, temp_render_buffer, (Vector2){boundingBox.x, boundingBox.y}, (float)textData->fontSize, (float)textData->letterSpacing, CLAY_COLOR_TO_RAYLIB_COLOR(textData->textColor));
 
                 break;
             }

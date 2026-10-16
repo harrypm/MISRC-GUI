@@ -19,6 +19,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#ifdef _WIN32
+#include <wchar.h>
+#endif
 
 #include "FLAC/stream_encoder.h"
 #include "FLAC/metadata.h"
@@ -225,12 +228,14 @@ static bool finalize_test_flac(const char *path, uint32_t num_samples)
 // ---- IO-layer decoder harness (STREAMINFO patch + seek) ----
 
 static uint64_t io_test_seen_total;
+static uint64_t io_test_decoded_samples;
 
 static FLAC__StreamDecoderWriteStatus io_test_write_cb(
     const FLAC__StreamDecoder *decoder, const FLAC__Frame *frame,
     const FLAC__int32 *const buffer[], void *client_data)
 {
-    (void)decoder; (void)frame; (void)buffer; (void)client_data;
+    (void)decoder; (void)buffer; (void)client_data;
+    io_test_decoded_samples += frame->header.blocksize;
     return FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE;
 }
 
@@ -254,7 +259,7 @@ static void io_test_error_cb(
 /* Open the finalized-convention file through the production IO layer with the
  * patch armed and verify the decoder sees the TRUE total and can seek past
  * the (lying) header total. */
-static void test_io_layer_patch_and_seek(const char *path)
+static void test_io_layer_patch_and_seek(const char *path, bool finalized)
 {
     test_case = "io_layer_patch_and_seek";
 
@@ -262,11 +267,13 @@ static void test_io_layer_patch_and_seek(const char *path)
     bool have_info = gui_playback_validate_file(path, &info);
     expect_true(have_info, "validation must read the header and RF tags");
     expect_u64(info.total_samples, TEST_SAMPLES, "resolved true total");
-    expect_u64(info.header_total_samples, ((uint64_t)TEST_SAMPLES + 500u) / 1000u,
-               "header total is the kHz-domain value");
+    expect_near(info.real_sample_rate_hz, TEST_RF_RATE_HZ, "resolved RF sample rate");
+    expect_near(info.duration_seconds, (double)TEST_SAMPLES / TEST_RF_RATE_HZ, "resolved RF duration");
+    expect_u64(info.header_total_samples, finalized ? ((uint64_t)TEST_SAMPLES + 500u) / 1000u : TEST_SAMPLES,
+               "header total matches the fixture convention");
 
-    FILE *f = fopen(path, "rb");
-    expect_true(f != NULL, "reopen file for IO layer test");
+    FILE *f = file_open_read_utf8(path);
+    expect_true(f != NULL, "reopen file through the production UTF-8 reader");
     if (!f) return;
 
     playback_io_t io;
@@ -294,22 +301,184 @@ static void test_io_layer_patch_and_seek(const char *path)
                "decoder-visible STREAMINFO total must be the patched true total");
 
     /* Without the patch these seeks fail: target >= header total (3000). */
+    io_test_decoded_samples = 0;
     expect_true(FLAC__stream_decoder_seek_absolute(dec, TEST_SAMPLES / 2),
                 "seek to mid-file (past header total) must succeed");
     expect_true(FLAC__stream_decoder_process_single(dec),
                 "decode after mid-file seek");
+    expect_true(io_test_decoded_samples > 0, "mid-file seek produces decoded samples");
+    io_test_decoded_samples = 0;
     expect_true(FLAC__stream_decoder_seek_absolute(dec, TEST_SAMPLES - 10),
                 "seek near end of real stream must succeed");
     expect_true(FLAC__stream_decoder_process_single(dec),
                 "decode after end seek");
+    expect_true(io_test_decoded_samples > 0, "end seek produces decoded samples");
+    io_test_decoded_samples = 0;
     expect_true(FLAC__stream_decoder_seek_absolute(dec, 0),
                 "seek back to start must succeed");
     expect_true(FLAC__stream_decoder_process_single(dec),
                 "decode after seek to start");
+    expect_true(io_test_decoded_samples > 0, "start seek produces decoded samples");
 
     FLAC__stream_decoder_finish(dec);
     FLAC__stream_decoder_delete(dec);
     fclose(f);
+}
+
+#ifdef _WIN32
+/* Create the fixture with wide Win32 APIs, independently of the reader under
+ * test. Both directory and basenames contain characters outside legacy ACPs. */
+#define TEST_UNICODE_NAME_W L"\u300C\u30FB \u300D\u4E2D\u6587\xD83D\xDCFC"
+static void test_unicode_paths(const char *ascii_old, const char *ascii_new)
+{
+    wchar_t temporary[1024], directory[1024], source_old[1024], source_new[1024];
+    wchar_t path_old[1024], path_new[1024], path_capture[1024], path_log[1024], path_wav[1024];
+    char utf8_old[2048], utf8_new[2048], utf8_capture[2048], utf8_log[2048], utf8_wav[2048];
+    test_case = "unicode_fixture";
+    DWORD temp_len = GetTempPathW(sizeof(temporary) / sizeof(*temporary), temporary);
+    bool ready = temp_len > 0 && temp_len < sizeof(temporary) / sizeof(*temporary) &&
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, ascii_old, -1,
+                            source_old, sizeof(source_old) / sizeof(*source_old)) > 0 &&
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, ascii_new, -1,
+                            source_new, sizeof(source_new) / sizeof(*source_new)) > 0 &&
+        swprintf(directory, sizeof(directory) / sizeof(*directory),
+                 L"%lsmisrc_pb_%lu_" TEST_UNICODE_NAME_W, temporary, GetCurrentProcessId()) > 0;
+    expect_true(ready, "prepare independent wide fixture paths");
+    if (!ready) return;
+    bool created = CreateDirectoryW(directory, NULL) != 0;
+    expect_true(created, "create Unicode directory");
+    if (!created) return;
+    swprintf(path_old, sizeof(path_old) / sizeof(*path_old),
+             L"%ls\\" TEST_UNICODE_NAME_W L"_old_8-bit_20msps.flac", directory);
+    swprintf(path_new, sizeof(path_new) / sizeof(*path_new),
+             L"%ls\\" TEST_UNICODE_NAME_W L"_new_8-bit_20msps.flac", directory);
+    swprintf(path_capture, sizeof(path_capture) / sizeof(*path_capture),
+             L"%ls\\" TEST_UNICODE_NAME_W L"_2026.10.16_01.02.03_8-bit_20msps.flac", directory);
+    swprintf(path_log, sizeof(path_log) / sizeof(*path_log),
+             L"%ls\\" TEST_UNICODE_NAME_W L"_2026.10.16_01.02.03_capture.log", directory);
+    swprintf(path_wav, sizeof(path_wav) / sizeof(*path_wav),
+             L"%ls\\" TEST_UNICODE_NAME_W L"_2026.10.16_01.02.03_audio.wav", directory);
+    ready = CopyFileW(source_old, path_old, TRUE) && CopyFileW(source_new, path_new, TRUE) &&
+        CopyFileW(source_old, path_capture, TRUE) &&
+        WideCharToMultiByte(CP_UTF8, 0, path_old, -1, utf8_old, sizeof(utf8_old), NULL, NULL) > 0 &&
+        WideCharToMultiByte(CP_UTF8, 0, path_new, -1, utf8_new, sizeof(utf8_new), NULL, NULL) > 0 &&
+        WideCharToMultiByte(CP_UTF8, 0, path_capture, -1, utf8_capture, sizeof(utf8_capture), NULL, NULL) > 0 &&
+        WideCharToMultiByte(CP_UTF8, 0, path_log, -1, utf8_log, sizeof(utf8_log), NULL, NULL) > 0 &&
+        WideCharToMultiByte(CP_UTF8, 0, path_wav, -1, utf8_wav, sizeof(utf8_wav), NULL, NULL) > 0;
+    expect_true(ready, "copy real Unicode files and convert their paths to UTF-8");
+    if (!ready) goto cleanup;
+
+    test_io_layer_patch_and_seek(utf8_old, false);
+    test_io_layer_patch_and_seek(utf8_new, true);
+    test_case = "unicode_source_identity";
+    gui_playback_length_cache_key_t key = {0};
+    bool fingerprinted = gui_playback_length_cache_snapshot(utf8_new, &key);
+    expect_true(fingerprinted, "Unicode source fingerprint");
+    FILE *held = file_open_read_utf8(utf8_new);
+    expect_true(held != NULL, "Unicode source read handle");
+    if (held) {
+        expect_true(fingerprinted && gui_playback_length_cache_matches_open_file(held, &key),
+                    "UTF-8 reader and wide fingerprint open the same file");
+        fclose(held);
+    }
+
+    test_case = "unicode_companion";
+    FILE *file = _wfopen(path_log, L"wb");
+    expect_true(file != NULL, "create Unicode companion log independently");
+    if (!file) goto cleanup;
+    const char log[] = "Capture duration: 7.5 seconds\n";
+    bool written = fwrite(log, 1, sizeof(log) - 1, file) == sizeof(log) - 1;
+    expect_true(fclose(file) == 0 && written, "write companion log");
+    file = _wfopen(path_wav, L"wb");
+    expect_true(file != NULL, "create Unicode companion WAV independently");
+    if (!file) goto cleanup;
+    /* 3 seconds of 48 kHz mono 16-bit PCM, only its duration header is needed. */
+    const unsigned char wav[44] = {
+        'R','I','F','F', 0x24,0x65,0x04,0, 'W','A','V','E',
+        'f','m','t',' ', 16,0,0,0, 1,0, 1,0, 0x80,0xbb,0,0,
+        0,0x77,1,0, 2,0, 16,0, 'd','a','t','a', 0,0x65,4,0
+    };
+    written = fwrite(wav, 1, sizeof(wav), file) == sizeof(wav);
+    expect_true(fclose(file) == 0 && written, "write companion WAV duration header");
+    double seconds = 0;
+    expect_true(gui_playback_read_log_duration_seconds(utf8_log, &seconds), "read Unicode companion log");
+    expect_near(seconds, 7.5, "log duration");
+    expect_true(gui_playback_read_wav_duration_seconds(utf8_wav, &seconds), "read Unicode companion WAV");
+    expect_near(seconds, 3.0, "WAV duration");
+    expect_true(gui_playback_try_companion_duration(utf8_capture, &seconds), "find Unicode companions");
+    expect_near(seconds, 7.5, "log takes priority when WAV is also present");
+    expect_true(DeleteFileW(path_log) != 0, "remove log to exercise WAV fallback");
+    expect_true(gui_playback_try_companion_duration(utf8_capture, &seconds), "find Unicode WAV fallback");
+    expect_near(seconds, 3.0, "WAV fallback duration");
+
+cleanup:
+    DeleteFileW(path_old);
+    DeleteFileW(path_new);
+    DeleteFileW(path_capture);
+    DeleteFileW(path_log);
+    DeleteFileW(path_wav);
+    expect_true(RemoveDirectoryW(directory) != 0, "remove Unicode fixture directory");
+}
+#undef TEST_UNICODE_NAME_W
+#endif
+
+static void test_remove_path(const char *path, bool directory) {
+#ifdef _WIN32
+    wchar_t wide[FILE_PATH_MAX];
+    expect_true(MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1,
+        wide, FILE_PATH_MAX) > 0, "convert cleanup path");
+    expect_true(directory ? RemoveDirectoryW(wide) != 0 : DeleteFileW(wide) != 0,
+                "remove test path");
+#else
+    expect_true((directory ? rmdir(path) : unlink(path)) == 0, "remove test path");
+#endif
+}
+
+static void test_long_path(const char *temporary, const char *source) {
+    test_case = "long_multibyte_path";
+    char component[247], root[FILE_PATH_MAX], first[FILE_PATH_MAX], second[FILE_PATH_MAX];
+    char path[FILE_PATH_MAX];
+    for (int i = 0; i < 82; i++) memcpy(component + i * 3, "\xE4\xB8\xAD", 3);
+    component[246] = '\0';
+    snprintf(root, sizeof(root), "%s/misrc_long_%d", temporary, (int)getpid());
+    snprintf(first, sizeof(first), "%s/%s", root, component);
+    snprintf(second, sizeof(second), "%s/%s", first, component);
+    snprintf(path, sizeof(path), "%s/8-bit_20msps.flac", second);
+    expect_true(strlen(path) > 512, "fixture exceeds the old byte cap");
+    expect_true(file_mkdir_utf8(root, 0700) == 0, "create test root");
+    expect_true(file_mkdir_utf8(first, 0700) == 0, "create first directory");
+    expect_true(file_mkdir_utf8(second, 0700) == 0, "create second directory");
+    FILE *input = file_open_read_utf8(source), *output = file_open_utf8(path, "wb");
+    expect_true(input && output, "copy FLAC into multibyte path");
+    if (input && output) {
+        unsigned char buffer[4096]; size_t n;
+        while ((n = fread(buffer, 1, sizeof(buffer), input)) != 0)
+            expect_true(fwrite(buffer, 1, n, output) == n, "copy fixture bytes");
+    }
+    if (input) fclose(input);
+    if (output) fclose(output);
+    playback_file_info_t info;
+    expect_true(gui_playback_validate_file(path, &info), "long FLAC validates");
+    expect_true(!strcmp(info.filepath, path), "retain the complete path");
+    test_io_layer_patch_and_seek(path, false);
+    test_remove_path(path, false); test_remove_path(second, true);
+    test_remove_path(first, true); test_remove_path(root, true);
+
+    char oversized[FILE_PATH_MAX + 1]; memset(oversized, 'a', FILE_PATH_MAX);
+    oversized[FILE_PATH_MAX] = '\0';
+    expect_true(!gui_playback_validate_file(oversized, &info), "reject oversize instead of truncating");
+#ifndef _WIN32
+    test_case = "posix_literal_backslash_companion";
+    snprintf(path, sizeof(path), "%s/literal\\tape_%d_2026.10.17_01.02.03_8-bit.flac", temporary, (int)getpid());
+    snprintf(first, sizeof(first), "%s/literal\\tape_%d_2026.10.17_01.02.03_capture.log", temporary, (int)getpid());
+    output = fopen(first, "wb");
+    expect_true(output != NULL, "create POSIX companion");
+    if (output) { fputs("Capture duration: 48.5 seconds\n", output); fclose(output); }
+    double seconds = 0;
+    expect_true(gui_playback_try_companion_duration(path, &seconds), "find literal backslash companion");
+    expect_near(seconds, 48.5, "companion duration");
+    test_remove_path(first, false);
+#endif
 }
 
 int main(void)
@@ -366,7 +535,11 @@ int main(void)
     expect_near(info.duration_seconds, (double)TEST_SAMPLES / TEST_RF_RATE_HZ,
                 "NEW true duration");
 
-    test_io_layer_patch_and_seek(path_new);
+    test_io_layer_patch_and_seek(path_new, true);
+    test_long_path(temp_dir, path_old);
+#ifdef _WIN32
+    test_unicode_paths(path_old, path_new);
+#endif
 
     unlink(path_old);
     unlink(path_new);

@@ -6,12 +6,14 @@
 
 #include "../core/gui_app.h"
 #include "../ui/gui_ui_scale.h"
+#include "../../common/file_utils.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <errno.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #if !defined(_WIN32) && !defined(_WIN64)
@@ -24,6 +26,7 @@
 #define CloseWindow Win32_CloseWindow
 #define ShowCursor Win32_ShowCursor
 #include <shlobj.h>
+#include <knownfolders.h>
 #include <shobjidl.h> 
 #undef ShowCursor
 #undef CloseWindow
@@ -45,53 +48,72 @@
 extern uint32_t get_num_cores(void);
 #endif
 
-static bool gui_settings_path_is_dir(const char *path) {
-    struct stat st;
-    if (!path || !path[0]) return false;
-    if (stat(path, &st) != 0) return false;
+// Reject oversized paths instead of silently opening a different filename.
+static bool gui_settings_copy(char *dst, size_t cap, const char *src) {
+    size_t len = strlen(src);
+    if (len >= cap) return false;
+    memcpy(dst, src, len + 1);
+    return true;
+}
+
+static bool gui_settings_format(char *dst, size_t cap, const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    int len = vsnprintf(dst, cap, fmt, args);
+    va_end(args);
+    if (len < 0 || (size_t)len >= cap) {
+        dst[0] = '\0';
+        return false;
+    }
+    return true;
+}
+
+static bool gui_settings_separator(char c) {
 #if defined(_WIN32) || defined(_WIN64)
-    return (st.st_mode & _S_IFDIR) != 0;
+    return c == '/' || c == '\\';
 #else
-    return S_ISDIR(st.st_mode);
+    return c == '/';
 #endif
+}
+
+static bool gui_settings_path_is_dir(const char *path) {
+    bool is_dir = false;
+    return path && path[0] && file_path_info_utf8(path, NULL, &is_dir) && is_dir;
 }
 
 static bool gui_settings_make_dir_if_needed(const char *path) {
     if (!path || !path[0]) return false;
     if (gui_settings_path_is_dir(path)) return true;
-#if defined(_WIN32) || defined(_WIN64)
-    if (_mkdir(path) == 0) return true;
-#else
-    if (mkdir(path, 0700) == 0) return true;
-#endif
-    if (errno == EEXIST) return gui_settings_path_is_dir(path);
-    return false;
+    if (file_mkdir_utf8(path, 0700) == 0) return true;
+    return errno == EEXIST && gui_settings_path_is_dir(path);
 }
 
-// Best-effort recursive mkdir for a file path's parent directories.
 static bool gui_settings_ensure_parent_dirs(const char *file_path) {
-    if (!file_path || !file_path[0]) return false;
-
-    char path_copy[512];
-    strncpy(path_copy, file_path, sizeof(path_copy) - 1);
-    path_copy[sizeof(path_copy) - 1] = '\0';
-
-    size_t len = strlen(path_copy);
-    if (len == 0) return false;
-
-    for (size_t i = 0; i < len; i++) {
-        char c = path_copy[i];
-        if (c != '/' && c != '\\') continue;
-        if (i == 0) continue;
+    char path_copy[FILE_PATH_MAX];
+    if (!file_path || !file_path[0] ||
+        !gui_settings_copy(path_copy, sizeof(path_copy), file_path)) return false;
+    size_t start = 1;
 #if defined(_WIN32) || defined(_WIN64)
-        // Skip "C:\" root separator.
+    // A UNC server/share root already exists; do not try mkdir on its server.
+    if (gui_settings_separator(path_copy[0]) && gui_settings_separator(path_copy[1])) {
+        start = 2;
+        while (path_copy[start] && !gui_settings_separator(path_copy[start])) start++;
+        if (path_copy[start]) start++;
+        while (path_copy[start] && !gui_settings_separator(path_copy[start])) start++;
+        if (path_copy[start]) start++;
+    }
+#endif
+    for (size_t i = start; path_copy[i]; i++) {
+        char c = path_copy[i];
+        if (!gui_settings_separator(c)) continue;
+#if defined(_WIN32) || defined(_WIN64)
         if (i == 2 && path_copy[1] == ':') continue;
 #endif
         path_copy[i] = '\0';
-        if (!gui_settings_make_dir_if_needed(path_copy)) return false;
+        bool ok = gui_settings_make_dir_if_needed(path_copy);
         path_copy[i] = c;
+        if (!ok) return false;
     }
-
     return true;
 }
 
@@ -112,120 +134,125 @@ bool gui_settings_override_active(void) {
 
 // Settings file location
 static const char* get_settings_file_path(void) {
-    static char settings_path[512];
+    static char settings_path[FILE_PATH_MAX];
     static bool initialized = false;
-    
-    if (s_override_settings_path && s_override_settings_path[0]) {
-        // --config <path> override: use it directly (no platform logic).
-        snprintf(settings_path, sizeof(settings_path), "%s", s_override_settings_path);
-        return settings_path;
-    }
-    if (!initialized) {
+    if (s_override_settings_path) return s_override_settings_path;
+    if (initialized) return settings_path;
+    char *base = NULL;
 #if defined(__ANDROID__)
-        // Android 11+ scoped storage blocks native fopen() on /sdcard/... .
-        // MainActivity.onCreate calls nativeSetStoragePath(getExternalFilesDir)
-        // before main() runs, so android_get_storage_path() returns the real,
-        // scoped-storage-exempt, writable app-external files dir. Fall back to
-        // the static path only if the JNI handoff hasn't happened yet.
-        extern const char *android_get_storage_path(void);
-        const char *ext = android_get_storage_path();
-        if (ext && ext[0]) {
-            snprintf(settings_path, sizeof(settings_path),
-                    "%s/misrc_gui_settings.json", ext);
-        } else {
-            strcpy(settings_path, "/sdcard/Android/data/dev.misrc.gui/files/misrc_gui_settings.json");
-        }
-#elif defined(__APPLE__)
-        // Use ~/Library/Preferences on macOS
-        const char* home = getenv("HOME");
-        if (home) {
-            snprintf(settings_path, sizeof(settings_path),
-                    "%s/Library/Preferences/com.misrc.gui.json", home);
-        } else {
-            strcpy(settings_path, "./misrc_gui_settings.json");
-        }
+    extern const char *android_get_storage_path(void);
+    const char *ext = android_get_storage_path();
+    gui_settings_format(settings_path, sizeof(settings_path), "%s/misrc_gui_settings.json",
+                        ext && ext[0] ? ext : "/sdcard/Android/data/dev.misrc.gui/files");
 #elif defined(_WIN32) || defined(_WIN64)
-        // Use %APPDATA% on Windows, then LOCALAPPDATA/USERPROFILE fallbacks.
-        const char* appdata = getenv("APPDATA");
-        if (!appdata || !appdata[0]) {
-            appdata = getenv("LOCALAPPDATA");
-        }
-        if (appdata && appdata[0]) {
-            snprintf(settings_path, sizeof(settings_path),
-                    "%s\\MISRC\\misrc_gui_settings.json", appdata);
-        } else {
-            const char* userprofile = getenv("USERPROFILE");
-            if (userprofile && userprofile[0]) {
-                snprintf(settings_path, sizeof(settings_path),
-                        "%s\\AppData\\Roaming\\MISRC\\misrc_gui_settings.json", userprofile);
-            } else {
-                strcpy(settings_path, "./misrc_gui_settings.json");
-            }
-        }
-#else
-        // Use XDG config directory on Linux/BSD.
-        const char* xdg_config_home = getenv("XDG_CONFIG_HOME");
-        if (xdg_config_home && xdg_config_home[0]) {
-            snprintf(settings_path, sizeof(settings_path),
-                    "%s/misrc_gui_settings.json", xdg_config_home);
-        } else {
-            const char* home = getenv("HOME");
-            if (home && home[0]) {
-                snprintf(settings_path, sizeof(settings_path),
-                        "%s/.config/misrc_gui_settings.json", home);
-            } else {
-                strcpy(settings_path, "./misrc_gui_settings.json");
-            }
-        }
-#endif
-        initialized = true;
+    base = file_getenv_utf8("APPDATA");
+    if (!base || !base[0]) { free(base); base = file_getenv_utf8("LOCALAPPDATA"); }
+    if (base && base[0]) {
+        gui_settings_format(settings_path, sizeof(settings_path), "%s/MISRC/misrc_gui_settings.json", base);
+    } else {
+        free(base);
+        base = file_getenv_utf8("USERPROFILE");
+        if (base && base[0])
+            gui_settings_format(settings_path, sizeof(settings_path), "%s/AppData/Roaming/MISRC/misrc_gui_settings.json", base);
+        else
+            strcpy(settings_path, "./misrc_gui_settings.json");
     }
-    
+#else
+    const char *suffix = "/.config/misrc_gui_settings.json";
+#ifdef __APPLE__
+    suffix = "/Library/Preferences/com.misrc.gui.json";
+#else
+    base = file_getenv_utf8("XDG_CONFIG_HOME");
+    if (base && base[0]) suffix = "/misrc_gui_settings.json";
+#endif
+    if (!base || !base[0]) { free(base); base = file_getenv_utf8("HOME"); }
+    if (base && base[0])
+        gui_settings_format(settings_path, sizeof(settings_path), "%s%s", base, suffix);
+    else
+        strcpy(settings_path, "./misrc_gui_settings.json");
+#endif
+    free(base);
+    initialized = true;
     return settings_path;
 }
 
-const char* gui_settings_get_desktop_path(void) {
-    static char desktop_path[512];
-    static bool initialized = false;
-    
-    if (!initialized) {
-#if defined(__ANDROID__)
-        // Android 11+: use the scoped-storage-exempt external files dir handed
-        // in from Java (getExternalFilesDir), so native fopen() can write
-        // capture logs/FLAC here and the user can adb pull them. Fall back to
-        // the static path only if the JNI handoff hasn't happened yet.
-        extern const char *android_get_storage_path(void);
-        const char *ext = android_get_storage_path();
-        if (ext && ext[0]) {
-            snprintf(desktop_path, sizeof(desktop_path), "%s", ext);
-        } else {
-            strcpy(desktop_path, "/sdcard/Android/data/dev.misrc.gui/files");
+#if defined(_WIN32) || defined(_WIN64)
+static bool gui_settings_from_wide(char *dst, size_t cap, const wchar_t *src) {
+    int need = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, src, -1, NULL, 0, NULL, NULL);
+    return need > 0 && (size_t)need <= cap &&
+        WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, src, -1, dst, (int)cap, NULL, NULL) == need;
+}
+#elif !defined(__ANDROID__) && !defined(__APPLE__)
+// user-dirs.dirs contains shell-style quoted paths, but no shell is executed.
+static void gui_settings_xdg_desktop(char *dst, size_t cap, const char *home) {
+    char config[FILE_PATH_MAX];
+    char *xdg = file_getenv_utf8("XDG_CONFIG_HOME");
+    bool ok = xdg && xdg[0]
+        ? gui_settings_format(config, sizeof(config), "%s/user-dirs.dirs", xdg)
+        : gui_settings_format(config, sizeof(config), "%s/.config/user-dirs.dirs", home);
+    free(xdg);
+    FILE *f = ok ? file_open_read_utf8(config) : NULL;
+    if (!f) return;
+    char line[FILE_PATH_MAX * 2];
+    while (fgets(line, sizeof(line), f)) {
+        const char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        const char key[] = "XDG_DESKTOP_DIR=\"";
+        if (strncmp(p, key, sizeof(key) - 1)) continue;
+        p += sizeof(key) - 1;
+        char path[FILE_PATH_MAX];
+        size_t len = 0;
+        if (!strncmp(p, "$HOME", 5) && (p[5] == '/' || p[5] == '"')) {
+            len = strlen(home);
+            if (len >= sizeof(path)) break;
+            memcpy(path, home, len);
+            p += 5;
         }
-#elif defined(__APPLE__)
-        const char* home = getenv("HOME");
-        if (home) {
-            snprintf(desktop_path, sizeof(desktop_path), "%s/Desktop", home);
-        } else {
-            strcpy(desktop_path, ".");
+        while (*p && *p != '"' && len + 1 < sizeof(path)) {
+            if (*p == '\\' && (p[1] == '\\' || p[1] == '"' || p[1] == '$' || p[1] == '`')) p++;
+            path[len++] = *p++;
         }
-#elif defined(_WIN32) || defined(_WIN64)
-        const char* userprofile = getenv("USERPROFILE");
-        if (userprofile) {
-            snprintf(desktop_path, sizeof(desktop_path), "%s\\Desktop", userprofile);
-        } else {
-            strcpy(desktop_path, ".");
-        }
-#else
-        const char* home = getenv("HOME");
-        if (home) {
-            snprintf(desktop_path, sizeof(desktop_path), "%s/Desktop", home);
-        } else {
-            strcpy(desktop_path, ".");
-        }
-#endif
-        initialized = true;
+        path[len] = '\0';
+        if (*p == '"' && gui_settings_path_is_dir(path)) gui_settings_copy(dst, cap, path);
+        break;
     }
-    
+    fclose(f);
+}
+#endif
+
+const char* gui_settings_get_desktop_path(void) {
+    static char desktop_path[FILE_PATH_MAX];
+    static bool initialized = false;
+    if (initialized) return desktop_path;
+#if defined(__ANDROID__)
+    extern const char *android_get_storage_path(void);
+    const char *ext = android_get_storage_path();
+    gui_settings_format(desktop_path, sizeof(desktop_path), "%s",
+                        ext && ext[0] ? ext : "/sdcard/Android/data/dev.misrc.gui/files");
+#elif defined(_WIN32) || defined(_WIN64)
+    PWSTR path = NULL;
+    if (SUCCEEDED(SHGetKnownFolderPath(&FOLDERID_Desktop, 0, NULL, &path))) {
+        gui_settings_from_wide(desktop_path, sizeof(desktop_path), path);
+        CoTaskMemFree(path);
+    }
+    if (!gui_settings_path_is_dir(desktop_path)) {
+        char *home = file_getenv_utf8("USERPROFILE");
+        gui_settings_copy(desktop_path, sizeof(desktop_path), home ? home : ".");
+        free(home);
+    }
+#else
+    char *home = file_getenv_utf8("HOME");
+    if (home && home[0]) {
+        gui_settings_format(desktop_path, sizeof(desktop_path), "%s/Desktop", home);
+        if (!gui_settings_path_is_dir(desktop_path)) gui_settings_copy(desktop_path, sizeof(desktop_path), home);
+#ifndef __APPLE__
+        gui_settings_xdg_desktop(desktop_path, sizeof(desktop_path), home);
+#endif
+    }
+    free(home);
+#endif
+    if (!desktop_path[0]) strcpy(desktop_path, ".");
+    initialized = true;
     return desktop_path;
 }
 
@@ -268,11 +295,19 @@ static void sanitize_tag(char *dst, size_t dst_len, const char *src) {
     for (size_t i = 0; src[i] && j + 1 < dst_len; i++) {
         char c = src[i];
         if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-            (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-') {
+            (c >= '0' && c <= '9') || (unsigned char)c >= 0x80 || c == '.' || c == '_' || c == '-') {
             dst[j++] = c;
         } else if (c == ' ' || c == '\t') {
             dst[j++] = '-';
         }
+    }
+    // A short tag buffer must not retain half of the final UTF-8 character.
+    if (j > 0 && (unsigned char)dst[j - 1] >= 0x80) {
+        size_t start = j - 1;
+        while (start > 0 && ((unsigned char)dst[start] & 0xc0) == 0x80) start--;
+        unsigned char lead = (unsigned char)dst[start];
+        size_t count = lead < 0xe0 ? 2 : lead < 0xf0 ? 3 : 4;
+        if (j - start < count) j = start;
     }
     dst[j] = '\0';
 
@@ -302,22 +337,22 @@ static void gui_settings_refresh_auto_names(gui_settings_t *settings) {
         sanitize_tag(rf_tag_b, sizeof(rf_tag_b), settings->rf_channel_tags[1]);
 
         if (rf_tag_a[0] && rate_tag_a[0]) {
-            snprintf(settings->output_filename_a, MAX_FILENAME_LEN, "%s_%s_%u-bit_%s.flac", base, rf_tag_a, (unsigned)bits_a, rate_tag_a);
+            gui_settings_format(settings->output_filename_a, MAX_FILENAME_LEN, "%s_%s_%u-bit_%s.flac", base, rf_tag_a, (unsigned)bits_a, rate_tag_a);
         } else if (rf_tag_a[0]) {
-            snprintf(settings->output_filename_a, MAX_FILENAME_LEN, "%s_%s_%u-bit.flac", base, rf_tag_a, (unsigned)bits_a);
+            gui_settings_format(settings->output_filename_a, MAX_FILENAME_LEN, "%s_%s_%u-bit.flac", base, rf_tag_a, (unsigned)bits_a);
         } else if (rate_tag_a[0]) {
-            snprintf(settings->output_filename_a, MAX_FILENAME_LEN, "rfA_%s_%u-bit_%s.flac", base, (unsigned)bits_a, rate_tag_a);
+            gui_settings_format(settings->output_filename_a, MAX_FILENAME_LEN, "rfA_%s_%u-bit_%s.flac", base, (unsigned)bits_a, rate_tag_a);
         } else {
-            snprintf(settings->output_filename_a, MAX_FILENAME_LEN, "rfA_%s_%u-bit.flac", base, (unsigned)bits_a);
+            gui_settings_format(settings->output_filename_a, MAX_FILENAME_LEN, "rfA_%s_%u-bit.flac", base, (unsigned)bits_a);
         }
         if (rf_tag_b[0] && rate_tag_b[0]) {
-            snprintf(settings->output_filename_b, MAX_FILENAME_LEN, "%s_%s_%u-bit_%s.flac", base, rf_tag_b, (unsigned)bits_b, rate_tag_b);
+            gui_settings_format(settings->output_filename_b, MAX_FILENAME_LEN, "%s_%s_%u-bit_%s.flac", base, rf_tag_b, (unsigned)bits_b, rate_tag_b);
         } else if (rf_tag_b[0]) {
-            snprintf(settings->output_filename_b, MAX_FILENAME_LEN, "%s_%s_%u-bit.flac", base, rf_tag_b, (unsigned)bits_b);
+            gui_settings_format(settings->output_filename_b, MAX_FILENAME_LEN, "%s_%s_%u-bit.flac", base, rf_tag_b, (unsigned)bits_b);
         } else if (rate_tag_b[0]) {
-            snprintf(settings->output_filename_b, MAX_FILENAME_LEN, "rfB_%s_%u-bit_%s.flac", base, (unsigned)bits_b, rate_tag_b);
+            gui_settings_format(settings->output_filename_b, MAX_FILENAME_LEN, "rfB_%s_%u-bit_%s.flac", base, (unsigned)bits_b, rate_tag_b);
         } else {
-            snprintf(settings->output_filename_b, MAX_FILENAME_LEN, "rfB_%s_%u-bit.flac", base, (unsigned)bits_b);
+            gui_settings_format(settings->output_filename_b, MAX_FILENAME_LEN, "rfB_%s_%u-bit.flac", base, (unsigned)bits_b);
         }
     } else {
         // RAW: 8/16 only. Extension is per-channel (.u8 / .u16) so the
@@ -336,22 +371,22 @@ static void gui_settings_refresh_auto_names(gui_settings_t *settings) {
         sanitize_tag(rf_tag_b, sizeof(rf_tag_b), settings->rf_channel_tags[1]);
 
         if (rf_tag_a[0] && rate_tag_a[0]) {
-            snprintf(settings->output_filename_a, MAX_FILENAME_LEN, "%s_%s_%u-bit_%s.%s", base, rf_tag_a, (unsigned)bits_a, rate_tag_a, ext_a);
+            gui_settings_format(settings->output_filename_a, MAX_FILENAME_LEN, "%s_%s_%u-bit_%s.%s", base, rf_tag_a, (unsigned)bits_a, rate_tag_a, ext_a);
         } else if (rf_tag_a[0]) {
-            snprintf(settings->output_filename_a, MAX_FILENAME_LEN, "%s_%s_%u-bit.%s", base, rf_tag_a, (unsigned)bits_a, ext_a);
+            gui_settings_format(settings->output_filename_a, MAX_FILENAME_LEN, "%s_%s_%u-bit.%s", base, rf_tag_a, (unsigned)bits_a, ext_a);
         } else if (rate_tag_a[0]) {
-            snprintf(settings->output_filename_a, MAX_FILENAME_LEN, "rfA_%s_%u-bit_%s.%s", base, (unsigned)bits_a, rate_tag_a, ext_a);
+            gui_settings_format(settings->output_filename_a, MAX_FILENAME_LEN, "rfA_%s_%u-bit_%s.%s", base, (unsigned)bits_a, rate_tag_a, ext_a);
         } else {
-            snprintf(settings->output_filename_a, MAX_FILENAME_LEN, "rfA_%s_%u-bit.%s", base, (unsigned)bits_a, ext_a);
+            gui_settings_format(settings->output_filename_a, MAX_FILENAME_LEN, "rfA_%s_%u-bit.%s", base, (unsigned)bits_a, ext_a);
         }
         if (rf_tag_b[0] && rate_tag_b[0]) {
-            snprintf(settings->output_filename_b, MAX_FILENAME_LEN, "%s_%s_%u-bit_%s.%s", base, rf_tag_b, (unsigned)bits_b, rate_tag_b, ext_b);
+            gui_settings_format(settings->output_filename_b, MAX_FILENAME_LEN, "%s_%s_%u-bit_%s.%s", base, rf_tag_b, (unsigned)bits_b, rate_tag_b, ext_b);
         } else if (rf_tag_b[0]) {
-            snprintf(settings->output_filename_b, MAX_FILENAME_LEN, "%s_%s_%u-bit.%s", base, rf_tag_b, (unsigned)bits_b, ext_b);
+            gui_settings_format(settings->output_filename_b, MAX_FILENAME_LEN, "%s_%s_%u-bit.%s", base, rf_tag_b, (unsigned)bits_b, ext_b);
         } else if (rate_tag_b[0]) {
-            snprintf(settings->output_filename_b, MAX_FILENAME_LEN, "rfB_%s_%u-bit_%s.%s", base, (unsigned)bits_b, rate_tag_b, ext_b);
+            gui_settings_format(settings->output_filename_b, MAX_FILENAME_LEN, "rfB_%s_%u-bit_%s.%s", base, (unsigned)bits_b, rate_tag_b, ext_b);
         } else {
-            snprintf(settings->output_filename_b, MAX_FILENAME_LEN, "rfB_%s_%u-bit.%s", base, (unsigned)bits_b, ext_b);
+            gui_settings_format(settings->output_filename_b, MAX_FILENAME_LEN, "rfB_%s_%u-bit.%s", base, (unsigned)bits_b, ext_b);
         }
     }
 
@@ -363,28 +398,28 @@ static void gui_settings_refresh_auto_names(gui_settings_t *settings) {
     sanitize_tag(audio_tag_34, sizeof(audio_tag_34), settings->audio_output_tags[2]);
 
     if (audio_tag_4ch[0]) {
-        snprintf(settings->audio_4ch_filename, MAX_FILENAME_LEN, "%s_%s_quad_4ch.wav", base, audio_tag_4ch);
+        gui_settings_format(settings->audio_4ch_filename, MAX_FILENAME_LEN, "%s_%s_quad_4ch.wav", base, audio_tag_4ch);
     } else {
-        snprintf(settings->audio_4ch_filename, MAX_FILENAME_LEN, "%s_quad_4ch.wav", base);
+        gui_settings_format(settings->audio_4ch_filename, MAX_FILENAME_LEN, "%s_quad_4ch.wav", base);
     }
     if (audio_tag_12[0]) {
-        snprintf(settings->audio_2ch_12_filename, MAX_FILENAME_LEN, "%s_%s_stereo_ch1_ch2.wav", base, audio_tag_12);
+        gui_settings_format(settings->audio_2ch_12_filename, MAX_FILENAME_LEN, "%s_%s_stereo_ch1_ch2.wav", base, audio_tag_12);
     } else {
-        snprintf(settings->audio_2ch_12_filename, MAX_FILENAME_LEN, "%s_stereo_ch1_ch2.wav", base);
+        gui_settings_format(settings->audio_2ch_12_filename, MAX_FILENAME_LEN, "%s_stereo_ch1_ch2.wav", base);
     }
     if (audio_tag_34[0]) {
-        snprintf(settings->audio_2ch_34_filename, MAX_FILENAME_LEN, "%s_%s_stereo_ch3_ch4.wav", base, audio_tag_34);
+        gui_settings_format(settings->audio_2ch_34_filename, MAX_FILENAME_LEN, "%s_%s_stereo_ch3_ch4.wav", base, audio_tag_34);
     } else {
-        snprintf(settings->audio_2ch_34_filename, MAX_FILENAME_LEN, "%s_stereo_ch3_ch4.wav", base);
+        gui_settings_format(settings->audio_2ch_34_filename, MAX_FILENAME_LEN, "%s_stereo_ch3_ch4.wav", base);
     }
 
     for (int i = 0; i < 4; i++) {
         char tag[40];
         sanitize_tag(tag, sizeof(tag), settings->audio_1ch_labels[i]);
         if (tag[0]) {
-            snprintf(settings->audio_1ch_filenames[i], MAX_FILENAME_LEN, "%s_%s_audio_ch%d.wav", base, tag, i + 1);
+            gui_settings_format(settings->audio_1ch_filenames[i], MAX_FILENAME_LEN, "%s_%s_audio_ch%d.wav", base, tag, i + 1);
         } else {
-            snprintf(settings->audio_1ch_filenames[i], MAX_FILENAME_LEN, "%s_audio_ch%d.wav", base, i + 1);
+            gui_settings_format(settings->audio_1ch_filenames[i], MAX_FILENAME_LEN, "%s_audio_ch%d.wav", base, i + 1);
         }
     }
 }
@@ -400,8 +435,7 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     settings->capture_b = true;
     
     // Set default save path to Desktop
-    strncpy(settings->output_path, gui_settings_get_desktop_path(), MAX_FILENAME_LEN - 1);
-    settings->output_path[MAX_FILENAME_LEN - 1] = '\0';
+    gui_settings_copy(settings->output_path, sizeof(settings->output_path), gui_settings_get_desktop_path());
     
     // Auto naming defaults
     settings->auto_names_enabled = true;
@@ -593,6 +627,16 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
              (unsigned)settings->net_client_port);
 }
 
+static void gui_settings_write_string(FILE *f, const char *key, const char *value, bool comma) {
+    fprintf(f, "  \"%s\": \"", key);
+    for (const unsigned char *p = (const unsigned char *)value; *p; p++) {
+        if (*p == '"' || *p == '\\') { fputc('\\', f); fputc(*p, f); }
+        else if (*p < 0x20) fprintf(f, "\\u%04x", *p);
+        else fputc(*p, f);
+    }
+    fprintf(f, "\"%s\n", comma ? "," : "");
+}
+
 // Simple JSON-like format for settings
 // 16.02.25 - Remediate Win save
 void gui_settings_save(const gui_settings_t *settings) {
@@ -602,49 +646,49 @@ void gui_settings_save(const gui_settings_t *settings) {
     if (!gui_settings_ensure_parent_dirs(path)) {
         return;
     }
-    FILE *f = fopen(path, "w");
+    FILE *f = file_open_utf8(path, "w");
     if (!f) {
         return;
     }
     
-    fprintf(f, "{\n");
+    fprintf(f, "{\n  \"settings_format_version\": 2,\n");
     fprintf(f, "  \"device_index\": %d,\n", settings->device_index);
-    fprintf(f, "  \"output_path\": \"%s\",\n", settings->output_path);
+    gui_settings_write_string(f, "output_path", settings->output_path, true);
     fprintf(f, "  \"auto_names_enabled\": %s,\n", settings->auto_names_enabled ? "true" : "false");
-    fprintf(f, "  \"output_base_name\": \"%s\",\n", settings->output_base_name);
+    gui_settings_write_string(f, "output_base_name", settings->output_base_name, true);
     fprintf(f, "  \"append_timestamp_on_capture_start\": %s,\n", settings->append_timestamp_on_capture_start ? "true" : "false");
     fprintf(f, "  \"rf_preview_budget_percent\": %d,\n", settings->rf_preview_budget_percent);
     fprintf(f, "  \"rf_bits_a\": %u,\n", (unsigned)settings->rf_bits_a);
     fprintf(f, "  \"rf_bits_b\": %u,\n", (unsigned)settings->rf_bits_b);
     fprintf(f, "  \"cxadc_tenbit_mode_a\": %s,\n", settings->cxadc_tenbit_mode_card[0] ? "true" : "false");
     fprintf(f, "  \"cxadc_tenbit_mode_b\": %s,\n", settings->cxadc_tenbit_mode_card[1] ? "true" : "false");
-    fprintf(f, "  \"rf_tag_a\": \"%s\",\n", settings->rf_channel_tags[0]);
-    fprintf(f, "  \"rf_tag_b\": \"%s\",\n", settings->rf_channel_tags[1]);
-    fprintf(f, "  \"output_filename_a\": \"%s\",\n", settings->output_filename_a);
-    fprintf(f, "  \"output_filename_b\": \"%s\",\n", settings->output_filename_b);
+    gui_settings_write_string(f, "rf_tag_a", settings->rf_channel_tags[0], true);
+    gui_settings_write_string(f, "rf_tag_b", settings->rf_channel_tags[1], true);
+    gui_settings_write_string(f, "output_filename_a", settings->output_filename_a, true);
+    gui_settings_write_string(f, "output_filename_b", settings->output_filename_b, true);
     fprintf(f, "  \"capture_a\": %s,\n", settings->capture_a ? "true" : "false");
     fprintf(f, "  \"capture_b\": %s,\n", settings->capture_b ? "true" : "false");
     fprintf(f, "  \"sample_count\": %llu,\n", (unsigned long long)settings->sample_count);
-    fprintf(f, "  \"capture_time\": \"%s\",\n", settings->capture_time);
+    gui_settings_write_string(f, "capture_time", settings->capture_time, true);
     fprintf(f, "  \"overwrite_files\": %s,\n", settings->overwrite_files ? "true" : "false");
-    fprintf(f, "  \"aux_filename\": \"%s\",\n", settings->aux_filename);
-    fprintf(f, "  \"raw_filename\": \"%s\",\n", settings->raw_filename);
+    gui_settings_write_string(f, "aux_filename", settings->aux_filename, true);
+    gui_settings_write_string(f, "raw_filename", settings->raw_filename, true);
 
     // Audio filenames + enables (mirror CLI options)
-    fprintf(f, "  \"audio_4ch_filename\": \"%s\",\n", settings->audio_4ch_filename);
-    fprintf(f, "  \"audio_2ch_12_filename\": \"%s\",\n", settings->audio_2ch_12_filename);
-    fprintf(f, "  \"audio_2ch_34_filename\": \"%s\",\n", settings->audio_2ch_34_filename);
-    fprintf(f, "  \"audio_1ch_1_filename\": \"%s\",\n", settings->audio_1ch_filenames[0]);
-    fprintf(f, "  \"audio_1ch_2_filename\": \"%s\",\n", settings->audio_1ch_filenames[1]);
-    fprintf(f, "  \"audio_1ch_3_filename\": \"%s\",\n", settings->audio_1ch_filenames[2]);
-    fprintf(f, "  \"audio_1ch_4_filename\": \"%s\",\n", settings->audio_1ch_filenames[3]);
-    fprintf(f, "  \"audio_1ch_1_label\": \"%s\",\n", settings->audio_1ch_labels[0]);
-    fprintf(f, "  \"audio_1ch_2_label\": \"%s\",\n", settings->audio_1ch_labels[1]);
-    fprintf(f, "  \"audio_1ch_3_label\": \"%s\",\n", settings->audio_1ch_labels[2]);
-    fprintf(f, "  \"audio_1ch_4_label\": \"%s\",\n", settings->audio_1ch_labels[3]);
-    fprintf(f, "  \"audio_tag_4ch\": \"%s\",\n", settings->audio_output_tags[0]);
-    fprintf(f, "  \"audio_tag_2ch_12\": \"%s\",\n", settings->audio_output_tags[1]);
-    fprintf(f, "  \"audio_tag_2ch_34\": \"%s\",\n", settings->audio_output_tags[2]);
+    gui_settings_write_string(f, "audio_4ch_filename", settings->audio_4ch_filename, true);
+    gui_settings_write_string(f, "audio_2ch_12_filename", settings->audio_2ch_12_filename, true);
+    gui_settings_write_string(f, "audio_2ch_34_filename", settings->audio_2ch_34_filename, true);
+    gui_settings_write_string(f, "audio_1ch_1_filename", settings->audio_1ch_filenames[0], true);
+    gui_settings_write_string(f, "audio_1ch_2_filename", settings->audio_1ch_filenames[1], true);
+    gui_settings_write_string(f, "audio_1ch_3_filename", settings->audio_1ch_filenames[2], true);
+    gui_settings_write_string(f, "audio_1ch_4_filename", settings->audio_1ch_filenames[3], true);
+    gui_settings_write_string(f, "audio_1ch_1_label", settings->audio_1ch_labels[0], true);
+    gui_settings_write_string(f, "audio_1ch_2_label", settings->audio_1ch_labels[1], true);
+    gui_settings_write_string(f, "audio_1ch_3_label", settings->audio_1ch_labels[2], true);
+    gui_settings_write_string(f, "audio_1ch_4_label", settings->audio_1ch_labels[3], true);
+    gui_settings_write_string(f, "audio_tag_4ch", settings->audio_output_tags[0], true);
+    gui_settings_write_string(f, "audio_tag_2ch_12", settings->audio_output_tags[1], true);
+    gui_settings_write_string(f, "audio_tag_2ch_34", settings->audio_output_tags[2], true);
 
     fprintf(f, "  \"enable_audio_4ch\": %s,\n", settings->enable_audio_4ch ? "true" : "false");
     fprintf(f, "  \"enable_audio_2ch_12\": %s,\n", settings->enable_audio_2ch_12 ? "true" : "false");
@@ -655,19 +699,19 @@ void gui_settings_save(const gui_settings_t *settings) {
     fprintf(f, "  \"misrc_v15_v25_ab_swap\": %s,\n", settings->misrc_v15_v25_ab_swap ? "true" : "false");
     fprintf(f, "  \"stop_on_dropout\": %s,\n", settings->stop_on_dropout ? "true" : "false");
     fprintf(f, "  \"level_autostop_enabled\": %s,\n", settings->level_autostop_enabled ? "true" : "false");
-    fprintf(f, "  \"level_autostop_level_str\": \"%s\",\n", settings->level_autostop_level_str);
-    fprintf(f, "  \"level_autostop_duration_str\": \"%s\",\n", settings->level_autostop_duration_str);
+    gui_settings_write_string(f, "level_autostop_level_str", settings->level_autostop_level_str, true);
+    gui_settings_write_string(f, "level_autostop_duration_str", settings->level_autostop_duration_str, true);
     fprintf(f, "  \"level_autostop_vpp\": %.3f,\n", settings->level_autostop_vpp);
     fprintf(f, "  \"level_autostop_vpp_hsdaoh\": %.3f,\n", settings->level_autostop_vpp_hsdaoh);
-    fprintf(f, "  \"ingest_project\": \"%s\",\n", settings->ingest_project);
-    fprintf(f, "  \"ingest_tape_id\": \"%s\",\n", settings->ingest_tape_id);
-    fprintf(f, "  \"ingest_tape_format\": \"%s\",\n", settings->ingest_tape_format);
-    fprintf(f, "  \"ingest_tape_size\": \"%s\",\n", settings->ingest_tape_size);
-    fprintf(f, "  \"ingest_tape_speed\": \"%s\",\n", settings->ingest_tape_speed);
-    fprintf(f, "  \"ingest_tape_condition\": \"%s\",\n", settings->ingest_tape_condition);
-    fprintf(f, "  \"ingest_operator\": \"%s\",\n", settings->ingest_operator);
-    fprintf(f, "  \"ingest_location\": \"%s\",\n", settings->ingest_location);
-    fprintf(f, "  \"ingest_notes\": \"%s\",\n", settings->ingest_notes);
+    gui_settings_write_string(f, "ingest_project", settings->ingest_project, true);
+    gui_settings_write_string(f, "ingest_tape_id", settings->ingest_tape_id, true);
+    gui_settings_write_string(f, "ingest_tape_format", settings->ingest_tape_format, true);
+    gui_settings_write_string(f, "ingest_tape_size", settings->ingest_tape_size, true);
+    gui_settings_write_string(f, "ingest_tape_speed", settings->ingest_tape_speed, true);
+    gui_settings_write_string(f, "ingest_tape_condition", settings->ingest_tape_condition, true);
+    gui_settings_write_string(f, "ingest_operator", settings->ingest_operator, true);
+    gui_settings_write_string(f, "ingest_location", settings->ingest_location, true);
+    gui_settings_write_string(f, "ingest_notes", settings->ingest_notes, true);
     fprintf(f, "  \"enable_audio_1ch_1\": %s,\n", settings->enable_audio_1ch[0] ? "true" : "false");
     fprintf(f, "  \"enable_audio_1ch_2\": %s,\n", settings->enable_audio_1ch[1] ? "true" : "false");
     fprintf(f, "  \"enable_audio_1ch_3\": %s,\n", settings->enable_audio_1ch[2] ? "true" : "false");
@@ -696,7 +740,7 @@ void gui_settings_save(const gui_settings_t *settings) {
     fprintf(f, "  \"flac_verification\": %s,\n", settings->flac_verification ? "true" : "false");
     fprintf(f, "  \"flac_threads\": %d,\n", settings->flac_threads);
     fprintf(f, "  \"flac_affinity_enabled\": %s,\n", settings->flac_affinity_enabled ? "true" : "false");
-    fprintf(f, "  \"flac_affinity_cpu_list\": \"%s\",\n", settings->flac_affinity_cpu_list);
+    gui_settings_write_string(f, "flac_affinity_cpu_list", settings->flac_affinity_cpu_list, true);
     fprintf(f, "  \"waveform_scale_mode\": %d,\n", settings->waveform_scale_mode);
     fprintf(f, "  \"enable_resample_a\": %s,\n", settings->enable_resample_a ? "true" : "false");
     fprintf(f, "  \"enable_resample_b\": %s,\n", settings->enable_resample_b ? "true" : "false");
@@ -715,7 +759,7 @@ void gui_settings_save(const gui_settings_t *settings) {
     fprintf(f, "  \"show_core_pinning_in_settings\": %s,\n", settings->show_core_pinning_in_settings ? "true" : "false");
     fprintf(f, "  \"memory_budget_gb\": %u,\n", (unsigned)settings->memory_budget_gb);
     fprintf(f, "  \"update_last_check_unix_s\": %llu,\n", (unsigned long long)settings->update_last_check_unix_s);
-    fprintf(f, "  \"update_last_release_tag\": \"%s\",\n", settings->update_last_release_tag);
+    gui_settings_write_string(f, "update_last_release_tag", settings->update_last_release_tag, true);
     fprintf(f, "  \"update_available_cached\": %s,\n", settings->update_available_cached ? "true" : "false");
     fprintf(f, "  \"rtlsdr_freq_hz\": %llu,\n", (unsigned long long)settings->rtlsdr_freq_hz);
     fprintf(f, "  \"rtlsdr_gain_mode\": %d,\n", settings->rtlsdr_gain_mode);
@@ -731,67 +775,165 @@ void gui_settings_save(const gui_settings_t *settings) {
     // Server/Client networking (cxadc_vhs_server-style peer mode).
     fprintf(f, "  \"net_mode\": %d,\n", settings->net_mode);
     fprintf(f, "  \"net_server_port\": %u,\n", (unsigned)settings->net_server_port);
-    fprintf(f, "  \"net_server_port_str\": \"%s\",\n", settings->net_server_port_str);
-    fprintf(f, "  \"net_client_host\": \"%s\",\n", settings->net_client_host);
+    gui_settings_write_string(f, "net_server_port_str", settings->net_server_port_str, true);
+    gui_settings_write_string(f, "net_client_host", settings->net_client_host, true);
     fprintf(f, "  \"net_client_port\": %u,\n", (unsigned)settings->net_client_port);
-    fprintf(f, "  \"net_client_port_str\": \"%s\",\n", settings->net_client_port_str);
-    fprintf(f, "  \"playback_file_a\": \"%s\",\n", settings->playback_file_a);
-    fprintf(f, "  \"playback_file_b\": \"%s\"\n", settings->playback_file_b);
+    gui_settings_write_string(f, "net_client_port_str", settings->net_client_port_str, true);
+    gui_settings_write_string(f, "playback_file_a", settings->playback_file_a, true);
+    gui_settings_write_string(f, "playback_file_b", settings->playback_file_b, false);
     fprintf(f, "}\n");
     
     fclose(f);
 }
 
-// Simple parser for our JSON-like format
-static char* find_value(const char* content, const char* key) {
-    static char value[512];
-    char search_key[256];
-    snprintf(search_key, sizeof(search_key), "\"%s\":", key);
-    
-    char* pos = strstr(content, search_key);
-    if (!pos) return NULL;
-    
-    pos += strlen(search_key);
-    while (*pos == ' ' || *pos == '\t') pos++; // Skip whitespace
-    
-    if (*pos == '"') {
-        // String value
-        pos++;
-        char* end = strchr(pos, '"');
-        if (!end) return NULL;
-        
-        size_t len = end - pos;
-        if (len >= sizeof(value)) len = sizeof(value) - 1;
-        strncpy(value, pos, len);
-        value[len] = '\0';
-        return value;
-    } else {
-        // Number or boolean
-        char* end = strpbrk(pos, ",\n}");
-        if (!end) return NULL;
-        
-        size_t len = end - pos;
-        if (len >= sizeof(value)) len = sizeof(value) - 1;
-        strncpy(value, pos, len);
-        value[len] = '\0';
-        
-        // Trim trailing whitespace
-        while (len > 0 && (value[len-1] == ' ' || value[len-1] == '\t')) {
-            value[--len] = '\0';
-        }
-        
-        return value;
+static int gui_settings_hex4(const char *p) {
+    int value = 0;
+    for (int i = 0; i < 4; i++) {
+        unsigned char c = (unsigned char)p[i];
+        int n = c >= '0' && c <= '9' ? c - '0' :
+                c >= 'a' && c <= 'f' ? c - 'a' + 10 :
+                c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+        if (n < 0) return -1;
+        value = (value << 4) | n;
     }
+    return value;
 }
 
-// Helpers
-static void trim_newlines(char *s) {
-    if (!s) return;
-    size_t len = strlen(s);
-    while (len > 0 && (s[len - 1] == '\n' || s[len - 1] == '\r')) {
-        s[--len] = '\0';
+static const char *gui_settings_value_start(const char *p, const char *key, bool escaped) {
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == '{' || *p == ',') p++;
+        if (*p++ != '"') return NULL;
+        const char *name = p;
+        while (*p && *p != '"') p++;
+        if (!*p) return NULL;
+        bool match = strlen(key) == (size_t)(p - name) && !memcmp(name, key, (size_t)(p - name));
+        p++;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p++ != ':') return NULL;
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+        if (match) return p;
+        if (*p == '"') {
+            p++;
+            while (*p && *p != '"') {
+                if (escaped && *p == '\\' && p[1]) p++;
+                p++;
+            }
+            if (!*p) return NULL;
+            p++;
+        }
+        while (*p && *p != ',' && *p != '}') p++;
+        if (*p == '}') return NULL;
     }
+    return NULL;
 }
+
+static bool s_settings_value_too_long = false;
+
+// Version 1 wrote Windows backslashes literally. Only decode escapes after
+// an explicit version marker; otherwise C:\tapes\new would change meaning.
+static char* find_value(const char* content, const char* key) {
+    static char value[FILE_PATH_MAX];
+    s_settings_value_too_long = false;
+    const char *version = gui_settings_value_start(content, "settings_format_version", true);
+    bool escaped = version && strtol(version, NULL, 10) >= 2;
+    const char *pos = gui_settings_value_start(content, key, escaped);
+    if (!pos) return NULL;
+    size_t len = 0;
+    if (*pos == '"') {
+        pos++;
+        while (*pos && *pos != '"') {
+            unsigned char c = (unsigned char)*pos++;
+            if (escaped && c == '\\') {
+                c = (unsigned char)*pos++;
+                switch (c) {
+                case '"': case '\\': case '/': break;
+                case 'b': c = '\b'; break;
+                case 'f': c = '\f'; break;
+                case 'n': c = '\n'; break;
+                case 'r': c = '\r'; break;
+                case 't': c = '\t'; break;
+                case 'u': {
+                    if (strlen(pos) < 4) return NULL;
+                    int hi = gui_settings_hex4(pos);
+                    if (hi < 0) return NULL;
+                    pos += 4;
+                    unsigned cp = (unsigned)hi;
+                    if (cp >= 0xd800 && cp <= 0xdbff) {
+                        if (strlen(pos) < 6 || pos[0] != '\\' || pos[1] != 'u') return NULL;
+                        int lo = gui_settings_hex4(pos + 2);
+                        if (lo < 0xdc00 || lo > 0xdfff) return NULL;
+                        cp = 0x10000 + ((cp - 0xd800) << 10) + (unsigned)(lo - 0xdc00);
+                        pos += 6;
+                    } else if (cp >= 0xdc00 && cp <= 0xdfff) return NULL;
+                    if (!cp) return NULL; // A native path cannot contain NUL.
+                    unsigned count = cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+                    if (len + count >= sizeof(value)) goto too_long;
+                    if (count == 1) value[len++] = (char)cp;
+                    else {
+                        value[len++] = (char)((count == 2 ? 0xc0 : count == 3 ? 0xe0 : 0xf0) | (cp >> (6 * (count - 1))));
+                        for (unsigned shift = count - 1; shift > 0; shift--)
+                            value[len++] = (char)(0x80 | ((cp >> (6 * (shift - 1))) & 0x3f));
+                    }
+                    continue;
+                }
+                default: return NULL;
+                }
+            }
+            if (len + 1 >= sizeof(value)) goto too_long;
+            value[len++] = (char)c;
+        }
+        if (*pos != '"') return NULL;
+    } else {
+        while (*pos && *pos != ',' && *pos != '\n' && *pos != '}') {
+            if (len + 1 >= sizeof(value)) return NULL;
+            value[len++] = *pos++;
+        }
+        while (len && (value[len - 1] == ' ' || value[len - 1] == '\t' || value[len - 1] == '\r')) len--;
+    }
+    value[len] = '\0';
+#if defined(_WIN32) || defined(_WIN64)
+    // Older native folder pickers saved ACP bytes. Keep existing UTF-8 intact,
+    // and migrate only legacy strings that cannot be decoded as UTF-8.
+    if (!escaped && !MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value, -1, NULL, 0)) {
+        wchar_t wide[FILE_PATH_MAX];
+        if (!MultiByteToWideChar(CP_ACP, 0, value, -1, wide, FILE_PATH_MAX) ||
+            !gui_settings_from_wide(value, sizeof(value), wide)) goto too_long;
+    }
+#endif
+    return value;
+too_long:
+    s_settings_value_too_long = true;
+    value[0] = '\0';
+    return value;
+}
+
+// A specified but oversized value must not silently select the default file.
+// Pickers use gui_settings_copy directly, retaining the previous selection.
+static bool gui_settings_load_string(char *dst, size_t cap, const char *src) {
+    if (!s_settings_value_too_long && gui_settings_copy(dst, cap, src)) return true;
+    dst[0] = '\0';
+    return false;
+}
+
+#if !defined(_WIN32) && !defined(_WIN64) && !defined(__ANDROID__)
+// Pickers append one newline. Read their complete output so embedded/trailing
+// newlines in a POSIX filename survive; reject overlong output, never a prefix.
+static bool gui_settings_read_picker(FILE *fp, char *dst, size_t cap) {
+    size_t len = 0;
+    bool overflow = false;
+    int c;
+    while ((c = fgetc(fp)) != EOF) {
+        if (!c) overflow = true;
+        if (len < cap) dst[len++] = (char)c;
+        else overflow = true;
+    }
+    if (ferror(fp) || overflow) return false;
+    if (len && dst[len - 1] == '\n') len--;
+    if (!len || len >= cap) return false;
+    dst[len] = '\0';
+    return true;
+}
+#endif
 
 // Backward-compat migration:
 // Earlier builds could permanently prefix output_base_name with a timestamp like:
@@ -822,110 +964,31 @@ static void strip_timestamp_prefix_inplace(char *s) {
     }
 }
 
-// Output-folder picker. Returns true if output_path changed.
-// NOTE: On Android this is no longer called — the settings click handler in
-// gui_ui.c launches the async SAF picker (android_pick_output_folder_async)
-// and applies the result via the per-frame poll, so the render thread never
-// blocks across the picker Activity transition. This sync path remains for
-// desktop platforms.
-bool gui_settings_choose_output_folder(gui_settings_t *settings) {
-    if (!settings) return false;
-    char picked[512] = {0};
+static bool gui_settings_pick_path(char *picked, size_t cap, bool folder) {
 #if defined(__ANDROID__)
-    /* Not reached on Android (async path in gui_ui.c handles it). */
-    (void)picked;
-    return false;
-#elif defined(__APPLE__)
-    // Use AppleScript choose folder dialog and return POSIX path.
-    const char *cmd = "osascript -e 'POSIX path of (choose folder with prompt \"Select output folder for MISRC captures\")'";
-    FILE *fp = popen(cmd, "r");
-    if (!fp) return false;
-    if (!fgets(picked, sizeof(picked), fp)) {
-        pclose(fp);
-        return false;
-    }
-    (void)pclose(fp);
+    (void)picked; (void)cap; (void)folder;
+    return false; // Android uses the async SAF picker.
 #elif defined(_WIN32) || defined(_WIN64)
-    // Native Win32 folder picker.
     HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-    BROWSEINFOA bi = {0};
-    bi.lpszTitle = "Select output folder for MISRC captures";
-    bi.ulFlags = BIF_RETURNONLYFSDIRS;
-    LPITEMIDLIST pidl = SHBrowseForFolderA(&bi);
-    if (pidl) {
-        SHGetPathFromIDListA(pidl, picked);
-        CoTaskMemFree(pidl);
-    }
-    if (hr == S_OK) CoUninitialize();
-#else
-    // Linux/BSD: try zenity first, then kdialog.
-    const char *cmd =
-        "sh -c '"
-        "if command -v zenity >/dev/null 2>&1; then "
-        "zenity --file-selection --directory --title=\"Select output folder for MISRC captures\"; "
-        "elif command -v kdialog >/dev/null 2>&1; then "
-        "kdialog --getexistingdirectory \"$HOME\" \"Select output folder for MISRC captures\"; "
-        "fi'";
-    FILE *fp = popen(cmd, "r");
-    if (!fp) return false;
-    if (!fgets(picked, sizeof(picked), fp)) {
-        pclose(fp);
-        return false;
-    }
-    (void)pclose(fp);
-#endif
-    trim_newlines(picked);
-    if (picked[0] == '\0') return false;
-
-    size_t len = strlen(picked);
-    while (len > 1 && (picked[len - 1] == '/' || picked[len - 1] == '\\')) {
-        picked[--len] = '\0';
-    }
-
-    if (strncmp(settings->output_path, picked, MAX_FILENAME_LEN) == 0) {
-        return false;
-    }
-    strncpy(settings->output_path, picked, MAX_FILENAME_LEN - 1);
-    settings->output_path[MAX_FILENAME_LEN - 1] = '\0';
-    return true;
-}
-
-// Cross-platform (best-effort) playback file picker.
-bool gui_settings_choose_playback_file(gui_settings_t *settings, int channel) {
-    if (!settings) return false;
-    if (channel != 0 && channel != 1) return false;
-
-    char picked[512] = {0};
-#if defined(__ANDROID__)
-    /* Not reached on Android (async path in gui_ui.c handles it). */
-    (void)picked;
-    return false;
-#elif defined(__APPLE__)
-    // choose file, return POSIX path
-    const char *cmd = "osascript -e 'POSIX path of (choose file with prompt \"Select FLAC playback file\")'";
-    FILE *fp = popen(cmd, "r");
-    if (!fp) return false;
-    if (!fgets(picked, sizeof(picked), fp)) {
-        pclose(fp);
-        return false;
-    }
-    (void)pclose(fp);
-    trim_newlines(picked);
-#elif defined(_WIN32) || defined(_WIN64)
-    // Native Win32 file picker using IFileOpenDialog
-    HRESULT hr2 = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     IFileOpenDialog *pfd = NULL;
+    bool ok = false;
     if (SUCCEEDED(CoCreateInstance(&CLSID_FileOpenDialog, NULL, CLSCTX_INPROC_SERVER,
-                                    &IID_IFileOpenDialog, (void **)&pfd))) {
-        COMDLG_FILTERSPEC filter = { L"FLAC files", L"*.flac" };
-        IFileOpenDialog_SetFileTypes(pfd, 1, &filter);
-        IFileOpenDialog_SetTitle(pfd, L"Select FLAC playback file");
+                                   &IID_IFileOpenDialog, (void **)&pfd))) {
+        if (folder) {
+            DWORD options = 0;
+            IFileOpenDialog_GetOptions(pfd, &options);
+            IFileOpenDialog_SetOptions(pfd, options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+        } else {
+            COMDLG_FILTERSPEC filter = { L"FLAC files", L"*.flac" };
+            IFileOpenDialog_SetFileTypes(pfd, 1, &filter);
+        }
+        IFileOpenDialog_SetTitle(pfd, folder ? L"Select output folder for MISRC captures" : L"Select FLAC playback file");
         if (SUCCEEDED(IFileOpenDialog_Show(pfd, NULL))) {
             IShellItem *psi = NULL;
             if (SUCCEEDED(IFileOpenDialog_GetResult(pfd, &psi))) {
                 PWSTR wpath = NULL;
                 if (SUCCEEDED(IShellItem_GetDisplayName(psi, SIGDN_FILESYSPATH, &wpath))) {
-                    WideCharToMultiByte(CP_UTF8, 0, wpath, -1, picked, sizeof(picked), NULL, NULL);
+                    ok = gui_settings_from_wide(picked, cap, wpath);
                     CoTaskMemFree(wpath);
                 }
                 IShellItem_Release(psi);
@@ -933,35 +996,47 @@ bool gui_settings_choose_playback_file(gui_settings_t *settings, int channel) {
         }
         IFileOpenDialog_Release(pfd);
     }
-    if (hr2 == S_OK) CoUninitialize();
-    trim_newlines(picked);
+    if (SUCCEEDED(hr)) CoUninitialize();
+    return ok;
 #else
-    // Linux/BSD: try zenity first, then kdialog.
-    const char *cmd =
-        "sh -c '"
-        "if command -v zenity >/dev/null 2>&1; then "
-        "zenity --file-selection --title=\"Select FLAC playback file\" --file-filter=\"*.flac\"; "
-        "elif command -v kdialog >/dev/null 2>&1; then "
-        "kdialog --getopenfilename \"$HOME\" \"*.flac|FLAC files (*.flac)\"; "
-        "fi'";
+#ifdef __APPLE__
+    const char *cmd = folder
+        ? "osascript -e 'POSIX path of (choose folder with prompt \"Select output folder for MISRC captures\")'"
+        : "osascript -e 'POSIX path of (choose file with prompt \"Select FLAC playback file\")'";
+#else
+    const char *cmd = folder
+        ? "sh -c 'if command -v zenity >/dev/null 2>&1; then "
+          "zenity --file-selection --directory --title=\"Select output folder for MISRC captures\"; "
+          "elif command -v kdialog >/dev/null 2>&1; then "
+          "kdialog --getexistingdirectory \"$HOME\" \"Select output folder for MISRC captures\"; fi'"
+        : "sh -c 'if command -v zenity >/dev/null 2>&1; then "
+          "zenity --file-selection --title=\"Select FLAC playback file\" --file-filter=\"*.flac\"; "
+          "elif command -v kdialog >/dev/null 2>&1; then "
+          "kdialog --getopenfilename \"$HOME\" \"*.flac|FLAC files (*.flac)\"; fi'";
+#endif
     FILE *fp = popen(cmd, "r");
     if (!fp) return false;
-    if (!fgets(picked, sizeof(picked), fp)) {
-        pclose(fp);
-        return false;
-    }
-    (void)pclose(fp);
-    trim_newlines(picked);
+    bool ok = gui_settings_read_picker(fp, picked, cap);
+    return pclose(fp) == 0 && ok;
 #endif
+}
 
-    if (picked[0] == '\0') return false;
-    char *dst = (channel == 0) ? settings->playback_file_a : settings->playback_file_b;
-    if (strncmp(dst, picked, MAX_FILENAME_LEN) == 0) {
-        return false;
-    }
-    strncpy(dst, picked, MAX_FILENAME_LEN - 1);
-    dst[MAX_FILENAME_LEN - 1] = '\0';
-    return true;
+bool gui_settings_choose_output_folder(gui_settings_t *settings) {
+    if (!settings) return false;
+    char picked[FILE_PATH_MAX];
+    if (!gui_settings_pick_path(picked, sizeof(picked), true)) return false;
+    // Keep native root and literal POSIX backslash characters unchanged.
+    if (!strcmp(settings->output_path, picked)) return false;
+    return gui_settings_copy(settings->output_path, sizeof(settings->output_path), picked);
+}
+
+bool gui_settings_choose_playback_file(gui_settings_t *settings, int channel) {
+    if (!settings || (channel != 0 && channel != 1)) return false;
+    char picked[FILE_PATH_MAX];
+    if (!gui_settings_pick_path(picked, sizeof(picked), false)) return false;
+    char *dst = channel == 0 ? settings->playback_file_a : settings->playback_file_b;
+    if (!strcmp(dst, picked)) return false;
+    return gui_settings_copy(dst, sizeof(settings->playback_file_a), picked);
 }
 
 // Normalize level_autostop_level_str on load: migrate legacy integer percent
@@ -1002,7 +1077,7 @@ void gui_settings_load(gui_settings_t *settings) {
     gui_settings_init_defaults(settings);
     
     const char* path = get_settings_file_path();
-    FILE* f = fopen(path, "r");
+    FILE* f = file_open_utf8(path, "rb");
     if (!f) return; // No settings file, use defaults
     
     // Read entire file
@@ -1010,7 +1085,7 @@ void gui_settings_load(gui_settings_t *settings) {
     long size = ftell(f);
     fseek(f, 0, SEEK_SET);
     
-    if (size <= 0 || size > 32768) { // Sanity check
+    if (size <= 0 || size > 262144) { // Sanity check
         fclose(f);
         return;
     }
@@ -1024,6 +1099,12 @@ void gui_settings_load(gui_settings_t *settings) {
     size_t read_size = fread(content, 1, size, f);
     content[read_size] = '\0';
     fclose(f);
+
+    // Editors may prefix either legacy or current settings with a UTF-8 BOM.
+    if (read_size >= 3 && !memcmp(content, "\xef\xbb\xbf", 3)) {
+        read_size -= 3;
+        memmove(content, content + 3, read_size + 1);
+    }
     
     // Parse values
     char* value;
@@ -1033,8 +1114,7 @@ void gui_settings_load(gui_settings_t *settings) {
     }
     
     if ((value = find_value(content, "output_path")) != NULL) {
-        strncpy(settings->output_path, value, MAX_FILENAME_LEN - 1);
-        settings->output_path[MAX_FILENAME_LEN - 1] = '\0';
+        gui_settings_load_string(settings->output_path, sizeof(settings->output_path), value);
     }
     
     // Auto naming
@@ -1042,8 +1122,8 @@ void gui_settings_load(gui_settings_t *settings) {
         settings->auto_names_enabled = (strcmp(value, "true") == 0);
     }
     if ((value = find_value(content, "output_base_name")) != NULL) {
-        strncpy(settings->output_base_name, value, MAX_FILENAME_LEN - 1);
-        settings->output_base_name[MAX_FILENAME_LEN - 1] = '\0';
+        if (!gui_settings_load_string(settings->output_base_name, sizeof(settings->output_base_name), value))
+            settings->output_path[0] = '\0';
         strip_timestamp_prefix_inplace(settings->output_base_name);
     }
     if ((value = find_value(content, "append_timestamp_on_capture_start")) != NULL) {
@@ -1088,22 +1168,20 @@ void gui_settings_load(gui_settings_t *settings) {
         settings->cxadc_tenbit_mode_card[1] = false;
     }
     if ((value = find_value(content, "rf_tag_a")) != NULL) {
-        strncpy(settings->rf_channel_tags[0], value, sizeof(settings->rf_channel_tags[0]) - 1);
-        settings->rf_channel_tags[0][sizeof(settings->rf_channel_tags[0]) - 1] = '\0';
+        if (!gui_settings_load_string(settings->rf_channel_tags[0], sizeof(settings->rf_channel_tags[0]), value))
+            settings->output_path[0] = '\0';
     }
     if ((value = find_value(content, "rf_tag_b")) != NULL) {
-        strncpy(settings->rf_channel_tags[1], value, sizeof(settings->rf_channel_tags[1]) - 1);
-        settings->rf_channel_tags[1][sizeof(settings->rf_channel_tags[1]) - 1] = '\0';
+        if (!gui_settings_load_string(settings->rf_channel_tags[1], sizeof(settings->rf_channel_tags[1]), value))
+            settings->output_path[0] = '\0';
     }
 
     if ((value = find_value(content, "output_filename_a")) != NULL) {
-        strncpy(settings->output_filename_a, value, MAX_FILENAME_LEN - 1);
-        settings->output_filename_a[MAX_FILENAME_LEN - 1] = '\0';
+        gui_settings_load_string(settings->output_filename_a, sizeof(settings->output_filename_a), value);
     }
 
     if ((value = find_value(content, "output_filename_b")) != NULL) {
-        strncpy(settings->output_filename_b, value, MAX_FILENAME_LEN - 1);
-        settings->output_filename_b[MAX_FILENAME_LEN - 1] = '\0';
+        gui_settings_load_string(settings->output_filename_b, sizeof(settings->output_filename_b), value);
     }
     
     if ((value = find_value(content, "capture_a")) != NULL) {
@@ -1133,8 +1211,7 @@ void gui_settings_load(gui_settings_t *settings) {
         settings->flac_affinity_enabled = (strcmp(value, "true") == 0);
     }
     if ((value = find_value(content, "flac_affinity_cpu_list")) != NULL) {
-        strncpy(settings->flac_affinity_cpu_list, value, sizeof(settings->flac_affinity_cpu_list) - 1);
-        settings->flac_affinity_cpu_list[sizeof(settings->flac_affinity_cpu_list) - 1] = '\0';
+        gui_settings_load_string(settings->flac_affinity_cpu_list, sizeof(settings->flac_affinity_cpu_list), value);
     }
 
     if ((value = find_value(content, "flac_level")) != NULL) {
@@ -1224,8 +1301,7 @@ void gui_settings_load(gui_settings_t *settings) {
         settings->update_last_check_unix_s = (uint64_t)strtoull(value, NULL, 10);
     }
     if ((value = find_value(content, "update_last_release_tag")) != NULL) {
-        strncpy(settings->update_last_release_tag, value, sizeof(settings->update_last_release_tag) - 1);
-        settings->update_last_release_tag[sizeof(settings->update_last_release_tag) - 1] = '\0';
+        gui_settings_load_string(settings->update_last_release_tag, sizeof(settings->update_last_release_tag), value);
     }
     if ((value = find_value(content, "update_available_cached")) != NULL) {
         settings->update_available_cached = (strcmp(value, "true") == 0);
@@ -1240,62 +1316,55 @@ void gui_settings_load(gui_settings_t *settings) {
 
     // Audio filenames + enables
     if ((value = find_value(content, "audio_4ch_filename")) != NULL) {
-        strncpy(settings->audio_4ch_filename, value, MAX_FILENAME_LEN - 1);
-        settings->audio_4ch_filename[MAX_FILENAME_LEN - 1] = '\0';
+        gui_settings_load_string(settings->audio_4ch_filename, sizeof(settings->audio_4ch_filename), value);
     }
     if ((value = find_value(content, "audio_2ch_12_filename")) != NULL) {
-        strncpy(settings->audio_2ch_12_filename, value, MAX_FILENAME_LEN - 1);
-        settings->audio_2ch_12_filename[MAX_FILENAME_LEN - 1] = '\0';
+        gui_settings_load_string(settings->audio_2ch_12_filename, sizeof(settings->audio_2ch_12_filename), value);
     }
     if ((value = find_value(content, "audio_2ch_34_filename")) != NULL) {
-        strncpy(settings->audio_2ch_34_filename, value, MAX_FILENAME_LEN - 1);
-        settings->audio_2ch_34_filename[MAX_FILENAME_LEN - 1] = '\0';
+        gui_settings_load_string(settings->audio_2ch_34_filename, sizeof(settings->audio_2ch_34_filename), value);
     }
     if ((value = find_value(content, "audio_1ch_1_filename")) != NULL) {
-        strncpy(settings->audio_1ch_filenames[0], value, MAX_FILENAME_LEN - 1);
-        settings->audio_1ch_filenames[0][MAX_FILENAME_LEN - 1] = '\0';
+        gui_settings_load_string(settings->audio_1ch_filenames[0], sizeof(settings->audio_1ch_filenames[0]), value);
     }
     if ((value = find_value(content, "audio_1ch_2_filename")) != NULL) {
-        strncpy(settings->audio_1ch_filenames[1], value, MAX_FILENAME_LEN - 1);
-        settings->audio_1ch_filenames[1][MAX_FILENAME_LEN - 1] = '\0';
+        gui_settings_load_string(settings->audio_1ch_filenames[1], sizeof(settings->audio_1ch_filenames[1]), value);
     }
     if ((value = find_value(content, "audio_1ch_3_filename")) != NULL) {
-        strncpy(settings->audio_1ch_filenames[2], value, MAX_FILENAME_LEN - 1);
-        settings->audio_1ch_filenames[2][MAX_FILENAME_LEN - 1] = '\0';
+        gui_settings_load_string(settings->audio_1ch_filenames[2], sizeof(settings->audio_1ch_filenames[2]), value);
     }
     if ((value = find_value(content, "audio_1ch_4_filename")) != NULL) {
-        strncpy(settings->audio_1ch_filenames[3], value, MAX_FILENAME_LEN - 1);
-        settings->audio_1ch_filenames[3][MAX_FILENAME_LEN - 1] = '\0';
+        gui_settings_load_string(settings->audio_1ch_filenames[3], sizeof(settings->audio_1ch_filenames[3]), value);
     }
 
     // Per-channel audio labels (optional)
     if ((value = find_value(content, "audio_1ch_1_label")) != NULL) {
-        strncpy(settings->audio_1ch_labels[0], value, sizeof(settings->audio_1ch_labels[0]) - 1);
-        settings->audio_1ch_labels[0][sizeof(settings->audio_1ch_labels[0]) - 1] = '\0';
+        if (!gui_settings_load_string(settings->audio_1ch_labels[0], sizeof(settings->audio_1ch_labels[0]), value))
+            settings->output_path[0] = '\0';
     }
     if ((value = find_value(content, "audio_1ch_2_label")) != NULL) {
-        strncpy(settings->audio_1ch_labels[1], value, sizeof(settings->audio_1ch_labels[1]) - 1);
-        settings->audio_1ch_labels[1][sizeof(settings->audio_1ch_labels[1]) - 1] = '\0';
+        if (!gui_settings_load_string(settings->audio_1ch_labels[1], sizeof(settings->audio_1ch_labels[1]), value))
+            settings->output_path[0] = '\0';
     }
     if ((value = find_value(content, "audio_1ch_3_label")) != NULL) {
-        strncpy(settings->audio_1ch_labels[2], value, sizeof(settings->audio_1ch_labels[2]) - 1);
-        settings->audio_1ch_labels[2][sizeof(settings->audio_1ch_labels[2]) - 1] = '\0';
+        if (!gui_settings_load_string(settings->audio_1ch_labels[2], sizeof(settings->audio_1ch_labels[2]), value))
+            settings->output_path[0] = '\0';
     }
     if ((value = find_value(content, "audio_1ch_4_label")) != NULL) {
-        strncpy(settings->audio_1ch_labels[3], value, sizeof(settings->audio_1ch_labels[3]) - 1);
-        settings->audio_1ch_labels[3][sizeof(settings->audio_1ch_labels[3]) - 1] = '\0';
+        if (!gui_settings_load_string(settings->audio_1ch_labels[3], sizeof(settings->audio_1ch_labels[3]), value))
+            settings->output_path[0] = '\0';
     }
     if ((value = find_value(content, "audio_tag_4ch")) != NULL) {
-        strncpy(settings->audio_output_tags[0], value, sizeof(settings->audio_output_tags[0]) - 1);
-        settings->audio_output_tags[0][sizeof(settings->audio_output_tags[0]) - 1] = '\0';
+        if (!gui_settings_load_string(settings->audio_output_tags[0], sizeof(settings->audio_output_tags[0]), value))
+            settings->output_path[0] = '\0';
     }
     if ((value = find_value(content, "audio_tag_2ch_12")) != NULL) {
-        strncpy(settings->audio_output_tags[1], value, sizeof(settings->audio_output_tags[1]) - 1);
-        settings->audio_output_tags[1][sizeof(settings->audio_output_tags[1]) - 1] = '\0';
+        if (!gui_settings_load_string(settings->audio_output_tags[1], sizeof(settings->audio_output_tags[1]), value))
+            settings->output_path[0] = '\0';
     }
     if ((value = find_value(content, "audio_tag_2ch_34")) != NULL) {
-        strncpy(settings->audio_output_tags[2], value, sizeof(settings->audio_output_tags[2]) - 1);
-        settings->audio_output_tags[2][sizeof(settings->audio_output_tags[2]) - 1] = '\0';
+        if (!gui_settings_load_string(settings->audio_output_tags[2], sizeof(settings->audio_output_tags[2]), value))
+            settings->output_path[0] = '\0';
     }
 
     if ((value = find_value(content, "enable_audio_4ch")) != NULL) {
@@ -1326,16 +1395,14 @@ void gui_settings_load(gui_settings_t *settings) {
         settings->level_autostop_enabled = (strcmp(value, "true") == 0);
     }
     if ((value = find_value(content, "level_autostop_level_str")) != NULL) {
-        strncpy(settings->level_autostop_level_str, value, sizeof(settings->level_autostop_level_str) - 1);
-        settings->level_autostop_level_str[sizeof(settings->level_autostop_level_str) - 1] = '\0';
+        gui_settings_load_string(settings->level_autostop_level_str, sizeof(settings->level_autostop_level_str), value);
         // Migrate legacy integer percent (1-99) -> normalized 0.X (0.1-0.8)
         // and clamp into range. Idempotent for already-0.X saves.
         gui_settings_normalize_level_autostop_level(settings->level_autostop_level_str,
                                                     sizeof(settings->level_autostop_level_str));
     }
     if ((value = find_value(content, "level_autostop_duration_str")) != NULL) {
-        strncpy(settings->level_autostop_duration_str, value, sizeof(settings->level_autostop_duration_str) - 1);
-        settings->level_autostop_duration_str[sizeof(settings->level_autostop_duration_str) - 1] = '\0';
+        gui_settings_load_string(settings->level_autostop_duration_str, sizeof(settings->level_autostop_duration_str), value);
     }
     if ((value = find_value(content, "level_autostop_vpp")) != NULL) {
         settings->level_autostop_vpp = (float)atof(value);
@@ -1346,40 +1413,31 @@ void gui_settings_load(gui_settings_t *settings) {
         if (!(settings->level_autostop_vpp_hsdaoh > 0.1f)) settings->level_autostop_vpp_hsdaoh = 2.0f;
     }
     if ((value = find_value(content, "ingest_project")) != NULL) {
-        strncpy(settings->ingest_project, value, sizeof(settings->ingest_project) - 1);
-        settings->ingest_project[sizeof(settings->ingest_project) - 1] = '\0';
+        gui_settings_load_string(settings->ingest_project, sizeof(settings->ingest_project), value);
     }
     if ((value = find_value(content, "ingest_tape_id")) != NULL) {
-        strncpy(settings->ingest_tape_id, value, sizeof(settings->ingest_tape_id) - 1);
-        settings->ingest_tape_id[sizeof(settings->ingest_tape_id) - 1] = '\0';
+        gui_settings_load_string(settings->ingest_tape_id, sizeof(settings->ingest_tape_id), value);
     }
     if ((value = find_value(content, "ingest_tape_format")) != NULL) {
-        strncpy(settings->ingest_tape_format, value, sizeof(settings->ingest_tape_format) - 1);
-        settings->ingest_tape_format[sizeof(settings->ingest_tape_format) - 1] = '\0';
+        gui_settings_load_string(settings->ingest_tape_format, sizeof(settings->ingest_tape_format), value);
     }
     if ((value = find_value(content, "ingest_tape_size")) != NULL) {
-        strncpy(settings->ingest_tape_size, value, sizeof(settings->ingest_tape_size) - 1);
-        settings->ingest_tape_size[sizeof(settings->ingest_tape_size) - 1] = '\0';
+        gui_settings_load_string(settings->ingest_tape_size, sizeof(settings->ingest_tape_size), value);
     }
     if ((value = find_value(content, "ingest_tape_speed")) != NULL) {
-        strncpy(settings->ingest_tape_speed, value, sizeof(settings->ingest_tape_speed) - 1);
-        settings->ingest_tape_speed[sizeof(settings->ingest_tape_speed) - 1] = '\0';
+        gui_settings_load_string(settings->ingest_tape_speed, sizeof(settings->ingest_tape_speed), value);
     }
     if ((value = find_value(content, "ingest_tape_condition")) != NULL) {
-        strncpy(settings->ingest_tape_condition, value, sizeof(settings->ingest_tape_condition) - 1);
-        settings->ingest_tape_condition[sizeof(settings->ingest_tape_condition) - 1] = '\0';
+        gui_settings_load_string(settings->ingest_tape_condition, sizeof(settings->ingest_tape_condition), value);
     }
     if ((value = find_value(content, "ingest_operator")) != NULL) {
-        strncpy(settings->ingest_operator, value, sizeof(settings->ingest_operator) - 1);
-        settings->ingest_operator[sizeof(settings->ingest_operator) - 1] = '\0';
+        gui_settings_load_string(settings->ingest_operator, sizeof(settings->ingest_operator), value);
     }
     if ((value = find_value(content, "ingest_location")) != NULL) {
-        strncpy(settings->ingest_location, value, sizeof(settings->ingest_location) - 1);
-        settings->ingest_location[sizeof(settings->ingest_location) - 1] = '\0';
+        gui_settings_load_string(settings->ingest_location, sizeof(settings->ingest_location), value);
     }
     if ((value = find_value(content, "ingest_notes")) != NULL) {
-        strncpy(settings->ingest_notes, value, sizeof(settings->ingest_notes) - 1);
-        settings->ingest_notes[sizeof(settings->ingest_notes) - 1] = '\0';
+        gui_settings_load_string(settings->ingest_notes, sizeof(settings->ingest_notes), value);
     }
     if ((value = find_value(content, "enable_audio_1ch_1")) != NULL) {
         settings->enable_audio_1ch[0] = (strcmp(value, "true") == 0);
@@ -1396,12 +1454,10 @@ void gui_settings_load(gui_settings_t *settings) {
 
     // Playback files
     if ((value = find_value(content, "playback_file_a")) != NULL) {
-        strncpy(settings->playback_file_a, value, MAX_FILENAME_LEN - 1);
-        settings->playback_file_a[MAX_FILENAME_LEN - 1] = '\0';
+        gui_settings_load_string(settings->playback_file_a, sizeof(settings->playback_file_a), value);
     }
     if ((value = find_value(content, "playback_file_b")) != NULL) {
-        strncpy(settings->playback_file_b, value, MAX_FILENAME_LEN - 1);
-        settings->playback_file_b[MAX_FILENAME_LEN - 1] = '\0';
+        gui_settings_load_string(settings->playback_file_b, sizeof(settings->playback_file_b), value);
     }
 
     // RTL-SDR settings
@@ -1452,12 +1508,10 @@ void gui_settings_load(gui_settings_t *settings) {
         settings->net_server_port = (uint16_t)p;
     }
     if ((value = find_value(content, "net_server_port_str")) != NULL) {
-        strncpy(settings->net_server_port_str, value, sizeof(settings->net_server_port_str) - 1);
-        settings->net_server_port_str[sizeof(settings->net_server_port_str) - 1] = '\0';
+        gui_settings_load_string(settings->net_server_port_str, sizeof(settings->net_server_port_str), value);
     }
     if ((value = find_value(content, "net_client_host")) != NULL) {
-        strncpy(settings->net_client_host, value, sizeof(settings->net_client_host) - 1);
-        settings->net_client_host[sizeof(settings->net_client_host) - 1] = '\0';
+        gui_settings_load_string(settings->net_client_host, sizeof(settings->net_client_host), value);
     }
     if ((value = find_value(content, "net_client_port")) != NULL) {
         long p = atol(value);
@@ -1465,8 +1519,7 @@ void gui_settings_load(gui_settings_t *settings) {
         settings->net_client_port = (uint16_t)p;
     }
     if ((value = find_value(content, "net_client_port_str")) != NULL) {
-        strncpy(settings->net_client_port_str, value, sizeof(settings->net_client_port_str) - 1);
-        settings->net_client_port_str[sizeof(settings->net_client_port_str) - 1] = '\0';
+        gui_settings_load_string(settings->net_client_port_str, sizeof(settings->net_client_port_str), value);
     }
     // Re-sync port string mirrors if the numeric port was loaded but the
     // string mirror was absent/empty (older settings files).

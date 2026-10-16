@@ -30,7 +30,7 @@ Font GetFontDefault(void)
     return (Font){ .baseSize = 16, .glyphCount = 1, .glyphs = &glyph };
 }
 
-Vector2 MeasureTextEx(Font font, const char *text, float font_size, float spacing)
+Vector2 gui_font_measure_text(Font font, const char *text, float font_size, float spacing)
 {
     float width = 0;
     float face_width = font.texture.id ? 1.25f : 1;
@@ -48,7 +48,7 @@ static int expected_text_width(const gui_app_t *app, const char *text, int size)
     Font font = GetFontDefault();
     if (app && app->fonts && app->fonts[0].texture.id && app->fonts[0].glyphs)
         font = app->fonts[0];
-    return (int)ceilf(MeasureTextEx(font, text, (float)size, 0).x);
+    return (int)ceilf(gui_font_measure_text(font, text, (float)size, 0).x);
 }
 
 int main(void)

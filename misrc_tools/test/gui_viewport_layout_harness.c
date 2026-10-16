@@ -23,7 +23,7 @@ Font GetFontDefault(void)
     return (Font){ .baseSize = 18, .glyphCount = 1, .glyphs = &glyph };
 }
 
-Vector2 MeasureTextEx(Font font, const char *text, float size, float spacing)
+Vector2 gui_font_measure_text(Font font, const char *text, float size, float spacing)
 {
     (void)font;
     size_t length = strlen(text);
@@ -37,6 +37,25 @@ static bool near(float a, float b)
 
 int main(void)
 {
+    char display[64];
+    const char *unicode_name = "\xe3\x80\x8c\xe3\x83\xbb \xe3\x80\x8d" "Tape.flac";
+    gui_ui_copy_text_prefix(display, sizeof(display), unicode_name);
+    expect_true(strcmp(display, unicode_name) == 0,
+                "short Unicode filenames keep their original bytes");
+    gui_ui_copy_text_prefix(display, 6, unicode_name);
+    expect_true(strcmp(display, "\xe3\x80\x8c") == 0,
+                "basename truncation never keeps part of a UTF-8 character");
+    gui_ui_copy_path_tail(display, sizeof(display),
+        "0123456789abcdef\xf0\x9f\x8e\xac" "abcdefghijklmnopqrstuvwx");
+    expect_true(strcmp(display, "...abcdefghijklmnopqrstuvwx") == 0,
+                "path tails skip a partial four-byte character at the cut");
+    gui_ui_copy_path_tail(display, 5,
+        "0123456789abcdef\xf0\x9f\x8e\xac" "abcdefghijklmnopqrstuvwx");
+    expect_true(strcmp(display, "...a") == 0, "small path displays respect capacity");
+    display[0] = 'x';
+    gui_ui_copy_path_tail(display, 0, "0123456789012345678901234567890123456789");
+    expect_true(display[0] == 'x', "zero-sized path displays are not written");
+
     const int widths[] = {80, 160, 320, 465, 960, 1920};
     const int heights[] = {80, 160, 180, 425, 540, 1080};
     const int counts[] = {2, 7, 20};

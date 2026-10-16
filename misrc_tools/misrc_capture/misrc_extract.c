@@ -25,6 +25,8 @@
 #include <inttypes.h>
 
 #include "../common/buffer.h"
+#include "../common/file_utils.h"
+#include "../common/utf8_argv.h"
 
 #ifndef _WIN32
 	#include <getopt.h>
@@ -71,6 +73,7 @@ void usage(void)
 
 int main(int argc, char **argv)
 {
+    if (!file_init_utf8_argv(&argc, &argv)) return 1;
 //set pipe mode to binary in windows
 #if defined(_WIN32) || defined(_WIN64)
 	_setmode(_fileno(stdout), O_BINARY);
@@ -161,7 +164,7 @@ int main(int argc, char **argv)
 		}
 		else 
 		{
-			input_1 = fopen(input_name_1, "rb");
+			input_1 = file_open_read_utf8(input_name_1);
 			if (!input_1) {
 				fprintf(stderr, "(1) : Failed to open %s\n", input_name_1);
 				return -ENOENT;
@@ -178,7 +181,7 @@ int main(int argc, char **argv)
 		}
 		else
 		{
-			output_1 = fopen(output_name_1, "wb");
+			output_1 = file_open_utf8(output_name_1, "wb");
 			if (!output_1) {
 				fprintf(stderr, "(2) : Failed to open %s\n", output_name_1);
 				return -ENOENT;
@@ -195,7 +198,7 @@ int main(int argc, char **argv)
 		}
 		else if(output_name_2 != NULL)
 		{
-			output_2 = fopen(output_name_2, "wb");
+			output_2 = file_open_utf8(output_name_2, "wb");
 			if (!output_2) {
 				fprintf(stderr, "(2) : Failed to open %s\n", output_name_2);
 				return -ENOENT;
@@ -212,7 +215,7 @@ int main(int argc, char **argv)
 		}
 		else if(output_name_aux != NULL)
 		{
-			output_aux = fopen(output_name_aux, "wb");
+			output_aux = file_open_utf8(output_name_aux, "wb");
 			if (!output_aux) {
 				fprintf(stderr, "(2) : Failed to open %s\n", output_name_aux);
 				return -ENOENT;

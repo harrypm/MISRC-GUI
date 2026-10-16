@@ -110,6 +110,7 @@ static const char* const _FLAC_StreamEncoderSetNumThreadsStatusString[] = {
 #include "../common/extract.h"
 #include "../common/wave.h"
 #include "../common/file_utils.h"
+#include "../common/utf8_argv.h"
 #include "misrc_capture_cli.h"
 
 #if LIBFLAC_ENABLED == 1 && defined(FLAC_API_VERSION_CURRENT) && FLAC_API_VERSION_CURRENT >= 14
@@ -845,6 +846,7 @@ void print_level(char ch, uint16_t level) {
 
 int main(int argc, char **argv)
 {
+    if (!file_init_utf8_argv(&argc, &argv)) return 1;
 //set pipe mode to binary in windows
 #if defined(_WIN32) || defined(_WIN64)
 	_setmode(_fileno(stdout), O_BINARY);

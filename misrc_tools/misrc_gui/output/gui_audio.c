@@ -7,6 +7,7 @@
 #include "../../common/threading.h"
 #include "../../common/buffer.h"
 #include "../../common/buffer_manager.h"
+#include "../../common/file_utils.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -494,26 +495,26 @@ skip_monitoring:
         if (!was_recording && is_recording) {
             fprintf(stderr, "[AUDIO] Recording started, opening files\n");
             
-            char path[512];
+            char path[FILE_PATH_MAX + MAX_FILENAME_LEN];
             wave_header_t hdr;
             memset(&hdr, 0, sizeof(hdr));
             
             if (a->app->settings.enable_audio_4ch) {
                 snprintf(path, sizeof(path), "%s/%s", a->app->settings.output_path, a->app->settings.audio_4ch_filename);
-                a->f_4ch = fopen(path, "wb");
+                a->f_4ch = file_open_utf8(path, "wb");
                 if (a->f_4ch && a->f_4ch != stdout) fwrite(&hdr, 1, sizeof(hdr), a->f_4ch);
             }
             
             if (a->app->settings.enable_audio_2ch_12) {
                 snprintf(path, sizeof(path), "%s/%s", a->app->settings.output_path, a->app->settings.audio_2ch_12_filename);
-                a->f_2ch[0] = fopen(path, "wb");
+                a->f_2ch[0] = file_open_utf8(path, "wb");
                 if (a->f_2ch[0] && a->f_2ch[0] != stdout) fwrite(&hdr, 1, sizeof(hdr), a->f_2ch[0]);
                 a->convert_2ch = true;
             }
             
             if (a->app->settings.enable_audio_2ch_34) {
                 snprintf(path, sizeof(path), "%s/%s", a->app->settings.output_path, a->app->settings.audio_2ch_34_filename);
-                a->f_2ch[1] = fopen(path, "wb");
+                a->f_2ch[1] = file_open_utf8(path, "wb");
                 if (a->f_2ch[1] && a->f_2ch[1] != stdout) fwrite(&hdr, 1, sizeof(hdr), a->f_2ch[1]);
                 a->convert_2ch = true;
             }
@@ -521,7 +522,7 @@ skip_monitoring:
             for (int i = 0; i < 4; i++) {
                 if (a->app->settings.enable_audio_1ch[i]) {
                     snprintf(path, sizeof(path), "%s/%s", a->app->settings.output_path, a->app->settings.audio_1ch_filenames[i]);
-                    a->f_1ch[i] = fopen(path, "wb");
+                    a->f_1ch[i] = file_open_utf8(path, "wb");
                     if (a->f_1ch[i] && a->f_1ch[i] != stdout) fwrite(&hdr, 1, sizeof(hdr), a->f_1ch[i]);
                     a->convert_1ch = true;
                 }
@@ -674,11 +675,11 @@ int gui_audio_start(gui_app_t *app, buffer_manager_t *bufmgr)
     s_audio_ctx.app = app;
 
     // Open files under output_path
-    char path[512];
+    char path[FILE_PATH_MAX + MAX_FILENAME_LEN];
 
     if (want_4ch) {
         snprintf(path, sizeof(path), "%s/%s", app->settings.output_path, app->settings.audio_4ch_filename);
-        s_audio_ctx.f_4ch = fopen(path, "wb");
+        s_audio_ctx.f_4ch = file_open_utf8(path, "wb");
         if (!s_audio_ctx.f_4ch) {
             gui_app_set_status(app, "Failed to open audio_4ch output");
             return -1;
@@ -687,7 +688,7 @@ int gui_audio_start(gui_app_t *app, buffer_manager_t *bufmgr)
 
     if (want_2ch_12) {
         snprintf(path, sizeof(path), "%s/%s", app->settings.output_path, app->settings.audio_2ch_12_filename);
-        s_audio_ctx.f_2ch[0] = fopen(path, "wb");
+        s_audio_ctx.f_2ch[0] = file_open_utf8(path, "wb");
         if (!s_audio_ctx.f_2ch[0]) {
             gui_app_set_status(app, "Failed to open audio_2ch_12 output");
             return -1;
@@ -697,7 +698,7 @@ int gui_audio_start(gui_app_t *app, buffer_manager_t *bufmgr)
 
     if (want_2ch_34) {
         snprintf(path, sizeof(path), "%s/%s", app->settings.output_path, app->settings.audio_2ch_34_filename);
-        s_audio_ctx.f_2ch[1] = fopen(path, "wb");
+        s_audio_ctx.f_2ch[1] = file_open_utf8(path, "wb");
         if (!s_audio_ctx.f_2ch[1]) {
             gui_app_set_status(app, "Failed to open audio_2ch_34 output");
             return -1;
@@ -708,7 +709,7 @@ int gui_audio_start(gui_app_t *app, buffer_manager_t *bufmgr)
     for (int i = 0; i < 4; i++) {
         if (write_files && app->settings.enable_audio_1ch[i]) {
             snprintf(path, sizeof(path), "%s/%s", app->settings.output_path, app->settings.audio_1ch_filenames[i]);
-            s_audio_ctx.f_1ch[i] = fopen(path, "wb");
+            s_audio_ctx.f_1ch[i] = file_open_utf8(path, "wb");
             if (!s_audio_ctx.f_1ch[i]) {
                 gui_app_set_status(app, "Failed to open audio_1ch output");
                 return -1;

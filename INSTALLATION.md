@@ -13,6 +13,12 @@ End users should grab prebuilt binaries from the [releases page](https://github.
 ### Linux (Debian/Ubuntu)
 `cmake git meson ninja-build nasm pkg-config libfftw3-dev libflac-dev libusb-1.0-0-dev libuvc-dev libsoxr-dev libasound2-dev libgl1-mesa-dev libx11-dev libxcursor-dev libxi-dev libxinerama-dev libxrandr-dev`
 
+The UI uses installed fonts for characters missing from its embedded fonts.
+For Chinese, Japanese and Korean filenames on Linux, install `fontconfig` and
+`fonts-noto-cjk` (or another CJK font). Windows uses its installed system fonts;
+install the corresponding language fonts if needed. Font coverage affects only
+display, not the UTF-8 paths used to read and write files.
+
 ### macOS (Homebrew)
 `cmake fftw flac libusb libuvc libsoxr meson nasm ninja pkgconf`
 

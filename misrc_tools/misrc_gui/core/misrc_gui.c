@@ -38,7 +38,9 @@
 #include "../output/gui_audio.h"
 #include "../net/gui_net.h"
 #include "../../common/threading.h"
+#include "../../common/utf8_argv.h"
 #include "version.h"
+#include "gui_font.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -441,6 +443,7 @@ static void gui_enable_debug_console(void) {
 #endif
 
 int main(int argc, char **argv) {
+    if (!file_init_utf8_argv(&argc, &argv)) return 1;
     bool debug_view = false;
     bool show_help = false;
     bool show_version = false;
@@ -1355,6 +1358,7 @@ int main(int argc, char **argv) {
     free(clay_memory);
 
     // Unload fonts if we loaded TTFs (not the default font)
+    gui_font_unload();
     if (fonts[0].texture.id != 0 && fonts[0].texture.id != GetFontDefault().texture.id) {
         UnloadFont(fonts[0]);
     }

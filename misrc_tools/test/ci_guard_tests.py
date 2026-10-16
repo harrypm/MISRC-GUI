@@ -1023,25 +1023,38 @@ def check_settings_persistence_contract(gui_settings_c_path: Path) -> int:
     source = read_text(gui_settings_c_path)
     required_snippets = [
         "gui_settings_ensure_parent_dirs(path)",
-        "getenv(\"APPDATA\")",
-        "getenv(\"LOCALAPPDATA\")",
-        "getenv(\"XDG_CONFIG_HOME\")",
-        "_mkdir(path)",
-        "mkdir(path, 0700)",
+        "file_getenv_utf8(\"APPDATA\")",
+        "file_getenv_utf8(\"LOCALAPPDATA\")",
+        "file_getenv_utf8(\"XDG_CONFIG_HOME\")",
+        "file_mkdir_utf8(path, 0700)",
     ]
     for snippet in required_snippets:
         if snippet not in source:
             return fail(f"Missing settings persistence contract snippet in gui_settings.c: {snippet}")
 
+    # Directory creation and file I/O now live in the shared UTF-8 helpers.
+    # Retain the platform checks here as well as the settings call-site checks.
+    file_utils = read_text(gui_settings_c_path.parents[2] / "common/file_utils.c")
+    for snippet in (
+        "GetEnvironmentVariableW(wide_name,",
+        "getenv(name)",
+        "_wmkdir(wide)",
+        "mkdir(path, (mode_t)mode)",
+        "_wfopen(wide, wide_mode)",
+        "fopen(filename, mode)",
+    ):
+        if snippet not in file_utils:
+            return fail(f"Missing settings filesystem contract snippet in file_utils.c: {snippet}")
+
     save_pos = source.find("void gui_settings_save(")
     if save_pos < 0:
         return fail("Could not locate gui_settings_save() in gui_settings.c")
     ensure_pos = source.find("gui_settings_ensure_parent_dirs(path)", save_pos)
-    fopen_pos = source.find("FILE *f = fopen(path, \"w\");", save_pos)
+    fopen_pos = source.find("FILE *f = file_open_utf8(path, \"w\");", save_pos)
     if ensure_pos < 0 or fopen_pos < 0:
-        return fail("Missing parent-dir ensure or fopen call in gui_settings_save()")
+        return fail("Missing parent-dir ensure or file_open_utf8 call in gui_settings_save()")
     if ensure_pos > fopen_pos:
-        return fail("gui_settings_save() must ensure parent directories before fopen")
+        return fail("gui_settings_save() must ensure parent directories before file_open_utf8")
     return 0
 
 def check_flac_large_file_offsets_contract(flac_writer_c_path: Path) -> int:

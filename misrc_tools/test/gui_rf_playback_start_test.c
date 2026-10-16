@@ -15,11 +15,12 @@
 #include <fftw3.h>
 #endif
 #include "../misrc_gui/input/gui_playback_length_cache.h"
+#include "../common/file_utils.h"
 
 static void *start_test_malloc(size_t bytes);
 static void *start_test_calloc(size_t count,size_t bytes);
 static void start_test_free(void *memory);
-static FILE *start_test_fopen(const char *filepath,const char *mode);
+static FILE *start_test_open_read_utf8(const char *filepath);
 static int start_test_fclose(FILE *file);
 static size_t start_test_fread(void *memory,size_t size,size_t count,FILE *file);
 static int start_test_ferror(FILE *file);
@@ -39,7 +40,7 @@ static FLAC__StreamDecoderInitStatus start_test_decoder_init_stream(
 #define malloc start_test_malloc
 #define calloc start_test_calloc
 #define free start_test_free
-#define fopen start_test_fopen
+#define file_open_read_utf8 start_test_open_read_utf8
 #define fclose start_test_fclose
 #define fread start_test_fread
 #define ferror start_test_ferror
@@ -57,7 +58,7 @@ static FLAC__StreamDecoderInitStatus start_test_decoder_init_stream(
 #undef fread
 #undef ferror
 #undef fclose
-#undef fopen
+#undef file_open_read_utf8
 #undef free
 #undef calloc
 #undef malloc
@@ -138,8 +139,8 @@ static void start_test_free(void *memory) {
     start_test_release();
     free(memory);
 }
-static FILE *start_test_fopen(const char *filepath,const char *mode) {
-    FILE *file=fopen(filepath,mode);
+static FILE *start_test_open_read_utf8(const char *filepath) {
+    FILE *file=file_open_read_utf8(filepath);
     if (!file) return NULL;
     start_test_acquire();
     unsigned slot=0;

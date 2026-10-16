@@ -35,7 +35,7 @@ Font GetFontDefault(void)
     return (Font){ .baseSize = 16, .glyphCount = 1, .glyphs = &glyph };
 }
 
-Vector2 MeasureTextEx(Font font, const char *text, float font_size, float spacing)
+Vector2 gui_font_measure_text(Font font, const char *text, float font_size, float spacing)
 {
     (void)font;
     float width = 0;
@@ -96,7 +96,7 @@ static const uint32_t test_counts[] = {
 
 static int text_width(const char *text)
 {
-    return (int)ceilf(MeasureTextEx(GetFontDefault(), text, 16, 0).x);
+    return (int)ceilf(gui_font_measure_text(GetFontDefault(), text, 16, 0).x);
 }
 
 static void expect_same_layout(gui_channel_stats_layout_t actual,

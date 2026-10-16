@@ -7,6 +7,8 @@
 #include "gui_dropdown.h"
 #include "gui_popup.h"
 #include "gui_device_label.h"
+#include "gui_text_edit.h"
+#include "gui_font.h"
 #include "../visualization/gui_fft.h"
 #include "../visualization/gui_oscilloscope.h"
 #include "../signal/gui_cvbs.h"
@@ -26,6 +28,7 @@
 #include "version.h"
 #include "../visualization/gui_custom_elements.h"
 #include "../../common/buffer_manager.h"
+#include "../../common/file_utils.h"
 #include "../../common/threading.h"
 #include <clay.h>
 #include <stdio.h>
@@ -1200,7 +1203,7 @@ static void record_limit_measure_char_widths(gui_app_t *app,
     float total = 0.0f;
     for (int i = 0; i < 8; i++) {
         char glyph[2] = { text[i], '\0' };
-        Vector2 m = MeasureTextEx(font, glyph, (float)font_size, 0.0f);
+        Vector2 m = gui_font_measure_text(font, glyph, (float)font_size, 0.0f);
         float w = m.x;
         if (w <= 0.0f) {
             w = (text[i] == ':') ? ((float)font_size * 0.35f) : ((float)font_size * 0.5f);
@@ -1409,7 +1412,7 @@ static void gui_ui_format_playback_readout(gui_app_t *app, int channel,
 // 64-bit file size, portable across the POSIX/Win32 builds.
 static uint64_t gui_ui_file_size_64(const char *path) {
     if (!path || !path[0]) return 0;
-    FILE *f = fopen(path, "rb");
+    FILE *f = file_open_read_utf8(path);
     if (!f) return 0;
     uint64_t size = 0;
 #if defined(_WIN32) || defined(_WIN64)
@@ -1462,7 +1465,7 @@ static void gui_ui_format_playback_fileinfo(gui_app_t *app, int channel,
         return;
     }
     typedef struct {
-        char path[512];
+        char path[FILE_PATH_MAX];
         uint64_t raw;
         uint64_t flac;
         bool valid;
@@ -1494,6 +1497,33 @@ static void gui_ui_format_playback_fileinfo(gui_app_t *app, int channel,
     }
 }
 
+/* Display-only truncation must not turn a valid UTF-8 filename into invalid bytes. */
+static void gui_ui_copy_text_prefix(char *dst, size_t capacity, const char *text)
+{
+    if (!dst || capacity == 0) return;
+    size_t length = strlen(text);
+    if (length >= capacity) length = (size_t)gui_text_boundary(text, (int)capacity - 1);
+    memcpy(dst, text, length);
+    dst[length] = '\0';
+}
+
+static void gui_ui_copy_path_tail(char *dst, size_t capacity, const char *path)
+{
+    size_t length = strlen(path);
+    if (length <= 30) {
+        gui_ui_copy_text_prefix(dst, capacity, path);
+        return;
+    }
+    size_t start = length - 27;
+    while (((unsigned char)path[start] & 0xc0) == 0x80) ++start;
+    if (capacity < 4) {
+        gui_ui_copy_text_prefix(dst, capacity, "...");
+        return;
+    }
+    memcpy(dst, "...", 3);
+    gui_ui_copy_text_prefix(dst + 3, capacity - 3, path + start);
+}
+
 // File basename for the info line ("Tape_08_..._video_rf_8-bit_20msps.flac").
 static void gui_ui_playback_file_basename(gui_app_t *app, int channel,
                                           char *dst, size_t dst_len)
@@ -1504,11 +1534,13 @@ static void gui_ui_playback_file_basename(gui_app_t *app, int channel,
     (void)gui_playback_get_selected_file_info(app, channel, &info);
     if (info.filepath[0] == '\0') return;
     const char *slash = strrchr(info.filepath, '/');
+    const char *sep = slash;
+#ifdef _WIN32
     const char *bslash = strrchr(info.filepath, '\\');
-    const char *sep = (slash && bslash) ? (slash > bslash ? slash : bslash)
-                                       : (slash ? slash : bslash);
+    if (bslash && (!sep || bslash > sep)) sep = bslash;
+#endif
     const char *base = sep ? (sep + 1) : info.filepath;
-    snprintf(dst, dst_len, "%s", base);
+    gui_ui_copy_text_prefix(dst, dst_len, base);
 }
 static bool gui_ui_seek_playback_from_track(gui_app_t *app, int track_index, float mouse_x)
 {
@@ -2131,7 +2163,7 @@ static int gui_ui_measure_button_width(const gui_app_t *app,
         font = GetFontDefault();
     }
     const char *safe_text = (text && text[0]) ? text : " ";
-    Vector2 m = MeasureTextEx(font, safe_text, (float)font_size, 0.0f);
+    Vector2 m = gui_font_measure_text(font, safe_text, (float)font_size, 0.0f);
     int measured_width = (int)ceilf(m.x) + (horizontal_padding * 2) + extra_width;
     return gui_ui_clamp_int(measured_width, min_width, max_width);
 }
@@ -2155,7 +2187,7 @@ static int gui_ui_measure_text_width(const gui_app_t *app,
         font = GetFontDefault();
     }
     const char *safe_text = (text && text[0]) ? text : " ";
-    Vector2 m = MeasureTextEx(font, safe_text, (float)font_size, 0.0f);
+    Vector2 m = gui_font_measure_text(font, safe_text, (float)font_size, 0.0f);
     return (int)ceilf(m.x);
 }
 
@@ -2180,7 +2212,7 @@ static void gui_ui_ellipsize_text(const gui_app_t *app,
     if (!font.glyphs) {
         font = GetFontDefault();
     }
-    if (MeasureTextEx(font, text, (float)font_size, 0.0f).x <=
+    if (gui_font_measure_text(font, text, (float)font_size, 0.0f).x <=
         (float)max_text_width) {
         return;
     }
@@ -2193,7 +2225,7 @@ static void gui_ui_ellipsize_text(const gui_app_t *app,
         }
         text[cut] = '\0';
         strncat(text, "...", text_capacity - strlen(text) - 1);
-        if (MeasureTextEx(font, text, (float)font_size, 0.0f).x <=
+        if (gui_font_measure_text(font, text, (float)font_size, 0.0f).x <=
             (float)max_text_width) {
             return;
         }
@@ -2647,13 +2679,7 @@ static bool gui_ui_text_field_char_allowed(ui_text_field_t field, int ch)
         // Hostname or IP: allow printable ASCII except quote (JSON-safe).
         return (ch >= 32 && ch < 127 && ch != '\"');
     }
-    if (ch < 32 || ch >= 127) {
-        return false;
-    }
-    if (field == UI_TEXT_FIELD_OUTPUT_PATH) {
-        return !(ch == '*' || ch == '?' || ch == '\"' || ch == '<' || ch == '>' || ch == '|');
-    }
-    return !(ch == '/' || ch == '\\' || ch == ':' || ch == '*' || ch == '?' || ch == '\"' || ch == '<' || ch == '>' || ch == '|');
+    return gui_text_path_char_allowed(ch, field == UI_TEXT_FIELD_OUTPUT_PATH);
 }
 
 static void gui_ui_text_field_font(ui_text_field_t field, int *font_size, int *font_id)
@@ -2714,11 +2740,13 @@ static Font gui_ui_text_get_font(const gui_app_t *app, int font_id)
     return font;
 }
 
-static float gui_ui_text_char_width_px(const gui_app_t *app, int font_id, int font_size, unsigned char ch)
+static float gui_ui_text_char_width_px(const gui_app_t *app, int font_id, int font_size, const char *text, int count)
 {
     Font font = gui_ui_text_get_font(app, font_id);
-    char glyph[2] = { (char)ch, '\0' };
-    Vector2 m = MeasureTextEx(font, glyph, (float)font_size, 0.0f);
+    char glyph[5] = {0};
+    if (count > 4) count = 1;
+    memcpy(glyph, text, (size_t)count);
+    Vector2 m = gui_font_measure_text(font, glyph, (float)font_size, 0.0f);
     if (m.x <= 0.0f) {
         return (float)font_size * 0.5f;
     }
@@ -2749,13 +2777,14 @@ static int gui_ui_text_cursor_from_click(gui_app_t *app,
     gui_ui_text_field_font(field, &font_size, &font_id);
 
     float x = 0.0f;
-    for (int i = 0; i < (int)len; i++) {
-        unsigned char ch = (unsigned char)text[i];
-        float w = gui_ui_text_char_width_px(app, font_id, font_size, ch);
+    for (int i = 0; i < (int)len; ) {
+        int next = gui_text_next(text, i);
+        float w = gui_ui_text_char_width_px(app, font_id, font_size, text + i, next - i);
         if (local_x < x + (w * 0.5f)) {
             return i;
         }
         x += w;
+        i = next;
     }
     return (int)len;
 }
@@ -2765,9 +2794,11 @@ static void gui_ui_text_clamp_state(const char *dst)
     size_t len = dst ? strlen(dst) : 0;
     if (s_active_text_cursor < 0) s_active_text_cursor = 0;
     if ((size_t)s_active_text_cursor > len) s_active_text_cursor = (int)len;
+    s_active_text_cursor = gui_text_boundary(dst ? dst : "", s_active_text_cursor);
     if (s_active_text_selection_anchor >= 0) {
         if (s_active_text_selection_anchor < 0) s_active_text_selection_anchor = 0;
         if ((size_t)s_active_text_selection_anchor > len) s_active_text_selection_anchor = (int)len;
+        s_active_text_selection_anchor = gui_text_boundary(dst ? dst : "", s_active_text_selection_anchor);
         if (s_active_text_selection_anchor == s_active_text_cursor) {
             s_active_text_selection_anchor = -1;
         }
@@ -2808,6 +2839,7 @@ static void gui_ui_text_set_cursor_position(const char *dst, int new_cursor, boo
     size_t len = dst ? strlen(dst) : 0;
     if (new_cursor < 0) new_cursor = 0;
     if ((size_t)new_cursor > len) new_cursor = (int)len;
+    new_cursor = gui_text_boundary(dst ? dst : "", new_cursor);
     if (keep_selection) {
         if (s_active_text_selection_anchor < 0) {
             s_active_text_selection_anchor = s_active_text_cursor;
@@ -2820,28 +2852,57 @@ static void gui_ui_text_set_cursor_position(const char *dst, int new_cursor, boo
 
 static bool gui_ui_text_insert_char(char *dst, size_t cap, int ch)
 {
-    if (!dst || cap == 0) return false;
-    size_t len = strlen(dst);
-    if (len + 1 >= cap) return false;
-    if (s_active_text_cursor < 0) s_active_text_cursor = 0;
-    if ((size_t)s_active_text_cursor > len) s_active_text_cursor = (int)len;
-    memmove(dst + s_active_text_cursor + 1,
-            dst + s_active_text_cursor,
-            len - (size_t)s_active_text_cursor + 1);
-    dst[s_active_text_cursor] = (char)ch;
-    s_active_text_cursor++;
+    if (!dst || cap == 0 || ch <= 0 || ch > 0x10ffff ||
+        (ch >= 0xd800 && ch <= 0xdfff)) return false;
+    int count = 0;
+    const char *text = CodepointToUTF8(ch, &count);
+    int start = s_active_text_cursor, end = start;
+    gui_ui_text_get_selection_range(dst, &start, &end);
+    if (!gui_text_replace(dst, cap, &s_active_text_cursor, start, end, text, (size_t)count)) {
+        gui_popup_info("Text is too long", "The text was not changed because it exceeds this field's capacity.");
+        return false;
+    }
+    s_active_text_selection_anchor = -1;
     return true;
 }
 
 static bool gui_ui_text_insert_filtered(ui_text_field_t field, char *dst, size_t cap, const char *src)
 {
-    if (!dst || !src) return false;
-    bool changed = false;
-    for (const unsigned char *p = (const unsigned char *)src; *p; ++p) {
-        int ch = (int)(*p);
-        if (!gui_ui_text_field_char_allowed(field, ch)) continue;
-        if (!gui_ui_text_insert_char(dst, cap, ch)) break;
-        changed = true;
+    if (!dst || !src || cap == 0) return false;
+    char *filtered = (char *)malloc(cap);
+    if (!filtered) return false;
+    size_t count = 0;
+    bool valid = true;
+    bool path_field = field == UI_TEXT_FIELD_OUTPUT_BASE_NAME ||
+                      field == UI_TEXT_FIELD_OUTPUT_PATH ||
+                      (field >= UI_TEXT_FIELD_RF_TAG_A && field <= UI_TEXT_FIELD_AUDIO_LABEL_4);
+    for (const char *p = src; *p; ) {
+        int size = 0;
+        int ch = GetCodepointNext(p, &size);
+        int encoded_size = 0;
+        const char *encoded = CodepointToUTF8(ch, &encoded_size);
+        if (size <= 0 || size != encoded_size || memcmp(p, encoded, (size_t)size) != 0) {
+            valid = false;
+            break;
+        }
+        if (!gui_ui_text_field_char_allowed(field, ch)) {
+            if (path_field) { valid = false; break; }
+            p += size;
+            continue;
+        }
+        if ((size_t)size >= cap - count) { valid = false; break; }
+        memcpy(filtered + count, p, (size_t)size);
+        count += (size_t)size;
+        p += size;
+    }
+    int start = s_active_text_cursor, end = start;
+    gui_ui_text_get_selection_range(dst, &start, &end);
+    bool changed = valid && count > 0 &&
+                   gui_text_replace(dst, cap, &s_active_text_cursor, start, end, filtered, count);
+    free(filtered);
+    if (changed) s_active_text_selection_anchor = -1;
+    else if (!valid || count > 0) {
+        gui_popup_info("Cannot paste text", "The text was not changed. It is too long or contains characters this field cannot accept.");
     }
     return changed;
 }
@@ -2907,9 +2968,11 @@ static void gui_ui_render_active_text(ui_text_field_t field,
     int cursor = s_active_text_cursor;
     if (cursor < 0) cursor = 0;
     if (cursor > len) cursor = len;
+    cursor = gui_text_boundary(text, cursor);
     int anchor = s_active_text_selection_anchor;
     if (anchor < 0) anchor = cursor;
     if (anchor > len) anchor = len;
+    anchor = gui_text_boundary(text, anchor);
     bool has_selection = (anchor != cursor);
     int sel_start = has_selection ? ((anchor < cursor) ? anchor : cursor) : cursor;
     int sel_end = has_selection ? ((anchor > cursor) ? anchor : cursor) : cursor;
@@ -3027,19 +3090,17 @@ static bool gui_ui_text_backspace(char *dst, int *cursor)
     if (!dst || !cursor) return false;
     size_t len = strlen(dst);
     if (len == 0 || *cursor <= 0) return false;
-    if ((size_t)*cursor > len) *cursor = (int)len;
-    memmove(dst + *cursor - 1, dst + *cursor, len - (size_t)(*cursor) + 1);
-    (*cursor)--;
-    return true;
+    *cursor = gui_text_boundary(dst, *cursor);
+    return gui_text_replace(dst, len + 1, cursor, gui_text_previous(dst, *cursor), *cursor, NULL, 0);
 }
 
 static bool gui_ui_text_delete(char *dst, int *cursor)
 {
     if (!dst || !cursor) return false;
     size_t len = strlen(dst);
+    *cursor = gui_text_boundary(dst, *cursor);
     if ((size_t)*cursor >= len) return false;
-    memmove(dst + *cursor, dst + *cursor + 1, len - (size_t)(*cursor));
-    return true;
+    return gui_text_replace(dst, len + 1, cursor, *cursor, gui_text_next(dst, *cursor), NULL, 0);
 }
 
 static void gui_ui_handle_active_text_edit(gui_app_t *app)
@@ -3112,7 +3173,6 @@ static void gui_ui_handle_active_text_edit(gui_app_t *app)
     }
     if (primary_mod_down && IsKeyPressed(KEY_V)) {
         const char *clip = GetClipboardText();
-        if (gui_ui_text_delete_selection(dst)) changed = true;
         if (clip && clip[0]) {
             if (gui_ui_text_insert_filtered(s_active_text_field, dst, cap, clip)) {
                 changed = true;
@@ -3125,8 +3185,11 @@ static void gui_ui_handle_active_text_edit(gui_app_t *app)
         size_t android_len = android_drain_text_input(android_text, sizeof(android_text));
         bool finish_edit_requested = false;
         if (android_len > 0) {
-            for (size_t i = 0; i < android_len; i++) {
-                unsigned char ach = (unsigned char)android_text[i];
+            for (size_t i = 0; i < android_len; ) {
+                int size = 0;
+                int ach = GetCodepointNext(android_text + i, &size);
+                if (size <= 0 || (size_t)size > android_len - i) break;
+                i += (size_t)size;
                 if (ach == '\0') break;
                 if (ach == '\r' || ach == '\n') {
                     finish_edit_requested = true;
@@ -3142,7 +3205,6 @@ static void gui_ui_handle_active_text_edit(gui_app_t *app)
                 }
                 if (primary_mod_down) continue;
                 if (!gui_ui_text_field_char_allowed(s_active_text_field, (int)ach)) continue;
-                if (gui_ui_text_delete_selection(dst)) changed = true;
                 if (gui_ui_text_insert_char(dst, cap, (int)ach)) changed = true;
             }
         }
@@ -3157,17 +3219,16 @@ static void gui_ui_handle_active_text_edit(gui_app_t *app)
     int ch = GetCharPressed();
     while (ch > 0) {
         if (!primary_mod_down && gui_ui_text_field_char_allowed(s_active_text_field, ch)) {
-            if (gui_ui_text_delete_selection(dst)) changed = true;
             if (gui_ui_text_insert_char(dst, cap, ch)) changed = true;
         }
         ch = GetCharPressed();
     }
 
     if (IsKeyPressed(KEY_LEFT)) {
-        gui_ui_text_set_cursor_position(dst, s_active_text_cursor - 1, shift_down);
+        gui_ui_text_set_cursor_position(dst, gui_text_previous(dst, s_active_text_cursor), shift_down);
     }
     if (IsKeyPressed(KEY_RIGHT)) {
-        gui_ui_text_set_cursor_position(dst, s_active_text_cursor + 1, shift_down);
+        gui_ui_text_set_cursor_position(dst, gui_text_next(dst, s_active_text_cursor), shift_down);
     }
     if (IsKeyPressed(KEY_HOME)) {
         gui_ui_text_set_cursor_position(dst, 0, shift_down);
@@ -3853,13 +3914,7 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                         }
                         // Show filename or "(none)"
                         const char *file_a = app->settings.playback_file_a[0] ? app->settings.playback_file_a : "(none)";
-                        // Truncate long paths for display
-                        size_t len_a = strlen(file_a);
-                        if (len_a > 30) {
-                            snprintf(playback_file_a_display, sizeof(playback_file_a_display), "...%s", file_a + len_a - 27);
-                        } else {
-                            snprintf(playback_file_a_display, sizeof(playback_file_a_display), "%s", file_a);
-                        }
+                        gui_ui_copy_path_tail(playback_file_a_display, sizeof(playback_file_a_display), file_a);
                         CLAY(CLAY_ID("PlaybackFileAPath"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER }, .padding = { 6, 6, 0, 0 } }, .backgroundColor = to_clay_color((Color){25,25,30,255}), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
                             CLAY_TEXT(make_string(playback_file_a_display), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(app->settings.playback_file_a[0] ? COLOR_TEXT : COLOR_TEXT_DIM) }));
                         }
@@ -3874,12 +3929,7 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                             CLAY_TEXT(CLAY_STRING("Ch B..."), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
                         }
                         const char *file_b = app->settings.playback_file_b[0] ? app->settings.playback_file_b : "(none)";
-                        size_t len_b = strlen(file_b);
-                        if (len_b > 30) {
-                            snprintf(playback_file_b_display, sizeof(playback_file_b_display), "...%s", file_b + len_b - 27);
-                        } else {
-                            snprintf(playback_file_b_display, sizeof(playback_file_b_display), "%s", file_b);
-                        }
+                        gui_ui_copy_path_tail(playback_file_b_display, sizeof(playback_file_b_display), file_b);
                         CLAY(CLAY_ID("PlaybackFileBPath"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER }, .padding = { 6, 6, 0, 0 } }, .backgroundColor = to_clay_color((Color){25,25,30,255}), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
                             CLAY_TEXT(make_string(playback_file_b_display), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(app->settings.playback_file_b[0] ? COLOR_TEXT : COLOR_TEXT_DIM) }));
                         }
@@ -4019,7 +4069,7 @@ static void render_record_limit_window(gui_app_t *app)
         Color timecode_fg = display_timecode_valid ? COLOR_TEXT : COLOR_CLIP_RED;
         int record_limit_timecode_font_size = record_limit_timecode_font_size_px();
         Font record_limit_font = record_limit_timecode_font(app);
-        Vector2 record_limit_timecode_text_size = MeasureTextEx(record_limit_font,
+        Vector2 record_limit_timecode_text_size = gui_font_measure_text(record_limit_font,
                                                                 "00:00:00",
                                                                 (float)record_limit_timecode_font_size,
                                                                 0.0f);
@@ -7713,7 +7763,7 @@ static bool render_main_panels(gui_app_t *app) {
         status_free_space_display[0] = '\0';
     }
     if (show_status_message) {
-        snprintf(status_message_display, sizeof(status_message_display), "%s", raw_status);
+        gui_ui_copy_text_prefix(status_message_display, sizeof(status_message_display), raw_status);
         if (status_message_width_budget < 24) {
             status_message_width_budget = 24;
         }
@@ -8298,7 +8348,7 @@ static void gui_ui_poll_android_results(gui_app_t *app)
 
     /* Picker results -> apply to settings. */
     int pkind = 0, pok = 0;
-    char ppath[512];
+    char ppath[FILE_PATH_MAX];
     if (android_poll_picker_result(&pkind, &pok, ppath, sizeof(ppath))) {
         fprintf(stderr, "[GUI] Android picker result: kind=%d ok=%d path='%s'\n",
                 pkind, pok, ppath);

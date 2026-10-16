@@ -19,6 +19,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "../../common/file_utils.h"
 
 // Forward declaration
 typedef struct gui_app gui_app_t;
@@ -55,7 +56,7 @@ typedef enum {
 //-----------------------------------------------------------------------------
 
 typedef struct {
-    char filepath[512];          // Full path to FLAC file
+    char filepath[FILE_PATH_MAX];          // Full path to FLAC file
     uint32_t sample_rate;        // Sample rate from FLAC STREAMINFO header
                                  // (kHz-domain value for RF captures, e.g. 20000 = 20 MSPS)
     uint8_t bits_per_sample;     // Bits per sample (8, 12, 16)
