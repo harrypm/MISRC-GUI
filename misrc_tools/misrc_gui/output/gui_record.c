@@ -76,6 +76,16 @@
 // maps to 65536*32 bytes == 1048576 samples per channel per writer read.
 #define GUI_RECORD_WRITER_BLOCK_BYTES ((size_t)65536 * 32)
 #define GUI_RECORD_WRITER_BLOCK_SAMPLES (GUI_RECORD_WRITER_BLOCK_BYTES / sizeof(int16_t))
+// stdio buffer for capture output files. libFLAC emits one small fwrite() per
+// frame (often <1 KB); with the default 4 KB CRT buffer each flush becomes a
+// separate write, which is round-trip bound on SMB/NFS targets.
+#define GUI_RECORD_OUTPUT_STDIO_BUFFER_BYTES ((size_t)8 * 1024 * 1024)
+
+static void gui_record_set_output_buffer(FILE *fp) {
+    if (fp) {
+        (void)setvbuf(fp, NULL, _IOFBF, GUI_RECORD_OUTPUT_STDIO_BUFFER_BYTES);
+    }
+}
 
 // Format file size into human-readable string
 static void format_file_size_u64(uint64_t size, char *buf, size_t buf_size) {
@@ -2687,6 +2697,8 @@ static int gui_record_start_confirmed(gui_app_t *app) {
         // Open FLAC files (respect per-channel enable)
         s_file_a = app->settings.capture_a ? fopen(path_a, "wb") : NULL;
         s_file_b = app->settings.capture_b ? fopen(path_b, "wb") : NULL;
+        gui_record_set_output_buffer(s_file_a);
+        gui_record_set_output_buffer(s_file_b);
 
         if ((app->settings.capture_a && !s_file_a) || (app->settings.capture_b && !s_file_b)) {
             gui_app_set_status(app, "Failed to open output files");
@@ -2928,6 +2940,8 @@ static int gui_record_start_confirmed(gui_app_t *app) {
         // RAW recording (respect per-channel enable)
         s_file_a = app->settings.capture_a ? fopen(path_a, "wb") : NULL;
         s_file_b = app->settings.capture_b ? fopen(path_b, "wb") : NULL;
+        gui_record_set_output_buffer(s_file_a);
+        gui_record_set_output_buffer(s_file_b);
 
         if ((app->settings.capture_a && !s_file_a) || (app->settings.capture_b && !s_file_b)) {
             gui_app_set_status(app, "Failed to open output files");
