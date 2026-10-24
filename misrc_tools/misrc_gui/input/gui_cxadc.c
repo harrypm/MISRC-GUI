@@ -844,7 +844,7 @@ bool gui_cxadc_get_sample_rate_hz(int card_idx, bool tenbit, uint32_t *rate_hz_o
     // the 40/20 MSPS clockgen baseline.
     return false;
 #else
-    double now = GetTime();
+    double now = gui_runtime_time();
     if (!s_cxadc_param_cache_valid[card_idx] ||
         (now - s_cxadc_param_cache_time_s) >= CXADC_RATE_CACHE_TTL_S) {
         int tenxfsc = 0, crystal = 0;

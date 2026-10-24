@@ -6,7 +6,9 @@
  */
 
 #include "gui_oscilloscope.h"
+#include "../../common/threading.h"
 #include "gui_phosphor_rt.h"
+#include "../net/gui_remote_monitor.h"
 #include "gui_fft.h"
 #include "../signal/gui_trigger.h"
 #include "../ui/gui_popup.h"
@@ -136,6 +138,10 @@ typedef struct {
     // Initialization flag
     bool initialized;
     bool trigger_source_defaulted_by_channel;
+    /* Remote source sampling stride, applied only in processing (not the
+     * time/div grid, which must always show the real ADC sample rate). */
+    float remote_stride;
+    uint32_t remote_last_sequence;
 } waveform_panel_state_t;
 
 typedef struct {
@@ -983,7 +989,7 @@ static bool waveform_process_display(waveform_panel_state_t *state,
     }
 
     // Get decimation factor from zoom_scale
-    float decimation = cfg->zoom_scale;
+    float decimation = cfg->zoom_scale / (state->remote_stride > 1.0f ? state->remote_stride : 1.0f);
     if (decimation < ZOOM_SCALE_MIN) decimation = ZOOM_SCALE_MIN;
     if (decimation > ZOOM_SCALE_MAX) decimation = ZOOM_SCALE_MAX;
 
@@ -1100,6 +1106,46 @@ static void waveform_vtable_process(void *state_ptr, const int16_t *samples,
     waveform_state_unlock(state);
 }
 
+/* Remote snapshots are prepared on the Pi and never feed the extraction or
+ * recording path. The only drawing path is the ORIGINAL Waveform vtable.
+ * The native segment retains sample-for-sample zoom up to the native prefix;
+ * the full-window decimated segment preserves local time/div at zoom out. */
+void gui_waveform_remote_apply(void *state_ptr,
+                               const struct gui_rm_scope_packet *packet,
+                               int channel) {
+    if (!state_ptr || !packet || channel < 0 || channel >= packet->channels) return;
+    waveform_panel_state_t *state = (waveform_panel_state_t *)state_ptr;
+    uint32_t sequence = gui_rm_get_u32(packet->sequence_le);
+    bool dirty = false;
+    float zoom;
+    waveform_state_lock(state);
+    dirty = state->config_dirty;
+    zoom = state->zoom_scale;
+    waveform_state_unlock(state);
+    if (state->remote_last_sequence == sequence && !dirty) return;
+    uint32_t source_count = gui_rm_get_u32(packet->source_count_le);
+    if (source_count < GUI_RM_SCOPE_SAMPLES) return;
+    float stride = (float)source_count / GUI_RM_SCOPE_SAMPLES;
+    bool wide = zoom >= stride;
+    int16_t samples_a[GUI_RM_SCOPE_SAMPLES];
+    int16_t samples_b[GUI_RM_SCOPE_SAMPLES];
+    for (size_t i = 0; i < GUI_RM_SCOPE_SAMPLES; ++i) {
+        const uint8_t *a = wide ? packet->ch[0].wide_le[i] : packet->ch[0].native_le[i];
+        const uint8_t *b = wide ? packet->ch[1].wide_le[i] : packet->ch[1].native_le[i];
+        samples_a[i] = gui_rm_get_s16(a);
+        samples_b[i] = gui_rm_get_s16(b);
+    }
+    state->remote_stride = wide ? stride : 1.0f;
+    uint32_t rate = gui_rm_get_u32(packet->sample_rate_le);
+    uint32_t effective_rate = wide ? (uint32_t)((double)rate / stride + 0.5) : rate;
+    if (effective_rate == 0) effective_rate = 1;
+    gui_waveform_set_trigger_source_buffers(samples_a, samples_b, GUI_RM_SCOPE_SAMPLES);
+    waveform_vtable_process(state, channel == 0 ? samples_a : samples_b,
+                            GUI_RM_SCOPE_SAMPLES, effective_rate);
+    gui_waveform_set_trigger_source_buffers(NULL, NULL, 0);
+    state->remote_last_sequence = sequence;
+}
+
 //-----------------------------------------------------------------------------
 // Waveform Line Panel Vtable
 //-----------------------------------------------------------------------------
@@ -1109,6 +1155,8 @@ static void *waveform_create(void) {
     if (!state) return NULL;
 
     // Default to phosphor mode
+    state->remote_stride = 1.0f;
+    state->remote_last_sequence = 0;
     state->render_mode = WAVEFORM_MODE_PHOSPHOR;
 
     // Initialize trigger settings with defaults
@@ -1875,4 +1923,70 @@ static const panel_vtable_t s_waveform_vtable = {
 
 void gui_waveform_panel_register(void) {
     panel_register(PANEL_VIEW_WAVEFORM, &s_waveform_vtable);
+}
+
+/* v5: server uses EXACT Local waveform processing (including SOXR + trigger),
+ * but produces normalized display samples without creating a graphics window.
+ * HTTP request threads serialize this CPU-only renderer because the Local
+ * resampler uses static temporary scratch buffers. */
+static atomic_flag s_rd_wave_lock=ATOMIC_FLAG_INIT;
+size_t gui_waveform_server_display_points(const int16_t *src,const int16_t *a,
+        const int16_t *b,size_t count,uint32_t rate,const gui_rd_config_t *cfg,
+        float out[GUI_RD_WIDTH],int32_t *trigger_pos){
+    if(!src||!out||!cfg||!trigger_pos||!count)return 0;
+    while(atomic_flag_test_and_set_explicit(&s_rd_wave_lock,memory_order_acquire))thrd_sleep_ms(1);
+    /* Keep resamplers cached across frames; no GPU resources used. */
+    static waveform_panel_state_t states[2];
+    static bool ready[2]={false,false};
+    int ch=(src==b)?1:0;
+    waveform_panel_state_t *st=&states[ch];
+    if(!ready[ch]){
+        atomic_flag_clear(&st->data_lock);
+        atomic_init(&st->display_width,GUI_RD_WIDTH);
+        st->remote_stride=1.f;
+        ready[ch]=true;
+    }
+    atomic_store(&st->display_width,(int)cfg->width);
+    waveform_runtime_cfg_t local={
+        .zoom_scale=cfg->zoom,
+        .trigger_enabled=cfg->trigger_enabled!=0,
+        .trigger_level=(int16_t)cfg->trigger_level,
+        .trigger_mode=(trigger_mode_t)cfg->trigger_mode,
+        .trigger_source=(trigger_source_t)cfg->trigger_source,
+    };
+    waveform_sample_t temp[GUI_RD_WIDTH];size_t n=0;int tr=-1;
+    gui_waveform_set_trigger_source_buffers(a,b,count);
+    bool ok=waveform_process_display(st,&local,src,count,rate,temp,&n,&tr);
+    gui_waveform_set_trigger_source_buffers(NULL,NULL,0);
+    if(ok){for(size_t i=0;i<n;i++)out[i]=temp[i].value;}
+    *trigger_pos=ok?tr:-1;
+    atomic_flag_clear_explicit(&s_rd_wave_lock,memory_order_release);
+    return ok?n:0;
+}
+void gui_waveform_remote_apply_points(void *state_ptr,const gui_rd_channel_t *ch,uint32_t sequence){
+    if(!state_ptr||!ch)return;
+    waveform_panel_state_t *state=state_ptr;
+    if(state->remote_last_sequence==sequence || ch->count==0)return;
+    waveform_state_lock(state);
+    for(size_t i=0;i<ch->count;i++)state->display_samples[i].value=ch->waveform[i];
+    state->display_samples_available=ch->count;
+    state->trigger_display_pos=ch->trigger_pos;
+    state->remote_stride=1.0f;
+    state->remote_last_sequence=sequence;
+    state->config_dirty=false;
+    waveform_state_unlock(state);
+}
+void gui_waveform_remote_publish_config(void *state_ptr,int ch){
+    if(!state_ptr)return;
+    waveform_panel_state_t *state=state_ptr;
+    gui_rd_config_t cfg;
+    waveform_state_lock(state);
+    cfg.zoom=state->zoom_scale;
+    cfg.width=(uint32_t)atomic_load(&state->display_width);
+    cfg.trigger_enabled=state->trigger_enabled;
+    cfg.trigger_level=state->trigger_level;
+    cfg.trigger_mode=state->trigger_mode;
+    cfg.trigger_source=state->trigger_source;
+    waveform_state_unlock(state);
+    gui_rd_publish_request(ch,cfg);
 }

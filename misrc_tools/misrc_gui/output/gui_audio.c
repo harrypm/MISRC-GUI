@@ -1,5 +1,7 @@
 #include "gui_audio.h"
 
+#include "../net/local_save_proxy.h"
+
 #include "raylib.h"
 
 #include "../../common/extract.h"
@@ -16,6 +18,15 @@
 #if LIBSOXR_ENABLED
 #include <soxr.h>
 #endif
+/* Local Save proxy API redirects only recording files, never OS-level resources. */
+#define fwrite mls_proxy_write
+#define fseek mls_proxy_seek
+#define fclose mls_proxy_close
+#define fflush mls_proxy_flush
+#define ferror mls_proxy_error
+#define clearerr mls_proxy_clearerr
+#define file_open_utf8 mls_proxy_open
+
 
 // External do_exit flag from ringbuffer.h
 extern atomic_int do_exit;

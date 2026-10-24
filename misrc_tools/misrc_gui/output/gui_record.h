@@ -23,6 +23,16 @@ typedef enum {
     GUI_ERROR_CLASS_PARSER = 2
 } gui_error_class_t;
 
+/* Sticky count for any confirmed record-path loss; reset on record start. */
+void gui_record_note_lost_block(void);
+
+/* Hardware/stream watchdog interruption makes an active recording incomplete,
+ * even if no ring-buffer block was dropped. Call BEFORE stopping capture. */
+void gui_record_mark_capture_interrupted(gui_app_t *app, const char *reason);
+
+/* Headless-side, once per 5s: raw input/encode throughput and record backlog. */
+void gui_record_poll_performance(gui_app_t *app, double now);
+
 // Initialize recording subsystem
 void gui_record_init(void);
 

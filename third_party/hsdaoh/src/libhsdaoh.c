@@ -347,8 +347,8 @@ int hsdaoh_clear_endpoint_halt(hsdaoh_dev_t *dev)
 	int r;
 
 	if (libusb_kernel_driver_active(dev->devh, 1) == 1) {
-		dev->driver_active = true;
 		r = libusb_detach_kernel_driver(dev->devh, 1);
+		if (r == 0) dev->driver_active_interface1 = true;
 		if (r < 0) {
 			fprintf(stderr, "Failed to detach UVC Kernel driver: %d\n", r);
 			return r;
@@ -469,8 +469,8 @@ int hsdaoh_open(hsdaoh_dev_t **out_dev, uint32_t index)
 
 	dev->hid_interface = 4;
 	if (libusb_kernel_driver_active(dev->devh, dev->hid_interface) == 1) {
-		dev->driver_active = true;
 		r = libusb_detach_kernel_driver(dev->devh, dev->hid_interface);
+		if (r == 0) dev->driver_active_interface4 = true;
 		if (r < 0) {
 			fprintf(stderr, "Failed to detach HID Kernel driver: %d\n", r);
 			goto err;
@@ -511,14 +511,25 @@ int hsdaoh_close(hsdaoh_dev_t *dev)
 	if (!dev)
 		return -1;
 
-	if (HSDAOH_INACTIVE != dev->async_status)
-		uvc_stop_streaming(dev->uvc_devh);
+	/* A caller can close directly after a partial open or successful start.
+	 * Always join the output worker before freeing its device state. */
+	if (HSDAOH_RUNNING == dev->async_status)
+		hsdaoh_stop_stream(dev);
 
 	libusb_release_interface(dev->devh, dev->hid_interface);
 
-	if (dev->driver_active) {
-		if (libusb_attach_kernel_driver(dev->devh, 1) && libusb_attach_kernel_driver(dev->devh, 4))
-			fprintf(stderr, "Reattaching kernel driver failed!\n");
+	/* The old `attach(1) && attach(4)` short-circuited: a successful
+	 * attach(1) silently skipped attach(4). Restore only interfaces that
+	 * were detached successfully during this open. */
+	if (dev->driver_active_interface1) {
+		int attach_rc = libusb_attach_kernel_driver(dev->devh, 1);
+		if (attach_rc < 0)
+			fprintf(stderr, "[HSDAOH] Reattach kernel driver interface 1 failed: %d\n", attach_rc);
+	}
+	if (dev->driver_active_interface4) {
+		int attach_rc = libusb_attach_kernel_driver(dev->devh, 4);
+		if (attach_rc < 0)
+			fprintf(stderr, "[HSDAOH] Reattach kernel driver interface 4 failed: %d\n", attach_rc);
 	}
 
 	uvc_close(dev->uvc_devh);
@@ -837,17 +848,24 @@ void _uvc_callback(uvc_frame_t *frame, void *ptr)
 {
 	hsdaoh_dev_t *dev = (hsdaoh_dev_t *)ptr;
 
+	/* USB callback thread owns these counters. Read them only after
+	 * uvc_stop_streaming() has joined/stopped callbacks. */
+	dev->uvc_frames_received++;
 	if (frame->frame_format != UVC_COLOR_FORMAT_YUYV) {
+		dev->uvc_frames_wrong_format++;
 		/* Report incorrect frame format */
 		hsdaoh_emit_msg(dev, HSDAOH_ERROR, "Error: incorrect frame format!\n");
 		return;
 	}
 
-	/* discard frame if it is incomplete (can happen after streaming was started) */
-	if (frame->data_bytes != (dev->width * dev->height * 2))
+	/* Incomplete UVC packets are otherwise dropped silently. */
+	if (frame->data_bytes != (dev->width * dev->height * 2)) {
+		dev->uvc_frames_incomplete++;
 		return;
+	}
 
 	if (dev->discard_start_frames) {
+		dev->uvc_frames_discarded++;
 		dev->discard_start_frames--;
 
 		if (dev->discard_start_frames == 5)
@@ -856,6 +874,7 @@ void _uvc_callback(uvc_frame_t *frame, void *ptr)
 		return;
 	}
 	if (dev->raw_cb) {
+		dev->uvc_frames_delivered++;
 		hsdaoh_data_info_t data_info;
 		memset(&data_info, 0, sizeof(data_info));
 		data_info.ctx = dev->cb_ctx;
@@ -874,63 +893,80 @@ void _uvc_callback(uvc_frame_t *frame, void *ptr)
 
 int hsdaoh_start_stream(hsdaoh_dev_t *dev, hsdaoh_read_cb_t cb, void *ctx, unsigned int buf_num)
 {
-	int r = 0;
+	int r;
+	uvc_error_t res;
+	uvc_stream_ctrl_t ctrl;
 
 	if (!dev)
 		return -1;
-
 	if (HSDAOH_INACTIVE != dev->async_status)
 		return -2;
 
+	/* Verify that UVC negotiation succeeds before spawning the output worker.
+	 * The old implementation returned pthread_create's success even when
+	 * uvc_start_streaming() failed, so GUI printed Connected with no video. */
+	dev->width = 1920;
+	dev->height = 1080;
+	dev->fps = 60;
+	res = uvc_get_stream_ctrl_format_size(dev->uvc_devh, &ctrl,
+		UVC_FRAME_FORMAT_YUYV, dev->width, dev->height, dev->fps);
+	if (res < 0) {
+		uvc_perror(res, "get_mode");
+		fprintf(stderr, "[HSDAOH] UVC mode negotiation failed: %d\n", (int)res);
+		return (int)res;
+	}
+
 	iqconverter_float_reset(dev->cnv_f1);
 	iqconverter_float_reset(dev->cnv_f2);
-
-	dev->async_status = HSDAOH_RUNNING;
-	dev->async_cancel = 0;
-
 	dev->cb = cb;
 	dev->cb_ctx = ctx;
-
-//	dev->output_float = true;
-
-	/* initialize with a threshold */
+	dev->async_cancel = 0;
 	dev->highest_numq = DEFAULT_BUFFERS/2;
 	dev->llbuf_num = (buf_num == 0) ? DEFAULT_BUFFERS : buf_num;
+	dev->uvc_frames_received = 0;
+	dev->uvc_frames_wrong_format = 0;
+	dev->uvc_frames_incomplete = 0;
+	dev->uvc_frames_discarded = 0;
+	dev->uvc_frames_delivered = 0;
 
-	pthread_mutex_init(&dev->ll_mutex, NULL);
-	pthread_cond_init(&dev->cond, NULL);
-
+	r = pthread_mutex_init(&dev->ll_mutex, NULL);
+	if (r != 0) return -1;
+	r = pthread_cond_init(&dev->cond, NULL);
+	if (r != 0) {
+		pthread_mutex_destroy(&dev->ll_mutex);
+		return -1;
+	}
+	dev->async_status = HSDAOH_RUNNING;
 	pthread_attr_t attr;
 	pthread_attr_init(&attr);
 	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
 	r = pthread_create(&dev->hsdaoh_output_worker_thread, &attr, hsdaoh_output_worker, (void *)dev);
 	pthread_attr_destroy(&attr);
-
-	uvc_error_t res;
-	uvc_stream_ctrl_t ctrl;
-
-	const uvc_format_desc_t *format_desc = uvc_get_format_descs(dev->uvc_devh);
-	const uvc_frame_desc_t *frame_desc = format_desc->frame_descs;
-	enum uvc_frame_format frame_format = UVC_FRAME_FORMAT_YUYV;
-
-	dev->width = 1920;
-	dev->height = 1080;
-	dev->fps = 60;
-
-	res = uvc_get_stream_ctrl_format_size(dev->uvc_devh, &ctrl, frame_format, dev->width, dev->height, dev->fps);
-
-	if (res < 0) {
-		uvc_perror(res, "get_mode"); /* device doesn't provide a matching stream */
-	} else {
-		/* start the UVC stream */
-		dev->discard_start_frames = 30;
-		res = uvc_start_streaming(dev->uvc_devh, &ctrl, _uvc_callback, (void *)dev, 0);
-
-		if (res < 0)
-			uvc_perror(res, "start_streaming"); /* unable to start stream */
+	if (r != 0) {
+		fprintf(stderr, "[HSDAOH] Output worker creation failed: %d\n", r);
+		dev->async_status = HSDAOH_INACTIVE;
+		pthread_cond_destroy(&dev->cond);
+		pthread_mutex_destroy(&dev->ll_mutex);
+		return -1;
 	}
 
-	return r;
+	dev->discard_start_frames = 30;
+	res = uvc_start_streaming(dev->uvc_devh, &ctrl, _uvc_callback, (void *)dev, 0);
+	if (res < 0) {
+		uvc_perror(res, "start_streaming");
+		fprintf(stderr, "[HSDAOH] UVC start failed: %d (capture NOT started)\n", (int)res);
+		dev->async_status = HSDAOH_CANCELING;
+		pthread_mutex_lock(&dev->ll_mutex);
+		pthread_cond_signal(&dev->cond);
+		pthread_mutex_unlock(&dev->ll_mutex);
+		pthread_join(dev->hsdaoh_output_worker_thread, NULL);
+		dev->async_status = HSDAOH_INACTIVE;
+		pthread_cond_destroy(&dev->cond);
+		pthread_mutex_destroy(&dev->ll_mutex);
+		return (int)res;
+	}
+	fprintf(stderr, "[HSDAOH] UVC stream started: 1920x1080 YUYV @60\n");
+	return 0;
 }
 
 int hsdaoh_stop_stream(hsdaoh_dev_t *dev)
@@ -946,6 +982,12 @@ int hsdaoh_stop_stream(hsdaoh_dev_t *dev)
 
 		/* End the stream. Blocks until last callback is serviced */
 		uvc_stop_streaming(dev->uvc_devh);
+		fprintf(stderr,
+		        "[HSDAOH] UVC summary: callbacks=%" PRIu64 " wrong_format=%" PRIu64
+		        " incomplete=%" PRIu64 " startup_discard=%" PRIu64 " raw_delivered=%" PRIu64 "\n",
+		        dev->uvc_frames_received, dev->uvc_frames_wrong_format,
+		        dev->uvc_frames_incomplete, dev->uvc_frames_discarded,
+		        dev->uvc_frames_delivered);
 
 		void *status;
 		struct llist *curelem, *prev;
@@ -962,6 +1004,9 @@ int hsdaoh_stop_stream(hsdaoh_dev_t *dev)
 		}
 
 		dev->global_numq = 0;
+		dev->async_status = HSDAOH_INACTIVE;
+		pthread_cond_destroy(&dev->cond);
+		pthread_mutex_destroy(&dev->ll_mutex);
 
 		return 0;
 	}

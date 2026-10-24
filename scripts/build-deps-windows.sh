@@ -164,6 +164,7 @@ log "raylib: $(pkg-config --modversion raylib) (built vendored with internal GLF
 # --- sanity -----------------------------------------------------------------
 pkg-config --exists hsdaoh || fail "hsdaoh.pc not resolvable after build"
 pkg-config --exists fftw3f || fail "fftw3f not found; install mingw-w64-ucrt-x86_64-fftw"
+pkg-config --exists libzstd || fail "libzstd not found; install mingw-w64-ucrt-x86_64-zstd"
 log "hsdaoh: $(pkg-config --modversion hsdaoh)"
 log "fftw3f: $(pkg-config --modversion fftw3f)"
 

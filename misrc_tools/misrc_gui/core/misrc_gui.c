@@ -12,6 +12,8 @@
 // WM_CLASS class, which the desktop matches against StartupWMClass in the
 // launcher, so it must stay version-independent. See the InitWindow() call.
 #define MISRC_WINDOW_CLASS_TITLE "MISRC Capture"
+/* Experimental Remote Monitor release identifier; not the upstream Git version. */
+#define REMOTE_MONITOR_PROJECT_VERSION "v7.4.12"
 
 // Clay UI library (header-only, implementation here)
 #define CLAY_IMPLEMENTATION
@@ -52,6 +54,10 @@
 #include <string.h>
 #include <math.h>
 #include <ctype.h>
+#if defined(__linux__) && !defined(__ANDROID__)
+#include <signal.h>
+#include <time.h>
+#endif
 #if defined(__APPLE__)
 #include <unistd.h>
 #include <limits.h>
@@ -95,7 +101,7 @@ static void print_usage(const char *program_name) {
     fprintf(stdout,
             "MISRC GUI %s\n"
             "Usage:\n"
-            "  %s [--help] [--version] [--smoke-test] [--debug-view] [--config <path>] [--auto-connect]\n"
+            "  %s [--help] [--version] [--smoke-test] [--debug-view] [--config <path>] [--auto-connect] [--headless-server]\n"
             "     [--select-device <index-or-name>] [--auto-capture] [--auto-record <seconds>]\n"
             "     [--check-update] [--update-dry-run] [--install-update [--yes]]\n"
             "     [--update-manifest <url-or-path>]\n"
@@ -133,6 +139,14 @@ static void print_usage(const char *program_name) {
             "           auto-names) in the config so the overwrite confirmation\n"
             "           popup cannot stall the run. Progress is logged with\n"
             "           [AUTO] prefixes on stderr.\n"
+            "\n"
+            "Headless Server mode (Linux):\n"
+            "  --headless-server [--config path] [--select-device index-or-name]\n"
+            "  Runs the existing network Server and capture backend without\n"
+            "  X11/Wayland/GLFW/OpenGL. Reads --config path, otherwise\n"
+            "  ./server_config.json if present; defaults to TCP port 8080.\n"
+            "  Hardware capture starts automatically when a device is present;\n"
+            "  client /start /stop /record /device commands remain available.\n"
             "\n"
             "Headless CLI capture mode:\n"
             "  Pass any capture option (e.g. --device-list, -a FILE) to run this\n"
@@ -598,6 +612,282 @@ static void app_modal_frame(void *ctx)
     SwapScreenBuffer();
 }
 
+#if defined(__linux__) && !defined(__ANDROID__)
+// Never perform non-async-signal-safe work in a signal handler.
+static volatile sig_atomic_t s_headless_shutdown = 0;
+static void headless_shutdown_signal(int sig) {
+    (void)sig;
+    s_headless_shutdown = 1;
+}
+
+static int headless_select_device(const gui_app_t *app, const char *selector) {
+    if (!app || app->device_count == 0) return -1;
+    if (selector && *selector) {
+        char *end = NULL;
+        long index = strtol(selector, &end, 10);
+        if (end != selector && *end == '\0') {
+            return (index >= 0 && index < app->device_count) ? (int)index : -1;
+        }
+        for (int i = 0; i < app->device_count; ++i) {
+            if (gui_strcasestr_local(app->devices[i].name, selector)) return i;
+        }
+        return -1;
+    }
+    // Prefer real devices; the simulated and playback entries are not suitable
+    // default capture targets on a dedicated hardware server.
+    const device_type_t priority[] = {
+        DEVICE_TYPE_HSDAOH, DEVICE_TYPE_MISRC_CLOCKGEN, DEVICE_TYPE_CXADC,
+        DEVICE_TYPE_SIMPLE_CAPTURE,
+#ifdef ENABLE_DDD
+        DEVICE_TYPE_DDD,
+#endif
+#ifdef ENABLE_FX3
+        DEVICE_TYPE_FX3,
+#endif
+#ifdef ENABLE_RTLSDR
+        DEVICE_TYPE_RTLSDR,
+#endif
+    };
+    for (size_t i = 0; i < sizeof(priority)/sizeof(priority[0]); ++i) {
+        int index = gui_find_first_device_of_type(app, priority[i]);
+        if (index >= 0) return index;
+    }
+    return -1;
+}
+
+static int gui_run_headless_server(const char *config_path, const char *selector, bool debug_view) {
+    s_headless_shutdown = 0;
+    // This path does not call InitWindow, SetConfigFlags, LoadShader or Clay.
+    // GPU assets are never created or destroyed here.
+    gui_runtime_set_headless(true);
+    SetTraceLogLevel(debug_view ? LOG_INFO : LOG_WARNING);
+
+    // Headless mode has its own optional, small server configuration. An
+    // explicit --config always wins; otherwise try server_config.json from
+    // the working directory. Keep the old v2 default if neither is present.
+    const char *server_config_path = config_path;
+    if (!server_config_path) {
+        FILE *default_config = fopen("server_config.json", "rb");
+        if (default_config) {
+            fclose(default_config);
+            server_config_path = "server_config.json";
+        }
+    }
+    if (server_config_path) {
+        FILE *check = fopen(server_config_path, "rb");
+        if (!check) {
+            fprintf(stderr, "[HEADLESS] ERROR: cannot open config file: %s\n", server_config_path);
+            gui_runtime_set_headless(false);
+            return 1;
+        }
+        // The existing GUI loader silently uses defaults for empty/oversized
+        // files. Fail early instead of listening on the wrong port by accident.
+        if (fseek(check, 0, SEEK_END) != 0) {
+            fprintf(stderr, "[HEADLESS] ERROR: cannot inspect config file: %s\n", server_config_path);
+            fclose(check);
+            gui_runtime_set_headless(false);
+            return 1;
+        }
+        long config_size = ftell(check);
+        fclose(check);
+        if (config_size <= 0 || config_size > 262144) {
+            fprintf(stderr, "[HEADLESS] ERROR: config file is empty or too large: %s\n", server_config_path);
+            gui_runtime_set_headless(false);
+            return 1;
+        }
+        fprintf(stderr, "[HEADLESS] Configuration: %s\n", server_config_path);
+    } else {
+        fprintf(stderr, "[HEADLESS] Configuration: default settings (port 8080 if unset)\n");
+    }
+
+    fprintf(stderr, "[HEADLESS] PROJECT VERSION: Remote Monitor %s\n", REMOTE_MONITOR_PROJECT_VERSION);
+    gui_app_t app = {0};
+    app.headless_server = true;
+    gui_settings_set_override_path(server_config_path);
+    gui_settings_load(&app.settings);
+    app.settings.net_mode = GUI_NET_MODE_SERVER;  // Explicit CLI flag wins.
+    app.settings.capture_limit_seconds = 0;
+
+    gui_app_init(&app);
+    if (!gui_net_active(&app)) {
+        fprintf(stderr, "[HEADLESS] ERROR: server cannot listen on port %u\n",
+                (unsigned)app.settings.net_server_port);
+        gui_app_cleanup(&app);
+        gui_runtime_set_headless(false);
+        return 1;
+    }
+    gui_app_enumerate_devices(&app);
+    int selected = headless_select_device(&app, selector);
+    if (selected >= 0) app.selected_device = selected;
+    else app.selected_device = -1;  // Never auto-start simulated capture.
+    if (selector && selected < 0)
+        fprintf(stderr, "[HEADLESS] Waiting for device matching '%s'\n", selector);
+    fprintf(stderr, "[HEADLESS] Server started on TCP port %u (no X11/Wayland/OpenGL)\n",
+            (unsigned)app.settings.net_server_port);
+    fprintf(stderr, "[HEADLESS] %d device(s) enumerated, selection: %s\n",
+            app.device_count, selected >= 0 ? app.devices[selected].name : "waiting for hardware");
+
+    struct sigaction action = {0};
+    action.sa_handler = headless_shutdown_signal;
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGINT, &action, NULL);
+    sigaction(SIGTERM, &action, NULL);
+
+    gui_reconnect_target_t target = {0};
+    if (selected >= 0) gui_set_reconnect_target_from_selected(&app, &target);
+    app.headless_retry_capture = true;
+    double next_attempt = gui_runtime_time() + 1.0;
+    double last_tick = gui_runtime_time();
+    int retry_count = 0;
+
+    while (!s_headless_shutdown && !atomic_load(&do_exit)) {
+        double now = gui_runtime_time();
+        float dt = (float)(now - last_tick);
+        if (dt < 0.0f) dt = 0.0f;
+        if (dt > 0.25f) dt = 0.25f;
+        last_tick = now;
+
+        // The HTTP workers only queue commands: execute device/capture/record
+        // changes on this thread, exactly as in the GUI render loop.
+        gui_net_poll_commands(&app);
+        gui_app_poll_capture_start(&app);
+        gui_capture_poll_hsdaoh_status(&app);
+        gui_app_update_vu_meters(&app, dt);
+        if (app.is_capturing && app.is_recording && app.settings.level_autostop_enabled) {
+            float level = (float)atof(app.settings.level_autostop_level_str);
+            float sustain = (float)atof(app.settings.level_autostop_duration_str);
+            if (level < 0.1f) level = 0.1f;
+            if (level > 0.8f) level = 0.8f;
+            if (sustain < 0.1f) sustain = 0.1f;
+            uint16_t pos = (uint16_t)atomic_load(&app.peak_a_pos);
+            uint16_t neg = (uint16_t)atomic_load(&app.peak_a_neg);
+            uint16_t peak = pos > neg ? pos : neg;
+            uint16_t threshold = (uint16_t)(level * (float)gui_app_level_autostop_full_scale(&app));
+            if (threshold == 0) threshold = 1;
+            if (!app.low_signal_armed) {
+                if (peak >= threshold) {
+                    app.low_signal_armed = true;
+                    app.low_signal_time = 0.0f;
+                }
+            } else if (peak < threshold) {
+                app.low_signal_time += dt;
+                if (app.low_signal_time >= sustain) {
+                    fprintf(stderr, "[HEADLESS] Level autostop: ending recording\n");
+                    gui_app_stop_recording(&app);
+                    app.low_signal_time = 0.0f;
+                    app.low_signal_armed = false;
+                }
+            } else {
+                app.low_signal_time = 0.0f;
+            }
+        }
+
+        if (app.is_capturing && atomic_exchange(&app.dropout_stop_requested, false)) {
+            gui_dropout_reason_t reason =
+                (gui_dropout_reason_t)atomic_exchange(&app.dropout_stop_reason, GUI_DROPOUT_NONE);
+            fprintf(stderr, "[HEADLESS] Dropout (%d), stopping capture\n", (int)reason);
+            if (app.is_recording) {
+                char msg[128];
+                snprintf(msg, sizeof(msg), "dropout reason %d", (int)reason);
+                gui_record_mark_capture_interrupted(&app, msg);
+            }
+            gui_set_reconnect_target_from_selected(&app, &target);
+            gui_app_stop_capture(&app);
+            app.headless_retry_capture = true;
+            retry_count = 0;
+            next_attempt = now + 1.0;
+        }
+        if (app.is_capturing && (now - app.capture_start_time) > 5.0 &&
+            gui_capture_device_timeout(&app, 2000)) {
+            uint64_t last_cb = atomic_load(&app.last_callback_time_ms);
+            uint64_t current_ms = get_time_ms();
+            unsigned long long age_ms = (unsigned long long)(current_ms >= last_cb ? current_ms-last_cb : 0);
+            fprintf(stderr, "[HEADLESS] Capture timeout (last USB callback %llu ms ago, record=%d); reconnecting\n",
+                    age_ms, app.is_recording ? 1 : 0);
+            if (app.is_recording) {
+                char msg[128];
+                snprintf(msg, sizeof(msg), "USB callback timeout (%llu ms)", age_ms);
+                gui_record_mark_capture_interrupted(&app, msg);
+            }
+            gui_set_reconnect_target_from_selected(&app, &target);
+            gui_app_stop_capture(&app);
+            app.headless_retry_capture = true;
+            retry_count = 0;
+            next_attempt = now + 1.0;
+        }
+        // Some MS2130 devices keep sending callbacks while the parser has no
+        // valid synchronized RF payload. The callback watchdog above cannot
+        // detect this. Only restart the *headless hsdaoh* stream if not a
+        // single valid RF write succeeded for 8 seconds. Both watchdogs use
+        // the same existing reconnect path; neither fires while stopped.
+        if (app.is_capturing && (now - app.capture_start_time) > 8.0 &&
+            gui_capture_rf_payload_timeout(&app, 8000)) {
+            unsigned long long valid_frames =
+                (unsigned long long)atomic_load(&app.valid_rf_payload_frames);
+            uint64_t now_ms = get_time_ms();
+            uint64_t cb_ms = atomic_load(&app.last_callback_time_ms);
+            uint64_t rf_ms = atomic_load(&app.last_rf_payload_time_ms);
+            unsigned long long cb_age = (unsigned long long)(now_ms >= cb_ms ? now_ms - cb_ms : 0);
+            unsigned long long rf_age = (unsigned long long)(now_ms >= rf_ms ? now_ms - rf_ms : 0);
+            fprintf(stderr,
+                    "[HEADLESS] No valid RF payload for >8 s (valid_rf_frames=%llu, stream_synced=%d, cb_age=%llums, rf_age=%llums); reconnecting MS2130\n",
+                    valid_frames, (int)atomic_load(&app.stream_synced), cb_age, rf_age);
+            if (app.is_recording) {
+                gui_record_mark_capture_interrupted(&app,
+                    "no valid RF payload for >8 s");
+            }
+            gui_set_reconnect_target_from_selected(&app, &target);
+            gui_app_stop_capture(&app);
+            app.headless_retry_capture = true;
+            retry_count = 0;
+            next_attempt = now + 1.0;
+        }
+        /* Keep the old capture's record counters and ringbuffer alive until
+         * its FLAC writer has drained and the client has ACKed ABORT/COMMIT. */
+        gui_record_poll_performance(&app, now);
+        // gui_net_poll_commands updates headless_retry_capture on /start or
+        // /stop. A remote /stop cancels automatic reconnect until /start.
+        if (app.is_capturing) app.headless_retry_capture = false;
+
+        if (app.headless_retry_capture && !app.is_capturing && !gui_playback_is_starting(&app) &&
+            !gui_record_is_finalizing() && now >= next_attempt) {
+            gui_app_enumerate_devices(&app);
+            int wanted = target.valid ? gui_find_reconnect_device(&app, &target) : -1;
+            if (wanted < 0 && !target.valid) wanted = headless_select_device(&app, selector);
+            // Never silently switch a previously selected capture to another
+            // physical source after a disconnect.
+            if (wanted >= 0) {
+                app.selected_device = wanted;
+                int rc = gui_app_start_capture(&app);
+                if (rc == 0) {
+                    gui_set_reconnect_target_from_selected(&app, &target);
+                    app.headless_retry_capture = false;
+                    retry_count = 0;
+                    fprintf(stderr, "[HEADLESS] Capture started: %s\n",
+                            app.devices[app.selected_device].name);
+                } else if (gui_status_is_permission_denied(&app)) {
+                    fprintf(stderr, "[HEADLESS] Permission denied, will retry after device permissions are fixed\n");
+                }
+            } else {
+                app.selected_device = -1;
+            }
+            retry_count++;
+            next_attempt = now + (retry_count < 3 ? 1.0 : 3.0);
+        }
+        // The shared threading wrapper provides this function on POSIX and Windows.
+        thrd_sleep_ms(50);
+    }
+    fprintf(stderr, "[HEADLESS] Stopping server and capture\n");
+    // Stop RF producers before closing and freeing their network fanout.
+    // This avoids a capture callback reading s_server during server_stop().
+    if (app.is_recording) gui_app_stop_recording(&app);
+    if (app.is_capturing) gui_app_stop_capture(&app);
+    gui_app_cleanup(&app);
+    gui_runtime_set_headless(false);
+    return 0;
+}
+#endif
+
 int main(int argc, char **argv) {
     if (!file_init_utf8_argv(&argc, &argv)) return 1;
     bool debug_view = false;
@@ -605,6 +895,7 @@ int main(int argc, char **argv) {
     bool show_version = false;
     bool smoke_test = false;
     bool auto_connect = false;
+    bool headless_server = false;
     bool has_capture_arg = false;
     const char *config_path = NULL;  /* --config <path> override */
     const char *select_device_arg = NULL;  /* --select-device <index-or-name> */
@@ -633,6 +924,10 @@ int main(int argc, char **argv) {
             smoke_test = true;
             continue;
         }
+        if (strcmp(a, "--headless-server") == 0) {
+            headless_server = true;
+            continue;
+        }
         if (strcmp(a, "--auto-connect") == 0) {
             auto_connect = true;
             continue;
@@ -646,9 +941,11 @@ int main(int argc, char **argv) {
             // platform default. Consumes the next arg. Recognized as a GUI
             // flag so it is NOT treated as a capture arg (which would route
             // the process into headless CLI capture mode).
-            if (i + 1 < argc) {
-                config_path = argv[++i];
+            if (i + 1 >= argc || argv[i + 1][0] == '-') {
+                fprintf(stderr, "--config requires a file path\n");
+                return 1;
             }
+            config_path = argv[++i];
             continue;
         }
         if (strcmp(a, "--select-device") == 0) {
@@ -731,6 +1028,19 @@ int main(int argc, char **argv) {
         }
         return gui_run_update_cli(update_cli_mode, update_manifest_source, update_cli_yes);
     }
+    if (headless_server) {
+#if defined(__linux__) && !defined(__ANDROID__)
+        if (has_capture_arg || auto_record_given || auto_capture || auto_connect ||
+            update_cli_mode != GUI_UPDATE_CLI_NONE) {
+            fprintf(stderr, "--headless-server cannot be combined with other capture/update/auto flags\n");
+            return 1;
+        }
+        return gui_run_headless_server(config_path, select_device_arg, debug_view);
+#else
+        fprintf(stderr, "--headless-server is currently supported on Linux only\n");
+        return 1;
+#endif
+    }
     if (auto_record_given && auto_record_seconds < 1) {
         fprintf(stderr, "--auto-record requires a positive <seconds> value\n");
         return 1;
@@ -798,7 +1108,10 @@ int main(int argc, char **argv) {
     const int min_window_width = 640;
     const int min_window_height = 360;
     char window_title[128];
-    snprintf(window_title, sizeof(window_title), "MISRC Capture %s", MIRSC_TOOLS_VERSION);
+    snprintf(window_title, sizeof(window_title), "MISRC Capture %s",
+             (strcmp(MIRSC_TOOLS_VERSION, "unknown_version") == 0 ||
+              strcmp(MIRSC_TOOLS_VERSION, "dev") == 0)
+                 ? REMOTE_MONITOR_PROJECT_VERSION : MIRSC_TOOLS_VERSION);
 #if defined(__linux__) && !defined(__ANDROID__)
     /* X11 window identity for launcher/taskbar matching. GLFW (raylib) sets
      * WM_CLASS = { RESOURCE_NAME env (else the title), the title } when the
@@ -1347,7 +1660,7 @@ int main(int argc, char **argv) {
         // full-scale from gui_app_level_autostop_full_scale(). This is the
         // bit-depth offset correction: 0.4 means 0.4 of the active backend's
         // full scale regardless of 12/10/8-bit depth.
-        if (app.is_capturing && app.is_recording && app.settings.level_autostop_enabled) {
+        if (!gui_net_is_client(&app) && app.is_capturing && app.is_recording && app.settings.level_autostop_enabled) {
             // Parse the configured level (normalized 0.1-0.8) and sustain duration (seconds).
             float level = (float)atof(app.settings.level_autostop_level_str);
             float sustain_s = (float)atof(app.settings.level_autostop_duration_str);
@@ -1580,12 +1893,13 @@ int main(int argc, char **argv) {
     // Restore the original window proc (Windows modal move/size driver)
     gui_win32_modal_shutdown();
 
-    // Cleanup
-    if (app.is_recording) {
-        gui_app_stop_recording(&app);
-    }
-    if (app.is_capturing) {
-        gui_app_stop_capture(&app);
+    // Cleanup: closing a remote monitor must NOT stop server recording/capture.
+    if (gui_net_is_client(&app)) {
+        app.is_recording = false;
+        app.is_capturing = false;
+    } else {
+        if (app.is_recording) gui_app_stop_recording(&app);
+        if (app.is_capturing) gui_app_stop_capture(&app);
     }
 
     // Save settings before cleanup

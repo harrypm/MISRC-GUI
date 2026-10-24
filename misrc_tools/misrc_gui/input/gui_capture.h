@@ -19,6 +19,8 @@ void gui_capture_set_audio_capture(bool enabled);
 // Check if device has timed out (no callbacks for too long)
 // Returns true if device appears disconnected
 bool gui_capture_device_timeout(gui_app_t *app, uint32_t timeout_ms);
+// Detect a live USB stream that delivers no valid RF payload to the ring.
+bool gui_capture_rf_payload_timeout(gui_app_t *app, uint32_t timeout_ms);
 
 // Request a capture stop due to a detected dropout/error. No-op unless the
 // user has enabled stop-on-dropout. Reason is recorded for the UI status line.

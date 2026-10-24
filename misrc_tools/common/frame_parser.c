@@ -7,6 +7,7 @@
 
 #include "frame_parser.h"
 #include <hsdaoh_crc.h>
+#include "fast_crc16.h"
 #include "misrc_debug.h"
 
 #include <stdio.h>
@@ -51,7 +52,7 @@ static uint16_t frame_compute_line_crc(const uint8_t *line_dat, unsigned int wid
         return 0;
     }
     size_t line_bytes = width_words * sizeof(uint16_t);
-    return crc16_ccitt(line_dat, line_bytes);
+    return misrc_crc16_ccitt_fast(line_dat, line_bytes);
 }
 
 static int frame_crc_error_tolerance(void)
@@ -370,6 +371,8 @@ frame_process_result_t frame_process(frame_parser_state_t *state,
     if (state->line_validation_reprime_frames > 0) {
         state->line_validation_reprime_frames--;
     }
+    result.crc_errors = crc_error_count;
+    result.idle_errors = idle_error_count;
 
     /* Handle errors - only count when synced */
     if (result.error_count > 0 && state->sync.stream_synced) {

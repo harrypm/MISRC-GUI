@@ -640,11 +640,48 @@ static void gui_settings_write_string(FILE *f, const char *key, const char *valu
     fprintf(f, "\"%s\n", comma ? "," : "");
 }
 
+/* The remote client mirrors server recording settings in app->settings for
+ * display. Never persist these remote paths/recording switches over the
+ * client's saved LOCAL recording profile when saving window/host preferences. */
+static gui_settings_t s_local_record_profile;
+static bool s_local_record_profile_ready=false;
+
+static void gui_settings_copy_record_profile(gui_settings_t *dst,const gui_settings_t *src){
+#define CPY(f) dst->f=src->f
+#define CPA(f) memcpy(dst->f,src->f,sizeof(dst->f))
+    CPA(output_path);CPA(output_base_name);CPA(output_filename_a);CPA(output_filename_b);
+    CPA(rf_channel_tags);CPA(audio_output_tags);CPA(audio_1ch_labels);
+    CPA(audio_4ch_filename);CPA(audio_2ch_12_filename);CPA(audio_2ch_34_filename);
+    CPA(audio_1ch_filenames);
+    CPY(auto_names_enabled);CPY(append_timestamp_on_capture_start);CPY(stop_on_dropout);
+    CPY(capture_a);CPY(capture_b);CPY(misrc_mode);CPY(misrc_v15_v25_ab_swap);
+    CPY(use_flac);CPY(flac_level);CPY(flac_threads);CPY(flac_verification);
+    CPY(overwrite_files);CPY(rf_bits_a);CPY(rf_bits_b);
+    CPY(enable_resample_a);CPY(enable_resample_b);CPY(resample_rate_a);CPY(resample_rate_b);
+    CPY(enable_audio_4ch);CPY(enable_audio_2ch_12);CPY(enable_audio_2ch_34);
+    CPA(enable_audio_1ch);
+#undef CPY
+#undef CPA
+}
+void gui_settings_restore_local_record_profile(gui_settings_t *settings){
+    if(settings && s_local_record_profile_ready)
+        gui_settings_copy_record_profile(settings,&s_local_record_profile);
+}
+
 // Simple JSON-like format for settings
 // 16.02.25 - Remediate Win save
 void gui_settings_save(const gui_settings_t *settings) {
     if (!settings) return;
-    
+    gui_settings_t persisted;
+    if(settings->net_mode == 2 && s_local_record_profile_ready){
+        persisted=*settings;
+        gui_settings_copy_record_profile(&persisted,&s_local_record_profile);
+        settings=&persisted;
+    }else if(settings->net_mode == 0){
+        gui_settings_copy_record_profile(&s_local_record_profile,settings);
+        s_local_record_profile_ready=true;
+    }
+
     const char* path = get_settings_file_path();
     if (!gui_settings_ensure_parent_dirs(path)) {
         return;
@@ -657,6 +694,8 @@ void gui_settings_save(const gui_settings_t *settings) {
     fprintf(f, "{\n  \"settings_format_version\": 2,\n");
     fprintf(f, "  \"device_index\": %d,\n", settings->device_index);
     gui_settings_write_string(f, "output_path", settings->output_path, true);
+    fprintf(f, "  \"local_save_enabled\": %s,\n",settings->local_save_enabled?"true":"false");
+    gui_settings_write_string(f,"local_save_path",settings->local_save_path,true);
     fprintf(f, "  \"auto_names_enabled\": %s,\n", settings->auto_names_enabled ? "true" : "false");
     gui_settings_write_string(f, "output_base_name", settings->output_base_name, true);
     fprintf(f, "  \"append_timestamp_on_capture_start\": %s,\n", settings->append_timestamp_on_capture_start ? "true" : "false");
@@ -1080,6 +1119,8 @@ void gui_settings_load(gui_settings_t *settings) {
     
     // Start with defaults
     gui_settings_init_defaults(settings);
+    gui_settings_copy_record_profile(&s_local_record_profile,settings);
+    s_local_record_profile_ready=true;
     
     const char* path = get_settings_file_path();
     FILE* f = file_open_utf8(path, "rb");
@@ -1118,6 +1159,12 @@ void gui_settings_load(gui_settings_t *settings) {
         settings->device_index = atoi(value);
     }
     
+    if ((value = find_value(content,"local_save_enabled"))!=NULL) {
+        settings->local_save_enabled = strstr(value,"true")==value;
+    }
+    if ((value = find_value(content,"local_save_path"))!=NULL) {
+        gui_settings_load_string(settings->local_save_path,sizeof(settings->local_save_path),value);
+    }
     if ((value = find_value(content, "output_path")) != NULL) {
         gui_settings_load_string(settings->output_path, sizeof(settings->output_path), value);
     }
@@ -1563,6 +1610,8 @@ void gui_settings_load(gui_settings_t *settings) {
 
     // Keep auto-derived names in sync on startup (RF prefixes are conditional on empty RF tags).
     gui_settings_refresh_auto_names(settings);
+    gui_settings_copy_record_profile(&s_local_record_profile,settings);
+    s_local_record_profile_ready=true;
 
     free(content);
 }

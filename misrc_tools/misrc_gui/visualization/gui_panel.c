@@ -7,6 +7,9 @@
  */
 
 #include "gui_panel.h"
+#include "../net/gui_net.h"
+#include "../net/gui_remote_monitor.h"
+#include "../net/gui_remote_display.h"
 #include "panel_interface.h"
 #include "../core/gui_app.h"
 #include "gui_oscilloscope.h"
@@ -92,11 +95,55 @@ void panel_clear_view_state(panel_view_type_t type, void *state) {
 // Channel Panel Rendering (Main Entry Point)
 //-----------------------------------------------------------------------------
 
+/* Unsupported remote views are intentionally placeholders until preview
+ * data exists. Waveform and FFT use the original local Harry panel vtables. */
+static void render_remote_unsupported(Rectangle bounds) {
+    DrawRectangleRec(bounds, COLOR_PANEL_BG);
+    DrawRectangleLinesEx(bounds, 1.0f, COLOR_GRID_MAJOR);
+    DrawText("Remote preview: panel in a later stage", (int)bounds.x+12,
+             (int)(bounds.y+bounds.height/2-8), 16, COLOR_TEXT_DIM);
+}
+
 // Helper: Render a single panel using vtable dispatch
 static void render_single_panel(gui_app_t *app, int channel,
                                  panel_view_type_t type, void *state,
                                  Rectangle bounds, Color color) {
+    if (gui_net_is_client(app) && type != PANEL_VIEW_WAVEFORM && type != PANEL_VIEW_FFT) {
+        render_remote_unsupported(bounds);
+        return;
+    }
     const panel_vtable_t *vtable = panel_get_vtable(type);
+    if (gui_net_is_client(app) && type == PANEL_VIEW_FFT) {
+        static gui_rd_frame_t frame;
+        bool valid = app->is_capturing && gui_rd_client_snapshot(&frame);
+        if (!valid || channel >= (int)frame.channels || !state) {
+            DrawRectangleRec(bounds, COLOR_PANEL_BG);
+            DrawRectangleLinesEx(bounds, 1.0f, COLOR_GRID_MAJOR);
+            DrawText("Waiting for remote FFT", (int)bounds.x+12,
+                     (int)(bounds.y+bounds.height/2-8), 16, COLOR_TEXT_DIM);
+            return;
+        }
+        gui_fft_remote_apply_float(state,frame.ch[channel].fft,
+                                   GUI_RD_BINS,frame.sample_rate,frame.sequence);
+    }
+    if (gui_net_is_client(app) && type == PANEL_VIEW_WAVEFORM) {
+        /* Reuse Harry's unmodified grid/line/phosphor/trigger/overlay renderer
+         * instead of the v2 custom 256-column remote drawing code. */
+        /* Rendering is main-thread only; reuse scratch rather than allocating
+         * a 64 KiB scope packet on every redraw. */
+        static gui_rd_frame_t frame;
+        bool valid = app->is_capturing && gui_rd_client_snapshot(&frame);
+        if (valid && state && channel < (int)frame.channels)
+            gui_waveform_remote_apply_points(state,&frame.ch[channel],frame.sequence);
+        if(state)gui_waveform_remote_publish_config(state,channel);
+        if (!valid || channel >= (int)frame.channels) {
+            DrawRectangleRec(bounds, COLOR_PANEL_BG);
+            DrawRectangleLinesEx(bounds, 1.0f, COLOR_GRID_MAJOR);
+            DrawText("Waiting for remote waveform", (int)bounds.x + 12,
+                     (int)(bounds.y + bounds.height/2 - 8), 16, COLOR_TEXT_DIM);
+            return;
+        }
+    }
 
     if (vtable && vtable->render) {
         vtable->render(state, app, channel, bounds, color);

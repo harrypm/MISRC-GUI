@@ -126,6 +126,9 @@ export CMAKE_PREFIX_PATH="$DEPS_PREFIX:${CMAKE_PREFIX_PATH:-}"
 
 # fftw3f is the one hard-required dep that is NOT vendored (comes from the
 # system). Fail early with a clear message instead of a meson configure error.
+if ! pkg-config --exists libzstd; then
+  fail "Missing libzstd pkg-config module. Install libzstd-dev and retry."
+fi
 if ! pkg-config --exists fftw3f; then
   fail "Missing fftw3f pkg-config module. Install FFTW3 dev files (e.g. libfftw3-dev) and retry."
 fi

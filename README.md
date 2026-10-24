@@ -363,6 +363,7 @@ These flags open the GUI window (no capture args):
 | `--debug-view` | — | Verbose runtime logs |
 | `--config` | `<path>` | Load settings from `<path>` instead of the platform default |
 | `--auto-connect` | — | Auto-trigger server/client connection (requires `--config`) |
+| `--headless-server` | — | Run capture and network server without an X11/Wayland/OpenGL window (port 8080 by default) |
 
 `--auto-connect` requires `--config <path>` with a server (`net_mode: 1`) or client (`net_mode: 2`) config. Server mode auto-starts capture so RF data flows to clients; client mode auto-connects to the configured server. Without `--config` it exits with an error.
 
@@ -547,6 +548,27 @@ bash misrc_tools/test/capture_stability_ci.sh misrc_gui misrc_extract /tmp/ci-ar
 ```
 
 </details>
+
+## Experimental headless Remote Monitor (contributor branch)
+
+This optional extension adds `misrc_gui --headless-server` for a Linux/Windows
+headless capture server and a GUI client that receives low-bandwidth Zstd
+waveform/FFT previews rather than the full raw RF stream. The server controls
+physical capture, encoding and recording. Optional **Local Save** writes
+recording output directly to the client computer without SMB shares.
+
+Run both server and client from the same branch. A server on a private trusted
+LAN can be started with `./build-local/misrc_gui --headless-server` (default
+port 8080) and optionally `--config /path/to/server.json`. Without the new
+flag, MISRC-GUI retains its normal local/GUI startup path, although shared
+components (parser, buffers, capture and rendering) contain changes too.
+
+The headless server requires libzstd at build time (Debian: `libzstd-dev`,
+MSYS2 UCRT64: `mingw-w64-ucrt-x86_64-zstd`). It starts on port 8080 by
+default; if `server_config.json` exists in the current directory, it is loaded
+automatically. Run only on a trusted LAN: the HTTP controls have no built-in
+authentication or TLS. This feature is experimental and has not been validated
+for uninterrupted long-duration dual-channel capture.
 
 ## History
 

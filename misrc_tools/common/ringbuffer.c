@@ -124,83 +124,74 @@ int rb_init(ringbuffer_t *rb, char *name, size_t size) {
 	return 0;
 }
 
+/*
+ * Single-producer/single-consumer double-mapped ringbuffer.
+ *
+ * head and tail are monotonic byte counters: only the consumer publishes
+ * head, and only the producer publishes tail. Never rewind the counters on
+ * wrap: doing so made rb_read_finished() a second writer of tail, racing
+ * with rb_write_finished() and eventually corrupting the record ring.
+ *
+ * Release/acquire pairs publish written samples before tail, and release
+ * consumed samples before head. Memory is addressed modulo buffer_size;
+ * the two virtual mappings allow a block to straddle the wrap boundary.
+ */
+static int rb_can_write(ringbuffer_t *rb, size_t n, size_t *tail_out) {
+    if (!rb || !rb->buffer || rb->buffer_size == 0 || n > rb->buffer_size)
+        return 0;
+    size_t tail = atomic_load_explicit(&rb->tail, memory_order_relaxed);
+    size_t head = atomic_load_explicit(&rb->head, memory_order_acquire);
+    if (tail < head || tail - head > rb->buffer_size ||
+        n > rb->buffer_size - (tail - head))
+        return 0;
+    if (tail_out) *tail_out = tail;
+    return 1;
+}
+
+static int rb_can_read(ringbuffer_t *rb, size_t n, size_t *head_out) {
+    if (!rb || !rb->buffer || rb->buffer_size == 0 || n > rb->buffer_size)
+        return 0;
+    size_t head = atomic_load_explicit(&rb->head, memory_order_relaxed);
+    size_t tail = atomic_load_explicit(&rb->tail, memory_order_acquire);
+    if (tail < head || tail - head > rb->buffer_size ||
+        n > tail - head)
+        return 0;
+    if (head_out) *head_out = head;
+    return 1;
+}
+
 int rb_put(ringbuffer_t *rb, void *data, size_t size) {
-	size_t head = atomic_load(&rb->head);
-	size_t tail = atomic_load(&rb->tail);
-	size_t map_size = rb->buffer_size * 2;
-	if(tail < head) {
-		return 1;
-	}
-	if(rb->buffer_size - (tail - head) < size) {
-		return 1;
-	}
-	if(tail >= map_size || size > (map_size - tail)) {
-		return 1;
-	}
-	memcpy(&rb->buffer[tail], data, size);
-	rb->tail += size;
-	return 0;
+    size_t tail;
+    if (!data || !rb_can_write(rb, size, &tail)) return 1;
+    memcpy(rb->buffer + tail % rb->buffer_size, data, size);
+    atomic_store_explicit(&rb->tail, tail + size, memory_order_release);
+    return 0;
 }
 
 void* rb_write_ptr(ringbuffer_t *rb, size_t size) {
-	size_t head = atomic_load(&rb->head);
-	size_t tail = atomic_load(&rb->tail);
-	size_t map_size = rb->buffer_size * 2;
-	if(tail < head) {
-		return NULL;
-	}
-	if(rb->buffer_size - (tail - head) < size) {
-		return NULL;
-	}
-	if(tail >= map_size || size > (map_size - tail)) {
-		return NULL;
-	}
-	return &rb->buffer[tail];
+    size_t tail;
+    if (!rb_can_write(rb, size, &tail)) return NULL;
+    return rb->buffer + tail % rb->buffer_size;
 }
 
 int rb_write_finished(ringbuffer_t *rb, size_t size) {
-	size_t head = atomic_load(&rb->head);
-	size_t tail = atomic_load(&rb->tail);
-	size_t map_size = rb->buffer_size * 2;
-	if(tail < head) {
-		return 1;
-	}
-	if(rb->buffer_size - (tail - head) < size) {
-		return 1;
-	}
-	if(tail >= map_size || size > (map_size - tail)) {
-		return 1;
-	}
-	rb->tail += size;
-	return 0;
+    size_t tail;
+    if (!rb_can_write(rb, size, &tail)) return 1;
+    atomic_store_explicit(&rb->tail, tail + size, memory_order_release);
+    return 0;
 }
 
 void* rb_read_ptr(ringbuffer_t *rb, size_t size) {
-	size_t head = atomic_load(&rb->head);
-	size_t tail = atomic_load(&rb->tail);
-	size_t map_size = rb->buffer_size * 2;
-	if(tail < head){
-		return NULL;
-	}
-	if(tail - head < size){
-		return NULL;
-	}
-	if(head >= map_size || size > (map_size - head)) {
-		return NULL;
-	}
-	return &rb->buffer[head];
+    size_t head;
+    if (!rb_can_read(rb, size, &head)) return NULL;
+    return rb->buffer + head % rb->buffer_size;
 }
 
 int rb_read_finished(ringbuffer_t *rb, size_t size) {
-	if(rb->tail - rb->head < size){
-		return 1;
-	}
-	rb->head += size;
-	if(rb->head >= rb->buffer_size) {
-		rb->head -= rb->buffer_size;
-		rb->tail -= rb->buffer_size;
-	}
-	return 0;
+    size_t head;
+    if (!rb_can_read(rb, size, &head)) return 1;
+    atomic_store_explicit(&rb->head, head + size, memory_order_release);
+    return 0;
 }
 
 void rb_close(ringbuffer_t *rb) {

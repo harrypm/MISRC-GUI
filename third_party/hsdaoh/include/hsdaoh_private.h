@@ -1,6 +1,8 @@
 #ifndef __HSDAOH_PRIVATE_H
 #define __HSDAOH_PRIVATE_H
 
+#include <stdint.h>
+
 enum hsdaoh_async_status {
 	HSDAOH_INACTIVE = 0,
 	HSDAOH_CANCELING,
@@ -55,7 +57,14 @@ struct hsdaoh_dev {
 
 	/* status */
 	int dev_lost;
-	bool driver_active;
+	bool driver_active_interface1;
+	bool driver_active_interface4;
+	/* UVC-frame counters are written by the callback and inspected after stop. */
+	uint64_t uvc_frames_received;
+	uint64_t uvc_frames_wrong_format;
+	uint64_t uvc_frames_incomplete;
+	uint64_t uvc_frames_discarded;
+	uint64_t uvc_frames_delivered;
 	unsigned int xfer_errors;
 	char manufact[256];
 	char product[256];

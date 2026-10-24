@@ -196,6 +196,8 @@ typedef struct {
     char output_filename_a[MAX_FILENAME_LEN];
     char output_filename_b[MAX_FILENAME_LEN];
     char output_path[FILE_PATH_MAX];        // Default save path (Desktop)
+    bool local_save_enabled;                 // Client only: send recording to this machine
+    char local_save_path[FILE_PATH_MAX];    // Client-owned path, never forwarded to server
     bool capture_a;
     bool capture_b;
 
@@ -405,6 +407,10 @@ typedef enum {
 
 // Main application state
 typedef struct gui_app {
+    // True only in the CLI --headless-server path; never initialize GPU/UI state.
+    bool headless_server;
+    // Controlled by the server main thread and queued HTTP /start /stop commands.
+    bool headless_retry_capture;
     // Device handles
     hsdaoh_dev_t *hs_dev;
     sc_handle_t *sc_dev;
@@ -553,6 +559,10 @@ typedef struct gui_app {
 
     // Device disconnect detection (timestamp of last successful callback)
     atomic_uint_fast64_t last_callback_time_ms;
+    // Real RF payload progress, distinct from USB callbacks. An MS2130 can
+    // keep calling us with frames the parser cannot synchronize/decode.
+    atomic_uint_fast64_t last_rf_payload_time_ms;
+    atomic_uint_fast64_t valid_rf_payload_frames;
 
     // Fonts
     Font *fonts;
@@ -598,6 +608,12 @@ typedef struct gui_app {
     atomic_int  net_peer_sample_rate;   // Hz reported by peer /stats.
     atomic_int  net_peer_device_count;  // device count from peer /devices.
     atomic_int  net_peer_selected;      // selected_device from peer.
+    // Network client readouts are server-owned. The client never needs a raw
+    // RF or audio stream merely to display ring occupancy and disk status.
+    atomic_int  net_remote_rf_buffer_pct;
+    atomic_int  net_remote_audio_buffer_pct;
+    atomic_bool net_remote_free_known;
+    atomic_uint_fast64_t net_remote_free_bytes;
     atomic_bool net_connected;          // server listening / client connected.
     atomic_bool net_error;              // last operation failed (see net_status).
 
@@ -623,6 +639,9 @@ static inline void gui_app_count_system_errors(gui_app_t *app, uint32_t count) {
 }
 
 // Application lifecycle
+// Uses a monotonic clock when the raylib window has not been initialized.
+void gui_runtime_set_headless(bool active);
+double gui_runtime_time(void);
 void gui_app_init(gui_app_t *app);
 void gui_app_cleanup(gui_app_t *app);
 
@@ -656,6 +675,7 @@ void gui_app_set_status(gui_app_t *app, const char *message);
 // Settings persistence
 void gui_settings_load(gui_settings_t *settings);
 void gui_settings_save(const gui_settings_t *settings);
+void gui_settings_restore_local_record_profile(gui_settings_t *settings);
 void gui_settings_init_defaults(gui_settings_t *settings);
 // Override the settings file path (e.g. from --config <path>). When set,
 // gui_settings_load/save use this path instead of the platform default.

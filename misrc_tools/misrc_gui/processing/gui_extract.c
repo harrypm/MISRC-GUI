@@ -13,6 +13,8 @@
 #include "../output/gui_record.h"
 #include "../visualization/gui_oscilloscope.h"
 #include "../signal/gui_cvbs.h"
+#include "../net/gui_remote_monitor.h"
+#include "../net/gui_net.h"
 #include "../../common/extract.h"
 #include "../../common/ringbuffer.h"
 #include "../../common/rb_event.h"
@@ -158,7 +160,7 @@ void gui_extract_prepare_stream(gui_app_t *app) {
     // No extraction producer is running here. Clear pressure from the prior
     // session so a new capture does not inherit its frozen-preview state.
     const gui_rf_block_info_t empty_info[2] = {{0}};
-    gui_video_submit_rf(app,NULL,NULL,0,0,empty_info,true);
+    if (!app->headless_server) gui_video_submit_rf(app,NULL,NULL,0,0,empty_info,true);
     app->buffers.rf_write_observer = observe_rf_write;
     app->buffers.rf_write_observer_context = app;
 }
@@ -339,16 +341,19 @@ static int extraction_thread(void *ctx) {
                             gui_record_spill_clear_forced(0);
                         }
                     } else if (drop_a) {
-                        char drop_msg[320];
+                        char drop_msg[480];
+                        double ring_fill = (double)bufmgr_fill_level(&s_extract_app->buffers, BUF_RECORD_A) / (1024.0 * 1024.0);
+                        double ring_cap = (double)s_extract_app->buffers.configs[BUF_RECORD_A].size / (1024.0 * 1024.0);
                         if (spill_error_a[0]) {
                             snprintf(drop_msg, sizeof(drop_msg),
-                                     "Record data loss on channel A at extract_frame=%u (spill enqueue failed: %s)",
-                                     frame_count, spill_error_a);
+                                     "Record data loss on channel A at extract_frame=%u (RecA=%.1f/%.1fMiB; spill enqueue failed: %s)",
+                                     frame_count, ring_fill, ring_cap, spill_error_a);
                         } else {
                             snprintf(drop_msg, sizeof(drop_msg),
                                      "Record data loss on channel A at extract_frame=%u (spill enqueue failed)",
                                      frame_count);
                         }
+                        gui_record_note_lost_block();
                         gui_record_log_capture_event(s_extract_app, "ERROR", drop_msg, GUI_ERROR_CLASS_SYSTEM, 1);
                         if (misrc_debug_enabled()) {
                             fprintf(stderr, "[EXTRACT] %s\n", drop_msg);
@@ -364,16 +369,19 @@ static int extraction_thread(void *ctx) {
                             gui_record_spill_clear_forced(1);
                         }
                     } else if (drop_b) {
-                        char drop_msg[320];
+                        char drop_msg[480];
+                        double ring_fill = (double)bufmgr_fill_level(&s_extract_app->buffers, BUF_RECORD_B) / (1024.0 * 1024.0);
+                        double ring_cap = (double)s_extract_app->buffers.configs[BUF_RECORD_B].size / (1024.0 * 1024.0);
                         if (spill_error_b[0]) {
                             snprintf(drop_msg, sizeof(drop_msg),
-                                     "Record data loss on channel B at extract_frame=%u (spill enqueue failed: %s)",
-                                     frame_count, spill_error_b);
+                                     "Record data loss on channel B at extract_frame=%u (RecB=%.1f/%.1fMiB; spill enqueue failed: %s)",
+                                     frame_count, ring_fill, ring_cap, spill_error_b);
                         } else {
                             snprintf(drop_msg, sizeof(drop_msg),
                                      "Record data loss on channel B at extract_frame=%u (spill enqueue failed)",
                                      frame_count);
                         }
+                        gui_record_note_lost_block();
                         gui_record_log_capture_event(s_extract_app, "ERROR", drop_msg, GUI_ERROR_CLASS_SYSTEM, 1);
                         if (misrc_debug_enabled()) {
                             fprintf(stderr, "[EXTRACT] %s\n", drop_msg);
@@ -381,8 +389,12 @@ static int extraction_thread(void *ctx) {
                     }
                 }
 
+                /* In Local Save even one missing RF block invalidates the
+                 * recording. Fail closed irrespective of the optional GUI
+                 * Stop-on-Dropout toggle. The client must keep .partial files. */
                 if ((drop_a || drop_b) &&
-                    s_extract_app->settings.stop_on_dropout &&
+                    (s_extract_app->settings.stop_on_dropout ||
+                     gui_net_local_save_recording()) &&
                     !atomic_load(&s_extract_app->dropout_stop_requested)) {
                     atomic_store(&s_extract_app->dropout_stop_reason, GUI_DROPOUT_BACKPRESSURE);
                     atomic_store(&s_extract_app->dropout_stop_requested, true);
@@ -430,7 +442,7 @@ static int extraction_thread(void *ctx) {
         // Write extracted samples to display buffer (lossy - OK to drop for display)
         // Display thread handles CVBS decode + oscilloscope processing
         // Frame layout: [samples_a: BUFFER_READ_SIZE * 2 bytes] [samples_b: BUFFER_READ_SIZE * 2 bytes]
-        if ((frame_count % ui_stride) == 0) {
+        if (!s_extract_app->headless_server && (frame_count % ui_stride) == 0) {
             size_t display_frame_size = BUFFER_READ_SIZE * sizeof(int16_t) * 2;
             uint8_t *display_buf = bufmgr_write_begin(&s_extract_app->buffers, BUF_DISPLAY,
                                                     display_frame_size, NULL);
@@ -461,13 +473,23 @@ static int extraction_thread(void *ctx) {
         }
         stamp.info[0].discontinuity |= mapping_gap;
         stamp.info[1].discontinuity |= mapping_gap;
-        gui_video_submit_rf(s_extract_app, mapped_a, mapped_b, stamp.counts[0], stamp.counts[1],
-                              stamp.info, atomic_load(&s_extract_app->rf_preview_input_supported));
+        // The remote GUI client decodes previews locally; the headless server
+        // must not copy into display buffers or spawn video preview workers.
+        if (!s_extract_app->headless_server)
+            gui_video_submit_rf(s_extract_app, mapped_a, mapped_b, stamp.counts[0], stamp.counts[1],
+                                stamp.info, atomic_load(&s_extract_app->rf_preview_input_supported));
         source_offset += BUFFER_READ_SIZE;
         // Update expensive UI stats at the same dynamic stride used for display.
         if ((frame_count % ui_stride) == 0) {
             //gui_extract_update_stats(s_extract_app, s_buf_a, s_buf_b, BUFFER_READ_SIZE);
             gui_extract_update_stats(s_extract_app, mapped_a, mapped_b, BUFFER_READ_SIZE);
+        }
+
+        /* Remote Monitor: precomputed, bounded, lossy snapshot; neither BUF_RECORD
+         * nor the capture/record lifecycle depends on a monitor consumer. */
+        if (s_extract_app->settings.net_mode == 1) {
+            gui_rm_submit(mapped_a, s_b_present ? mapped_b : NULL,
+                          BUFFER_READ_SIZE, atomic_load(&s_extract_app->sample_rate));
         }
 
         // Sample counters always updated (cheap atomic ops)
@@ -724,51 +746,51 @@ uint8_t *gui_extract_get_buf_aux(void) {
     return s_buf_aux;
 }
 
+/* Each extracted 65536-sample block is scanned hundreds of times a second.
+ * The original mixed peak/clipping loop tested (i < 1000) for EVERY sample,
+ * and interleaved a dynamically present channel B. Two independent passes
+ * let GCC/Clang vectorize the large clipping reductions on AArch64/NEON,
+ * while preserving exact clipping counters and first-1000 signed peaks.
+ * GUI, headless and Local Save all share identical observable counters. */
 void gui_extract_update_stats(gui_app_t *app, const int16_t *buf_a,
                               const int16_t *buf_b, size_t num_samples) {
+    if (!app || !buf_a) return;
     size_t clip_a_pos = 0, clip_a_neg = 0;
     size_t clip_b_pos = 0, clip_b_neg = 0;
     uint16_t peak_a_pos = 0, peak_a_neg = 0;
     uint16_t peak_b_pos = 0, peak_b_neg = 0;
-     bool have_b = (buf_b != NULL); // buf_b may be NULL in upstream mode, so check before processing B channel stats                            
-    // Peak detection uses first 1000 samples
-    size_t peak_samples = (num_samples < 1000) ? num_samples : 1000;
+    size_t peak_samples = num_samples < 1000 ? num_samples : 1000;
 
-     for (size_t i = 0; i < num_samples; i++) {
-        int16_t sa = buf_a[i];
+    /* Do not introduce another decimation: clipping totals must remain exact. */
+    for (size_t i = 0; i < num_samples; ++i) {
+        int16_t x = buf_a[i];
+        clip_a_pos += x >= 2047;
+        clip_a_neg += x <= -2048;
+    }
+    for (size_t i = 0; i < peak_samples; ++i) {
+        int32_t x = buf_a[i];
+        if (x > 0 && (uint32_t)x > peak_a_pos) peak_a_pos = (uint16_t)x;
+        if (x < 0 && (uint32_t)(-x) > peak_a_neg) peak_a_neg = (uint16_t)(-x);
+    }
 
-        // Clipping detection (12-bit ADC: +2047 is positive clip, -2048 is negative clip)
-        if (sa >= 2047) clip_a_pos++;
-        else if (sa <= -2048) clip_a_neg++;
-
-        // Peak detection (first N samples only) - A
-        if (i < peak_samples) {
-            if (sa > 0 && (uint16_t)sa > peak_a_pos) peak_a_pos = (uint16_t)sa;
-            if (sa < 0 && (uint16_t)(-sa) > peak_a_neg) peak_a_neg = (uint16_t)(-sa);
+    if (buf_b) {
+        for (size_t i = 0; i < num_samples; ++i) {
+            int16_t x = buf_b[i];
+            clip_b_pos += x >= 2047;
+            clip_b_neg += x <= -2048;
         }
-
-        // B only if present
-        if (have_b) {
-            int16_t sb = buf_b[i];
-
-            if (sb >= 2047) clip_b_pos++;
-            else if (sb <= -2048) clip_b_neg++;
-
-            if (i < peak_samples) {
-                if (sb > 0 && (uint16_t)sb > peak_b_pos) peak_b_pos = (uint16_t)sb;
-                if (sb < 0 && (uint16_t)(-sb) > peak_b_neg) peak_b_neg = (uint16_t)(-sb);
-            }
+        for (size_t i = 0; i < peak_samples; ++i) {
+            int32_t x = buf_b[i];
+            if (x > 0 && (uint32_t)x > peak_b_pos) peak_b_pos = (uint16_t)x;
+            if (x < 0 && (uint32_t)(-x) > peak_b_neg) peak_b_neg = (uint16_t)(-x);
         }
     }
 
-
-    // Update atomic counters
     atomic_fetch_add(&app->clip_count_a_pos, clip_a_pos);
     atomic_fetch_add(&app->clip_count_a_neg, clip_a_neg);
     atomic_store(&app->peak_a_pos, peak_a_pos);
     atomic_store(&app->peak_a_neg, peak_a_neg);
-
-    if (have_b) {
+    if (buf_b) {
         atomic_fetch_add(&app->clip_count_b_pos, clip_b_pos);
         atomic_fetch_add(&app->clip_count_b_neg, clip_b_neg);
         atomic_store(&app->peak_b_pos, peak_b_pos);
@@ -779,7 +801,6 @@ void gui_extract_update_stats(gui_app_t *app, const int16_t *buf_a,
         atomic_store(&app->clip_count_b_pos, 0);
         atomic_store(&app->clip_count_b_neg, 0);
     }
-
 }
 
 rb_event_t *gui_extract_get_data_event(void) {
