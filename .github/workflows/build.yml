@@ -160,6 +160,7 @@ jobs:
             imagemagick \
             libasound2-dev \
             libfftw3-dev \
+            libzstd-dev \
             libgl1-mesa-dev \
             libusb-1.0-0-dev \
             libuvc-dev \
@@ -530,6 +531,7 @@ jobs:
             mingw-w64-ucrt-x86_64-nasm
             mingw-w64-ucrt-x86_64-ninja
             mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-zstd
 
       - name: Setup MSYS2 (retry no cache)
         if: steps.setup_msys2_cached.outcome == 'failure'
@@ -551,6 +553,7 @@ jobs:
             mingw-w64-ucrt-x86_64-nasm
             mingw-w64-ucrt-x86_64-ninja
             mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-zstd
 
       - name: Resolve build version
         id: version
@@ -971,6 +974,7 @@ jobs:
             /usr/local/Homebrew/Library/Taps/hashicorp/homebrew-tap; do
             rm -rf "$tap_dir"
           done
+          brew install zstd
           for formula in cmake fftw flac libusb libuvc meson nasm ninja pkgconf libsoxr; do
             if ! brew list --versions "$formula" >/dev/null 2>&1; then
               brew install "$formula"

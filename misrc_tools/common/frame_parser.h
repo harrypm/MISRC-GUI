@@ -157,6 +157,8 @@ typedef struct {
     size_t stream0_bytes;               /* Payload bytes for stream 0 (RF) */
     size_t stream1_bytes;               /* Payload bytes for stream 1 (audio) */
     int error_count;                    /* Number of CRC/idle errors in frame */
+    int crc_errors;                     /* CRC category for actionable diagnosis */
+    int idle_errors;                    /* Idle category for actionable diagnosis */
     bool valid;                         /* True if frame can be processed */
     bool report_errors;                 /* True if errors should be reported (after priming) */
 } frame_process_result_t;

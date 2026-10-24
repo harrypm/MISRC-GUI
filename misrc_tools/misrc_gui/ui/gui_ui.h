@@ -13,7 +13,7 @@
 #define COLOR_BUTTON_HOVER    (Color){ 80, 80, 92, 255 }
 #define COLOR_BUTTON_ACTIVE   (Color){ 95, 95, 110, 255 }
 #define COLOR_TEXT            (Color){ 220, 220, 230, 255 }
-#define COLOR_TEXT_DIM        (Color){ 140, 140, 155, 255 }
+#define COLOR_TEXT_DIM        (Color){ 174, 174, 188, 255 }
 #define COLOR_CHANNEL_A       (Color){ 80, 220, 100, 255 }
 #define COLOR_CHANNEL_B       (Color){ 220, 200, 80, 255 }
 #define COLOR_SYNC_GREEN      (Color){ 50, 200, 80, 255 }
@@ -32,7 +32,7 @@
 #define FONT_SIZE_NORMAL       18    // Normal UI text, buttons, labels
 #define FONT_SIZE_DROPDOWN     18    // Dropdown menu headers
 #define FONT_SIZE_DROPDOWN_OPT 16   // Dropdown menu option items
-#define FONT_SIZE_STATUS       18    // Status bar text
+#define FONT_SIZE_STATUS       19    // Status bar text
 #define FONT_SIZE_OSC_LABEL    20    // Oscilloscope channel labels "CH A", "CH B"
 #define FONT_SIZE_OSC_SCALE    16    // Oscilloscope scale ticks "+1", "0", "-1"
 #define FONT_SIZE_OSC_DIV      18    // Oscilloscope division labels "1ms/div", "1kHz/div"
@@ -40,7 +40,7 @@
 #define FONT_SIZE_VU_SCALE     16    // VU meter scale ticks
 #define FONT_SIZE_VU_CLIP      14    // VU meter clip indicators "+CLIP", "-CLIP"
 #define FONT_SIZE_STATS_LABEL  18    // Per-channel stats panel channel label
-#define FONT_SIZE_STATS        16    // Per-channel stats panel text
+#define FONT_SIZE_STATS        18    // Per-channel stats panel text
 
 // UI Layout functions
 void gui_render_layout(gui_app_t *app);

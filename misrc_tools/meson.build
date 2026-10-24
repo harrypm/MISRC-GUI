@@ -60,6 +60,7 @@ sources_capture = [
   'common/rb_event.c',
   'common/buffer_manager.c',
   'common/flac_writer.c',
+  'common/fast_crc16.c',
   'common/frame_parser.c',
   'common/device_enum.c',
   'common/file_utils.c',
@@ -233,6 +234,7 @@ else
   cflags += ['-DLIBASOUND_ENABLED=0']
 endif
 
+zstd_dep = dependency('libzstd', required: true, static: windows_static_deps)
 fftw3f_dep = dependency('fftw3f', required : false, static: windows_static_deps)
 if fftw3f_dep.found()
   cflags += ['-DLIBFFTW_ENABLED=1']
@@ -466,6 +468,12 @@ if raylib_dep.found()
     'misrc_gui/ui/clay_renderer_raylib.c',
     # Server/Client networking (cxadc_vhs_server-style peer mode)
     'misrc_gui/net/gui_net.c',
+    'misrc_gui/net/local_save_protocol.c',
+    'misrc_gui/net/local_save_files.c',
+    'misrc_gui/net/local_save_proxy.c',
+    'misrc_gui/net/gui_remote_fs.c',
+    'misrc_gui/net/gui_remote_monitor.c',
+    'misrc_gui/net/gui_remote_display.c',
     # Output
     'misrc_gui/output/gui_record.c',
     'misrc_gui/output/gui_record_direct.c',
@@ -475,6 +483,7 @@ if raylib_dep.found()
     'common/rb_event.c',
     'common/buffer_manager.c',
     'common/flac_writer.c',
+    'common/fast_crc16.c',
     'common/frame_parser.c',
     'common/device_enum.c',
     'common/file_utils.c',
@@ -508,6 +517,7 @@ if raylib_dep.found()
   endif
 
   gui_deps = deps + [ raylib_dep, fftw3f_dep ]
+  gui_deps += [ zstd_dep ]
 
   gui_cflags = cflags + [
     '-O3',                    # Maximum optimization (should already be set by buildtype=release)

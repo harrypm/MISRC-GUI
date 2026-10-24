@@ -139,6 +139,7 @@ pkg_check_modules(LIBUSB REQUIRED libusb-1.0)
 pkg_check_modules(FLAC REQUIRED flac)
 pkg_check_modules(SOXR REQUIRED soxr)
 pkg_check_modules(FFTW3F REQUIRED fftw3f)
+pkg_check_modules(ZSTD REQUIRED libzstd)
 
 # Test if FLAC library actually has threading support... we need v1.5+
 # (Version doesn't guarantee the feature - depends on build flags)

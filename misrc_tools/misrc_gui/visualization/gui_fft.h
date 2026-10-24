@@ -149,6 +149,12 @@ void gui_fft_cleanup(fft_state_t *state);
 void gui_fft_process_raw(fft_state_t *state, const int16_t *samples,
                          size_t count, uint32_t sample_rate);
 
+/* Remote Monitor: install precomputed server FFT bins in the ORIGINAL FFT
+ * panel renderer. The remote packet must contain 4096-point/2049-bin data. */
+void gui_fft_remote_apply(void *panel_state, const uint8_t *spectrum_le,
+                          size_t bins, uint32_t sample_rate, uint32_t sequence);
+
+
 // Swap buffers if new data available (called from render thread before rendering)
 // Copies back buffer to front buffer if magnitude_ready flag is set.
 void gui_fft_swap_buffers(fft_state_t *state);
@@ -168,5 +174,10 @@ void gui_fft_swap_buffers(fft_state_t *state);
 //   fonts: Font array (index 0 = Inter, index 1 = Space Mono), NULL for default
 void gui_fft_render(fft_state_t *state, float x, float y,
                     float width, float height, Color color, Font *fonts);
+
+/* v5 CPU-only Local FFTW server + float32 client feed (pre-EMA). */
+void gui_fft_server_bins(const int16_t *samples,size_t count,uint32_t rate,float *out,size_t bins);
+void gui_fft_remote_apply_float(void *state,const float *bins,size_t count,
+                                uint32_t sample_rate,uint32_t sequence);
 
 #endif // GUI_FFT_H

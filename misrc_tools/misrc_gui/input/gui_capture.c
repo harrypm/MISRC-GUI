@@ -928,7 +928,9 @@ void gui_capture_callback(void *data_info_ptr) {
     // Handle errors
     if (result.error_count > 0 && result.report_errors) {
         char err_msg[128];
-        snprintf(err_msg, sizeof(err_msg), "Frame parser error burst: %d errors in callback frame", result.error_count);
+        snprintf(err_msg, sizeof(err_msg),
+                 "Frame parser error burst: %d errors (CRC=%d idle=%d) in callback frame, fcnt=%u",
+                 result.error_count, result.crc_errors, result.idle_errors, (unsigned)meta.framecounter);
         gui_record_log_capture_event(app, "ERROR", err_msg, GUI_ERROR_CLASS_PARSER, (uint32_t)result.error_count);
         if (misrc_debug_enabled()) {
             fprintf(stderr, "[CB] %d frame errors, %u frames since last error\n",
@@ -996,6 +998,12 @@ void gui_capture_callback(void *data_info_ptr) {
                            capture_handler_audio_filter, &s_capture_handler);
 
     bufmgr_write_end(&app->buffers, BUF_CAPTURE_RF, result.stream0_bytes);
+    // An incoming USB callback is not proof that valid RF made it into the
+    // ringbuffer. Only advance this heartbeat after a successful RF write.
+    atomic_store(&app->last_rf_payload_time_ms, get_time_ms());
+    if (atomic_fetch_add(&app->valid_rf_payload_frames, 1) == 0) {
+        fprintf(stderr, "[CB] First valid RF payload accepted (%zu bytes)\n", result.stream0_bytes);
+    }
     if (buf_out_audio) {
         bufmgr_write_end(&app->buffers, BUF_CAPTURE_AUDIO, result.stream1_bytes);
     }
@@ -1049,17 +1057,36 @@ static inline void gui_upstream_mark_synced(gui_app_t *app)
 
 
 // Initialize application
+// A raylib window is not created in --headless-server mode. glfwGetTime()
+// therefore cannot be used for capture / recording timestamps in that mode.
+static atomic_bool s_headless_runtime = ATOMIC_VAR_INIT(false);
+void gui_runtime_set_headless(bool active) {
+    atomic_store(&s_headless_runtime, active);
+}
+double gui_runtime_time(void) {
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (atomic_load(&s_headless_runtime)) {
+        struct timespec now;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) == 0)
+            return (double)now.tv_sec + (double)now.tv_nsec / 1000000000.0;
+    }
+#endif
+    return GetTime();
+}
+
 void gui_app_init(gui_app_t *app) {
     // Initialize panel registry and register all panel types
     // This must happen before any panel state is created
-    panel_registry_init();
-    gui_waveform_panel_register();
-    gui_fft_panel_register();
-    gui_cvbs_panel_register();
-    gui_histogram_panel_register();
-    gui_waterfall_panel_register();
-    gui_spectrograph_panel_register();
-    gui_demod_panel_register();
+    if (!app->headless_server) panel_registry_init();
+    if (!app->headless_server) {
+        gui_waveform_panel_register();
+        gui_fft_panel_register();
+        gui_cvbs_panel_register();
+        gui_histogram_panel_register();
+        gui_waterfall_panel_register();
+        gui_spectrograph_panel_register();
+        gui_demod_panel_register();
+    }
 
     // Initialize per-channel display buffers
     memset(app->display_samples_a, 0, sizeof(app->display_samples_a));
@@ -1154,8 +1181,8 @@ void gui_app_init(gui_app_t *app) {
     app->trigger_b.phosphor_color = PHOSPHOR_COLOR_HEATMAP;  // Opacity mode by default
 
     // Initialize phosphor display state
-    app->phosphor_a = (phosphor_rt_t *)calloc(1, sizeof(phosphor_rt_t));
-    app->phosphor_b = (phosphor_rt_t *)calloc(1, sizeof(phosphor_rt_t));
+    if (!app->headless_server) app->phosphor_a = (phosphor_rt_t *)calloc(1, sizeof(phosphor_rt_t));
+    if (!app->headless_server) app->phosphor_b = (phosphor_rt_t *)calloc(1, sizeof(phosphor_rt_t));
 
     // Set phosphor config (render textures are created lazily on first use)
     if (app->phosphor_a) {
@@ -1178,14 +1205,14 @@ void gui_app_init(gui_app_t *app) {
     app->panel_config_a.split = true;
     app->panel_config_a.left_view = PANEL_VIEW_WAVEFORM;
     app->panel_config_a.right_view = PANEL_VIEW_FFT;
-    app->panel_config_a.left_state = panel_create_view_state(PANEL_VIEW_WAVEFORM);
-    app->panel_config_a.right_state = panel_create_view_state(PANEL_VIEW_FFT);
+    if (!app->headless_server) app->panel_config_a.left_state = panel_create_view_state(PANEL_VIEW_WAVEFORM);
+    if (!app->headless_server) app->panel_config_a.right_state = panel_create_view_state(PANEL_VIEW_FFT);
 
     app->panel_config_b.split = true;
     app->panel_config_b.left_view = PANEL_VIEW_WAVEFORM;
     app->panel_config_b.right_view = PANEL_VIEW_FFT;
-    app->panel_config_b.left_state = panel_create_view_state(PANEL_VIEW_WAVEFORM);
-    app->panel_config_b.right_state = panel_create_view_state(PANEL_VIEW_FFT);
+    if (!app->headless_server) app->panel_config_b.left_state = panel_create_view_state(PANEL_VIEW_WAVEFORM);
+    if (!app->headless_server) app->panel_config_b.right_state = panel_create_view_state(PANEL_VIEW_FFT);
 
     // Note: All buffers (BUF_CAPTURE_RF, BUF_CAPTURE_AUDIO, etc.) are initialized
     // by buffer manager automatically on first use
@@ -1205,7 +1232,8 @@ void gui_app_init(gui_app_t *app) {
     gui_extract_prepare_stream(app);
 
     // Initialize display thread (allocated, started on capture start)
-    app->display_thread = (display_thread_t *)calloc(1, sizeof(display_thread_t));
+    if (!app->headless_server)
+        app->display_thread = (display_thread_t *)calloc(1, sizeof(display_thread_t));
     if (app->display_thread) {
         if (gui_display_thread_init(app->display_thread) != 0) {
             fprintf(stderr, "Failed to initialize display thread state\n");
@@ -1236,7 +1264,7 @@ void gui_app_init(gui_app_t *app) {
     // Server/Client from the info page each session.
     // EXCEPTION: when launched with --config <path> (automated testing),
     // respect the config's net_mode instead of forcing Local.
-    if (!gui_settings_override_active()) {
+    if (!gui_settings_override_active() && !app->headless_server) {
         app->settings.net_mode = GUI_NET_MODE_LOCAL;
         gui_settings_save(&app->settings);
     }
@@ -1317,7 +1345,7 @@ void gui_app_cleanup(gui_app_t *app) {
     panel_config_cleanup(&app->panel_config_b);
 
     // Cleanup oscilloscope static resources
-    gui_oscilloscope_cleanup();
+    if (!app->headless_server) gui_oscilloscope_cleanup();
 
     // Cleanup display thread
     if (app->display_thread) {
@@ -1677,6 +1705,10 @@ static void gui_capture_upstream_callback(hsdaoh_data_info_t *data_info) //
             }
 
             bufmgr_write_end(&app->buffers, BUF_CAPTURE_RF, packed_bytes);
+            atomic_store(&app->last_rf_payload_time_ms, get_time_ms());
+            if (atomic_fetch_add(&app->valid_rf_payload_frames, 1) == 0) {
+                fprintf(stderr, "[CB] First valid RF payload accepted (%zu bytes; dual-ADC)\n", packed_bytes);
+            }
             bufmgr_signal_data(&app->buffers, BUF_CAPTURE_RF);
             atomic_fetch_add(&app->frame_count, 1);
             s_upstream_chb_ready = false;
@@ -1754,6 +1786,10 @@ static void gui_capture_upstream_callback(hsdaoh_data_info_t *data_info) //
         }
 
         bufmgr_write_end(&app->buffers, BUF_CAPTURE_RF, packed_bytes);
+        atomic_store(&app->last_rf_payload_time_ms, get_time_ms());
+        if (atomic_fetch_add(&app->valid_rf_payload_frames, 1) == 0) {
+            fprintf(stderr, "[CB] First valid RF payload accepted (%zu bytes; upstream)\n", packed_bytes);
+        }
         bufmgr_signal_data(&app->buffers, BUF_CAPTURE_RF);
 
         if (data_info->srate > 0) {
@@ -1870,9 +1906,17 @@ int gui_app_start_capture(gui_app_t *app) {
         fprintf(stderr, "[GUI] Already capturing\n");
         return 0;
     }
+    /* A reconnect must not reset recording counters/buffers while the old
+     * FLAC writer still drains them and the client transaction finalizes. */
+    if (gui_record_is_finalizing()) {
+        fprintf(stderr, "[GUI] Capture start deferred: recording finalization still running\n");
+        gui_app_set_status(app, "Finalizing previous recording before reconnect...");
+        return -1;
+    }
 
-    if (app->device_count == 0) {
-        fprintf(stderr, "[GUI] No devices available\n");
+    if (app->device_count == 0 || app->selected_device < 0 ||
+        app->selected_device >= app->device_count) {
+        fprintf(stderr, "[GUI] No devices available (or none selected)\n");
         gui_app_set_status(app, "No devices available");
         return -1;
     }
@@ -1950,7 +1994,7 @@ int gui_app_start_capture(gui_app_t *app) {
                      prev_runtime_mode ? "MISRC" : "HSDAOH",
                      app->capture_mode_runtime_misrc ? "MISRC" : "HSDAOH",
                      app->user_capture_mode_misrc ? "MISRC" : "HSDAOH");
-            app->capture_start_time = GetTime();
+            app->capture_start_time = gui_runtime_time();
             app->reconnect_pending = false;
             app->reconnect_attempts = 0;
             {
@@ -1998,7 +2042,7 @@ int gui_app_start_capture(gui_app_t *app) {
             // is sent (done inside gui_fx3_start), so the 5s grace period must
             // begin here, not at app init. Without this, capture_start_time stays
             // 0 and the watchdog reaps the session within 2s -> connect loop.
-            app->capture_start_time = GetTime();
+            app->capture_start_time = gui_runtime_time();
             app->reconnect_pending = false;
             app->reconnect_attempts = 0;
             {
@@ -2038,7 +2082,7 @@ int gui_app_start_capture(gui_app_t *app) {
         }
         int rtl_rc = gui_rtlsdr_start(app);
         if (rtl_rc == 0) {
-            app->capture_start_time = GetTime();
+            app->capture_start_time = gui_runtime_time();
             app->reconnect_pending = false;
             app->reconnect_attempts = 0;
             {
@@ -2109,7 +2153,7 @@ int gui_app_start_capture(gui_app_t *app) {
             // Same watchdog fix as FX3: capture_start_time must be set here or
             // the auto-reconnect watchdog fires within 2s (DdD streams
             // immediately on bulk submit, but the grace baseline still matters).
-            app->capture_start_time = GetTime();
+            app->capture_start_time = gui_runtime_time();
             app->reconnect_pending = false;
             app->reconnect_attempts = 0;
             {
@@ -2183,6 +2227,8 @@ int gui_app_start_capture(gui_app_t *app) {
     atomic_store(&app->rf_preview_input_supported, true);
     atomic_store(&app->audio_sample_rate, DEFAULT_AUDIO_SAMPLE_RATE);
     atomic_store(&app->last_callback_time_ms, get_time_ms());
+    atomic_store(&app->last_rf_payload_time_ms, get_time_ms());
+    atomic_store(&app->valid_rf_payload_frames, 0);
     atomic_store(&app->dropout_stop_requested, false);
     atomic_store(&app->dropout_stop_reason, GUI_DROPOUT_NONE);
     app->low_signal_time = 0.0f;
@@ -2412,8 +2458,10 @@ windows_mf_open_hid:
         // Without this, a first-connect USB claim that takes >2 s causes an
         // immediate false timeout -> disconnect -> reconnect cycle.
         atomic_store(&app->last_callback_time_ms, get_time_ms());
+        atomic_store(&app->last_rf_payload_time_ms, get_time_ms());
+        atomic_store(&app->valid_rf_payload_frames, 0);
         app->is_capturing = true;
-        app->capture_start_time = GetTime();
+        app->capture_start_time = gui_runtime_time();
         app->reconnect_pending = false;
         app->reconnect_attempts = 0;
 
@@ -2772,16 +2820,24 @@ void gui_app_stop_capture(gui_app_t *app) {
 
 // Recording wrappers - delegate to gui_record module
 int gui_app_start_recording(gui_app_t *app) {
-    // Client mode: record locally to the client's set storage directory.
-    // The client receives RF+audio from the server via the network pump
-    // threads, so local recording works the same as a local capture. Do NOT
-    // forward record-on to the remote server - the client records to its
-    // own output_path, not the server's.
+    if (!app) return -1;
+    /* Remote Monitor: all recording takes place on the headless SERVER.
+     * Never open local FLAC writers or create a file on the Windows client. */
+    if (gui_net_is_client(app)) {
+        gui_net_client_request_record(app, true);
+        gui_net_set_status(app, "Requested SERVER-side recording");
+        return 0;
+    }
     return gui_record_start(app);
 }
 
 void gui_app_stop_recording(gui_app_t *app) {
-    // Client mode: stop local recording (not the remote server's).
+    if (!app) return;
+    if (gui_net_is_client(app)) {
+        gui_net_client_request_record(app, false);
+        gui_net_set_status(app, "Requested SERVER-side recording stop");
+        return;
+    }
     gui_record_stop(app);
 }
 
@@ -2954,7 +3010,7 @@ void gui_app_clear_display(gui_app_t *app) {
         strncpy(app->status_message, message,
                 sizeof(app->status_message) - 1);
         app->status_message[sizeof(app->status_message) - 1] = '\0';
-        app->status_message_time = GetTime();
+        app->status_message_time = gui_runtime_time();
     }
 void gui_capture_poll_hsdaoh_status(gui_app_t *app)
 {
@@ -2990,6 +3046,20 @@ void gui_capture_poll_hsdaoh_status(gui_app_t *app)
     if (local[0] != '\0') {
         gui_app_set_status(app, local);
     }
+}
+
+// No valid RF writes even though USB callbacks might still be arriving.
+// Intended for hsdaoh/MS2130 headless capture. Do not conflate this with the
+// callback watchdog, as frame sync can fail while USB remains healthy.
+bool gui_capture_rf_payload_timeout(gui_app_t *app, uint32_t timeout_ms) {
+    if (!app || !app->is_capturing || !app->hs_dev || gui_playback_is_running(app)) return false;
+    uint64_t last_rf = atomic_load(&app->last_rf_payload_time_ms);
+    uint64_t now = get_time_ms();
+    if (now < last_rf) {
+        atomic_store(&app->last_rf_payload_time_ms, now);
+        return false;
+    }
+    return last_rf != 0 && (now - last_rf) > timeout_ms;
 }
 
 // Check if device has timed out (no callbacks for too long)

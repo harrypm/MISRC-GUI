@@ -5717,7 +5717,7 @@ static int gui_playback_commit(gui_app_t *app, playback_ctx_t *prepared) {
      * hardware-input swap must never leak into playback — it crossed the
      * panel feeds against the sliders. */
     app->capture_mode_runtime_misrc = false;
-    app->capture_start_time = GetTime();
+    app->capture_start_time = gui_runtime_time();
     app->reconnect_pending = false;
     app->reconnect_attempts = 0;
     {

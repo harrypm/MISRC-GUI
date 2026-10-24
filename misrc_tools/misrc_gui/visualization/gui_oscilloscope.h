@@ -18,6 +18,13 @@
 //-----------------------------------------------------------------------------
 
 void gui_waveform_panel_register(void);
+/* Remote Monitor: populate the original waveform panel's state with reduced
+ * on-wire ADC samples. The native renderer, overlay, zoom and phosphor remain
+ * exactly the same implementation as in Local mode. */
+struct gui_rm_scope_packet;
+void gui_waveform_remote_apply(void *state, const struct gui_rm_scope_packet *packet,
+                               int channel);
+
 
 //-----------------------------------------------------------------------------
 // Phosphor Parameters
@@ -66,5 +73,14 @@ ssize_t find_trigger_point(const int16_t *buf, size_t count,
 void gui_waveform_set_trigger_source_buffers(const int16_t *samples_ch1,
                                              const int16_t *samples_ch2,
                                              size_t count);
+
+/* v5 shared ORIGINAL resampler+trigger output (CPU only; safe in headless). */
+#include "../net/gui_remote_display.h"
+size_t gui_waveform_server_display_points(const int16_t *src,const int16_t *a,
+    const int16_t *b,size_t count,uint32_t sample_rate,
+    const gui_rd_config_t *cfg,float out[GUI_RD_WIDTH],int32_t *trigger_pos);
+void gui_waveform_remote_apply_points(void *state,const gui_rd_channel_t *data,
+                                    uint32_t sequence);
+void gui_waveform_remote_publish_config(void *state,int channel);
 
 #endif // GUI_OSCILLOSCOPE_H

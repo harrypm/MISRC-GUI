@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Cross-build the six MISRC GUI dependencies for Android arm64-v8a (API 30)
+# Cross-build MISRC GUI dependencies for Android arm64-v8a (API 30)
 # into .deps/install-android-arm64. Mirrors scripts/build-appimage-local.sh
 # and the main-branch CI (build.yml) dep builds, but adds the NDK toolchain.
 #
 # Deps (all built static):
 #   libFLAC 1.5.0   - hard-required by meson.build (flac.pc must report 1.5.0)
+#   libzstd 1.5.7   - remote monitor preview compression (static, Android arm64)
 #   FFTW 3.3.10     - single-precision (fftw3f), required by misrc_gui
 #   libsoxr 0.1.3   - optional resampler (LIBSOXR_ENABLED)
 #   libusb 1.0.27   - Android backend (highest risk; FX3/DdD/hsdaoh depend on it)
@@ -39,6 +40,10 @@ FLAC_VERSION=1.5.0
 FLAC_TARBALL="flac-${FLAC_VERSION}.tar.xz"
 FLAC_URL="https://github.com/xiph/flac/releases/download/${FLAC_VERSION}/${FLAC_TARBALL}"
 FLAC_SHA256="f2c1c76592a82ffff8413ba3c4a1299b6c7ab06c734dee03fd88630485c2b920"
+
+ZSTD_VERSION=1.5.7
+ZSTD_TARBALL="zstd-${ZSTD_VERSION}.tar.gz"
+ZSTD_URL="https://github.com/facebook/zstd/releases/download/v${ZSTD_VERSION}/${ZSTD_TARBALL}"
 
 FFTW_VERSION=3.3.10
 FFTW_TARBALL="fftw-${FFTW_VERSION}.tar.gz"
@@ -124,6 +129,32 @@ else
   cmake --install "$DEPS_SRC_DIR/flac-build"
 fi
 record "libFLAC" "${FLAC_VERSION} (sha256 ${FLAC_SHA256})"
+
+# ---------------- libzstd 1.5.7 (static, Android arm64) ----------------
+# Remote Monitor uses ZSTD_compress / ZSTD_decompress and Meson requires
+# libzstd.pc. The host's apt libzstd-dev is x86_64 and must NOT be used by the
+# Android NDK cross-build. Install a static arm64 library into DEPS_PREFIX so
+# it links directly into libmisrc_gui.so (no additional APK .so to package).
+log "=== libzstd ${ZSTD_VERSION} (Android static) ==="
+if [[ "$(pc_version libzstd)" == "${ZSTD_VERSION}" ]] && \
+   { [[ -f "$DEPS_PREFIX/lib/libzstd.a" ]] || [[ -f "$DEPS_PREFIX/lib64/libzstd.a" ]]; }; then
+  log "skip (libzstd.pc already ${ZSTD_VERSION} with static library)"
+else
+  download "$ZSTD_URL" "$DEPS_SRC_DIR/$ZSTD_TARBALL"
+  ZSTD_SHA="$(sha256sum "$DEPS_SRC_DIR/$ZSTD_TARBALL" | awk '{print $1}')"
+  rm -rf "$DEPS_SRC_DIR/zstd-src" "$DEPS_SRC_DIR/zstd-build"
+  mkdir -p "$DEPS_SRC_DIR/zstd-src"
+  tar -xf "$DEPS_SRC_DIR/$ZSTD_TARBALL" -C "$DEPS_SRC_DIR/zstd-src" --strip-components=1
+  cmake_x -S "$DEPS_SRC_DIR/zstd-src/build/cmake" -B "$DEPS_SRC_DIR/zstd-build" \
+    -DZSTD_BUILD_STATIC=ON -DZSTD_BUILD_SHARED=OFF \
+    -DZSTD_BUILD_PROGRAMS=OFF -DZSTD_BUILD_TESTS=OFF
+  cmake --build "$DEPS_SRC_DIR/zstd-build" --parallel "$JOBS"
+  cmake --install "$DEPS_SRC_DIR/zstd-build"
+fi
+[[ "$(pc_version libzstd)" == "${ZSTD_VERSION}" ]] || fail "Android libzstd.pc was not installed"
+{ [[ -f "$DEPS_PREFIX/lib/libzstd.a" ]] || [[ -f "$DEPS_PREFIX/lib64/libzstd.a" ]]; } || \
+  fail "Android static libzstd.a was not installed"
+record "libzstd" "${ZSTD_VERSION} (sha256 ${ZSTD_SHA:-$(sha256sum "$DEPS_SRC_DIR/$ZSTD_TARBALL" 2>/dev/null | awk '{print $1}')})"
 
 # ---------------- FFTW 3.3.10 (single precision -> fftw3f) ----------------
 log "=== FFTW ${FFTW_VERSION} (fftw3f) ==="
@@ -451,7 +482,7 @@ fi
 
 # ---------------- summary ----------------
 log "=== installed .pc versions ==="
-for pc in flac fftw3f soxr libusb-1.0 libuvc hsdaoh libhsdaoh raylib; do
+for pc in flac libzstd fftw3f soxr libusb-1.0 libuvc hsdaoh libhsdaoh raylib; do
   v="$(pc_version "$pc")"
   printf '  %-14s %s\n' "$pc" "${v:-(missing)}"
 done

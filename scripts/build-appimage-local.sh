@@ -298,6 +298,7 @@ run_container_internal() {
     imagemagick \
     libasound2-dev \
     libfftw3-dev \
+    libzstd-dev \
     libflac-dev \
     libgl1-mesa-dev \
     libsoxr-dev \

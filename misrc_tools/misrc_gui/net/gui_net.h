@@ -4,15 +4,17 @@
  * Any MISRC-GUI instance can run in one of three modes (gui_settings_t.net_mode):
  *   0 = Local  (default; no networking, behaves exactly as before)
  *   1 = Server (host/master: owns hardware + capture, serves HTTP control + RF/audio streams)
- *   2 = Client (slave: connects to a Server, mirrors device list/controls/state,
- *               ingests RF+audio streams into the local pipeline, and forwards its
- *               own start/stop/record/device-select actions to the server)
+ *   2 = Client (slave: connects to a Server, mirrors device/record state,
+ *               consumes only compressed Remote Monitor display points, and
+ *               forwards capture/record/setting requests to the server)
  *
  * Protocol: HTTP/1.0, GET-only (adapted from the reference cxadc-capture-server).
  *   GET /version            -> MISRC version text
  *   GET /stats              -> JSON capture/device state snapshot
  *   GET /devices            -> JSON enumerated device list (for client dropdown mirror)
- *   GET /controls           -> JSON mirrored control state (misrc mode, bits, resample)
+ *   GET /controls           -> JSON authoritative server-owned settings
+ *   GET /set?ab_swap=0|1    -> queue A/B swap on server (other allowlisted keys
+ *                             documented in README.md)
  *   GET /start              -> request capture start (server executes on main thread)
  *   GET /stop               -> request capture stop
  *   GET /record?on=1|0      -> request recording on/off
@@ -20,11 +22,9 @@
  *   GET /rf                 -> chunked raw RF stream (tapped from BUF_CAPTURE_RF writes)
  *   GET /baseband           -> chunked raw audio stream (tapped from BUF_CAPTURE_AUDIO writes)
  *
- * Thread-safety: HTTP endpoints and the client mirror thread only ever set atomic
- * command flags on gui_app_t (net_cmd_*). The main render loop polls them via
- * gui_net_poll_commands() and gui_net_poll_mirror() and executes the real control
- * actions (gui_app_start_capture, device selection, etc.) on the main thread - the
- * same safe pattern already used by app->dropout_stop_requested. No device handles
+ * Thread-safety: HTTP handlers queue validated controls through atomics. The
+ * main loop applies settings and capture commands; the client worker stages
+ * mirrored controls atomically for the Windows render thread to apply. No device handles
  * or is_capturing state are mutated from worker threads.
  *
  * v1 is LAN-only with no authentication or encryption (mirrors the reference
@@ -86,7 +86,30 @@ void gui_net_poll_mirror(gui_app_t *app);
 void gui_net_client_request_start(gui_app_t *app);
 void gui_net_client_request_stop(gui_app_t *app);
 void gui_net_client_request_record(gui_app_t *app, bool on);
+/* Server-owned, acknowledged client file sink. Never falls back to server disk. */
+bool gui_net_local_save_recording(void);
+bool gui_net_local_save_failed(void);
+/* Snapshot of send-queue pressure and last successful ACK for failure logs. */
+void gui_net_local_save_diagnostics(char *buf, size_t cap);
+int gui_net_local_save_begin(void);
+int gui_net_local_save_send(unsigned type,unsigned file_id,uint64_t offset,const void *data,size_t len);
+bool gui_net_local_save_end(bool commit);
 void gui_net_client_request_device(gui_app_t *app, int device_index);
+/* Queue one allowlisted server-owned capture setting (coalesced per key). */
+void gui_net_client_request_control(gui_app_t *app, const char *key, int value);
+
+/* v7: Remote recording paths, names and tags are server-owned UTF-8 strings. */
+void gui_net_client_request_string(gui_app_t *app, const char *key, const char *value);
+void gui_net_client_set_text_editing(gui_app_t *app, bool editing);
+/* Request a server-absolute directory ("~" = server home, "" = OS root / drives).
+ * State is asynchronous: false until the reply for the current request arrives. */
+void gui_net_client_browse_folders(gui_app_t *app,const char *server_path,unsigned page);
+bool gui_net_client_folder_state(const gui_app_t *app,char *path,size_t pathcap,
+    char *parent,size_t parentcap,bool *recovered,bool *computer,bool *error);
+bool gui_net_client_folder_has_more(const gui_app_t *app);
+int gui_net_client_folder_count(const gui_app_t *app);
+bool gui_net_client_folder_name(const gui_app_t *app,int index,char *out,size_t cap);
+void gui_net_client_storage_status(gui_app_t *app,char *out,size_t cap);
 
 /* Human-readable mode name and a status string for the info-page UI. */
 const char *gui_net_mode_name(int mode);

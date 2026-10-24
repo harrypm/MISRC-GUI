@@ -312,6 +312,8 @@ if ($LASTEXITCODE -ne 0) {
     Fail "Missing fftw3f pkg-config module. Install FFTW3 dev files and retry."
 }
 
+& pkg-config --exists libzstd
+if ($LASTEXITCODE -ne 0) { Fail "Missing libzstd; install mingw-w64-ucrt-x86_64-zstd" }
 $fftwVersion = (& pkg-config --modversion fftw3f).Trim()
 Write-Log "fftw3f: $fftwVersion"
 
