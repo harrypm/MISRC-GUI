@@ -88,25 +88,58 @@ typedef struct {
 #define HT_NTSC  2
 #define HT_SECAM 3
 
+/* burst_level_frac is the fraction of the (white - blanking) span that is
+ * the burst PEAK amplitude: PAL 3/14 = the ITU 0.3 V p-p burst on the 0.7
+ * span; NTSC 0.20 = the 40 IRE p-p burst on the 100/140 span. The real EBU
+ * HackDAC reference measures 0.221 V p-p - reproduced by the ITU frac times
+ * the 0.75 capture-chain chroma gain below (measured, see the probe log). */
 static const ht_config_t HT_CONF[GUI_TESTGEN_SYSTEM_COUNT] = {
-    /* PAL — hacktv vid_config_pal.
+    /* PAL — hacktv vid_config_pal (sync_rise 0.32 = the measured real-chain
+     * edge: the EBU reference's blanking->white 10-90 is 0.19us, i.e. a
+     * raised-cosine parameter of 0.32).
      * Field 1 picture starts at slot 43, field 2 at slot 667 (288 lines). */
-    { 625, 51.95, 10.40, 4.70, 2.35, 27.30, 0.20,
+    { 625, 51.95, 10.40, 4.70, 2.35, 27.30, 0.32,
       0.70, 0.00, 0.00, -0.30,
-      HT_PAL, 2.25, 0.30, 5.60, 3.0/7.0, 4433618.75, 0.877, 0.493,
+      HT_PAL, 2.25, 0.30, 5.60, 3.0/14.0, 4433618.75, 0.877, 0.493,
       1250, 5, { 43, 667 }, 288 },
-    /* NTSC — hacktv vid_config_ntsc.
+    /* NTSC — hacktv vid_config_ntsc (sync_rise per the same real chain).
+     * active_left 9.45 = the decoder's NTSC profile's active_start: the
+     * back-porch window (burst_end..active_start) must NOT overlap the
+     * picture - with hacktv's 9.20 the porch sampler lands inside the
+     * castellated edge strip and poisons the level commit.
      * Field 1 picture starts at slot 38, field 2 at slot 564 (242 lines). */
-    { 525, 52.90, 9.20, 4.70, 2.30, 27.10, 0.25,
+    { 525, 52.90, 9.45, 4.70, 2.30, 27.10, 0.32,
       100.0/140, 7.5/140, 0.00, -40.0/140,
-      HT_NTSC, 2.50, 0.30, 5.30, 4.0/10.0, 3579545.4545, 0.877, 0.493,
+      HT_NTSC, 2.50, 0.30, 5.30, 0.20, 3579545.4545, 0.877, 0.493,
       1050, 6, { 38, 564 }, 242 },
     /* SECAM — hacktv vid_config_secam (PAL luma geometry + FM chroma) */
-    { 625, 51.95, 10.40, 4.70, 2.35, 27.30, 0.20,
+    { 625, 51.95, 10.40, 4.70, 2.35, 27.30, 0.32,
       0.70, 0.00, 0.00, -0.30,
       HT_SECAM, 2.25, 0.30, 5.60, 0.0, 4433618.75, 0.877, 0.493,
       1250, 5, { 43, 667 }, 288 },
 };
+
+/* Capture-chain chroma gain: the real EBU HackDAC reference measures its
+ * bar chroma AND burst uniformly at 0.75x the standard amplitudes (yellow
+ * chroma 0.176 composite vs the standard 0.235; burst 0.221 p-p vs 0.3 -
+ * a 0.075-span uniform factor, direct max/min probe of the raw file).
+ * The simulated device emulates a live capture through the same chain. */
+#define HT_CHROMA_GAIN 0.75
+
+/* AC-coupling baseline bump (measured on the EBU reference, per line): at
+ * each field's VBI the whole baseline rides up and decays back (the porch:
+ * -1,434 -> +3,598, decay tau ~10 lines, the sync step intact). The bump
+ * PEAKS at the first picture lines (+5,024 on the white bar there - the
+ * decoder's white commit (blank + 90% of the filtered luma max) is exactly
+ * calibrated against that sagged early-field luma max; without it the
+ * commit lands ~10% below the plateau and the top of the picture clamps
+ * flat - the washed-out active area). The bump is smooth (no stream
+ * discontinuity) and carries no DC bias: the calibrated -0.30/+0.70
+ * waveform readout is preserved. */
+#define HT_SAG_PEAK       0.152   /* composite, the bump's value at picture start */
+#define HT_SAG_TAU_RISE   7.0     /* lines, rise across the VBI */
+#define HT_SAG_TAU_DECAY  9.4     /* lines, decay after picture start */
+#define HT_SAG_PIC_START  21.0    /* lines, first picture line after the VBI */
 
 /* SECAM FM centres (hacktv SECAM_* defines) */
 #define HT_SECAM_DB 4250000.0
@@ -259,11 +292,11 @@ size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
     int eq_smp = (int)(c->vsync_short_us * (double)sample_rate / 1e6 + 0.5);
     int broad_smp = (int)(c->vsync_long_us * (double)sample_rate / 1e6 + 0.5);
 
-    /* hacktv vid_init: burst parameters */
+    /* hacktv vid_init: burst parameters (plus the chain gain) */
     int burst_left_smp = (int)(c->burst_left_us * (double)sample_rate / 1e6 + 0.5);
     double burst_rise_s = c->burst_rise_us * 1e-6;
     double burst_width_s = c->burst_width_us * 1e-6;
-    double burst_amp = c->burst_level_frac * (white16 - blank16);
+    double burst_amp = c->burst_level_frac * (white16 - blank16) * HT_CHROMA_GAIN;
     if (burst_amp < 0) burst_amp = -burst_amp;
 
     /* hacktv vid_init: colour carrier phase increment per sample */
@@ -365,34 +398,49 @@ size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
                                 c->colour_mode == HT_NTSC) {
                                 /* QAM on the subcarrier: U rides sin,
                                  * V rides cos with the PAL V-switch. */
-                                double u_scaled = u * (white16 - blank16);
-                                double v_scaled = v * (white16 - blank16);
+                                double u_scaled = u * (white16 - blank16)
+                                                * HT_CHROMA_GAIN;
+                                double v_scaled = v * (white16 - blank16)
+                                                * HT_CHROMA_GAIN;
                                 double phase = fsc_inc * (double)abs_pos;
                                 chroma += u_scaled * sin(phase) +
                                           v_scaled * pal_switch * cos(phase);
                             } else {
-                                /* SECAM FM: alternating D'R'/D'B' per line */
+                                /* SECAM FM, matching the decoder's verified
+                                 * demod convention (the tbc-tools port, user-
+                                 * verified on the real SECAM capture):
+                                 *   D'B = +1.505*(B-Y), 230 kHz per unit
+                                 *   D'R = -1.902*(R-Y), 280 kHz per unit
+                                 * In the 0..1 U/V domain (u=0.493*(B-Y),
+                                 * v=0.877*(R-Y)): D'B = +3.052*u,
+                                 * D'R = -2.168*v. Amplitude: the ITU 230 mV
+                                 * p-p through the chain gain. */
                                 bool dr = (pal_switch > 0);
-                                double comp = dr ? v : u;
-                                double centre = dr ? HT_SECAM_DR : HT_SECAM_DB;
                                 double span = white16 - blank16;
-                                double freq = centre + comp * span * 1e6;
+                                double d = dr ? -2.168 * v : 3.052 * u;
+                                double centre = dr ? HT_SECAM_DR : HT_SECAM_DB;
+                                double dev = dr ? 280e3 : 230e3;
+                                double freq = centre + dev * d;
                                 secam_phase += 2.0 * M_PI * freq
                                              / (double)sample_rate;
-                                chroma += 0.25 * span * sin(secam_phase);
+                                chroma += 0.1643 * span * HT_CHROMA_GAIN
+                                         * sin(secam_phase);
                             }
-                        } else if (c->colour_mode == HT_SECAM) {
-                            /* Porch: run at the line's centre frequency */
-                            bool dr = (pal_switch > 0);
-                            double centre = dr ? HT_SECAM_DR : HT_SECAM_DB;
-                            secam_phase += 2.0 * M_PI * centre
-                                         / (double)sample_rate;
-                            chroma += 0.25 * (white16 - blank16)
-                                     * sin(secam_phase);
-                        }
+                            }
+                        } else if (c->colour_mode == HT_SECAM &&
+                                   x >= (size_t)hsync_smp) {
+                            /* Porch (post-sync, pre-picture): centre
+                             * frequency. The subcarrier is BLANKED during
+                             * the sync itself - it never rides the tip. */
+                        bool dr = (pal_switch > 0);
+                        double centre = dr ? HT_SECAM_DR : HT_SECAM_DB;
+                        secam_phase += 2.0 * M_PI * centre
+                                     / (double)sample_rate;
+                        chroma += 0.1643 * (white16 - blank16)
+                                 * HT_CHROMA_GAIN * sin(secam_phase);
                     }
 
-                    double base_v = signal * 32767.0;
+                double base_v = signal * 32767.0;
                     if (base_v > 32767.0) base_v = 32767.0;
                     if (base_v < -32768.0) base_v = -32768.0;
                     base_buf[n] = (int16_t)lrint(base_v);
@@ -412,8 +460,8 @@ size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
     free(slot_start);
 
     /* PASS 2: apply the sync_rise raised-cosine shaping to the BASE signal
-     * only (hacktv's sync pulse edges rise over sync_rise = 0.20us PAL /
-     * 0.25us NTSC). The chroma is added unfiltered afterwards. */
+     * only (hacktv's IRT1090 rise shape). The chroma is added unfiltered
+     * afterwards. */
     int rise_n = (int)(c->sync_rise_us * (double)sample_rate / 1e6 + 0.5);
     if (rise_n < 1) rise_n = 1;
     if (rise_n > (int)need) rise_n = (int)need;
@@ -452,6 +500,40 @@ size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
     free(kern);
     free(base_buf);
     free(chroma_buf);
+
+    /* PASS 3: the AC-coupling baseline bump at each field boundary (frame
+     * start and mid-frame, the two field VBI positions). The real chain's
+     * input coupling charges on the broad pulses and decays after them
+     * (measured on the EBU reference: the porch -1,434 -> +3,598, decay
+     * tau ~10 lines, the sync step intact). Smooth everywhere, so the frame
+     * seam stays continuous and the VBI pulse gates are not disturbed. The
+     * bump lifts the early-field luma max, which is what the decoder's
+     * white commit (blank + 90% of the filtered luma max) is calibrated
+     * against; without it the commit lands 10% below the plateau and the
+     * top of the picture clamps flat. No DC bias: the calibrated
+     * -0.30/+0.70 waveform readout is preserved. */
+    {
+        double lines_per_frame = (double)c->lines;
+        double half = lines_per_frame / 2.0;   /* 312.5 / 262.5 */
+        double amp = HT_SAG_PEAK * 32767.0;
+        for (size_t n = 0; n < need; n++) {
+            double line = (double)n * lines_per_frame / (double)need;
+            double d2 = line - half;
+            double b1 = amp * (1.0 - exp(-line / HT_SAG_TAU_RISE))
+                            * exp(-fmax(0.0, line - HT_SAG_PIC_START)
+                                      / HT_SAG_TAU_DECAY);
+            double b2 = 0.0;
+            if (d2 >= 0.0) {
+                b2 = amp * (1.0 - exp(-d2 / HT_SAG_TAU_RISE))
+                         * exp(-fmax(0.0, d2 - HT_SAG_PIC_START)
+                                   / HT_SAG_TAU_DECAY);
+            }
+            double value = (double)out[n] + b1 + b2;
+            if (value > 32767.0) value = 32767.0;
+            if (value < -32768.0) value = -32768.0;
+            out[n] = (int16_t)lrint(value);
+        }
+    }
 
     return need;
 }

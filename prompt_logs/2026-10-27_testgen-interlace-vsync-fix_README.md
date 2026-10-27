@@ -1,8 +1,13 @@
 # 2026-10-27 — Test Gen simulated CVBS: V-sync rolling fix (interlaced half-line model)
 
-Status: PAL SYNC FIX USER-VERIFIED (2026-10-27, GUI: Simulated device + Gen,
-waveform panel, trigger mode - rolling gone). NTSC/SECAM stability and colour
-correctness still to be confirmed on screen.
+Status: PAL SYNC FIX USER-VERIFIED. ROUND 2 (contrast + NTSC/SECAM)
+USER-VERIFIED: "massive improvement although the signal on the left and
+right sides are a bit broken". ROUND 3 (the solid-white cast strips + the
+baseline bump) USER-REJECTED: "broke it more - hard white in the black, the
+white is too big". ROUND 4 (the cast strips REMOVED - the reference is
+plain full-height bars, the hacktv av_test pattern; the coupling bump
+reshaped to peak at the picture's start) USER-VERIFIED ("good", 2026-10-27).
+NEXT: SECAM clean-up (the pre-emphasis/ident port from hacktv secam.c).
 
 ## Symptom
 
@@ -91,6 +96,136 @@ same-phase H pair across each frame boundary (the real PAL 4-field wrap).
 2. Gen NTSC and SECAM cycle - same stability.
 3. Colour still correct (burst/V-switch parity preserved by construction,
    but confirm on screen).
+
+## Round 2: the active-area contrast (washed out) + NTSC/SECAM
+
+A/B against the real reference (Desktop\cvbs-pal-ebu_2026.10.19_18.01.52_
+Video_RF_12-bit.flac), decoded with the EXACT GUI panel path
+(gui_cvbs_test --panel --full on both raws):
+
+1. WASH-OUT (all systems). The decoder's white commit = blank + 90% of the
+   filtered luma max (gui_cvbs.c:2758) needs the pattern's luma max ABOVE
+   the bar-white plateau. The real EBU card's castellated edge strips sit at
+   0.856 composite = 1.22x the 0.70 bar white (measured); the sim's plain
+   full-field bars had luma max = the bar white exactly -> the commit landed
+   10% below the plateau -> the display range (21,688) narrower than the
+   signal span (24,304): the bright bars clamped flat at 255 (the real's
+   peak = 212) and the darks lifted. FIX: the EBU castellated edge strips
+   (black/white checker, left+right, active/16 wide, 0.854 white) - the
+   commit then lands at 26,423 (the real's 26,629) and the white bar maps
+   to ~0.92 of display range, no clamping. No DC shift: the calibrated
+   -0.30/+0.70 waveform readout is preserved.
+2. THE CHAIN CHROMA GAIN 0.75. The real capture's bar chroma and burst
+   measure uniformly 0.75x the standard amplitudes (yellow chroma 0.176
+   composite vs the standard 0.235; burst 0.221 p-p vs 0.3 - the earlier
+   probe's burst number 7,685 confirmed by the aligned dump). The generator
+   scales U/V and the burst by HT_CHROMA_GAIN 0.75; the burst fracs are the
+   standards (PAL 3/14, NTSC 0.20). The decoded bar amps now match the
+   real's (yellow 0.305 vs 0.288, cyan 0.441 vs 0.418, red 0.457 vs 0.445,
+   blue 0.327 vs 0.318).
+3. SECAM. Two bugs: (a) the FM subcarrier rode the H-sync (the porch branch
+   ran for x < hsync): the raw min measured -16,494 (the tip poisoned);
+   fixed - the subcarrier is blanked during the sync. (b) The D' polarity
+   was inverted vs the decoder's verified demod convention
+   (D'B = +1.505*(B-Y) at 230 kHz/unit, D'R = -1.902*(R-Y) at 280 kHz/unit):
+   the bars decoded with the swapped axes; fixed (D'B = +3.052*u,
+   D'R = -2.168*v). The decode now: 248/0 accepted, the correct vectors
+   (yellow 166.4, blue 350.4), fob/for calibrated 4.250/4.406 MHz.
+4. NTSC. hacktv's active_left 9.20us put the picture (and the castellation)
+   inside the decoder's back-porch window (burst_end..active_start =
+   7.8..9.45us): the porch sampled the cast checker (dc +16,132) and the
+   VBI detection died (5 candidates in 250 fields). FIX: active_left 9.45
+   (the decoder's profile value). The decode: 247/1 (the 1 = the stream-
+   start bootstrap), the vectors correct.
+5. Edge rise. The EBU reference's blanking->white 10-90 measures 0.19us =
+   a raised-cosine parameter of 0.32 (hacktv's 0.20/0.25 spec values are
+   ~1.6x faster than the real chain); sync_rise_us = 0.32 all systems.
+   (A ringing/emulation attempt was REVERTED: the real edges do not ring,
+   and a one-pole coupling emulation shifted the baseline by the content's
+   mean, which would have broken the calibrated waveform readout; the sag
+   transient variant broke the VBI parity gates - both measured and
+   dropped.)
+
+Headless verification after the fixes (all at 40 MSPS, --panel --full):
+PAL 248/0 accepted, NTSC 247/1, SECAM 248/0; the bar vectors exact; the
+bar amps within ~5% of the real reference; the PPM row/column profile
+matches the real's (the cast 47-54 vs 49-56, the white bar 223 vs 212, the
+blacks 0/10 both). meson test 44/45 (the one failure = the pre-existing
+update_cli version-compare semantic conflict, unrelated).
+
+## Round 3: the castellated sides (user: "sides a bit broken")
+
+The user's screenshot (the Video panel) shows the round-2 checker cast
+decoding as a dense black/white vertical striping. Per-line PPM profiles of
+the reference decode: the reference card's cast strips are SOLID bar-white
+(constant 212 down every row, no checker - measured at the fine row steps);
+the checker was my invention.
+
+Also measured on the reference, per line: at each field's VBI the WHOLE
+baseline rides up (the porch -1,434 -> +3,598) and decays exponentially
+(tau ~10 lines) back to -1,430, the sync step staying intact through the
+sag. This baseline bump is what the decoder's white commit (blank + 90% of
+the filtered luma max) rides: it is why the reference's committed display
+white lands above the bar-white plateau (no clamping). Two earlier attempts
+were measured and dropped: (a) an edge-ringing emulation (the real edges do
+NOT ring - the blanking->white edge measures a clean 0.19us 10-90 rise, no
+overshoot), and (b) a discontinuous per-frame sag (it shifted which EQ
+pulses cross the slicing threshold and broke the VBI parity gates, 247
+"repeat parity" rejects).
+
+Round-3 changes:
+1. The cast strips = SOLID white at the bar-white level (the reference's
+   measured structure) for PAL/SECAM.
+2. The AC-coupling baseline bump = restored as a CONTINUOUS smooth bump per
+   field boundary (rise tau 2.5 lines through the VBI, decay tau 10.2
+   lines, peak ~0.155 composite - the reference's measured shape). Smooth
+   across frame seams; no DC bias; the -0.30/+0.70 waveform readout is
+   preserved.
+3. NTSC: the bump at ANY amplitude poisons the NTSC back-porch window
+   (burst_end 7.8..active_start 9.45us sits differently than PAL's) and
+   kills the VBI gates (measured: accepted drops to 0-27 with cad/par
+   rejects at every bump variant). NTSC keeps the user-verified per-line
+   checker at 0.854 (its headroom for the white commit) and takes no bump.
+   Follow-up: audit the NTSC porch window/interactions with a real NTSC
+   reference capture before touching it again.
+
+Headless verification: PAL 248/0, NTSC 247/1, SECAM 248/0 (the levels'
+commit: PAL white 22,760 / SECAM 22,878); GUI rebuilt; user verdict:
+REJECTED ("hard white in the black, the white is too big" - the solid
+white strips = the invented element, too prominent; the bump's lift
+visibly brightened the top of the picture).
+
+## Round 4: the cast strips REMOVED (the reference = plain full-height
+## bars) + the bump reshaped to peak at the picture's start
+
+Reference PPM re-measurement (definitive): the reference card is PLAIN
+FULL-HEIGHT 8 BARS, edge to edge of the active area - no cast strips, no
+checker (the hacktv av_test pattern; the "cast-like" values I profiled
+earlier were the porch/burst-leakage column, not card content). Both cast
+variants (round-2 checker, round-3 solid) were my inventions - removed
+entirely.
+
+The coupling bump RESHAPED to the reference's measured behaviour: the bump
+RISES across the VBI (tau ~7 lines) and PEAKS at the first picture lines
+(+5,024 s16 on the white bar there - the reference's per-line dump: the
+first picture line's white = 27,776 vs the steady 22,752 plateau), then
+decays (tau ~9.4 lines). Previous shape peaked mid-VBI and had decayed
+away by the picture - useless for the white commit.
+
+NTSC now works WITH the bump (248/0): the earlier NTSC bump-failures were
+confounded with the cast-strip experiments (the cast's edges landed inside
+the NTSC porch window and poisoned the level commit); with plain bars the
+bump is clean on all three systems.
+
+Headless verification: PAL 248/0, NTSC 248/0, SECAM 248/0; the commits:
+PAL black 348/white 26,189; NTSC black 267/white 24,138; SECAM black
+430/white 23,535 (the reference: black -1,364/white 26,629); the row-200
+column profile matches within ~7% everywhere (the sim 228/176/182/0/10/55
+vs the reference 212/163/169/0/10/55). meson test 44/45 (the one failure =
+the pre-existing update_cli version-compare semantic conflict).
+GUI rebuilt; awaiting user verification.
+
+## Files touched
 
 ## Files touched
 
