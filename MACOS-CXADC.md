@@ -153,3 +153,33 @@ unsigned mapping, Darwin ring lifecycle and the new upstream updater tests pass.
 This is build/test validation of the merge; the hardware capture evidence above
 was recorded on the original integration, not repeated for this merge.
 Cross-platform hosted CI status is reported separately in the pull request.
+
+## Two-card installation validation (2026-10-29)
+
+Two CX23880 endpoints attach to driver build 8 through an ASM1184e switch.
+Each card individually recorded approximately three seconds of disconnected-input
+RAW u8 through this GUI (85,983,232 bytes each), with zero reported writer drops
+and DMA overruns and verified teardown. Distinct session registry IDs in names
+and device markers identify the selected endpoint. The native reconnect selector
+now requires an exact marker: identical names and the shared card-count index
+must not silently select another card. A regression test exercises the actual
+selector with identical cards and missing/replaced identities. Registry IDs are
+session identities, not permanent serial numbers; refresh/reselect after reattach.
+
+Independent concurrent driver-client tests passed at 3, 10 and 60 seconds outside
+the GUI. The minute test saved 1,718,353,920 bytes per card with 25 wraps each,
+zero reported DMA errors/overruns and restored PCI command state. No authoritative
+zero-loss sample count is available. Neither analog input carried a test signal.
+
+This does **not** add simultaneous macOS dual-card GUI capture or claim clock
+synchronization. ClockGen hardware and synchronized GUI integration remain pending.
+The GUI still captures one selected card per session. Driver PCIe/DMA code and
+Linux/Windows capture paths were not changed. No security settings were changed.
+
+Native build, static guards, smoke and reconnect regression pass. Meson: 38/41
+pass; existing failures are gui_settings_paths, gui_audio_hifi_monitor and
+timing-sensitive gui_rf_preview_worker, previously observed on the upstream
+baseline. The GUI recordings also ran successfully on this final build.
+
+Full transport-test reproduction and limitations: see docs/DUAL-CARD-VALIDATION.md
+in the cxadc-macos checkout. Raw test files and logs remain private/ignored.

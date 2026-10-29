@@ -83,6 +83,7 @@ int gui_cxadc_macos_detect(void) {
     return device_count;
 }
 const char *gui_cxadc_macos_name(int index) { return index>=0 && index<device_count ? devices[index].name : "CXADC macOS unavailable"; }
+uint64_t gui_cxadc_macos_registry_id(int index) { return index>=0 && index<device_count ? devices[index].registry_id : 0; }
 void gui_cxadc_macos_select(int index) { if(!atomic_load(&active) && index>=0 && index<device_count)selected=index; }
 static uint32_t *parameter(cxadc_client_settings *s,const char *name) {
     if(!strcmp(name,"vmux"))return &s->vmux;

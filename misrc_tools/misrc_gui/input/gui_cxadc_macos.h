@@ -7,6 +7,7 @@
 struct gui_app;
 int gui_cxadc_macos_detect(void);
 const char *gui_cxadc_macos_name(int index);
+uint64_t gui_cxadc_macos_registry_id(int index);
 void gui_cxadc_macos_select(int index);
 int gui_cxadc_macos_get(const char *parameter, int *value);
 int gui_cxadc_macos_set(const char *parameter, int value);

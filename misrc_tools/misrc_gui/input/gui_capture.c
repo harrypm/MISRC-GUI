@@ -1496,7 +1496,8 @@ void gui_app_enumerate_devices(gui_app_t *app) {
     for(int i=0;i<cxadc_card_count && app->device_count<MAX_DEVICES;i++) {
         device_info_t *dst=&app->devices[app->device_count++];
         snprintf(dst->name,sizeof(dst->name),"[CXADC] %s",gui_cxadc_macos_name(i));
-        snprintf(dst->serial,sizeof(dst->serial),"CXADC_MACOS_%d",i);
+        snprintf(dst->serial,sizeof(dst->serial),"CXADC_MACOS_%d_%llx",i,
+                 (unsigned long long)gui_cxadc_macos_registry_id(i));
         dst->type=DEVICE_TYPE_CXADC;dst->index=1;
     }
 #else
