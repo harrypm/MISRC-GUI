@@ -112,10 +112,14 @@ static const ht_config_t HT_CONF[GUI_TESTGEN_SYSTEM_COUNT] = {
       100.0/140, 7.5/140, 0.00, -40.0/140,
       HT_NTSC, 2.50, 0.30, 5.30, 0.20, 3579545.4545, 0.877, 0.493,
       1050, 6, { 38, 564 }, 242 },
-    /* SECAM — hacktv vid_config_secam (PAL luma geometry + FM chroma) */
+    /* SECAM — hacktv vid_config_secam (PAL luma geometry + FM chroma).
+     * ev_co/eu_co are the SECAM D deviations in Hz per colour-difference
+     * unit (hacktv's SECAM configs REPLACE the PAL 0.877/0.493 with them):
+     * ev_co = -1.902*280e3 (D'R), eu_co = +1.505*230e3 (D'B). */
     { 625, 51.95, 10.40, 4.70, 2.35, 27.30, 0.32,
       0.70, 0.00, 0.00, -0.30,
-      HT_SECAM, 2.25, 0.30, 5.60, 0.0, 4433618.75, 0.877, 0.493,
+      HT_SECAM, 2.25, 0.30, 5.60, 0.0, 4433618.75,
+      -1.902 * 280e3, 1.505 * 230e3,
       1250, 5, { 43, 667 }, 288 },
 };
 
@@ -141,9 +145,35 @@ static const ht_config_t HT_CONF[GUI_TESTGEN_SYSTEM_COUNT] = {
 #define HT_SAG_TAU_DECAY  9.4     /* lines, decay after picture start */
 #define HT_SAG_PIC_START  21.0    /* lines, first picture line after the VBI */
 
-/* SECAM FM centres (hacktv SECAM_* defines) */
-#define HT_SECAM_DB 4250000.0
-#define HT_SECAM_DR 4406250.0
+/* SECAM FM chain constants (hacktv video.c SECAM_* defines, verbatim) */
+#define HT_SECAM_DB     4250000.0   /* 272 fH, D'b rest frequency */
+#define HT_SECAM_DR     4406250.0   /* 282 fH, D'r rest frequency */
+#define HT_SECAM_FM     4328125.0   /* 277 fH, FM carrier centre */
+#define HT_SECAM_DEV    1000000.0   /* deviation scale: INT16_MAX = +1 MHz */
+#define HT_SECAM_F0     4286000.0   /* cloche (bell) centre frequency */
+#define HT_SECAM_FSYNC  350000.0    /* field-ident ramp deviation */
+/* hacktv reuses the burst window as the SECAM chroma render window
+ * (vid_config_secam .burst_width = 56.9us, .burst_left = 5.6us). The
+ * REAL card (the decoder's reference) differs in two measured ways:
+ * the carrier reaches full envelope BEFORE the decoder's porch window
+ * opens at the burst position (the porch median is its per-line zero -
+ * a slow rise inside that window put ~13 kHz MAD on the zero and a
+ * false ~0.08 chroma on black), and the envelope's fall completes
+ * inside the line. So: start at the sync end (4.7us), 0.3us edges,
+ * plateau through the active area. */
+#define HT_SECAM_WIN_US   57.5
+#define HT_SECAM_RISE_US  0.3
+#define HT_SECAM_IRT1090  2.0738786
+/* Standard SECAM video pre-emphasis (the low-frequency "horn"): zero at
+ * 85 kHz, pole at 255 kHz (x3 shelf). hacktv's IIR (in={1.0,-0.90456054},
+ * out={2.90456054,-2.80912108}) is the bilinear transform of exactly this
+ * prototype at 16 MHz; redesigned here for the 40 MSPS stream. */
+#define HT_SECAM_PE_FZ  85000.0
+#define HT_SECAM_PE_FP  255000.0
+/* Chroma D deviations per unit of colour difference (hacktv ev_co/eu_co
+ * for SECAM: ev_co = -1.902*280e3 D'R, eu_co = +1.505*230e3 D'B) */
+#define HT_SECAM_DR_HZ  (-1.902 * 280e3)
+#define HT_SECAM_DB_HZ  (1.505 * 230e3)
 
 /* --- hacktv _burstwin (raised-cosine envelope) --------------------------- */
 
@@ -157,6 +187,93 @@ static double ht_burstwin(double t, double width, double rise) {
     else w = 0.0;
     w = fmax(0.0, fmin(1.0, w));
     return 0.5 - 0.5 * cos(M_PI * w);
+}
+
+/* --- SECAM chain (port of hacktv _vid_render_secam + filters) ------------ */
+
+/* hacktv common.c rc_window: raised-cosine window with integrated
+ * raised-cosine edges (t seconds from window start). */
+static double ht_rc_window(double t, double left, double width, double rise) {
+    double r;
+    t -= left + width / 2;
+    t = fabs(t) - (width - rise) / 2;
+    if (t <= 0) {
+        r = 1.0;
+    } else if (t < rise) {
+        t = 1.0 - t / rise * 2;
+        r = 0.5 * (1.0 + t + sin(M_PI * t) / M_PI);
+    } else {
+        r = 0.0;
+    }
+    return r;
+}
+
+/* hacktv fir.c kaiser window (beta 7) + fir_low_pass / fir_band_reject,
+ * in double precision (hacktv quantises to int16 taps; inaudible). */
+static double ht_i_zero(double x) {
+    double sum = 1.0, u = 1.0, halfx = x / 2.0, temp;
+    int n = 1;
+    do {
+        temp = halfx / (double)n;
+        n += 1;
+        temp *= temp;
+        u *= temp;
+        sum += u;
+    } while (u >= 1e-21 * sum);
+    return sum;
+}
+
+static void ht_kaiser(double *taps, int ntaps, double beta) {
+    double i_beta = 1.0 / ht_i_zero(beta);
+    double inm1 = 1.0 / ((double)(ntaps - 1));
+    taps[0] = i_beta;
+    for (int i = 1; i < ntaps - 1; i++) {
+        double temp = 2 * i * inm1 - 1;
+        taps[i] = ht_i_zero(beta * sqrt(1.0 - temp * temp)) * i_beta;
+    }
+    taps[ntaps - 1] = i_beta;
+}
+
+static void ht_fir_low_pass(double *taps, int ntaps, double sample_rate,
+                            double cutoff, double gain) {
+    int M = (ntaps - 1) / 2;
+    double fwT0 = 2.0 * M_PI * cutoff / sample_rate;
+    ht_kaiser(taps, ntaps, 7.0);
+    for (int n = -M; n <= M; n++) {
+        if (n == 0) taps[n + M] *= fwT0 / M_PI;
+        else taps[n + M] *= sin(n * fwT0) / (n * M_PI);
+    }
+    double fmax = taps[M];
+    for (int n = 1; n <= M; n++) fmax += 2 * taps[n + M];
+    gain /= fmax;
+    for (int n = 0; n < ntaps; n++) taps[n] *= gain;
+}
+
+static void ht_fir_band_reject(double *taps, int ntaps, double sample_rate,
+                               double low_cutoff, double high_cutoff, double gain) {
+    int M = (ntaps - 1) / 2;
+    double fwT0 = 2.0 * M_PI * low_cutoff / sample_rate;
+    double fwT1 = 2.0 * M_PI * high_cutoff / sample_rate;
+    ht_kaiser(taps, ntaps, 7.0);
+    for (int n = -M; n <= M; n++) {
+        if (n == 0) taps[n + M] *= 1.0 + (fwT0 - fwT1) / M_PI;
+        else taps[n + M] *= (sin(n * fwT0) - sin(n * fwT1)) / (n * M_PI);
+    }
+    double fmax = taps[M];
+    for (int n = 1; n <= M; n++) fmax += 2 * taps[n + M];
+    gain /= fmax;
+    for (int n = 0; n < ntaps; n++) taps[n] *= gain;
+}
+
+/* hacktv _secam_g: complex cloche (bell) gain of the chroma sub-carrier at
+ * f Hz: 0.115 * (1 + j*16u) / (1 + j*1.26u), u = f/f0 - f0/f. */
+static void ht_secam_g(double f, double *g_re, double *g_im) {
+    double u = f / HT_SECAM_F0 - HT_SECAM_F0 / f;
+    double lq = 16.0 * u;
+    double rq = 1.26 * u;
+    double d = 1.0 + rq * rq;
+    *g_re = 0.115 * (1.0 + lq * rq) / d;
+    *g_im = 0.115 * (lq - rq) / d;
 }
 
 /* --- hacktv av_test bars (75% amplitude) --------------------------------- */
@@ -210,7 +327,7 @@ typedef enum {
 } sl_pulse_t;
 
 size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
-                         uint32_t sample_rate) {
+                         uint32_t sample_rate, uint32_t frame_index) {
     if ((int)system < 0 || (int)system >= GUI_TESTGEN_SYSTEM_COUNT) return 0;
     if (!out || sample_rate == 0) return 0;
     const ht_config_t *c = &HT_CONF[system];
@@ -302,10 +419,7 @@ size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
     /* hacktv vid_init: colour carrier phase increment per sample */
     double fsc_inc = 2.0 * M_PI * c->fsc_hz / (double)sample_rate;
 
-    /* SECAM FM phase accumulator (continuous across the frame) */
-    double secam_phase = 0.0;
-
-    /* PASS 1: baseband luma/sync into base_buf, chroma into chroma_buf.
+/* PASS 1: baseband luma/sync into base_buf, chroma into chroma_buf.
      * hacktv applies the sync_rise shaping only to the sync/level steps and
      * keeps chroma on its own path; a combined filter would attenuate the
      * 4.43 MHz subcarrier. */
@@ -405,39 +519,8 @@ size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
                                 double phase = fsc_inc * (double)abs_pos;
                                 chroma += u_scaled * sin(phase) +
                                           v_scaled * pal_switch * cos(phase);
-                            } else {
-                                /* SECAM FM, matching the decoder's verified
-                                 * demod convention (the tbc-tools port, user-
-                                 * verified on the real SECAM capture):
-                                 *   D'B = +1.505*(B-Y), 230 kHz per unit
-                                 *   D'R = -1.902*(R-Y), 280 kHz per unit
-                                 * In the 0..1 U/V domain (u=0.493*(B-Y),
-                                 * v=0.877*(R-Y)): D'B = +3.052*u,
-                                 * D'R = -2.168*v. Amplitude: the ITU 230 mV
-                                 * p-p through the chain gain. */
-                                bool dr = (pal_switch > 0);
-                                double span = white16 - blank16;
-                                double d = dr ? -2.168 * v : 3.052 * u;
-                                double centre = dr ? HT_SECAM_DR : HT_SECAM_DB;
-                                double dev = dr ? 280e3 : 230e3;
-                                double freq = centre + dev * d;
-                                secam_phase += 2.0 * M_PI * freq
-                                             / (double)sample_rate;
-                                chroma += 0.1643 * span * HT_CHROMA_GAIN
-                                         * sin(secam_phase);
                             }
-                            }
-                        } else if (c->colour_mode == HT_SECAM &&
-                                   x >= (size_t)hsync_smp) {
-                            /* Porch (post-sync, pre-picture): centre
-                             * frequency. The subcarrier is BLANKED during
-                             * the sync itself - it never rides the tip. */
-                        bool dr = (pal_switch > 0);
-                        double centre = dr ? HT_SECAM_DR : HT_SECAM_DB;
-                        secam_phase += 2.0 * M_PI * centre
-                                     / (double)sample_rate;
-                        chroma += 0.1643 * (white16 - blank16)
-                                 * HT_CHROMA_GAIN * sin(secam_phase);
+                        }
                     }
 
                 double base_v = signal * 32767.0;
@@ -455,9 +538,178 @@ size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
         }
     }
 
-    free(slot_type);
-    free(slot_hidx);
-    free(slot_start);
+    /* PASS 1.5 (SECAM only): the full hacktv _vid_render_secam FM chain.
+     * Per H line: build the D control signal (D'b rest 4.25 MHz / D'r rest
+     * 4.40625 MHz around the 4.328125 MHz FM centre, INT16_MAX = +-1 MHz),
+     * vertically averaged with the previous line's opposite component
+     * (hacktv chrominance_buffer second half); the first 9 H lines of each
+     * field carry the field ident ramp instead (D'r +350 kHz over 15 us,
+     * D'b -350 kHz over 18 us, from active_left). Then: 15-tap kaiser
+     * low-pass at 1.7 MHz, the SECAM video pre-emphasis horn (85/255 kHz,
+     * DC gain 1, x3 HF; hacktv's 16 MHz IIR redesigned here for the stream
+     * rate), per-type deviation clamps (D'b [CB-350k, CB+506k], D'r
+     * [CR-506k, CR+350k]), then FM render across the 56.9 us window
+     * (5.6 us start, 1 us IRT1090 raised-cosine edges - hacktv reuses the
+     * burst window constants for the SECAM chroma envelope) with the
+     * complex cloche gain and a per-line phase reset (0 or pi by global
+     * line % 3). */
+    if (c->colour_mode == HT_SECAM) {
+        const double rest_db = (HT_SECAM_DB - HT_SECAM_FM) / HT_SECAM_DEV;
+        const double rest_dr = (HT_SECAM_DR - HT_SECAM_FM) / HT_SECAM_DEV;
+        const double dmin_db = (HT_SECAM_DB - HT_SECAM_FM - 350e3) / HT_SECAM_DEV;
+        const double dmax_db = (HT_SECAM_DB - HT_SECAM_FM + 506e3) / HT_SECAM_DEV;
+        const double dmin_dr = (HT_SECAM_DR - HT_SECAM_FM - 506e3) / HT_SECAM_DEV;
+        const double dmax_dr = (HT_SECAM_DR - HT_SECAM_FM + 350e3) / HT_SECAM_DEV;
+        const double fm_level = (white16 - blank16) * 32767.0 * HT_CHROMA_GAIN;
+        const size_t chroma_left = (size_t)hsync_smp;
+        const size_t chroma_len = (size_t)((HT_SECAM_WIN_US * 1e-6
+                                + HT_SECAM_RISE_US * HT_SECAM_IRT1090 * 1e-6)
+                                * (double)sample_rate) + 1;
+        const double env_width = HT_SECAM_WIN_US * 1e-6;
+        const double env_rise = HT_SECAM_RISE_US * HT_SECAM_IRT1090 * 1e-6;
+        double *d_line = (double *)malloc((size_t)(line_smp + 8) * sizeof(double));
+        double *d_src = (double *)malloc((size_t)(line_smp + 8) * sizeof(double));
+        double lp[15];
+        double pe_b0, pe_b1, pe_fb;
+
+        if (!d_line || !d_src) {
+            free(d_line); free(d_src);
+            free(slot_type); free(slot_hidx); free(slot_start);
+            free(base_buf); free(chroma_buf);
+            return 0;
+        }
+        ht_fir_low_pass(lp, 15, (double)sample_rate, 1.70e6, 1.0);
+        {
+            /* hacktv's IIR (in {1.0,-0.90456054} / out {2.90456054,
+             * -2.80912108}; y = x*b0 + x_prev*b1 - y_prev*a1) is the
+             * bilinear transform of the 85/255 kHz horn designed at 16 MHz. */
+            const double cwin = 2.0 * (double)sample_rate;
+            double wz = 2.0 * M_PI * HT_SECAM_PE_FZ;
+            double wp = 2.0 * M_PI * HT_SECAM_PE_FP;
+            double z0 = (cwin - wz) / (cwin + wz);
+            double p1 = (cwin - wp) / (cwin + wp);
+            pe_b0 = (wp / wz) * (wz + cwin) / (wp + cwin);
+            pe_b1 = -pe_b0 * z0;
+            pe_fb = p1;
+        }
+
+        for (int s = 0; s < slots_total; s++) {
+            size_t ss, ss2, len;
+            int hidx, field, line;
+            long long global;
+            bool dr, is_ident;
+            double rest, dmin, dmax, phase;
+
+            if (slot_type[s] != SL_H || slot_hidx[s] < 0) continue;
+            ss = slot_start[s];
+            ss2 = (s + 2 <= slots_total) ? slot_start[s + 2] : need;
+            if (ss >= need) break;
+            len = (ss2 > need ? need : ss2) - ss;
+            if (len == 0) continue;
+
+            hidx = slot_hidx[s];
+            field = (s < mid) ? 0 : 1;
+            /* Line numbering picked so D'r lands on the decoder's EVEN
+             * field rows (the real card's cadence: drOnEven=1, measured).
+             * The frame stride 625 (odd) flips the D'r/D'b cadence every
+             * frame, as on a real transmitter chain. */
+            line = hidx + ((field == 0) ? 7 : 321);
+            global = (long long)frame_index * 625 + line;
+            dr = (global & 1) != 0;
+            is_ident = hidx < 9;
+            rest = dr ? rest_dr : rest_db;
+            dmin = dr ? dmin_dr : dmin_db;
+            dmax = dr ? dmax_dr : dmax_db;
+
+            if (is_ident) {
+                double dev = (dr ? 1.0 : -1.0) * HT_SECAM_FSYNC / HT_SECAM_DEV;
+                double rw = (dr ? 15e-6 : 18e-6);
+                for (size_t x = 0; x < len; x++) {
+                    double t = (double)((ssize_t)x - active_left)
+                               / (double)sample_rate / rw;
+                    if (t < 0.0) t = 0.0;
+                    if (t > 1.0) t = 1.0;
+                    d_line[x] = rest + dev * t;
+                }
+            } else {
+                /* The REAL card transmits the RAW colour difference per
+                 * line (no hacktv transmit-side vertical averaging - the
+                 * receiver's one-line hold does the averaging; measured on
+                 * the capture: the cyan D'b plateau reads 0.75x the
+                 * standard deviation with no D'r blend). */
+                for (size_t x = 0; x < len; x++) {
+                    if (x < (size_t)active_left ||
+                        x >= (size_t)active_left + (size_t)active_width) {
+                        d_line[x] = rest;
+                        continue;
+                    }
+                    int ax = (int)x - active_left;
+                    int bar = (ax * 8) / active_width;
+                    if (bar > 7) bar = 7;
+                    if (bar < 0) bar = 0;
+                    double y, u, v;
+                    ht_rgb_to_yuv(c, HT_BARS[bar].r, HT_BARS[bar].g,
+                                  HT_BARS[bar].b, &y, &u, &v);
+                    /* u/v are the SECAM deviations in Hz (the SECAM
+                     * config's ev_co/eu_co); the chain gain scales the
+                     * deviation (0.75x, measured on the real card). */
+                    double own_hz = HT_CHROMA_GAIN * (dr ? v : u);
+                    d_line[x] = (own_hz + (dr ? HT_SECAM_DR : HT_SECAM_DB)
+                                 - HT_SECAM_FM) / HT_SECAM_DEV;
+                }
+            }
+
+            /* 15-tap kaiser low-pass, block mode (edges held) */
+            memcpy(d_src, d_line, len * sizeof(double));
+            for (size_t x = 0; x < len; x++) {
+                double acc = 0.0;
+                for (int j = -7; j <= 7; j++) {
+                    ssize_t idx = (ssize_t)x + j;
+                    if (idx < 0) idx = 0;
+                    if ((size_t)idx >= len) idx = (ssize_t)len - 1;
+                    acc += lp[j + 7] * d_src[idx];
+                }
+                d_line[x] = acc;
+            }
+
+            /* Video pre-emphasis horn */
+            {
+                double x_prev = 0.0, y_prev = 0.0;
+                for (size_t x = 0; x < len; x++) {
+                    double xv = d_line[x];
+                    double yv = pe_b0 * xv + pe_b1 * x_prev + pe_fb * y_prev;
+                    x_prev = xv;
+                    y_prev = yv;
+                    d_line[x] = yv;
+                }
+            }
+
+            /* Deviation limit stops */
+            for (size_t x = 0; x < len; x++) {
+                if (d_line[x] < dmin) d_line[x] = dmin;
+                if (d_line[x] > dmax) d_line[x] = dmax;
+            }
+
+            /* FM render with the cloche gain and envelope */
+            phase = ((global % 3) == 0) ? 0.0 : M_PI;
+            for (size_t x = chroma_left; x < len; x++) {
+                size_t w = x - chroma_left;
+                double env, freq, g_re, g_im, c;
+                if (w >= chroma_len) break;
+                env = ht_rc_window((double)w / (double)sample_rate,
+                                   env_rise / 2.0, env_width, env_rise);
+                freq = HT_SECAM_FM + d_line[x] * HT_SECAM_DEV;
+                ht_secam_g(freq, &g_re, &g_im);
+                c = fm_level * (cos(phase) * g_re - sin(phase) * g_im) * env;
+                if (c > 32767.0) c = 32767.0;
+                if (c < -32768.0) c = -32768.0;
+                chroma_buf[ss + x] = (int16_t)lrint(c);
+                phase += 2.0 * M_PI * freq / (double)sample_rate;
+            }
+        }
+        free(d_line);
+        free(d_src);
+    }
 
     /* PASS 2: apply the sync_rise raised-cosine shaping to the BASE signal
      * only (hacktv's IRT1090 rise shape). The chroma is added unfiltered
@@ -492,13 +744,63 @@ size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
             }
             base_f += kern[i] * (double)base_buf[idx];
         }
-        double value = base_f + (double)chroma_buf[n];
+        double value = base_f;
         if (value > 32767.0) value = 32767.0;
         if (value < -32768.0) value = -32768.0;
         out[n] = (int16_t)lrint(value);
     }
     free(kern);
     free(base_buf);
+
+    /* SECAM only: the luminance video band-reject notch (hacktv
+     * secam_l_fir, ~6 dB deep around the chroma band) over the active
+     * area, so luma edges cannot beat with the FM subcarrier. */
+    if (c->colour_mode == HT_SECAM) {
+        double nt[51];
+        double sum = 0.0;
+        ht_fir_band_reject(nt, 51, (double)sample_rate,
+                           HT_SECAM_FM - 1e6, HT_SECAM_FM + 1e6, 1.0);
+        nt[25] += 0.5;
+        for (int i = 0; i < 51; i++) sum += nt[i];
+        for (int i = 0; i < 51; i++) nt[i] /= sum;
+        for (int s = 0; s < slots_total; s++) {
+            size_t ss, ss2, a0n, a1n;
+            double *tmp;
+            if (slot_type[s] != SL_H || slot_hidx[s] < 0) continue;
+            ss = slot_start[s];
+            ss2 = (s + 2 <= slots_total) ? slot_start[s + 2] : need;
+            a0n = ss + (size_t)active_left;
+            a1n = (ss2 > need ? need : ss2);
+            if (a1n > a0n + (size_t)active_width) a1n = a0n + (size_t)active_width;
+            if (a0n >= need || a1n <= a0n) continue;
+            tmp = (double *)malloc((a1n - a0n) * sizeof(double));
+            if (!tmp) break;
+            for (size_t n = a0n; n < a1n; n++) tmp[n - a0n] = (double)out[n];
+            for (size_t n = a0n; n < a1n; n++) {
+                double acc = 0.0;
+                for (int j = 0; j < 51; j++) {
+                    ssize_t idx = (ssize_t)(n - a0n) + j - 25;
+                    if (idx < 0) idx = 0;
+                    if ((size_t)idx >= a1n - a0n) idx = (ssize_t)(a1n - a0n) - 1;
+                    acc += nt[j] * tmp[idx];
+                }
+                out[n] = (int16_t)lrint(acc);
+            }
+            free(tmp);
+        }
+    }
+
+    free(slot_type);
+    free(slot_hidx);
+    free(slot_start);
+
+    /* Chroma add (PAL/NTSC QAM from PASS 1; SECAM FM from PASS 1.5) */
+    for (size_t n = 0; n < need; n++) {
+        double value = (double)out[n] + (double)chroma_buf[n];
+        if (value > 32767.0) value = 32767.0;
+        if (value < -32768.0) value = -32768.0;
+        out[n] = (int16_t)lrint(value);
+    }
     free(chroma_buf);
 
     /* PASS 3: the AC-coupling baseline bump at each field boundary (frame

@@ -662,18 +662,26 @@ static int simulated_capture_thread(void *ctx) {
             size_t need = gui_testgen_frame_samples(
                 (gui_testgen_system_t)sim_system, SIM_SAMPLE_RATE);
             if (need > 0) {
+                /* TWO pre-generated frames, streamed alternately: SECAM's
+                 * D'r/D'b line cadence and ident type alternate every frame
+                 * (hacktv global-line parity), so a single repeated frame
+                 * would hold one cadence and break field identification. */
                 int16_t *grown = (int16_t *)realloc(cvbs_frame,
-                                                    need * sizeof(int16_t));
+                                                    2 * need * sizeof(int16_t));
                 if (grown) {
                     cvbs_frame = grown;
-                    cvbs_frame_samples = gui_testgen_frame(
+                    cvbs_frame_samples = 2 * need;
+                    gui_testgen_frame(
                         (gui_testgen_system_t)sim_system, cvbs_frame, need,
-                        SIM_SAMPLE_RATE);
+                        SIM_SAMPLE_RATE, 0);
+                    gui_testgen_frame(
+                        (gui_testgen_system_t)sim_system, cvbs_frame + need,
+                        need, SIM_SAMPLE_RATE, 1);
                     cvbs_frame_pos = 0;
-                    fprintf(stderr, "[SIM] Channel A: %s hacktv frame "
-                            "(%zu samples at %u MSPS)\n",
+                    fprintf(stderr, "[SIM] Channel A: %s hacktv frames "
+                            "(2x %zu samples at %u MSPS)\n",
                             gui_testgen_system_name((gui_testgen_system_t)sim_system),
-                            cvbs_frame_samples, SIM_SAMPLE_RATE / 1000000);
+                            need, SIM_SAMPLE_RATE / 1000000);
                 }
             }
         }

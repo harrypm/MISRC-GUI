@@ -36,10 +36,13 @@ const char *gui_testgen_system_name(gui_testgen_system_t system);
 size_t gui_testgen_frame_samples(gui_testgen_system_t system, uint32_t sample_rate);
 
 /* Generate one full interlaced frame of composite CVBS into out[cap].
+ * frame_index selects the frame in the stream (SECAM uses it for the
+ * D'r/D'b line cadence, which alternates every frame, and for the per-line
+ * 3-line carrier phase pattern; PAL/NTSC ignore it).
  * Returns the number of int16 samples written, 0 if cap is too small.
  * Output is a full-scale int16 composite signal (sync tip ~ -0.30, white
  * ~ +0.70 of full scale for PAL/SECAM; NTSC setup per hacktv). */
 size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
-                         uint32_t sample_rate);
+                         uint32_t sample_rate, uint32_t frame_index);
 
 #endif /* GUI_TESTGEN_H */
