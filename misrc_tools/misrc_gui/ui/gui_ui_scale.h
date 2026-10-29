@@ -4,7 +4,11 @@
 #include <stdbool.h>
 
 #define GUI_UI_SCALE_MIN_PERCENT 75
+#if defined(__ANDROID__)
+#define GUI_UI_SCALE_MAX_PERCENT 300
+#else
 #define GUI_UI_SCALE_MAX_PERCENT 200
+#endif
 #define GUI_UI_SCALE_DEFAULT_PERCENT 100
 #define GUI_UI_SCALE_STEP_PERCENT 10
 #define GUI_UI_SCALE_HUD_DURATION_S 1.5

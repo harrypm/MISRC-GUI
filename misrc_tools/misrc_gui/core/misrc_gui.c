@@ -30,6 +30,10 @@
 #include "../../misrc_capture/misrc_capture_cli.h"
 #endif
 #include "../ui/gui_ui.h"
+#if defined(__ANDROID__)
+#define GUI_ANDROID_VIEWPORT_IMPLEMENTATION
+#include "gui_android_viewport.h"
+#endif
 #include "../input/gui_playback.h"
 #include "../visualization/gui_text.h"
 #include "../input/gui_capture.h"
@@ -929,6 +933,11 @@ int main(int argc, char **argv) {
     // so automated tests can launch the GUI with a pre-written config.
     gui_settings_set_override_path(config_path);
     gui_settings_load(&app.settings);
+#if defined(__ANDROID__)
+    // Render the existing UI without layout zoom on Android. The touch
+    // viewport scales the whole frame, including its outer borders.
+    app.settings.ui_scale_percent = GUI_UI_SCALE_DEFAULT_PERCENT;
+#endif
     gui_ui_set_scale_percent(app.settings.ui_scale_percent);
     // Push the persisted CVBS System selection (0=PAL/1=NTSC/2=SECAM) into
     // the video panel decoders: every created panel starts in the user's
@@ -1493,10 +1502,19 @@ int main(int argc, char **argv) {
             }
         }
 
+        // Apply Android gestures before Clay hit testing. Only a verified
+        // single tap triggers controls; a pan/pinch must never click them.
+#if defined(__ANDROID__)
+        gui_android_viewport_update();
+#endif
         // Update Clay mouse state
         Vector2 mouse_pos = gui_ui_get_mouse_position();
         Clay_SetPointerState((Clay_Vector2){ mouse_pos.x, mouse_pos.y },
+#if defined(__ANDROID__)
+                             gui_android_viewport_click_pressed(MOUSE_LEFT_BUTTON));
+#else
                              IsMouseButtonDown(MOUSE_LEFT_BUTTON));
+#endif
         Clay_UpdateScrollContainers(true, (Clay_Vector2){
             ui_zoom_result.passthrough_x * 20.0f,
             ui_zoom_result.passthrough_y * 20.0f
@@ -1755,6 +1773,9 @@ int main(int argc, char **argv) {
 
         // Render
         BeginDrawing();
+#if defined(__ANDROID__)
+        const bool android_canvas_active = gui_android_viewport_begin_canvas();
+#endif
         ClearBackground(COLOR_BG);
 
         // Render Clay UI (custom elements are handled via CLAY_RENDER_COMMAND_TYPE_CUSTOM)
@@ -1767,6 +1788,9 @@ int main(int argc, char **argv) {
 
 #if defined(__APPLE__)
         gui_cxadc_macos_ui_draw(&app);
+#endif
+#if defined(__ANDROID__)
+        gui_android_viewport_present_canvas(android_canvas_active);
 #endif
         EndDrawing();
     }
@@ -1797,6 +1821,9 @@ int main(int argc, char **argv) {
         UnloadFont(fonts[1]);
     }
 
+#if defined(__ANDROID__)
+    gui_android_viewport_shutdown();
+#endif
     CloseWindow();
 
     // Nonzero exit when the unattended --auto-record cycle failed (0 for

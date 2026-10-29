@@ -6,6 +6,19 @@
 
 #include "gui_phosphor_rt.h"
 #include "rlgl.h"
+
+#if defined(__ANDROID__)
+#include "../core/gui_android_viewport.h"
+/* Nested render textures are not a stack in raylib: EndTextureMode() always
+ * switches to the default framebuffer. Restore the Android full-UI canvas
+ * after finishing any inner phosphor/FFT texture pass. */
+#define PHOSPHOR_END_TEXTURE_MODE() do { \
+    EndTextureMode(); \
+    gui_android_viewport_restore_canvas_after_texture(); \
+} while (0)
+#else
+#define PHOSPHOR_END_TEXTURE_MODE() EndTextureMode()
+#endif
 #include <math.h>
 #include <stdlib.h>
 
@@ -329,8 +342,8 @@ bool phosphor_rt_init(phosphor_rt_t *prt, int logical_width,
     Matrix outer_modelview = rlGetMatrixModelview();
 
     // Clear render textures
-    BeginTextureMode(prt->rt[0]); ClearBackground(BLACK); EndTextureMode();
-    BeginTextureMode(prt->rt[1]); ClearBackground(BLACK); EndTextureMode();
+    BeginTextureMode(prt->rt[0]); ClearBackground(BLACK); PHOSPHOR_END_TEXTURE_MODE();
+    BeginTextureMode(prt->rt[1]); ClearBackground(BLACK); PHOSPHOR_END_TEXTURE_MODE();
     rlSetMatrixModelview(outer_modelview);
 
     prt->width = width;
@@ -361,8 +374,8 @@ void phosphor_rt_clear(phosphor_rt_t *prt) {
     if (!prt || !prt->valid) return;
 
     Matrix outer_modelview = rlGetMatrixModelview();
-    BeginTextureMode(prt->rt[0]); ClearBackground(BLACK); EndTextureMode();
-    BeginTextureMode(prt->rt[1]); ClearBackground(BLACK); EndTextureMode();
+    BeginTextureMode(prt->rt[0]); ClearBackground(BLACK); PHOSPHOR_END_TEXTURE_MODE();
+    BeginTextureMode(prt->rt[1]); ClearBackground(BLACK); PHOSPHOR_END_TEXTURE_MODE();
     rlSetMatrixModelview(outer_modelview);
 }
 
@@ -445,7 +458,7 @@ void phosphor_rt_end_frame(phosphor_rt_t *prt) {
     if (!prt || !prt->valid) return;
 
     EndBlendMode();
-    EndTextureMode();
+    PHOSPHOR_END_TEXTURE_MODE();
     if (prt->outer_modelview_saved) {
         rlSetMatrixModelview(prt->outer_modelview);
         prt->outer_modelview_saved = false;

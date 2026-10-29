@@ -5,6 +5,11 @@
  */
 
 #include "gui_ui.h"
+#if defined(__ANDROID__)
+#include "../core/gui_android_viewport.h"
+// Gesture-filtered single taps replace native mouse-press events on Android.
+#define IsMouseButtonPressed(button) gui_android_viewport_click_pressed(button)
+#endif
 #include "gui_dropdown.h"
 #include "gui_popup.h"
 #include "gui_device_label.h"
@@ -171,7 +176,11 @@ Vector2 gui_ui_get_render_scale(void)
 
 Vector2 gui_ui_get_mouse_position(void)
 {
+#if defined(__ANDROID__)
+    Vector2 position = gui_android_viewport_pointer();
+#else
     Vector2 position = GetMousePosition();
+#endif
     float scale = gui_ui_get_scale_factor();
     position.x /= scale;
     position.y /= scale;
@@ -8863,6 +8872,12 @@ static void gui_ui_poll_android_results(gui_app_t *app)
 
 // Handle UI interactions
 void gui_handle_interactions(gui_app_t *app) {
+#if defined(__ANDROID__)
+    if (gui_android_viewport_block_controls()) {
+        gui_ui_set_click_consumed();
+        return;
+    }
+#endif
 #if defined(__APPLE__)
     if(gui_cxadc_macos_ui_handle(app))return;
 #endif
@@ -9950,27 +9965,48 @@ void gui_handle_interactions(gui_app_t *app) {
                 return;
             } else {
 #if defined(__ANDROID__)
-                /* Async USB permission: never block the render thread on the
-                 * system permission dialog (a separate Activity that destroys
-                 * our EGL surface mid-block). If the fd is already granted,
-                 * start capture now; otherwise launch the async permission
-                 * request and let the per-frame poll complete the connect. */
-                extern int android_usb_has_fd(void);
-                extern int android_request_usb_permission_async(void);
-                extern int android_permission_pending(void);
-                extern void android_usb_clear_fd(void);
-                if (android_usb_has_fd()) {
-                    /* fd already granted: start capture on a worker thread so
-                     * the render loop stays responsive during hsdaoh_open. */
-                    gui_app_start_capture_async(app);
-                    app->reconnect_pending = false;
-                    app->reconnect_attempts = 0;
-                } else if (!android_permission_pending()) {
-                    android_usb_clear_fd();
-                    if (android_request_usb_permission_async()) {
-                        gui_app_set_status(app, "Requesting USB permission...");
+                /* Network clients do NOT own local capture hardware.  The
+                 * previous Android-only path unconditionally requested USB
+                 * permission, so Connect failed in Monitor & Remote mode if
+                 * the phone had no USB device (as intended). Keep the remote
+                 * start/stop commands distinct from local USB capture. */
+                if (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT ||
+                    app->settings.net_mode == GUI_NET_MODE_CLIENT) {
+                    bool peer_connected = app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT
+                        ? gui_monitor_client_connected() : gui_net_active(app);
+                    if (peer_connected) {
+                        /* This only queues a command to the server; it never
+                         * opens local USB (see gui_app_start_capture). */
+                        if (gui_app_start_capture(app) == 0) {
+                            app->reconnect_pending = false;
+                            app->reconnect_attempts = 0;
+                        }
+                    } else if (!gui_net_client_connection_running(app)) {
+                        /* The network connection itself was disconnected:
+                         * re-start its worker instead of asking for USB. */
+                        gui_net_client_toggle_connection(app);
+                        gui_app_set_status(app, "Connecting to remote Server...");
                     } else {
-                        gui_app_set_status(app, "USB permission request failed to start");
+                        gui_app_set_status(app, "Waiting for remote Server connection...");
+                    }
+                } else {
+                    /* Local capture only: async Android USB permission.
+                     * Never block the render thread on the system dialog. */
+                    extern int android_usb_has_fd(void);
+                    extern int android_request_usb_permission_async(void);
+                    extern int android_permission_pending(void);
+                    extern void android_usb_clear_fd(void);
+                    if (android_usb_has_fd()) {
+                        gui_app_start_capture_async(app);
+                        app->reconnect_pending = false;
+                        app->reconnect_attempts = 0;
+                    } else if (!android_permission_pending()) {
+                        android_usb_clear_fd();
+                        if (android_request_usb_permission_async()) {
+                            gui_app_set_status(app, "Requesting USB permission...");
+                        } else {
+                            gui_app_set_status(app, "USB permission request failed to start");
+                        }
                     }
                 }
 #else
