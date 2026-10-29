@@ -63,6 +63,32 @@
 - misrc_tools/misrc_gui/input/gui_simulated.c (two-frame stream for alternating cadence)
 - temp harness: %TEMP%\testgen_check\testgen_raw.c (frame_index arg)
 
+## SECAM port results (commit 8ddd6d9)
+- Fixes applied after the first A/B: SECAM ev_co/eu_co are the Hz deviations
+  (the old port double-scaled them with the PAL 0.877/0.493); removed hacktv's
+  transmit-side vertical averaging (the real card transmits raw D per line -
+  derived from the real bar values: cyan D'b = 0.75x standard with no D'r
+  blend); envelope starts at the sync end with 0.3 us edges (a slow rise
+  inside the decoder's porch window put 13 kHz MAD on the per-line zero and
+  a false ~0.08 chroma on black); cadence set to the real card's drOnEven=1.
+- A/B decode (panel path, sim vs real):
+  fob 4249973 / for 4406223 vs real 4249945 / 4406195 (within 28 Hz)
+  offset -27 Hz (real -55), noiseMad 57 Hz (real 321), drOnEven=1 (matches)
+  black 0.000 (real 0.003)
+  angles: 167.3/283.6/239.8/59.3/104.1/345.3 vs real
+  167.4/284.3/241.0/59.7/103.4/346.5 (all within 1.5 deg)
+  amps within +-17% (the real card's per-bar deviation is non-uniform
+  0.70-0.93x standard; the uniform 0.75x chain gain is the best fit)
+- Decoded bar RGB hues match the real decode on every bar.
+- Validation: build-local.ps1 gate OK; meson test 44/45 (the single FAIL is
+  the pre-existing update_cli dev-version test, blocked on user decision);
+  gui_rf_secam + gui_rf_mesecam OK.
+- CI: run 40844023101 (5ef0d5d, meson fix): Linux AppImage x86_64 + arm64
+  and Android APK all SUCCESS (the original failures are fixed); the run's
+  failure was only the macOS arm64 job CANCELLED mid-flight by the newer
+  push. Run 40847441487 (8ddd6d9) queued for the full picture.
+
 ## Status
-- CI fix pushed; CI run for 5ef0d5d pending at time of writing.
-- SECAM port implemented locally; A/B decode verification in progress.
+- Awaiting user visual confirmation of SECAM in the GUI (simulated device,
+  Test Gen mode).
+- Awaiting the queued CI run for the complete green picture.

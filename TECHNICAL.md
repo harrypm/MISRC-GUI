@@ -1037,3 +1037,153 @@ GUI playback resolves the truth via the probe + tags and decodes to EOF.
 - Real-file checks: `/tmp/flac_probe_test.c`, `/tmp/flac_seek_verify.c`,
   `/tmp/flac_loop_verify.c`, `/tmp/flac_seg_bench.c` (probe/patch/seek/
   EOF-loop/parallel-segment decode on the actual captures).
+
+## Test Gen — simulated CVBS test signal generator (hacktv port)
+
+The Simulated device's Test Gen mode synthesizes standards-accurate 75%
+colour-bar CVBS for PAL, NTSC and SECAM on demand, and streams it through
+the FULL capture pipeline (waveform, FFT, Video panel decode, recording)
+like a live signal. Sources:
+`misrc_tools/misrc_gui/signal/gui_testgen.{c,h}` (generator) and
+`misrc_tools/misrc_gui/input/gui_simulated.c` (streaming device). The
+generator is a port of hacktv's line-based video pipeline
+(`third_party/hacktv/src/video.c`, GPL-3.0-or-later, byte-identical to
+upstream master as of 2026-10); every timing/level constant is verbatim
+from hacktv's `vid_config_*` structs unless noted as a measured
+real-chain calibration below.
+
+### Frame model: interlaced half-line slot grid (the V-sync rolling fix)
+
+The generator models the interlaced half-line (32 us) slot grid directly
+instead of classifying whole 64 us lines. The CVBS decoder derives field
+parity from the half-line offset of each field's first equalizing pulse
+(`gui_cvbs.c cvbs_vbi_first_eq`: half-line -> parity 0, integer ->
+parity 1) and rejects candidates that repeat a parity — a whole-line
+model puts BOTH fields' first EQ pulse at the same offset, every second
+field is rejected, and the picture rolls vertically.
+
+- PAL: 1250 slots/frame; field 1 train EQ x5 / broad x5 / EQ x5 at slots
+  0-14, H grid on ODD slots 15..623 (field 1) and 641..1249 (field 2);
+  field 2 train at 625-639; slot 624/640 blank.
+- NTSC: 1050 slots, 6-pulse trains, H grid on EVEN slots.
+- Slot boundaries are spread over the frame (need/slots +-1 sample) so
+  the line period stays exact at any rate — there is NO
+  integer-samples-per-line assumption anywhere (NTSC at 40 MSPS is
+  2542.22 samples/line; a line-buffered generator would drift).
+- The decoder's verified gates: f1 first EQ at slot 0 (half-line offset
+  from the last H at slot -1), f2 first EQ at slot 625 (integer offset
+  from the last H at 623); field starts 312.0/313.0 lines apart.
+
+### Levels and real-chain calibrations (EBU HackDAC reference)
+
+The simulated device emulates a live capture through the measured chain
+of the real EBU HackDAC card (all values direct probes of the raw
+capture; see `prompt_logs/2026-10-29_secam-testgen-build-fixes_README.md`
+and the restore-point zips):
+
+- Domain: the generator emits full-scale int16 (sync -0.30, blank 0.00,
+  white +0.70 for PAL/SECAM; NTSC 100/140 setup per hacktv). The
+  simulated device maps that to the capture domain: `buf_a = cvbs *
+  2170` (12-bit), raw = 12-bit << 4 — real sync tip -10,500 int16, white
+  +24,300, chroma peaks clipping at the 8-bit ceiling, all reproduced.
+- Chroma/burst gain 0.75x: the real card's bar chroma AND burst measure
+  uniformly at 0.75x the standard amplitudes (yellow chroma 0.176
+  composite vs 0.235 standard; burst 0.221 V p-p vs 0.3).
+- sync_rise 0.32 us (not hacktv's 0.20-0.25): the reference's
+  blanking->white 10-90 is 0.19 us, a raised-cosine parameter of 0.32.
+- NTSC active_left 9.45 us (not hacktv's 9.20): the decoder's NTSC
+  profile samples the back porch at burst_end..active_start, and with
+  9.20 that sampler lands inside the castellated edge strip and poisons
+  the level commit. The bars are plain full-height (the real card has no
+  castellation strips; early checker-strip attempts were removed after
+  measuring the card).
+- AC-coupling baseline bump (all systems): the real chain's baseline
+  sags through each field VBI and recovers (porch -1,434 -> +3,598
+  counts, tau ~10 lines, the sync step intact). The bump PEAKS at the
+  first picture lines (+5,024 counts on the early-field white bar) —
+  the decoder's white commit (blank + 90% of the filtered luma max) is
+  calibrated against that sagged early-field luma max; without it the
+  commit lands ~10% low and the top of the picture clamps flat (the
+  washed-out active area). Applied as a smooth per-field-boundary bump
+  (rise tau 7 lines, decay tau 9.4, no DC bias, frame-seam continuous).
+
+### SECAM: the full hacktv FM chain + real-card corrections
+
+SECAM chroma is a faithful port of hacktv's `_vid_render_secam` + filter
+chain (commit 8ddd6d9; earlier simplified attempts — continuous-phase
+sine, demod-convention frequency tables — produced scrambled vectors and
+a false ~0.22 chroma on black and were replaced wholesale):
+
+- D control signal in hacktv lookup units: `d = (dev_Hz + rest - FM) /
+  1e6` around the FM centre 4.328125 MHz (277 fH); D'b rest 4.25 MHz
+  (272 fH), D'r rest 4.40625 MHz (282 fH). The SECAM config's
+  ev_co/eu_co are the Hz-domain deviations -1.902*280e3 (D'R) and
+  +1.505*230e3 (D'B) — hacktv's SECAM configs REPLACE the PAL
+  0.877/0.493 coefficients; applying BOTH double-scales the deviations.
+- Chain per line: 15-tap kaiser low-pass (1.7 MHz) -> video pre-emphasis
+  horn (85/255 kHz, DC gain 1, x3 HF; hacktv's IIR
+  {1.0,-0.90456054}/{2.90456054,-2.80912108} is that bilinear prototype
+  designed at 16 MHz — redesigned for the 40 MSPS stream) -> per-type
+  deviation limit stops (D'b [CB-350k, CB+506k], D'r mirrored) -> FM
+  render with the complex cloche gain 0.115*(1+j16u)/(1+j1.26u),
+  u = f/f0 - f0/f, f0 = 4.286 MHz, and a per-line phase reset (0 or pi
+  by global line % 3) -> raised-cosine envelope window.
+- Field ident: the first 9 H lines of each field carry rest + ramp
+  (D'r +350 kHz over 15 us, D'b -350 kHz over 18 us, from active_left).
+- Luma: 51-tap band-reject notch (FM centre +-1 MHz, mixed 50% = ~6 dB
+  deep) over the active area (hacktv `secam_l_fir`), so luma edges
+cannot
+  beat with the subcarrier.
+
+Three real-card behaviours DIFFER from hacktv, all measured on the
+capture (the decoder is validated on real data, so the card is the
+reference):
+
+1. NO transmit-side vertical averaging. hacktv averages each line's D
+   with the previous line's opposite component before FM; the real card
+   transmits the RAW colour difference per line (derived from the bar
+   values: the cyan D'b plateau reads 0.75x standard with no D'r blend;
+   with hacktv's averaging the decoder's held-component reconstruction
+   double-averages and the hues scramble). The receiver's one-line hold
+   does the averaging.
+2. The 0.75 capture-chain gain applies to the DEVIATION (the FM
+   amplitude barely matters — the demod is frequency-based and every
+   gate is relative).
+3. The carrier reaches full envelope BEFORE the decoder's porch window
+   opens (hacktv's 2 us rise starts at the burst position). The porch
+   median is the decoder's per-line discriminator zero; a slow rise
+   inside that window put ~13 kHz MAD on the zero and a false ~0.08
+   chroma on black. The generator starts the envelope at the sync end
+   (4.7 us) with 0.3 us edges and ends the fall inside the line.
+
+The D'r/D'b cadence is set to the real card's (`drOnEven=1`, measured):
+`gui_testgen_frame` takes a `frame_index` (the cadence and ident type
+alternate every frame — the 625-line stride is odd, as on a real
+transmitter chain) and the simulated device pre-generates TWO frames and
+streams them alternately — a single repeated frame would hold one
+cadence and break field identification.
+
+### Verification (headless panel-path A/B, commit 8ddd6d9)
+
+Harness: `testgen_raw <pal|ntsc|secam> <frames> <out.raw>` (temp
+harness, compiles gui_testgen.c against the 2170-scale raw domain) then
+`gui_cvbs_test --secam --rate=40 --s16 --panel --full` decodes sim and
+real through the identical panel path. Sim vs real (2026-10-29):
+
+- Carrier pair: fob 4249973 / for 4406223 vs real 4249945 / 4406195
+  (within 28 Hz; the pre-port rests were 81 kHz low).
+- drOnEven=1, offset -27 Hz (real -55), porch noiseMad 57 Hz (real 321).
+- Black bar: U/V 0.000 (real 0.003; pre-port: amp 0.219 false chroma).
+- Bar angles: 167.3 / 283.6 / 239.8 / 59.3 / 104.1 / 345.3 vs real
+  167.4 / 284.3 / 241.0 / 59.7 / 103.4 / 346.5 — all within 1.5 deg.
+- Amplitudes within +-17%: the real card's own per-bar deviation is
+  non-uniform (0.70-0.93x standard, an analog gain quirk of the card);
+  the uniform 0.75x is the best fit.
+- Decoded bar RGB hues match the real decode on every bar (including
+  the card's own desaturated-green quirk).
+- Gates: `scripts/build-local.ps1` (guards + build + smoke);
+  `meson test` 44/45 — the single FAIL is the unrelated `update_cli`
+  dev-version comparison test (blocked on a semantics decision);
+  `gui_rf_secam` + `gui_rf_mesecam` pass.
+- Restore point: `restore_points/2026-10-29_secam-fm-chain-good.zip`
+  (user-confirmed good).
