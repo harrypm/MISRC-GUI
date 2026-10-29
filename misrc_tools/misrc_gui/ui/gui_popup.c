@@ -9,6 +9,10 @@
 #include "gui_ui.h"
 #include <clay.h>
 #include <raylib.h>
+#if defined(__ANDROID__)
+#include "../core/gui_android_viewport.h"
+#define IsMouseButtonPressed(button) gui_android_viewport_click_pressed(button)
+#endif
 #include <string.h>
 
 //-----------------------------------------------------------------------------
