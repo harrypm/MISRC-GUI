@@ -1,8 +1,8 @@
 # Prompt Log — 2026-10-19 — CVBS colour phase (real-capture fit), full-frame hybrid (tbc-tools analyse), FFT wording/chrome scope
 
-Companion to `prompt_readme_cvbs_colour_phase_hybrid.md` (the full commands, outputs, A/B
-measurements, the reconstruction of the hard-crashed 2026-10-18 session, and the fix
-derivations).
+Companion to `2026-10-19_cvbs-colour-phase-hybrid-full_README.md` (the full commands,
+outputs, A/B measurements, the reconstruction of the hard-crashed 2026-10-18 session,
+and the fix derivations) — same folder, moved from the repo root 2026-10-29.
 
 Headless-verified state (not GUI-confirmed): canonical build + smoke test PASS; full
 meson suite 34/34 (incl. the new `gui_cvbs_baseband` full-view hybrid contracts and

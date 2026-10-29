@@ -436,6 +436,206 @@ rate stays — never a wrong override.
   unit test; a genuinely stale-sysfs card (the reporting user's machine)
   is the final end-to-end confirmation.
 
+## CXADC kernel driver — capture start/stop + stream sync (driver side)
+
+How the stock cxadc kernel driver (cxadc-linux3 tree, source verified at
+`/home/harry/cxadc/cxadc.c`) actually starts, paces and stops a capture. This
+is the foundation the GUI-side alignment work in the next section builds on;
+line numbers are from that tree (2026-10-29).
+
+### Constants that define the sync grid (cxadc.c:60-68)
+
+- 64 MiB DMA ring = `MAX_DMA_PAGE` 8192 individually-coherent 4 KiB pages
+  (allocated per page in `cxadc_probe`, not one contiguous block).
+- `CLUSTER_BUFFER_SIZE` 2048: each RISC WRITE moves 2 KiB, so a page is
+  filled by exactly 2 WRITEs.
+- `IRQ_PERIOD_IN_PAGES` = `0x200000 >> PAGE_SHIFT` = 512 pages = 2 MiB —
+  must be a power of two (the IRQ handler masks with `& ~(512-1)`).
+
+### There is no userspace start/stop command
+
+No ioctl starts or stops capture. The RISC/DMA engine starts once in
+`cxadc_probe()` (cxadc.c:1044-1047: `MO_DEV_CNTRL2` bit 5 "run risc",
+`MO_VID_DMACNTRL` bits 7|3 "enable fifo and risc") and free-runs for the
+life of the module. `MO_VID_INTMSK` is set to `INTERRUPT_MASK` 0x18888 at
+probe (cxadc.c:1155), but PCI-level delivery stays gated off until a user
+opens the device. Userspace open()/close() are reader attach/detach:
+
+- open: IRQ-gated handshake (below) that anchors the reader.
+- close: `cxadc_char_release()` (cxadc.c:718-728) writes ONLY
+  `MO_PCI_INTMSK = 0` — the engine keeps DMA-ing and `MO_VBI_GPCNT` keeps
+  counting.
+
+This free-run is why the GUI rate probe must drain a backlog (see the
+feed-rate check section above) and why an fd always has fresh pre-open
+content available immediately.
+
+### Producer: the RISC program (make_risc_instructions, cxadc.c:560-599)
+
+An infinite loop of WRITE instructions in a coherent buffer:
+
+- `SYNC|CNT_RESET` at entry.
+- Per page: 2 x 2 KiB WRITEs; the page-final WRITE carries `RISC_CNT_INC`
+  (so the VBI general-purpose counter `MO_VBI_GPCNT` = current page index
+  0..8191), `RISC_CNT_RESET` on the last page 8191 (counter wraps to 0), and
+  `RISC_IRQ1` on every 512th page (cxadc.c:585-590).
+- `JUMP` back to the first WRITE (cxadc.c:593-594).
+
+So the producer position is hardware state (GPCNT), and IRQs land exactly on
+the 2 MiB grid — the same grid the GUI sync-start uses.
+
+### Start sync: the open() handshake (cxadc_char_open, cxadc.c:601-716)
+
+1. Exclusive open: `in_use` under `mutex` (one reader per card; v0.5 change).
+2. Card config re-applied (vmux, 8/16-bit capture ctrl, AGC/gain, PLL/SCONV
+   sample rate) while the engine keeps running — settings take effect
+   mid-stream.
+3. `atomic_set(&lgpcnt, -1)` sentinel (cxadc.c:699), then
+   `MO_PCI_INTMSK = 1` to un-gate PCI IRQ delivery (cxadc.c:700).
+4. `wait_event_interruptible(readQ, lgpcnt != -1)` (cxadc.c:702) — open()
+   BLOCKS until the IRQ handler publishes a page position. A signal aborts
+   cleanly: re-mask the IRQ, `in_use = false`, return the error.
+5. `initial_page = lgpcnt` (cxadc.c:713) — the read anchor for this fd.
+
+First-ever open after module load waits up to one IRQ period (~73 ms
+stock). A re-open returns near-instantly: `MO_VID_INTMSK` stays 0x18888
+while nobody holds the fd, so `MO_VID_INTSTAT` accumulates un-acked IRQ1
+bits and the pending status fires as soon as `MO_PCI_INTMSK` is un-gated.
+
+### IRQ handler: the guaranteed-pages rule (cxadc_irq, cxadc.c:829-857)
+
+On RISC IRQ1 (video status bit 0x8):
+
+- read `MO_VBI_GPCNT`, round DOWN to the 512-page grid:
+  `gp_cnt &= ~(IRQ_PERIOD_IN_PAGES - 1)` (cxadc.c:850)
+- publish `atomic_set(&lgpcnt, gp_cnt)` + `wake_up_interruptible(&readQ)`
+  (cxadc.c:851-852)
+- acknowledge by writing the masked status back to `MO_VID_INTSTAT`
+  (cxadc.c:854)
+
+The in-code comment records the hardware caveat: GPCNT can LEAD the data
+(the counter may show page 1 while page 1 is still in flight to RAM), but a
+received IRQ guarantees everything up to its boundary has landed. `lgpcnt`
+therefore means exactly: pages [anchor .. lgpcnt) are resident and safe to
+copy. The power-of-two mask keeps the round-down on the RISC program's own
+IRQ grid, so it never rounds past a guaranteed boundary. Other bits of
+0x18888 (bits 3/7/11/15/16) are only logged and acked — bit 3 alone drives
+the sync.
+
+### Steady-state sync: read() (cxadc_char_read, cxadc.c:730-796)
+
+- Reader page = `((offset % 64 MiB) / 4096 + initial_page) % 8192`
+  (cxadc.c:738-740): position is a pure function of the fd offset,
+  anchored at open.
+- Copy while reader page != lgpcnt (partial-page offsets supported);
+  every copied page is memset to 0 (cxadc.c:758) — destructive read.
+  Consumed bytes read back as zeros until the writer's next lap rewrites
+  them (~2.3 s later); zeros on a forward read are only possible via
+  seek-back/re-read of consumed offsets.
+- Caught up (reader page == lgpcnt): `O_NONBLOCK` returns a short read;
+  blocking sleeps on readQ until the next IRQ moves lgpcnt (cxadc.c:786) —
+  wakeups are 2 MiB-granular, ~73 ms stock.
+- No flow control, no overrun signalling: a reader slower than the feed is
+  silently lapped — unread pages are overwritten with newer data, so loss
+  appears as a forward content jump, not as zeros or an error. A reader
+  that idles with the fd open accumulates readable backlog bounded by the
+  64 MiB ring (beyond that it is lapped).
+- Gain registers are re-written on every loop stall (cxadc.c:773-778),
+  which is how live `level`/`sixdb`/`center_offset` changes apply
+  mid-capture without ioctls.
+
+### Stop semantics: two levels
+
+Level 1 — close() (reader detach): `MO_PCI_INTMSK = 0` only. No drain, no
+flush, no final-release wait: whatever the writer has produced past the
+reader's position stays in the ring and is abandoned (overwritten on later
+laps). GPCNT keeps counting, INTSTAT keeps accumulating, and a subsequent
+open re-syncs immediately via the pending status.
+
+Level 2 — `disable_card()` (cxadc.c:480-491), the only true stop:
+`MO_PCI_INTMSK = 0`, `MO_VID_INTMSK = 0`, `MO_VID_INTSTAT = ~0` (clear all),
+`MO_VID_DMACNTRL = 0` (FIFO + RISC off), `MO_DEV_CNTRL2 = 0` (RISC halted).
+Callers: `cxadc_remove()` (rmmod / device removal / system shutdown —
+`.shutdown = cxadc_remove`, cxadc.c:1414) and `cxadc_suspend()`.
+
+### Suspend/resume (cxadc.c:1242-1405)
+
+Suspend = `disable_card()` + AGC register reset + PCI power-down. Resume
+re-runs the full probe init sequence (the comment: "I have no idea what
+state this card is in after resume so re-init the hardware and re-sync our
+settings"), including restarting the RISC engine and `request_irq()`.
+GPCNT restarts from 0, so any fd held open across suspend has a stale
+`initial_page` anchor — readers must re-open to re-sync after a resume.
+
+### Pace and timing accuracy (crystal-locked byte rate, both widths)
+
+The byte rate equals the "MHz" figure in every mode (8-bit @ 8fsc ~=
+28.64 MB/s; 16-bit @ 4fsc = 14.32 MS/s x 2 B = the same bytes/s), so grid
+timing is identical for both sample widths:
+
+- 28.636 MHz stock: 2 MiB release ~= 73.2 ms; 64 MiB ring ~= 2.34 s
+- 35.8 MHz (tenxfsc=1): 58.6 ms; 1.87 s
+- 40 MHz (mod/clockgen): 52.4 ms; 1.68 s
+- 54 MHz (mod): 38.8 ms; 1.25 s
+
+Accuracy properties of the sync mechanism:
+
+- Sample continuity is exact by construction: the RISC loop writes every
+  page in order and never skips, so a stream is gapless unless the reader
+  is lapped (a silent full-ring overwrite). The sync mechanism cannot drop
+  or duplicate samples — it only decides when data becomes readable.
+- Release granularity is the 2 MiB grid: lgpcnt advances only at
+  boundaries, so wakeups are quantized to one period. The writer is
+  mid-period most of the time, so the newest readable byte sits 0..1
+  period (0-73 ms stock) behind the live capture edge.
+- Wakeup latency never becomes drift: the IRQ guarantees the pages are
+  resident in RAM before the wakeup, so a delayed wakeup (tens of us on
+  the 36-core rig; potentially ms under heavy load) only delays
+  consumption — backlog grows, the content time of every byte is
+  unchanged.
+- The stream carries no timestamps: content time = byte offset / nominal
+  rate, so absolute timing accuracy = clock accuracy. A stock crystal is
+  typically ±20-50 ppm (class spec, not measured here): 20 ppm = 1.2 ms of
+  drift per minute (72 ms/h); 50 ppm = 3 ms/min (180 ms/h) vs wall clock.
+  The sysfs `crystal` value is only an input to the PLL/SCONV math — the
+  driver does no ongoing rate correction (the GUI's measured-rate check is
+  the mitigation; see the feed-rate section above).
+- Driver arithmetic quantization (custom rates): the PLL fractional field
+  is 20 bits — steps of (crystal/40)/2^20 ~= 0.68 Hz at stock
+  (cxadc.c:674-684) — and SCONV is integer-truncated: tenxfsc=1 computes
+  `131072*4/5` = 104857, truncating 104857.6 (~5.7 ppm ratio error), and
+  the generic `131072*crystal/tenxfsc` (cxadc.c:686) truncates by up to
+  ~10 ppm at 40 MHz-scale values. Custom tenxfsc rates carry this on top
+  of the crystal spec.
+- A/B relative drift: two cards on independent crystals walk apart at
+  their relative ppm (milliseconds per minute at tens of ppm). The
+  clockgen rig feeds both cards from one clock, so relative drift is ~0 —
+  the precondition for the byte-exact A/B alignment in the next section
+  holding over a whole capture.
+- When a boundary's actual instant is needed (not just "somewhere in this
+  period"), the GUI's 1-byte blocking read (next section) completes within
+  the IRQ/wakeup slop of the crossing itself — measured tens of
+  microseconds, near-identical per card. The anchor is byte-exact, so grid
+  quantization affects when you learn the position, never what the
+  position is.
+
+### How the GUI layers on top of this
+
+- `cxadc_sync_card_starts()` (next section) uses exactly this grid: open()
+  latches a 512-page-aligned `initial_page`, and lgpcnt advances only on
+  the same grid, so boundary releases recur at exact 2,097,152-byte
+  multiples of an fd's consumed bytes — a grid-aligned reader is always a
+  whole number of 2 MiB releases behind the writer.
+- The rate probe's drain phase exists because of the free-run + backlog
+  behavior above (first-attempt hardware measurements of 50-72 MHz were the
+  driver backlog, not the card).
+- The destructive zeroing is why the card stream is consume-once: the GUI
+  never re-reads an offset, and the direct RAW path records exactly what
+  read() returned.
+- Per-card state only: every `struct cxadc` has its own readQ/lgpcnt/
+  initial_page; the driver has zero cross-card sync — that is the GUI +
+  clockgen layer's job.
+
 ## Multi-stream capture start alignment (CXADC cards + clockgen audio)
 
 Equal sample counts between capture streams do NOT mean aligned content.
