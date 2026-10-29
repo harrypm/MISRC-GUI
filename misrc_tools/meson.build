@@ -1,6 +1,6 @@
 project('MISRC', 'c',
         default_options: ['c_std=c11', 'buildtype=release', 'b_lto=true'],
-        meson_version: '>=0.54')
+        meson_version: '>=0.55')
 
 
 # Version string: git-version.py is the portable twin of git-version.sh.
@@ -8,9 +8,19 @@ project('MISRC', 'c',
 # local Windows builds on the 'unknown_version' fallback (v1.2.7 updater
 # false-positive class). Any Python that can run meson itself can run the
 # port; git-version.sh stays the source of truth for CI shell scripts.
+# NOTE: the interpreter path must be a plain STRING (full_path()). meson 0.61.2
+# (the ubuntu-22.04 runner's system meson: Linux AppImage + Android APK jobs)
+# does shutil.which(vcs_cmd[0]) in func_vcs_tag, which raises
+# "TypeError: expected str, bytes or os.PathLike object, not ExternalProgram"
+# when handed the program object -> meson setup dies (CI runs 40448680208+).
+# The script path must ALSO be absolute: meson converts files() to a path
+# relative to the BUILD dir, but vcstagger runs the command with
+# cwd=source_dir - the relative form only resolved by accident when the
+# build dir was a sibling of misrc_tools (build-local), never on CI.
 version_prog = find_program('python3', 'python', required: false, native: true)
 if version_prog.found()
-  version_target = vcs_tag(command: [version_prog, files('git-version.py')],
+  version_target = vcs_tag(command: [version_prog.full_path(),
+                                     meson.current_source_dir() / 'git-version.py'],
                            fallback: 'unknown_version', input: 'version.h.in', output: 'version.h')
 else
   version_target = vcs_tag(command: ['git-version.sh'],
