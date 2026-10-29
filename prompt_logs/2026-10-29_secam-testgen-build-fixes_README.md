@@ -88,7 +88,21 @@
   failure was only the macOS arm64 job CANCELLED mid-flight by the newer
   push. Run 40847441487 (8ddd6d9) queued for the full picture.
 
-## Status
-- Awaiting user visual confirmation of SECAM in the GUI (simulated device,
-  Test Gen mode).
-- Awaiting the queued CI run for the complete green picture.
+## Session close (user confirmed the SECAM fix good)
+- User confirmed: "good fixed". Restore point created per the restore
+  rule: `restore_points/2026-10-29_secam-fm-chain-good.zip` (gui_testgen.c/
+  .h, gui_simulated.c, meson.build, this log).
+- Rebased local main onto origin/main (6caded7, the TECHNICAL.md +
+  prompt_logs tidy-up) with autostash; no conflicts.
+- Signal-generator notes added to TECHNICAL.md ("Test Gen — simulated
+  CVBS test signal generator (hacktv port)" section: slot model, chain
+  calibrations, the SECAM FM chain + the three real-card differences,
+  cadence contract, verification numbers); this log moved into
+  prompt_logs/ with the date-prefixed name. Commit 98564f1 pushed.
+- CI on the tip: run 40870316686 first completed failure with ONLY the
+  "macOS APP build (universal)" job CANCELLED ~15 min in (infra flake:
+  no timeout-minutes configured, the job's log blob was never retained);
+  every platform build job succeeded. Rerun of the failed jobs
+  (`gh run rerun --failed`) -> completed SUCCESS: all builds pass on
+  every platform (Linux AppImage x86_64+arm64, Windows EXE x86_64+arm64,
+  macOS APP x86_64+arm64+universal, Android APK, all guard tests).
