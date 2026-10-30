@@ -614,6 +614,16 @@ typedef struct gui_app {
     atomic_int  net_peer_selected;      // selected_device from peer.
     atomic_bool net_connected;          // server listening / client connected.
     atomic_bool net_error;               // last operation failed (see net_status).
+    /* RF transport diagnostics, published atomically by server/client threads.
+     * The two counters are deliberately separate: the client cannot know
+     * whether a stream interruption came from server queue pressure. */
+    atomic_uint_fast64_t net_rf_server_stream_drops;
+    atomic_uint_fast64_t net_rf_client_interruptions;
+    atomic_uint_fast64_t net_audio_server_stream_drops;
+    atomic_uint_fast64_t net_audio_client_interruptions;
+    atomic_size_t net_rf_server_queue_bytes;
+    atomic_size_t net_audio_server_queue_bytes;
+    atomic_bool net_rf_client_stream_live;
     /* Set by the async net mode transition worker (gui_net_request_apply_mode)
      * when the main loop should re-enumerate local devices once (leaving a
      * client mode / returning to Local). Consumed on the main thread; the

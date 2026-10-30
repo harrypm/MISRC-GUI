@@ -1,11 +1,13 @@
 /* Independent M-Server/M-Client transport. No full RF /rf or /baseband.
  * MRD5/Zstd-1 carries original Harry waveform/FFT display values only. */
 #include "gui_monitor_transport.h"
+#include "gui_monitor_session_state.h"
 #include "gui_remote_display.h"
 #include "gui_remote_fs.h"
 #include "gui_monitor_settings.h"
 #include "gui_monitor_local_save.h"
 #include "../output/gui_record.h"
+#include "../ui/gui_popup.h"
 #include "../../common/buffer_manager.h"
 #include "../../common/file_utils.h"
 #include <inttypes.h>
@@ -51,6 +53,9 @@ typedef int mon_sock_t;
 /* Display preview uses the original float32 waveform/FFT frame (MRD5)
  * and Zstd compression level 1. HTTP control remains MISRC-M/2. */
 #define MON_PREVIEW_PERIOD_MS 100u
+/* A 400 ms recv timeout caused spurious failures on busy M-Servers/Wi-Fi.
+ * It bounds an individual send/recv wait, not the entire HTTP request. */
+#define MON_HTTP_TIMEOUT_MS 1500
 #define MON_REMOTE_PATH GUI_REMOTE_FS_PATH
 #define MON_BROWSER_WIRE 40000u
 static atomic_uint g_preview_transfers;
@@ -95,9 +100,78 @@ static struct {
     atomic_bool reset_clips_pending[2];
     /* 0=none, 1=unreachable, 2=incompatible M-protocol, 3=invalid status. */
     atomic_int last_error;
+    atomic_uint status_dropouts,preview_dropouts;
+    atomic_bool preview_error;
 } g_client;
 
 
+/* Correlated asynchronous Record response. No filesystem I/O on socket
+ * worker; the main thread publishes the outcome after executing the command.
+ * The lock protects an atomic request-id + result + escaped message snapshot. */
+static atomic_flag g_record_result_lock=ATOMIC_FLAG_INIT;
+static void mon_record_lock(void){
+    while(atomic_flag_test_and_set_explicit(&g_record_result_lock,memory_order_acquire))
+        thrd_sleep_ms(1);
+}
+static void mon_record_unlock(void){
+    atomic_flag_clear_explicit(&g_record_result_lock,memory_order_release);
+}
+static struct {
+    uint64_t next_id,pending_id,completed_id;
+    unsigned result_code; /* 0=started/stopped; 1=failed; 2=awaiting confirmation */
+    char detail[256]; /* URL-encoded; safe to embed in a JSON string */
+} g_record_result;
+static atomic_flag g_record_ui_lock=ATOMIC_FLAG_INIT;
+static char g_record_ui_message[512];
+static bool g_record_ui_pending;
+static void mon_record_ui_error(const char *message){
+    while(atomic_flag_test_and_set_explicit(&g_record_ui_lock,memory_order_acquire))
+        thrd_sleep_ms(1);
+    snprintf(g_record_ui_message,sizeof(g_record_ui_message),"%s",message);
+    g_record_ui_pending=true;
+    atomic_flag_clear_explicit(&g_record_ui_lock,memory_order_release);
+}
+uint64_t gui_monitor_server_queue_record(gui_app_t *app,int command){
+    if(!app || command<1 || command>3)return 0;
+    mon_record_lock();
+    uint64_t id=++g_record_result.next_id;
+    if(!id)id=++g_record_result.next_id;
+    g_record_result.pending_id=id;
+    atomic_store(&app->net_cmd_monitor_record,command);
+    mon_record_unlock();
+    return id;
+}
+int gui_monitor_server_take_record(gui_app_t *app,uint64_t *request_id){
+    if(request_id)*request_id=0;
+    if(!app)return 0;
+    mon_record_lock();
+    int command=atomic_exchange(&app->net_cmd_monitor_record,0);
+    if(command && request_id)*request_id=g_record_result.pending_id;
+    if(command)g_record_result.pending_id=0;
+    mon_record_unlock();
+    return command;
+}
+void gui_monitor_server_record_result(uint64_t request_id,unsigned result,const char *detail){
+    if(!request_id)return;
+    char encoded[256]={0};
+    /* Use the existing URL encoding rules (ASCII token, no JSON injection). */
+    if(detail){
+        static const char hex[]="0123456789ABCDEF";
+        size_t n=0;
+        for(const unsigned char *v=(const unsigned char *)detail;*v && n+4<sizeof(encoded);v++){
+            unsigned char c=*v;
+            if((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='-'||c=='_'||c=='.')
+                encoded[n++]=(char)c;
+            else {encoded[n++]='%';encoded[n++]=hex[c>>4];encoded[n++]=hex[c&15];}
+        }
+        encoded[n]=0;
+    }
+    mon_record_lock();
+    g_record_result.completed_id=request_id;
+    g_record_result.result_code=result;
+    snprintf(g_record_result.detail,sizeof(g_record_result.detail),"%s",encoded);
+    mon_record_unlock();
+}
 /* Phase 2I: fully M-only remote recording config and device catalogue.
  * Network workers never read/write app->settings or app->devices directly.
  * Main-thread snapshots are protected by a very short atomic lock. */
@@ -285,6 +359,22 @@ static void mon_cfg_snapshot(gui_app_t *app){
 /* Main-thread mirror; preserving every non-recording client setting. */
 void gui_monitor_client_sync_main(gui_app_t *app){
     if(!app||app->settings.net_mode!=4)return;
+    /* Popups are main-thread UI objects. Never open one from the network worker.
+     * Hold the mailbox if another popup (e.g. overwrite confirmation) is open. */
+    if(!gui_popup_is_open()){
+        char message[512]={0};
+        while(atomic_flag_test_and_set_explicit(&g_record_ui_lock,memory_order_acquire))
+            thrd_sleep_ms(1);
+        if(g_record_ui_pending){
+            snprintf(message,sizeof(message),"%s",g_record_ui_message);
+            g_record_ui_pending=false;
+        }
+        atomic_flag_clear_explicit(&g_record_ui_lock,memory_order_release);
+        if(message[0]){
+            gui_app_set_status(app,"Recording failed. Check settings!");
+            gui_popup_info("Remote recording failed",message);
+        }
+    }
     char received[MON_SETTINGS_WIRE_CAP]={0};bool first=false,apply=false;
     cfg_lock();
     if(g_cfg_client.received && !g_cfg_client.send_pending){
@@ -645,6 +735,14 @@ bool gui_monitor_server_handle_request(uintptr_t socket_handle,
             free_cached_valid=gui_record_get_output_free_space_bytes(app,&free_cached_bytes);
         }
 
+        uint64_t record_result_id=0;
+        unsigned record_result_code=0;
+        char record_result_detail[256];
+        mon_record_lock();
+        record_result_id=g_record_result.completed_id;
+        record_result_code=g_record_result.result_code;
+        snprintf(record_result_detail,sizeof(record_result_detail),"%s",g_record_result.detail);
+        mon_record_unlock();
         snprintf(body,sizeof(body),
             "{\"protocol\":\"MISRC-M/2\",\"state\":%u,\"sample_rate\":%u,\"frames\":%u,\"errors\":%u,\"missed\":%u,"
             "\"record_elapsed_ms\":%" PRIu64 ",\"raw_a\":%" PRIu64 ",\"raw_b\":%" PRIu64 ","
@@ -654,7 +752,7 @@ bool gui_monitor_server_handle_request(uintptr_t socket_handle,
             "\"local_queue_bytes\":%" PRIu64 ",\"local_queue_capacity\":%" PRIu64 ","
             "\"capture_a\":%u,\"capture_b\":%u,\"use_flac\":%u,\"local_save\":%u,"
             "\"stream_synced\":%u,\"server_free_valid\":%u,\"server_free_bytes\":%" PRIu64 ","
-            "\"clip_a_pos\":%u,\"clip_a_neg\":%u,\"clip_b_pos\":%u,\"clip_b_neg\":%u}\n",
+            "\"clip_a_pos\":%u,\"clip_a_neg\":%u,\"clip_b_pos\":%u,\"clip_b_neg\":%u,\"record_result_id\":%" PRIu64 ",\"record_result_code\":%u,\"record_result_detail\":\"%s\"}\n",
             state,(unsigned)atomic_load(&app->sample_rate),
             (unsigned)atomic_load(&app->frame_count),
             (unsigned)atomic_load(&app->error_count),
@@ -671,7 +769,8 @@ bool gui_monitor_server_handle_request(uintptr_t socket_handle,
             app->settings.use_flac?1u:0u,gui_monitor_local_save_recording()?1u:0u,
             atomic_load(&app->stream_synced)?1u:0u,free_cached_valid?1u:0u,free_cached_bytes,
             (unsigned)atomic_load(&app->clip_count_a_pos),(unsigned)atomic_load(&app->clip_count_a_neg),
-            (unsigned)atomic_load(&app->clip_count_b_pos),(unsigned)atomic_load(&app->clip_count_b_neg));
+            (unsigned)atomic_load(&app->clip_count_b_pos),(unsigned)atomic_load(&app->clip_count_b_neg),
+            record_result_id,record_result_code,record_result_detail);
         mon_answer(fd,200,"application/json",body);return false;
     }
     if(strcmp(path,"/monitor/start")==0) {
@@ -688,9 +787,11 @@ bool gui_monitor_server_handle_request(uintptr_t socket_handle,
         if(on && !strcmp(query,"on=1&local=1") && !gui_monitor_local_save_server_ready()) {
             mon_answer(fd,409,"text/plain","no Monitor & Remote local receiver\n");return false;
         }
-        atomic_store(&app->net_cmd_monitor_record,
-                     on ? (!strcmp(query,"on=1&local=1") ? 2 : 1) : 3);
-        mon_answer(fd,200,"text/plain","record queued\n");return false;
+        uint64_t id=gui_monitor_server_queue_record(app,
+                    on ? (!strcmp(query,"on=1&local=1") ? 2 : 1) : 3);
+        char body[80];
+        snprintf(body,sizeof(body),"record queued %" PRIu64 "\n",id);
+        mon_answer(fd,200,"text/plain",body);return false;
     }
     mon_answer(fd,404,"text/plain","monitor endpoint not found\n");
     return false;
@@ -701,6 +802,12 @@ int gui_monitor_server_start(gui_app_t *app,uint16_t port) {
     if(!app||!port)return -1;
     if(atomic_load(&g_server.active))
         return g_server.app==app&&g_server.port==port?0:-1;
+    mon_record_lock();
+    g_record_result.pending_id=0;
+    g_record_result.completed_id=0;
+    g_record_result.result_code=0;
+    g_record_result.detail[0]=0;
+    mon_record_unlock();
     gui_monitor_local_save_server_init();
     memset(&g_cfg_server,0,sizeof(g_cfg_server));
     mon_cfg_snapshot(app);
@@ -735,7 +842,7 @@ static int mon_get(const char *host,uint16_t port,const char *path,char *dst,siz
     for(struct addrinfo *p=addr;p;p=p->ai_next){
         sock=socket(p->ai_family,p->ai_socktype,p->ai_protocol);
         if(sock==MON_BAD)continue;
-        mon_timeouts(sock,400);
+        mon_timeouts(sock,MON_HTTP_TIMEOUT_MS);
         if(connect(sock,p->ai_addr,(int)p->ai_addrlen)==0)break;
         mon_close(sock);sock=MON_BAD;
     }
@@ -774,7 +881,7 @@ static int mon_get_preview(const char *host,uint16_t port){
     for(struct addrinfo *p=addr;p;p=p->ai_next){
         sock=socket(p->ai_family,p->ai_socktype,p->ai_protocol);
         if(sock==MON_BAD)continue;
-        mon_timeouts(sock,400);
+        mon_timeouts(sock,MON_HTTP_TIMEOUT_MS);
         if(connect(sock,p->ai_addr,(int)p->ai_addrlen)==0)break;
         mon_close(sock);sock=MON_BAD;
     }
@@ -871,14 +978,49 @@ static void mon_worker_output(void){
 }
 static int mon_client_thread(void *ctx){
     (void)ctx;
+    gui_monitor_session_state_t session={0};
+    uint64_t expected_record_id=0;
     while(!atomic_load(&g_client.stopping)){
         char response[4096];
         int status_rc=mon_get(g_client.host,g_client.port,"/monitor/status",response,sizeof(response));
-        if(status_rc==0 && strstr(response,"\"protocol\":\"MISRC-M/2\"")!=NULL){
+        uint64_t status_state=0;
+        bool verified=status_rc==0 &&
+            strstr(response,"\"protocol\":\"MISRC-M/2\"")!=NULL &&
+            mon_json_u64(response,"state",&status_state) && status_state<=2;
+        if(verified){
+            if(gui_monitor_session_status_ok(&session)){
+                fprintf(stderr,"[M-CLIENT] Status recovered after network dropout; session preserved\n");
+                gui_app_set_status(g_client.app,"Monitor network recovered; session retained");
+            }
             atomic_store(&g_client.last_error,0);
-            int state=0;unsigned rate=0,frames=0,errors=0,missed=0;
-            char *p=strstr(response,"\"state\":");
-            if(p)state=atoi(p+8);
+            if(expected_record_id){
+                uint64_t result_id=0,result_code=0;
+                if(mon_json_u64(response,"record_result_id",&result_id) &&
+                   mon_json_u64(response,"record_result_code",&result_code) &&
+                   result_id==expected_record_id){
+                    if(result_code==1){
+                        char reason[256]={0};
+                        const char *key="\"record_result_detail\":\"";
+                        const char *start=strstr(response,key);
+                        if(start){
+                            start+=strlen(key);
+                            const char *end=strchr(start,'"');
+                            if(end && (size_t)(end-start)<sizeof(reason))
+                                (void)mon_url_decode(start,(size_t)(end-start),reason,sizeof(reason));
+                        }
+                        char msg[512];
+                        snprintf(msg,sizeof(msg),"Recording failed on server: %s",
+                                 reason[0]?reason:"unknown server error");
+                        fprintf(stderr,"[M-CLIENT] %s\n",msg);
+                        mon_record_ui_error(msg);
+                    }else if(result_code==2){
+                        gui_app_set_status(g_client.app,"Recording is awaiting confirmation on server");
+                    }
+                    expected_record_id=0;
+                }
+            }
+            int state=(int)status_state;unsigned rate=0,frames=0,errors=0,missed=0;
+            char *p=NULL;
             p=strstr(response,"\"sample_rate\":");
             if(p)rate=(unsigned)strtoul(p+14,NULL,10);
             p=strstr(response,"\"frames\":");
@@ -930,11 +1072,25 @@ static int mon_client_thread(void *ctx){
             atomic_store(&g_client.app->net_connected,true);
             /* Skipping the preview fetch when stopping halves the
              * gui_monitor_client_stop join wait (a mode switch stopping the
-             * monitor thread does not wait out a second 400 ms transfer). */
+             * monitor thread does not wait out another preview transfer). */
             if(state>0 && !atomic_load(&g_client.stopping)){
-                if(mon_get_preview(g_client.host,g_client.port)!=0)
-                    gui_rd_client_clear();
-            }else if(state<=0) gui_rd_client_clear();
+                if(mon_get_preview(g_client.host,g_client.port)!=0){
+                    /* An individual preview failure is not a user Disconnect.
+                     * Retain the last complete frame and expose its staleness. */
+                    if(gui_monitor_session_preview_failed(&session)){
+                        fprintf(stderr,"[M-CLIENT] Preview request failed; last valid frame retained\n");
+                        /* The UI reads g_client.preview_error for the live warning. */
+                    }
+                }else if(gui_monitor_session_preview_ok(&session)){
+                    fprintf(stderr,"[M-CLIENT] Preview stream recovered\n");
+                }
+                atomic_store(&g_client.preview_error,session.preview_failed);
+                atomic_store(&g_client.preview_dropouts,session.preview_errors);
+            }else if(state<=0){
+                gui_rd_client_clear();  /* Server explicitly reports idle. */
+                session.preview_failed=false;
+                atomic_store(&g_client.preview_error,false);
+            }
             /* M-Client's server-owned filesystem browser runs only on this
              * network worker. GUI remains responsive on slow NAS mounts. */
             mon_worker_folders();
@@ -972,38 +1128,51 @@ static int mon_client_thread(void *ctx){
                         fprintf(stderr,"[M-LOCAL] Receiver start failed; recording NOT started\n");
                     }else if(mon_get(g_client.host,g_client.port,"/monitor/record?on=1&local=1",
                                     response,sizeof(response))!=0){
-                        gui_app_set_status(app,"Local Save request rejected by Server");
+                        mon_record_ui_error("Recording failed: Local Save request rejected by server");
                         gui_monitor_local_save_client_stop();
+                    }else if(sscanf(response,"record queued %" SCNu64,&expected_record_id)!=1){
+                        gui_app_set_status(app,"Older server: recording requested; no result confirmation available");
                     }
-                }else (void)mon_get(g_client.host,g_client.port,"/monitor/record?on=1",response,sizeof(response));
+                }else{
+                    if(mon_get(g_client.host,g_client.port,"/monitor/record?on=1",response,sizeof(response))!=0){
+                        mon_record_ui_error("Recording failed: server request could not be delivered");
+                    }else if(sscanf(response,"record queued %" SCNu64,&expected_record_id)!=1){
+                        gui_app_set_status(app,"Older server: recording requested; no result confirmation available");
+                    }
+                }
             }
             if(atomic_exchange(&app->net_cmd_record_off,false))
                 (void)mon_get(g_client.host,g_client.port,"/monitor/record?on=0",response,sizeof(response));
         }else{
             int error_reason=1; /* Network, socket, or HTTP error. */
-            if(status_rc==0){
+            if(status_rc==0)
                 error_reason=strstr(response,"\"protocol\":\"MISRC-M/1\"") ? 2 : 3;
-            }
+            bool first=gui_monitor_session_status_failed(&session);
+            atomic_store(&g_client.status_dropouts,session.status_errors);
             atomic_store(&g_client.last_error,error_reason);
-            atomic_store(&g_client.connected,false);
-            atomic_store(&g_client.record_stats_valid,false);
-            for(int ch=0;ch<2;ch++) atomic_store(&g_client.reset_clips_pending[ch],false);
-            atomic_store(&g_client.peer_state,0);
-            atomic_store(&g_client.peer_frames,0);
-            atomic_store(&g_client.peer_errors,0);
-            atomic_store(&g_client.peer_missed,0);
-            atomic_store(&g_client.app->net_connected,false);
-            gui_rd_client_clear();
-            gui_monitor_local_save_client_stop();
-            mon_cfg_disconnect();
-            fs_lock();g_fs_client.output_valid=false;
-            g_fs_client.ready=false;fs_unlock();
-            /* Do not execute stale capture commands after a later reconnect. */
+            if(first || session.consecutive_status_errors==10 ||
+               (session.consecutive_status_errors%100)==0){
+                fprintf(stderr,"[M-CLIENT] Status error %d (%u consecutive, %u total); %s\n",
+                    error_reason,session.consecutive_status_errors,session.status_errors,
+                    session.established?"established session retained":"still waiting for first connection");
+                if(first && session.established)
+                    gui_app_set_status(g_client.app,"Monitor NETWORK ERROR: session retained; retrying");
+            }
+            /* DO NOT clear session, remote display, peer counters, synchronized
+             * settings, local-save receiver or the remote device catalogue here.
+             * Transient request errors must not cause Connect/Disconnect loops.
+             * The explicit stop/restart path below owns all of that teardown. */
+            /* Drop commands whose delivery cannot be confirmed. Never silently
+             * replay a stale Record/Stop click after network recovery. */
             gui_app_t *app=g_client.app;
-            atomic_store(&app->net_cmd_start,false);
-            atomic_store(&app->net_cmd_stop,false);
-            atomic_store(&app->net_cmd_record_on,false);
-            atomic_store(&app->net_cmd_record_off,false);
+            bool pending=atomic_exchange(&app->net_cmd_start,false);
+            pending=atomic_exchange(&app->net_cmd_stop,false)||pending;
+            pending=atomic_exchange(&app->net_cmd_record_on,false)||pending;
+            pending=atomic_exchange(&app->net_cmd_record_off,false)||pending;
+            if(pending){
+                fprintf(stderr,"[M-CLIENT] Discarded unconfirmed capture/record command during network error\n");
+                gui_app_set_status(app,"Monitor network error: command not sent; retry when healthy");
+            }
         }
         thrd_sleep_ms(MON_PREVIEW_PERIOD_MS);
     }
@@ -1025,6 +1194,11 @@ int gui_monitor_client_start(gui_app_t *app,const char *host,uint16_t port){
         (size_t)g_cfg_client.local_count*sizeof(device_info_t));
     g_cfg_client.local_selected=app->selected_device;
     cfg_unlock();
+    while(atomic_flag_test_and_set_explicit(&g_record_ui_lock,memory_order_acquire))
+        thrd_sleep_ms(1);
+    g_record_ui_pending=false;
+    g_record_ui_message[0]=0;
+    atomic_flag_clear_explicit(&g_record_ui_lock,memory_order_release);
     fs_lock();memset(&g_fs_client,0,sizeof(g_fs_client));fs_unlock();
     snprintf(g_client.host,sizeof(g_client.host),"%s",host);
     atomic_store(&g_client.stopping,false);
@@ -1036,6 +1210,9 @@ int gui_monitor_client_start(gui_app_t *app,const char *host,uint16_t port){
     atomic_store(&g_client.peer_errors,0);
     atomic_store(&g_client.peer_missed,0);
     atomic_store(&g_client.last_error,0);
+    atomic_store(&g_client.status_dropouts,0);
+    atomic_store(&g_client.preview_dropouts,0);
+    atomic_store(&g_client.preview_error,false);
     for(int ch=0;ch<2;ch++) atomic_store(&g_client.reset_clips_pending[ch],false);
     if(thrd_create(&g_client.thread,mon_client_thread,NULL)!=thrd_success)return -1;
     atomic_store(&g_client.running,true);
@@ -1066,6 +1243,7 @@ void gui_monitor_client_stop(void){
     atomic_store(&g_client.peer_errors,0);
     atomic_store(&g_client.peer_missed,0);
     atomic_store(&g_client.last_error,0);
+    atomic_store(&g_client.preview_error,false);
     g_client.app=NULL;
     fs_lock();memset(&g_fs_client,0,sizeof(g_fs_client));fs_unlock();
 }
@@ -1133,6 +1311,9 @@ bool gui_monitor_client_matches(const char *host,uint16_t port){
            strcmp(g_client.host,host)==0 && g_client.port==port;
 }
 int gui_monitor_client_last_error(void){return atomic_load(&g_client.last_error);}
+uint32_t gui_monitor_client_status_dropouts(void){return atomic_load(&g_client.status_dropouts);}
+uint32_t gui_monitor_client_preview_dropouts(void){return atomic_load(&g_client.preview_dropouts);}
+bool gui_monitor_client_preview_error(void){return atomic_load(&g_client.preview_error);}
 
 
 void gui_monitor_server_poll_settings(gui_app_t *app){

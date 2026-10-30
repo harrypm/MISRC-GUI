@@ -4,6 +4,7 @@
  */
 
 #include "gui_net.h"
+#include "gui_net_queue_limits.h"
 #include "gui_monitor_transport.h"
 #include "gui_monitor_local_save.h"
 #include "../input/gui_playback.h"
@@ -191,46 +192,92 @@ static int net_read_headers(net_sock_t fd, char *buf, size_t cap) {
 }
 
 /* -------------------------------------------------------------------------
- * Broadcast fanout: one producer (capture tap), N subscribers (/rf clients).
- * Chunks are refcounted; a chunk is freed once no subscriber references it.
+ * Broadcast fanout: bounded shared queue for /rf and /baseband subscribers.
+ *
+ * Queue nodes are owned by the fanout and all subscriber cursors are protected
+ * by f->mtx. A chunk is reclaimed as soon as every subscriber has advanced
+ * past it. Slow clients are disconnected rather than allowing an unlimited
+ * queue to exhaust the server's memory.
  * ------------------------------------------------------------------------- */
+
 
 typedef struct net_chunk {
     size_t len;
-    int refcount;
     struct net_chunk *next;
     uint8_t data[];
 } net_chunk_t;
 
+typedef struct net_fanout_sub net_fanout_sub_t;
 typedef struct {
     net_mutex_t mtx;
     net_cond_t cond;
     net_chunk_t *head;
     net_chunk_t *tail;
+    net_fanout_sub_t *subs;
+    size_t queued_bytes;
+    size_t max_bytes;
+    gui_app_t *telemetry_app;
+    bool audio_queue;
     int subscribers;
     bool shutdown;
     bool initialized;
 } net_fanout_t;
 
-typedef struct {
+struct net_fanout_sub {
     net_fanout_t *f;
     net_chunk_t *cur;
     size_t off;
-} net_fanout_sub_t;
+    net_fanout_sub_t *next;
+    bool overflowed;
+};
 
-static void net_fanout_init(net_fanout_t *f) {
+static void net_fanout_init(net_fanout_t *f, gui_app_t *telemetry_app, bool audio_queue) {
     memset(f, 0, sizeof(*f));
     net_mutex_init(&f->mtx);
     net_cond_init(&f->cond);
+    f->max_bytes = audio_queue ? GUI_NET_AUDIO_QUEUE_LIMIT_BYTES : GUI_NET_RF_QUEUE_LIMIT_BYTES;
+    f->telemetry_app = telemetry_app;
+    f->audio_queue = audio_queue;
     f->initialized = true;
 }
 
-static void net_fanout_free_chunk(net_chunk_t *c) {
-    /* Decrement refcount; free if zero. Caller may pass NULL. */
-    if (!c) return;
-    if (--c->refcount <= 0) {
-        free(c);
+/* Telemetry is separate from queue ownership, so the UI may read atomics
+ * without locking or touching the short-lived server/fanout objects. */
+static void net_fanout_publish_queue(net_fanout_t *f) {
+    if (!f->telemetry_app) return;
+    if (f->audio_queue) atomic_store(&f->telemetry_app->net_audio_server_queue_bytes, f->queued_bytes);
+    else atomic_store(&f->telemetry_app->net_rf_server_queue_bytes, f->queued_bytes);
+}
+
+static void net_fanout_report_drop(net_fanout_t *f) {
+    if (!f->telemetry_app) return;
+    if (f->audio_queue) atomic_fetch_add(&f->telemetry_app->net_audio_server_stream_drops, 1);
+    else atomic_fetch_add(&f->telemetry_app->net_rf_server_stream_drops, 1);
+}
+
+/* Reclaim prefix no longer referenced by ANY subscriber. Must hold f->mtx. */
+static void net_fanout_trim_locked(net_fanout_t *f) {
+    while (f->head) {
+        bool in_use = false;
+        for (net_fanout_sub_t *s = f->subs; s; s = s->next) {
+            if (s->cur == f->head) { in_use = true; break; }
+        }
+        if (in_use) break;
+        net_chunk_t *done = f->head;
+        f->head = done->next;
+        f->queued_bytes -= done->len;
+        if (!f->head) f->tail = NULL;
+        free(done);
     }
+    net_fanout_publish_queue(f);
+}
+
+static void net_fanout_shutdown(net_fanout_t *f) {
+    if (!f || !f->initialized) return;
+    net_mutex_lock(&f->mtx);
+    f->shutdown = true;
+    net_cond_broadcast(&f->cond);
+    net_mutex_unlock(&f->mtx);
 }
 
 static void net_fanout_destroy(net_fanout_t *f) {
@@ -238,15 +285,16 @@ static void net_fanout_destroy(net_fanout_t *f) {
     net_mutex_lock(&f->mtx);
     f->shutdown = true;
     net_cond_broadcast(&f->cond);
+    /* Caller must first ensure all subscriber workers have exited. */
     net_chunk_t *c = f->head;
     while (c) {
-        net_chunk_t *n = c->next;
-        /* Drop producer reference. Subscribers should already be gone. */
-        c->refcount = 0;
+        net_chunk_t *next = c->next;
         free(c);
-        c = n;
+        c = next;
     }
     f->head = f->tail = NULL;
+    f->queued_bytes = 0;
+    net_fanout_publish_queue(f);
     net_mutex_unlock(&f->mtx);
     net_cond_destroy(&f->cond);
     net_mutex_destroy(&f->mtx);
@@ -254,15 +302,14 @@ static void net_fanout_destroy(net_fanout_t *f) {
 }
 
 static void net_fanout_subscribe(net_fanout_t *f, net_fanout_sub_t *s) {
-    s->f = f;
-    s->cur = NULL;
-    s->off = 0;
+    memset(s, 0, sizeof(*s));
     net_mutex_lock(&f->mtx);
-    f->subscribers++;
-    /* Start at head (oldest buffered) if any. */
-    if (f->head) {
-        s->cur = f->head;
-        s->cur->refcount++;
+    if (!f->shutdown) {
+        s->f = f;
+        s->next = f->subs;
+        f->subs = s;
+        f->subscribers++;
+        /* New clients start from FUTURE data, not an old cached stream. */
     }
     net_mutex_unlock(&f->mtx);
 }
@@ -271,101 +318,114 @@ static void net_fanout_unsubscribe(net_fanout_sub_t *s) {
     if (!s || !s->f) return;
     net_fanout_t *f = s->f;
     net_mutex_lock(&f->mtx);
-    if (f->subscribers > 0) f->subscribers--;
-    net_chunk_t *cur = s->cur;
-    s->cur = NULL;
-    s->off = 0;
-    net_mutex_unlock(&f->mtx);
-    net_fanout_free_chunk(cur);
+    net_fanout_sub_t **pp = &f->subs;
+    while (*pp && *pp != s) pp = &(*pp)->next;
+    if (*pp == s) {
+        *pp = s->next;
+        f->subscribers--;
+    }
     s->f = NULL;
+    s->cur = NULL;
+    s->next = NULL;
+    net_fanout_trim_locked(f);
+    net_mutex_unlock(&f->mtx);
 }
 
-/* Producer: append data. If there are no subscribers, drop it (no copy/alloc). */
 static void net_fanout_push(net_fanout_t *f, const void *data, size_t len) {
-    if (!f || !f->initialized || len == 0) return;
+    if (!f || !f->initialized || !data || len == 0) return;
     net_mutex_lock(&f->mtx);
-    if (f->shutdown || f->subscribers <= 0) {
+    if (f->shutdown || f->subscribers == 0) {
         net_mutex_unlock(&f->mtx);
         return;
     }
-    net_chunk_t *c = (net_chunk_t *)malloc(sizeof(net_chunk_t) + len);
-    if (!c) {
-        net_mutex_unlock(&f->mtx);
-        return;
+    /* An individual source chunk larger than the entire queue budget cannot
+     * be delivered without violating the bound. Drop slow subscriptions. */
+    net_chunk_t *c = NULL;
+    if (len <= f->max_bytes && len <= SIZE_MAX - sizeof(net_chunk_t)) {
+        c = (net_chunk_t *)malloc(sizeof(net_chunk_t) + len);
     }
-    c->len = len;
-    c->refcount = f->subscribers; /* each current subscriber will read it */
-    c->next = NULL;
-    memcpy(c->data, data, len);
-    if (f->tail) f->tail->next = c; else f->head = c;
-    f->tail = c;
+    if (c) {
+        c->len = len;
+        c->next = NULL;
+        memcpy(c->data, data, len);
+        if (f->tail) f->tail->next = c; else f->head = c;
+        f->tail = c;
+        f->queued_bytes += len;
+        for (net_fanout_sub_t *s = f->subs; s; s = s->next) {
+            if (!s->overflowed && !s->cur) s->cur = c;
+        }
+    } else {
+        for (net_fanout_sub_t *s = f->subs; s; s = s->next) {
+            if (!s->overflowed) net_fanout_report_drop(f);
+            s->overflowed = true;
+            s->cur = NULL;
+        }
+    }
+    /* Drop only the slowest subscriber(s) pinning the oldest chunk. */
+    net_fanout_trim_locked(f);
+    while (f->queued_bytes > f->max_bytes && f->head) {
+        bool dropped = false;
+        for (net_fanout_sub_t *s = f->subs; s; s = s->next) {
+            if (s->cur == f->head) {
+                if (!s->overflowed) net_fanout_report_drop(f);
+                s->overflowed = true;
+                s->cur = NULL;
+                dropped = true;
+            }
+        }
+        if (!dropped) break;
+        fprintf(stderr, "[NET] %s fanout: transmit/receive throughput insufficient; "
+                        "client stream dropped (queue limit %zu MiB)\n",
+                f->audio_queue ? "Audio" : "RF", f->max_bytes / (1024U * 1024U));
+        net_fanout_trim_locked(f);
+    }
     net_cond_broadcast(&f->cond);
     net_mutex_unlock(&f->mtx);
 }
 
-/* Subscriber: read up to cap bytes into dst. Blocks up to timeout_ms for data.
- * Returns bytes read (0 if timeout with no data), -1 on shutdown/EOF. */
+/* Returns bytes read; 0 on timeout; -1 on stop or queue overflow. */
 static ssize_t net_fanout_read(net_fanout_sub_t *s, void *dst, size_t cap, int timeout_ms) {
     if (!s || !s->f) return -1;
     net_fanout_t *f = s->f;
     size_t copied = 0;
     net_mutex_lock(&f->mtx);
     while (cap > 0) {
+        if (f->shutdown || s->overflowed) {
+            copied = 0;
+            break;
+        }
         if (s->cur && s->off >= s->cur->len) {
-            /* Advance to next chunk, release current. */
-            net_chunk_t *next = s->cur->next;
-            if (next) next->refcount++;
-            net_chunk_t *done = s->cur;
-            s->cur = next;
+            s->cur = s->cur->next;
             s->off = 0;
-            net_mutex_unlock(&f->mtx);
-            net_fanout_free_chunk(done);
-            net_mutex_lock(&f->mtx);
+            net_fanout_trim_locked(f);
             continue;
         }
         if (s->cur) {
             size_t avail = s->cur->len - s->off;
             size_t n = (avail < cap) ? avail : cap;
-            memcpy((char *)dst + copied, s->cur->data + s->off, n);
+            memcpy((uint8_t *)dst + copied, s->cur->data + s->off, n);
             s->off += n;
             copied += n;
             cap -= n;
             if (cap == 0) break;
             continue;
         }
-        /* No current chunk: wait for producer or shutdown. */
-        if (f->shutdown) {
-            break;
-        }
-        if (timeout_ms <= 0) {
-            break;
-        }
-        /* Wait with timeout. */
+        if (timeout_ms <= 0) break;
 #ifdef _WIN32
-        if (!SleepConditionVariableCS(&f->cond, &f->mtx, (unsigned long)timeout_ms)) {
-            break;
-        }
+        if (!SleepConditionVariableCS(&f->cond, &f->mtx, (DWORD)timeout_ms)) break;
 #else
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
         ts.tv_sec += timeout_ms / 1000;
         ts.tv_nsec += (timeout_ms % 1000) * 1000000L;
         if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
-        int rc = pthread_cond_timedwait(&f->cond, &f->mtx, &ts);
-        if (rc == ETIMEDOUT) {
-            timeout_ms = 0;
-            break;
-        }
+        if (pthread_cond_timedwait(&f->cond, &f->mtx, &ts) == ETIMEDOUT) break;
 #endif
-        /* Loop back: maybe a new chunk arrived or shutdown. */
-        if (!s->cur && f->head) {
-            s->cur = f->head;
-            s->cur->refcount++;
-        }
-        if (f->shutdown) break;
+        /* Re-check subscriber cursor, overflow and shutdown after wakeup. */
     }
+    bool failed = f->shutdown || s->overflowed;
     net_mutex_unlock(&f->mtx);
-    return (ssize_t)copied;
+    return failed ? -1 : (ssize_t)copied;
 }
 
 /* -------------------------------------------------------------------------
@@ -396,6 +456,7 @@ typedef struct {
     net_fanout_t audio;
     atomic_int rf_clients;
     atomic_int audio_clients;
+    atomic_int active_workers;  /* detached HTTP handlers: join via count before freeing server */
     /* UDP discovery beacon broadcaster. */
     thrd_t beacon_thread;
     atomic_bool beacon_stop;
@@ -615,7 +676,29 @@ void gui_net_status_string(const gui_app_t *app, char *buf, size_t len) {
     }
     if (s_server) {
         if (atomic_load(&s_server->running)) {
-            snprintf(buf, len, "Listening on :%u (RF + MISRC-M/2 monitor)", (unsigned)s_server->port);
+            uint_fast64_t rf_drops = atomic_load(&s_server->app->net_rf_server_stream_drops);
+            uint_fast64_t au_drops = atomic_load(&s_server->app->net_audio_server_stream_drops);
+            size_t rf_q = atomic_load(&s_server->app->net_rf_server_queue_bytes);
+            size_t au_q = atomic_load(&s_server->app->net_audio_server_queue_bytes);
+            unsigned rf_pct = gui_net_queue_percent(rf_q, GUI_NET_RF_QUEUE_LIMIT_BYTES);
+            unsigned au_pct = gui_net_queue_percent(au_q, GUI_NET_AUDIO_QUEUE_LIMIT_BYTES);
+            if (rf_drops || au_drops) {
+                snprintf(buf, len,
+                    "RF/Audio throughput insufficient: dropped RF:%llu Audio:%llu; "
+                    "network queue RF:%u%%/256MiB Audio:%u%%/64MiB (link or receiver)",
+                    (unsigned long long)rf_drops, (unsigned long long)au_drops,
+                    rf_pct, au_pct);
+            } else if (rf_pct >= GUI_NET_QUEUE_WARN_PERCENT ||
+                       au_pct >= GUI_NET_QUEUE_WARN_PERCENT) {
+                snprintf(buf, len,
+                    "RF/Audio transfer backlog: RF:%u%%/256MiB Audio:%u%%/64MiB; "
+                    "check link/receiver throughput",
+                    rf_pct, au_pct);
+            } else {
+                snprintf(buf, len,
+                    "Listening :%u; network queues RF:%u%%/256MiB Audio:%u%%/64MiB; drops 0",
+                    (unsigned)s_server->port, rf_pct, au_pct);
+            }
         } else {
             snprintf(buf, len, "Server failed to listen on :%u", (unsigned)s_server->port);
         }
@@ -623,22 +706,24 @@ void gui_net_status_string(const gui_app_t *app, char *buf, size_t len) {
     }
     if (s_client) {
         if (s_client->monitor_only) {
-            if (gui_monitor_client_connected()) {
-                snprintf(buf, len, "Monitor & Remote connected %s:%u",
-                         app->settings.net_client_host, (unsigned)app->settings.net_client_port);
+            int reason=gui_monitor_client_last_error();
+            bool established=gui_monitor_client_connected();
+            if(gui_monitor_client_running() && reason!=0){
+                const char *detail=reason==2?"incompatible MISRC-M/1 peer":
+                                   reason==3?"invalid MISRC-M/2 status":"status request unreachable";
+                snprintf(buf,len,"Monitor & Remote: NETWORK ERROR (%s, %u failures); %s",
+                         detail,gui_monitor_client_status_dropouts(),
+                         established?"session retained":"awaiting first connection");
+            } else if(established && gui_monitor_client_preview_error()){
+                snprintf(buf,len,"Monitor & Remote: PREVIEW ERROR (%u failures); session retained",
+                         gui_monitor_client_preview_dropouts());
+            } else if(established){
+                snprintf(buf,len,"Monitor & Remote connected %s:%u (status errors: %u, preview: %u)",
+                         app->settings.net_client_host,(unsigned)app->settings.net_client_port,
+                         gui_monitor_client_status_dropouts(),gui_monitor_client_preview_dropouts());
             } else if (gui_monitor_client_running()) {
-                int reason=gui_monitor_client_last_error();
-                if(reason==2){
-                    snprintf(buf,len,"Monitor & Remote: incompatible MISRC-M/1 server (requires M/2)");
-                } else if(reason==3){
-                    snprintf(buf,len,"Monitor & Remote: invalid server protocol (requires MISRC-M/2)");
-                } else if(reason==1){
-                    snprintf(buf,len,"Monitor & Remote: cannot reach %s:%u",
-                             app->settings.net_client_host,(unsigned)app->settings.net_client_port);
-                } else {
-                    snprintf(buf,len,"Monitor & Remote verifying %s:%u (MISRC-M/2 required)",
-                             app->settings.net_client_host,(unsigned)app->settings.net_client_port);
-                }
+                snprintf(buf,len,"Monitor & Remote verifying %s:%u (MISRC-M/2 required)",
+                         app->settings.net_client_host,(unsigned)app->settings.net_client_port);
             } else {
                 snprintf(buf,len,"Monitor & Remote: %d server(s) discovered; select or Connect",
                          gui_net_discovered_count());
@@ -646,7 +731,32 @@ void gui_net_status_string(const gui_app_t *app, char *buf, size_t len) {
             return;
         }
         if (atomic_load(&s_client->connected)) {
-            snprintf(buf, len, "Connected to %s:%u", s_client->host, (unsigned)s_client->port);
+            uint_fast64_t rf_interruptions = atomic_load(&app->net_rf_client_interruptions);
+            uint_fast64_t au_interruptions = atomic_load(&app->net_audio_client_interruptions);
+            uint_fast64_t server_rf_drops = atomic_load(&app->net_rf_server_stream_drops);
+            size_t server_rf_queue = atomic_load(&app->net_rf_server_queue_bytes);
+            unsigned rf_pct = gui_net_queue_percent(server_rf_queue, GUI_NET_RF_QUEUE_LIMIT_BYTES);
+            if (server_rf_drops) {
+                snprintf(buf, len,
+                    "SERVER RF OVERFLOW: insufficient stream throughput (link/receiver); "
+                    "drops:%llu, queue:%u%%/256MiB; local RF interruptions:%llu",
+                    (unsigned long long)server_rf_drops, rf_pct,
+                    (unsigned long long)rf_interruptions);
+            } else if (rf_pct >= GUI_NET_QUEUE_WARN_PERCENT) {
+                snprintf(buf, len,
+                    "RF STREAM AT RISK: server backlog %u%%/256MiB (link/receiver too slow)",
+                    rf_pct);
+            } else if (rf_interruptions || au_interruptions) {
+                bool rf_live = atomic_load(&app->net_rf_client_stream_live);
+                snprintf(buf, len,
+                    "STREAM %s: RF:%llu Audio:%llu interruptions; check network/receiver; %s:%u",
+                    rf_live ? "recovered" : "retrying",
+                    (unsigned long long)rf_interruptions,
+                    (unsigned long long)au_interruptions,
+                    s_client->host, (unsigned)s_client->port);
+            } else {
+                snprintf(buf, len, "Connected to %s:%u", s_client->host, (unsigned)s_client->port);
+            }
         } else if (atomic_load(&s_client->worker_started) && s_client->host[0]) {
             snprintf(buf, len, "Connecting to %s:%u ...", s_client->host, (unsigned)s_client->port);
         } else if (atomic_load(&s_client->error)) {
@@ -715,10 +825,16 @@ static void server_build_stats(gui_app_t *app, char *buf, size_t len) {
         "{\"state\":%d,\"sample_rate\":%u,\"total_samples\":%llu,"
         "\"frames\":%u,\"errors\":%u,\"selected_device\":%d,"
         "\"device_count\":%d,\"device_name\":\"%s\",\"device_type\":%d,"
-        "\"audio_frame_bytes\":%d}",
+        "\"audio_frame_bytes\":%d,"
+        "\"rf_fanout_queue_bytes\":%zu,\"audio_fanout_queue_bytes\":%zu,"
+        "\"rf_fanout_stream_drops\":%llu,\"audio_fanout_stream_drops\":%llu}",
         state, (unsigned)sr, (unsigned long long)total,
         (unsigned)frames, (unsigned)errors, sel,
-        dcount, dname, dtype, audio_frame);
+        dcount, dname, dtype, audio_frame,
+        atomic_load(&app->net_rf_server_queue_bytes),
+        atomic_load(&app->net_audio_server_queue_bytes),
+        (unsigned long long)atomic_load(&app->net_rf_server_stream_drops),
+        (unsigned long long)atomic_load(&app->net_audio_server_stream_drops));
 }
 
 static void server_build_devices(gui_app_t *app, char *buf, size_t len) {
@@ -910,34 +1026,32 @@ static void server_handle_request(gui_app_t *app, net_sock_t fd, const char *met
     net_send_str(fd, "HTTP/1.0 404 Not Found\r\n\r\n");
 }
 
-/* Per-client thread: read one request, serve it, close. For /rf + /baseband
- * the serve loops until the client disconnects. */
+/* Per-client thread: read one request, serve it, close. For /rf and
+ * /baseband this thread lives until the client disconnects. */
+typedef struct {
+    gui_app_t *app;
+    net_sock_t fd;
+    net_server_t *srv;
+} net_server_client_ctx_t;
+
 static int server_client_thread(void *arg) {
-    typedef struct { gui_app_t *app; net_sock_t fd; } ctx_t;
-    ctx_t *c = (ctx_t *)arg;
+    net_server_client_ctx_t *c = (net_server_client_ctx_t *)arg;
     gui_app_t *app = c->app;
     net_sock_t fd = c->fd;
+    net_server_t *srv = c->srv;
     free(c);
 
-    /* Bound recv/send so a stuck/missing client cannot hold this (detached)
-     * thread forever on a blocking call. */
     net_set_timeouts(fd, 5000, 5000);
-
-    /* Monitor folder URLs can contain percent-escaped, 4096-byte UTF-8
-     * paths. Do not truncate them at the legacy 4 KiB HTTP header limit. */
     char buf[16384];
     int len = net_read_headers(fd, buf, sizeof(buf));
     if (len <= 0) {
         net_close(fd);
-        return 0;
+        goto done;
     }
-    /* Dispatch by requested protocol. Both clients connect to the same
-     * TCP port; monitor requests do not enter the legacy RF handler. */
     if (strncmp(buf, "GET /monitor/", 13) == 0) {
-        bool socket_transferred = gui_monitor_server_handle_request(
-            (uintptr_t)fd, app, buf);
+        bool socket_transferred = gui_monitor_server_handle_request((uintptr_t)fd, app, buf);
         if (!socket_transferred) net_close(fd);
-        return 0;
+        goto done;
     }
     char method[8] = {0};
     char uri[256] = {0};
@@ -945,10 +1059,12 @@ static int server_client_thread(void *arg) {
     if (4 != sscanf(buf, "%7s %255s HTTP/%d.%d", method, uri, &v1, &v2)) {
         net_send_str(fd, "HTTP/1.0 400 Bad Request\r\n\r\n");
         net_close(fd);
-        return 0;
+        goto done;
     }
     server_handle_request(app, fd, method, uri);
     net_close(fd);
+done:
+    atomic_fetch_sub(&srv->active_workers, 1);
     return 0;
 }
 
@@ -979,13 +1095,15 @@ static int server_listen_thread(void *arg) {
             if (atomic_load(&srv->stop_flag)) break;
             continue;
         }
-        typedef struct { gui_app_t *app; net_sock_t fd; } ctx_t;
-        ctx_t *c = (ctx_t *)malloc(sizeof(ctx_t));
+        net_server_client_ctx_t *c = (net_server_client_ctx_t *)malloc(sizeof(*c));
         if (!c) { net_close(cfd); continue; }
         c->app = app;
         c->fd = cfd;
+        c->srv = srv;
+        atomic_fetch_add(&srv->active_workers, 1);
         thrd_t t;
         if (thrd_create(&t, server_client_thread, c) != thrd_success) {
+            atomic_fetch_sub(&srv->active_workers, 1);
             net_close(cfd);
             free(c);
             continue;
@@ -1040,9 +1158,14 @@ static int server_start(gui_app_t *app, uint16_t port) {
     atomic_store(&srv->stop_flag, false);
     atomic_store(&srv->rf_clients, 0);
     atomic_store(&srv->audio_clients, 0);
+    atomic_store(&srv->active_workers, 0);
     atomic_store(&srv->beacon_stop, false);
-    net_fanout_init(&srv->rf);
-    net_fanout_init(&srv->audio);
+    atomic_store(&app->net_rf_server_stream_drops, 0);
+    atomic_store(&app->net_rf_server_queue_bytes, 0);
+    atomic_store(&app->net_audio_server_stream_drops, 0);
+    atomic_store(&app->net_audio_server_queue_bytes, 0);
+    net_fanout_init(&srv->rf, app, false);
+    net_fanout_init(&srv->audio, app, true);
 
     srv->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (!net_sock_valid(srv->listen_fd)) {
@@ -1091,6 +1214,9 @@ static void server_stop(net_server_t *srv) {
     atomic_store(&srv->stop_flag, true);
     atomic_store(&srv->running, false);
     atomic_store(&srv->beacon_stop, true);
+    /* Stop live /rf streams BEFORE freeing their shared queue. */
+    net_fanout_shutdown(&srv->rf);
+    net_fanout_shutdown(&srv->audio);
     if (net_sock_valid(srv->listen_fd)) {
         /* shutdown() wakes any blocking select()/accept() on this socket in
          * addition to the non-blocking loop, then close(). */
@@ -1104,7 +1230,11 @@ static void server_stop(net_server_t *srv) {
     }
     thrd_join(srv->listen_thread, NULL);
     thrd_join(srv->beacon_thread, NULL);
-    /* Wake any /rf + /baseband streaming subscribers so they exit. */
+    /* Accepted client threads are detached. Wait until all handlers have
+     * exited before destroying the queues or the server they reference. */
+    while (atomic_load(&srv->active_workers) != 0) {
+        thrd_sleep_ms(10);
+    }
     net_fanout_destroy(&srv->rf);
     net_fanout_destroy(&srv->audio);
     if (srv->app) {
@@ -1253,6 +1383,14 @@ static int json_int(const char *j, const char *key, int def) {
     return atoi(p + strlen(pat));
 }
 
+static uint64_t json_uint64(const char *j, const char *key, uint64_t def) {
+    char pat[64];
+    snprintf(pat, sizeof(pat), "\"%s\":", key);
+    const char *pos = strstr(j, pat);
+    if (!pos) return def;
+    return (uint64_t)strtoull(pos + strlen(pat), NULL, 10);
+}
+
 static void json_str(const char *j, const char *key, char *out, size_t cap) {
     if (!out || cap == 0) return;
     out[0] = '\0';
@@ -1351,6 +1489,7 @@ static int client_pump_thread(void *arg) {
         // A reconnect loses RF continuity even if the mirrored capture state
         // never became idle. Bind the new stream's first write to a new epoch.
         if (!pc->is_audio) atomic_fetch_add(&app->rf_stream_epoch, 1);
+        if (!pc->is_audio) atomic_store(&app->net_rf_client_stream_live, true);
         fprintf(stderr, "[NET] client pump %s streaming (frame=%d)\n", path, frame);
         /* Body loop: read until the stream closes, then reconnect. */
         while (!atomic_load(&cli->pump_stop)) {
@@ -1396,7 +1535,10 @@ static int client_pump_thread(void *arg) {
         /* Stream ended (recv 0 / error) or pump_stop: close and either reconnect
          * or exit. */
         net_close(fd);
+        if (!pc->is_audio) atomic_store(&app->net_rf_client_stream_live, false);
         if (atomic_load(&cli->pump_stop)) break;
+        if (pc->is_audio) atomic_fetch_add(&app->net_audio_client_interruptions, 1);
+        else atomic_fetch_add(&app->net_rf_client_interruptions, 1);
         fprintf(stderr, "[NET] client pump %s stream dropped, reconnecting...\n", path);
         thrd_sleep_ms(reconnect_ms);
     }
@@ -1486,6 +1628,7 @@ static void client_stop_ingest(gui_app_t *app, net_client_t *cli) {
     if (!atomic_load(&cli->ingest_active)) return;
     fprintf(stderr, "[NET] client: stopping ingest backend\n");
     atomic_store(&cli->pump_stop, true);
+    atomic_store(&app->net_rf_client_stream_live, false);
     /* The pump threads will exit when recv returns 0/error or pump_stop is seen.
      * They own their sockets; closing happens inside the thread. Join them. */
     thrd_join(cli->rf_pump_thread, NULL);
@@ -1504,11 +1647,45 @@ static void client_stop_ingest(gui_app_t *app, net_client_t *cli) {
 /* Worker thread: connect, poll /stats + /devices + /controls, mirror, and
  * forward queued command flags to the server. Does NOT touch is_capturing or
  * buffers directly (the main thread starts/stops ingest on state changes). */
+/* The server /stats counters are lifetime totals. A legacy Client session
+ * must show only dropouts since THAT client session began; otherwise a stale
+ * server overflow immediately re-triggers the warning after mode switching.
+ * Keep the baseline in the worker (one worker per explicit Client connection)
+ * rather than clearing the server's counters, which other clients may need.
+ */
+typedef struct {
+    uint64_t baseline;
+    bool initialized;
+} net_client_drop_baseline_t;
+
+static uint64_t net_client_session_drops(net_client_drop_baseline_t *state,
+                                         uint64_t server_total) {
+    /* A restarted server can reset its totals. Re-baseline, never underflow. */
+    if (!state->initialized || server_total < state->baseline) {
+        state->baseline = server_total;
+        state->initialized = true;
+    }
+    return server_total - state->baseline;
+}
+
+static void net_client_clear_stream_diagnostics(gui_app_t *app) {
+    if (!app) return;
+    atomic_store(&app->net_rf_client_interruptions, 0);
+    atomic_store(&app->net_audio_client_interruptions, 0);
+    atomic_store(&app->net_rf_server_stream_drops, 0);
+    atomic_store(&app->net_audio_server_stream_drops, 0);
+    atomic_store(&app->net_rf_server_queue_bytes, 0);
+    atomic_store(&app->net_audio_server_queue_bytes, 0);
+    atomic_store(&app->net_rf_client_stream_live, false);
+}
+
 static int client_worker_thread(void *arg) {
     net_client_t *cli = (net_client_t *)arg;
     gui_app_t *app = cli->app;
     int backoff_ms = 500;
     int last_peer_state = -1;
+    net_client_drop_baseline_t rf_drops = {0};
+    net_client_drop_baseline_t audio_drops = {0};
     int miss_streak = 0;  /* consecutive /stats failures; tear down ingest only after several */
     bool first_contact = false;  /* fetch /devices immediately on first good /stats */
     while (!atomic_load(&cli->stop_flag)) {
@@ -1584,6 +1761,22 @@ static int client_worker_thread(void *arg) {
         int sel = json_int(stats, "selected_device", -1);
         int dc = json_int(stats, "device_count", 0);
         int af = json_int(stats, "audio_frame_bytes", 12);
+        /* Optional telemetry from newer servers: older peers simply lack
+         * these fields and retain generic interruption warnings. */
+        uint64_t rf_queue = json_uint64(stats, "rf_fanout_queue_bytes", 0);
+        uint64_t audio_queue = json_uint64(stats, "audio_fanout_queue_bytes", 0);
+        atomic_store(&app->net_rf_server_queue_bytes,
+                     (size_t)(rf_queue > GUI_NET_RF_QUEUE_LIMIT_BYTES ? GUI_NET_RF_QUEUE_LIMIT_BYTES : rf_queue));
+        atomic_store(&app->net_audio_server_queue_bytes,
+                     (size_t)(audio_queue > GUI_NET_AUDIO_QUEUE_LIMIT_BYTES ? GUI_NET_AUDIO_QUEUE_LIMIT_BYTES : audio_queue));
+        /* Report only NEW server overflows since this Client session began.
+         * The server keeps its lifetime counters for independent clients. */
+        atomic_store(&app->net_rf_server_stream_drops,
+                     net_client_session_drops(&rf_drops,
+                         json_uint64(stats, "rf_fanout_stream_drops", 0)));
+        atomic_store(&app->net_audio_server_stream_drops,
+                     net_client_session_drops(&audio_drops,
+                         json_uint64(stats, "audio_fanout_stream_drops", 0)));
         atomic_store(&cli->peer_state, st);
         atomic_store(&cli->peer_sample_rate, sr);
         atomic_store(&cli->peer_selected, sel);
@@ -1812,6 +2005,9 @@ static int client_start_worker(net_client_t *cli) {
     if (cli->monitor_only) return -1;  /* No legacy RF ingest in M-Client. */
     if (atomic_load(&cli->worker_started)) return 0;
     if (!cli->host[0]) return -1;
+    /* Explicit reconnect, mode switch, or a newly selected server: fresh UI
+     * counters. The worker also establishes a new remote /stats baseline. */
+    net_client_clear_stream_diagnostics(cli->app);
     atomic_store(&cli->stop_flag, false);
     if (thrd_create(&cli->worker_thread, client_worker_thread, cli) != thrd_success) {
         return -1;
@@ -1835,6 +2031,9 @@ static void client_stop_worker(net_client_t *cli) {
     atomic_store(&cli->error, false);
     atomic_store(&cli->peer_state, 0);
     atomic_store(&cli->stop_flag, false);
+    /* The previous manual Client connection is over. Do not keep the old
+     * red warning visible while disconnected or after a mode transition. */
+    net_client_clear_stream_diagnostics(cli->app);
 }
 
 static int client_start(gui_app_t *app, const char *host, uint16_t port,
@@ -1867,6 +2066,9 @@ static int client_start(gui_app_t *app, const char *host, uint16_t port,
     net_mutex_init(&cli->dev_mtx);
     net_mutex_init(&cli->disc_mtx);
 
+    /* An explicit mode change starts a fresh Client UI session. Monitor
+     * Client has separate diagnostics and does not use the legacy fanout. */
+    if (!monitor_only) net_client_clear_stream_diagnostics(app);
     /* Start the UDP discovery listener so the UI can show found servers, even
      * before a specific host is selected. */
     if (thrd_create(&cli->discovery_thread, client_discovery_thread, cli) != thrd_success) {
@@ -2097,26 +2299,63 @@ void gui_net_poll_commands(gui_app_t *app) {
         }
         /* Distinct command channels preserve each protocol's semantics when
          * both kinds of client are connected to this Server at once. */
-        int monitor_record = atomic_exchange(&app->net_cmd_monitor_record, 0);
-        if (monitor_record == 3 && app->is_recording) {
-            fprintf(stderr, "[M-SERVER] executing /monitor/record off\n");
-            gui_app_stop_recording(app);
-        } else if ((monitor_record == 1 || monitor_record == 2) &&
-                   app->is_capturing && !app->is_recording) {
-            bool local = monitor_record == 2;
-            fprintf(stderr, "[M-SERVER] executing /monitor/record on (local=%d)\n", local);
-            if (!local || gui_monitor_local_save_begin() == 0) {
-                if (gui_app_start_recording(app) != 0 && local)
-                    (void)gui_monitor_local_save_end(false);
-            } else {
-                gui_app_set_status(app, "Local Save rejected: receiver unavailable");
-                fprintf(stderr, "[M-LOCAL] Record rejected: receiver unavailable\n");
+        uint64_t monitor_record_id=0;
+        int monitor_record=gui_monitor_server_take_record(app,&monitor_record_id);
+        if(monitor_record){
+            unsigned result=0; /* 0=success, 1=failed, 2=pending GUI confirmation */
+            char reason[384]={0};
+            if(monitor_record==3){
+                if(app->is_recording){
+                    fprintf(stderr,"[M-SERVER] executing /monitor/record off\n");
+                    gui_app_stop_recording(app);
+                }
+            }else if(!app->is_capturing){
+                result=1;
+                snprintf(reason,sizeof(reason),"Start capture first");
+            }else if(app->is_recording){
+                result=1;
+                snprintf(reason,sizeof(reason),"Recording is already running");
+            }else{
+                bool local=monitor_record==2;
+                fprintf(stderr,"[M-SERVER] executing /monitor/record on (local=%d)\n",local);
+                if(!local || gui_monitor_local_save_begin()==0){
+                    int record_rc=gui_app_start_recording(app);
+                    if(record_rc==0){
+                        fprintf(stderr,"[M-SERVER] recording started (local=%d)\n",local);
+                    }else{
+                        result=record_rc==1?2:1;
+                        const char *detail=app->status_message[0]?app->status_message:
+                            "recording did not start";
+                        snprintf(reason,sizeof(reason),"%s",detail);
+                        if(strstr(detail,"Output directory") && app->settings.output_path[0]){
+                            size_t n=strlen(reason);
+                            snprintf(reason+n,sizeof(reason)-n," (%s)",app->settings.output_path);
+                        }
+                        fprintf(stderr,
+                                "[M-SERVER] recording did NOT start: rc=%d (%s), output_path='%s', reason='%s'\n",
+                                record_rc,record_rc==1?"awaiting overwrite confirmation":"error",
+                                app->settings.output_path,detail);
+                        if(local)(void)gui_monitor_local_save_end(false);
+                    }
+                }else{
+                    result=1;
+                    snprintf(reason,sizeof(reason),"Local Save rejected: receiver unavailable");
+                    gui_app_set_status(app,reason);
+                    fprintf(stderr,"[M-LOCAL] Record rejected: receiver unavailable\n");
+                }
             }
+            gui_monitor_server_record_result(monitor_record_id,result,reason);
         }
         if (atomic_exchange(&app->net_cmd_record_on, false)) {
             if (app->is_capturing && !app->is_recording) {
                 fprintf(stderr, "[NET] server: executing /record on\n");
-                (void)gui_app_start_recording(app); /* legacy always records to server */
+                int record_rc = gui_app_start_recording(app); /* legacy always records to server */
+                if (record_rc != 0)
+                    fprintf(stderr,
+                            "[NET] server: /record on did NOT start: rc=%d (%s), output_path='%s', reason='%s'\n",
+                            record_rc, record_rc == 1 ? "awaiting overwrite confirmation" : "error",
+                            app->settings.output_path,
+                            app->status_message[0] ? app->status_message : "no status provided");
             }
         }
         if (atomic_exchange(&app->net_cmd_record_off, false)) {

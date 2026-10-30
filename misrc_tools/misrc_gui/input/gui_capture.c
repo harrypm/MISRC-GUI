@@ -1094,6 +1094,15 @@ void gui_app_init(gui_app_t *app) {
     app->sim_thread = NULL;
     atomic_store(&app->sim_running, false);
 
+    // Initialize RF transport diagnostics before UI and network worker access.
+    atomic_store(&app->net_rf_server_stream_drops, 0);
+    atomic_store(&app->net_rf_client_interruptions, 0);
+    atomic_store(&app->net_audio_server_stream_drops, 0);
+    atomic_store(&app->net_audio_client_interruptions, 0);
+    atomic_store(&app->net_audio_server_queue_bytes, 0);
+    atomic_store(&app->net_rf_server_queue_bytes, 0);
+    atomic_store(&app->net_rf_client_stream_live, false);
+
     // Initialize playback device state
     atomic_store(&app->playback_running, false);
 
