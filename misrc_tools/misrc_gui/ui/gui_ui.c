@@ -467,6 +467,17 @@ static bool gui_ui_selected_device_is_playback(const gui_app_t *app)
     return app->devices[app->selected_device].type == DEVICE_TYPE_PLAYBACK;
 }
 
+#if defined(__ANDROID__)
+/* Android Test Signal generates its samples in software. It must not open or
+ * request permission for a USB device, including when auto-reconnecting. */
+static bool gui_ui_selected_device_is_simulated(const gui_app_t *app)
+{
+    if (!app) return false;
+    if (app->selected_device < 0 || app->selected_device >= app->device_count) return false;
+    return app->devices[app->selected_device].type == DEVICE_TYPE_SIMULATED;
+}
+#endif
+
 #ifdef ENABLE_DDD
 // DdD is single-channel (channel A only); channel B has no signal source.
 static bool gui_ui_selected_device_is_ddd(const gui_app_t *app)
@@ -9083,8 +9094,13 @@ static void gui_ui_poll_android_results(gui_app_t *app)
     if (android_permission_pending()) {
         int granted = 0;
         if (android_poll_usb_permission_result(&granted)) {
-            if (gui_playback_is_starting(app)) {
-                // Consume the permission result without starting another source.
+            if (gui_playback_is_starting(app) ||
+                gui_ui_selected_device_is_simulated(app) ||
+                gui_ui_selected_device_is_playback(app) ||
+                gui_net_is_client(app)) {
+                /* A USB response can arrive after the user has changed
+                 * sources. Never start Test Signal, playback or a network
+                 * client as a side effect of a stale USB permission result. */
             } else if (granted && android_usb_has_fd()) {
                 gui_app_set_status(app, "USB permission granted, starting capture...");
                 gui_app_start_capture_async(app);
@@ -10253,8 +10269,15 @@ void gui_handle_interactions(gui_app_t *app) {
                     } else {
                         gui_app_set_status(app, "Waiting for remote Server connection...");
                     }
+                } else if (gui_ui_selected_device_is_simulated(app)) {
+                    /* Software generator: use the existing non-blocking
+                     * capture worker directly. No USB hardware or Android
+                     * USB permission is needed for Test Signal. */
+                    gui_app_start_capture_async(app);
+                    app->reconnect_pending = false;
+                    app->reconnect_attempts = 0;
                 } else {
-                    /* Local capture only: async Android USB permission.
+                    /* Local USB hardware only: async Android permission.
                      * Never block the render thread on the system dialog. */
                     extern int android_usb_has_fd(void);
                     extern int android_request_usb_permission_async(void);

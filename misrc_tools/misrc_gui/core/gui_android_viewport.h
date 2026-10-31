@@ -186,7 +186,9 @@ Vector2 gui_android_viewport_pointer(void)
 bool gui_android_viewport_begin_canvas(void)
 {
     gui_android_viewport_state_t *v = &s_android_view;
-    if (v->zoom <= 1.001f) return false; // fast path; no extra GPU pass at 1x
+    /* TEST ONLY: use the same off-screen canvas at 1x and when zoomed.
+     * This isolates differences between direct screen rendering and
+     * the render-texture path. It is not yet a safe-area fix. */
     const int w = GetRenderWidth(), h = GetRenderHeight();
     if (w <= 0 || h <= 0) return false;
     if (w != v->canvas_width || h != v->canvas_height) {

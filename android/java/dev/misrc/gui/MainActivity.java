@@ -20,6 +20,9 @@ import android.text.Editable;
 import android.text.InputType;
 import android.util.Log;
 import android.view.KeyEvent;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
+import android.view.WindowManager;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.inputmethod.BaseInputConnection;
@@ -132,6 +135,36 @@ public class MainActivity extends NativeActivity {
      * cannot enumerate /dev/bus/usb without root, so Java owns presence). */
     private native void nativeSetUsbDevicePresent(boolean present);
 
+    /** Hide the Android system bars; swipes can temporarily reveal them. */
+    private void enforceImmersiveMode() {
+        WindowInsetsController controller = getWindow().getInsetsController();
+        if (controller != null) {
+            controller.setSystemBarsBehavior(
+                    WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+            controller.hide(WindowInsets.Type.systemBars());
+        }
+    }
+
+    /** Full-width immersive window. The native UI is no longer globally
+     * shrunk/translated by display-cutout insets. Keep crucial controls away
+     * from the camera's *physical* cutout in a future localized layout pass. */
+    private void configureFullscreenDisplay() {
+        WindowManager.LayoutParams params = getWindow().getAttributes();
+        params.layoutInDisplayCutoutMode =
+                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
+        getWindow().setAttributes(params);
+        getWindow().setDecorFitsSystemWindows(false);
+        enforceImmersiveMode();
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus) {
+            enforceImmersiveMode();
+        }
+    }
+
     @Override
     public void onCreate(android.os.Bundle savedInstanceState) {
         // Initialize Java-side USB services first.
@@ -149,6 +182,7 @@ public class MainActivity extends NativeActivity {
         }
         // Start NativeActivity (loads libmisrc_gui.so, runs android_main -> main()).
         super.onCreate(savedInstanceState);
+        configureFullscreenDisplay();
         // Native symbols are guaranteed after super.onCreate(); push startup
         // storage path now so native fopen() uses app-private external storage.
         if (startupStoragePath != null) {
@@ -257,6 +291,7 @@ public class MainActivity extends NativeActivity {
     @Override
     protected void onResume() {
         super.onResume();
+        enforceImmersiveMode();
         try {
             nativeRegisterActivity(this);
         } catch (UnsatisfiedLinkError e) {
