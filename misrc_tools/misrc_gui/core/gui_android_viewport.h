@@ -16,6 +16,8 @@ Vector2 gui_android_viewport_pointer(void);
 bool gui_android_viewport_begin_canvas(void);
 void gui_android_viewport_present_canvas(bool active);
 void gui_android_viewport_restore_canvas_after_texture(void);
+/* Native-resolution zoom transform, also used for Clay scissor bounds. */
+void gui_android_viewport_get_render_transform(float *zoom, float *x, float *y);
 void gui_android_viewport_shutdown(void);
 
 #if defined(GUI_ANDROID_VIEWPORT_IMPLEMENTATION)
@@ -183,12 +185,30 @@ Vector2 gui_android_viewport_pointer(void)
                       (v->click_screen.y - v->y) / v->zoom };
 }
 
+/* Draw the *elements* at the final pinch zoom instead of magnifying a
+ * previously rasterized screen-sized bitmap. The two bundled fonts already
+ * use 64px atlases, so their glyphs keep their detail at normal pinch zooms.
+ * Keep the off-screen canvas at physical display resolution: no zoom^2 GPU
+ * memory consumption and no change to Clay's logical layout or pointer map.
+ */
+static void android_view_apply_canvas_transform(const gui_android_viewport_state_t *v)
+{
+    rlTranslatef(v->x, v->y, 0.0f);
+    rlScalef(v->zoom, v->zoom, 1.0f);
+}
+
+void gui_android_viewport_get_render_transform(float *zoom, float *x, float *y)
+{
+    if (zoom) *zoom = s_android_view.zoom;
+    if (x) *x = s_android_view.x;
+    if (y) *y = s_android_view.y;
+}
+
 bool gui_android_viewport_begin_canvas(void)
 {
     gui_android_viewport_state_t *v = &s_android_view;
-    /* TEST ONLY: use the same off-screen canvas at 1x and when zoomed.
-     * This isolates differences between direct screen rendering and
-     * the render-texture path. It is not yet a safe-area fix. */
+    /* Always draw through the canvas, including 1x. The direct-screen path
+     * previously produced the clipping seen on some Android handsets. */
     const int w = GetRenderWidth(), h = GetRenderHeight();
     if (w <= 0 || h <= 0) return false;
     if (w != v->canvas_width || h != v->canvas_height) {
@@ -205,6 +225,7 @@ bool gui_android_viewport_begin_canvas(void)
     }
     BeginTextureMode(v->canvas);
     v->canvas_active = true;
+    android_view_apply_canvas_transform(v);
     return true;
 }
 
@@ -217,9 +238,11 @@ void gui_android_viewport_present_canvas(bool active)
     ClearBackground(BLACK);
     const Rectangle source = { 0, 0, (float)v->canvas_width,
                               -(float)v->canvas_height };
-    const Rectangle dest = { v->x, v->y,
-                             (float)v->canvas_width * v->zoom,
-                             (float)v->canvas_height * v->zoom };
+    /* Already drawn at pinch zoom; present at native pixel size. Scaling
+     * the finished canvas again would reintroduce blurred text. */
+    const Rectangle dest = { 0, 0,
+                             (float)v->canvas_width,
+                             (float)v->canvas_height };
     DrawTexturePro(v->canvas.texture, source, dest, (Vector2){0, 0}, 0, WHITE);
 }
 
@@ -243,6 +266,9 @@ void gui_android_viewport_restore_canvas_after_texture(void)
     const gui_android_viewport_state_t *v = &s_android_view;
     if (!v->canvas_active || !v->canvas.id) return;
     BeginTextureMode(v->canvas);
+    /* Nested phosphor/FFT textures reset raylib's framebuffer AND its
+     * projection/modelview. Restore the exact outer canvas transform. */
+    android_view_apply_canvas_transform(v);
 }
 
 void gui_android_viewport_shutdown(void)
