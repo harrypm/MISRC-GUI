@@ -59,7 +59,7 @@ jobs:
             guard_mode: static
           - runner: windows-2022
             guard_mode: static
-          - runner: macos-14
+          - runner: macos-15
             guard_mode: runtime
     steps:
       - name: Checkout
@@ -922,7 +922,7 @@ jobs:
       matrix:
         include:
           - arch: arm64
-            runner: macos-14
+            runner: macos-15
           - arch: x86_64
             runner: macos-15-intel
     runs-on: ${{ matrix.runner }}
@@ -1220,7 +1220,7 @@ jobs:
 
   macos-app-universal:
     name: macOS APP build (universal)
-    runs-on: macos-14
+    runs-on: macos-15
     needs:
       - macos-app-build
     steps:

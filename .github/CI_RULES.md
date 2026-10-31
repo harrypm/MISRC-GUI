@@ -42,7 +42,7 @@ old runner images):
 | preflight / android-apk / release | ubuntu-22.04 / ubuntu-24.04 | ubuntu-22.04 is the AppImage glibc baseline. |
 | windows-exe (x86_64) | windows-2022 | |
 | windows-exe (arm64) | windows-11-arm | ARM64 Windows is experimental; flagged in release notes. |
-| macos-app (arm64) | macos-14 | Apple Silicon. |
+| macos-app (arm64) | macos-15 | Apple Silicon. |
 | macos-app (x86_64) | macos-15-intel | Intel. |
 
 Rules:
