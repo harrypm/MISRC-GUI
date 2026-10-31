@@ -42,7 +42,7 @@ def check_cross_platform_workflow_coverage(workflow_path: Path) -> int:
         "windows-exe:",
         "runs-on: windows-2022",
         "macos-app-build:",
-        "runner: macos-14",
+        "runner: macos-15",
         "runner: macos-15-intel",
         "macos-app-universal:",
         "android-apk:",
