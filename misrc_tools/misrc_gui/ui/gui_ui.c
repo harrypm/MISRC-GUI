@@ -31,6 +31,7 @@
 #include "../output/gui_record.h"
 #include "../input/gui_capture.h" // Support hsdoah-rp2350 Error & stats
 #include "../net/gui_net.h"
+#include "../net/gui_net_queue_limits.h"
 #include "../net/gui_monitor_transport.h"
 #include "../core/gui_updater.h" // Manifest-driven updater: releases page + auto-patch manifest + confirmed self-update
 #include "version.h"
@@ -465,6 +466,17 @@ static bool gui_ui_selected_device_is_playback(const gui_app_t *app)
     if (app->selected_device < 0 || app->selected_device >= app->device_count) return false;
     return app->devices[app->selected_device].type == DEVICE_TYPE_PLAYBACK;
 }
+
+#if defined(__ANDROID__)
+/* Android Test Signal generates its samples in software. It must not open or
+ * request permission for a USB device, including when auto-reconnecting. */
+static bool gui_ui_selected_device_is_simulated(const gui_app_t *app)
+{
+    if (!app) return false;
+    if (app->selected_device < 0 || app->selected_device >= app->device_count) return false;
+    return app->devices[app->selected_device].type == DEVICE_TYPE_SIMULATED;
+}
+#endif
 
 #ifdef ENABLE_DDD
 // DdD is single-channel (channel A only); channel B has no signal source.
@@ -1536,6 +1548,22 @@ static char stat_rec_raw[2][32];
 static char stat_rec_flac[2][32];
 static char stat_rec_ratio[2][24];
 static char stat_rec_duration[2][24];
+
+// Snapshot of what is visible in each channel's recording card. The UI
+// renders live values, while the existing info popup shows a click-time
+// snapshot. Keep this out of gui_app_t: no recording or network state changes.
+typedef struct {
+    bool visible;
+    bool recording;
+    bool buffer_known;
+    bool local_save;
+    unsigned buffer_fill_pct;
+    uint64_t write_waits;
+    uint64_t dropped_blocks;
+    uint64_t send_queue_bytes;
+    uint64_t send_queue_capacity;
+} gui_record_details_view_t;
+static gui_record_details_view_t s_record_details_view[2];
 
 // Playback file display buffers
 static char playback_file_a_display[64];
@@ -5049,6 +5077,26 @@ static void render_version_info_window(gui_app_t *app)
         {
             static char net_status[160];
             gui_net_status_string(app, net_status, sizeof(net_status));
+            /* Warn about actual RF queue pressure/dropouts without claiming the
+             * physical LAN is necessarily the bottleneck. Server and legacy
+             * Client statistics are independent from the monitor transport. */
+            bool rf_transport_warning = false;
+            if (app->settings.net_mode == GUI_NET_MODE_SERVER) {
+                rf_transport_warning = atomic_load(&app->net_rf_server_stream_drops) > 0 ||
+                    atomic_load(&app->net_audio_server_stream_drops) > 0 ||
+                    atomic_load(&app->net_rf_server_queue_bytes) >=
+                        gui_net_queue_warn_bytes(GUI_NET_RF_QUEUE_LIMIT_BYTES) ||
+                    atomic_load(&app->net_audio_server_queue_bytes) >=
+                        gui_net_queue_warn_bytes(GUI_NET_AUDIO_QUEUE_LIMIT_BYTES);
+            } else if (app->settings.net_mode == GUI_NET_MODE_CLIENT) {
+                rf_transport_warning = atomic_load(&app->net_rf_client_interruptions) > 0 ||
+                    atomic_load(&app->net_audio_client_interruptions) > 0 ||
+                    atomic_load(&app->net_rf_server_stream_drops) > 0 ||
+                    atomic_load(&app->net_rf_server_queue_bytes) >=
+                        gui_net_queue_warn_bytes(GUI_NET_RF_QUEUE_LIMIT_BYTES);
+            }
+            Color net_status_color = rf_transport_warning
+                ? (Color){255, 170, 80, 255} : COLOR_TEXT;
             CLAY(CLAY_ID("VersionInfoNetStatusRow"), {
                 .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 }
             }) {
@@ -5057,7 +5105,7 @@ static void render_version_info_window(gui_app_t *app)
                         CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
                 }
                 CLAY_TEXT(make_string(net_status),
-                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
+                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(net_status_color) }));
             }
         }
         // Credits (without license/year text).
@@ -6325,6 +6373,8 @@ static void render_toolbar(gui_app_t *app, bool ddd_compact_labels) {
 
 // Fixed width for labels to ensure alignment
 #define LABEL_WIDTH 50
+// Recording values keep a readable size; show fewer items in the narrow sidebar.
+#define FONT_SIZE_RECORD_READOUT 16
 
 typedef struct {
     uint32_t clip_pos, clip_neg;
@@ -6388,7 +6438,7 @@ static gui_channel_stats_layout_t gui_ui_stats_layout(gui_app_t *app,
     char record_size_max[32];
     snprintf(record_size_max, sizeof(record_size_max), "RAW: %.2f GB",
              (double)UINT64_MAX / 1000000000.0);
-    int record_width = gui_ui_measure_text_width(app, record_size_max, FONT_SIZE_STATS, 1);
+    int record_width = gui_ui_measure_text_width(app, record_size_max, FONT_SIZE_STATS, 0);
     width = fmaxf(width, record_width + padding * 2);
     if (!compact) width = fmaxf(width, ceilf(185 * gui_ui_stats_width_scale(s_ui_scale_percent)));
     view_width = (int)width - label_width - gap - padding * 2;
@@ -6612,6 +6662,7 @@ static void render_channel_stats(gui_app_t *app, int channel,
             bool show_record_stats = remote_active
                 ? (remote_ch_enabled && (remote_recording || raw_bytes>0 || comp_bytes>0 || m_record->elapsed_ms>0))
                 : (app->is_capturing && (app->is_recording || raw_bytes > 0 || comp_bytes > 0 || app->last_recording_duration_s > 0.0));
+            if (!show_record_stats) s_record_details_view[channel].visible = false;
             if (show_record_stats) {
                 double shown_duration = m_record ? (double)m_record->elapsed_ms/1000.0
                     : (app->is_recording ? (GetTime() - app->recording_start_time) : app->last_recording_duration_s);
@@ -6644,54 +6695,144 @@ static void render_channel_stats(gui_app_t *app, int channel,
                     buf_rec_flac[0] = '\0';
                     buf_rec_ratio[0] = '\0';
                 }
-                CLAY(CLAY_IDI("RecDurationRow", channel), { .layout = STAT_ROW_LAYOUT }) {
-                    CLAY_TEXT(make_string(buf_rec_duration),
-                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(channel_value_color) }));
-                }
-                if (!quarter_scale_layout) {
-                    CLAY(CLAY_IDI("RecRawRow", channel), { .layout = STAT_ROW_LAYOUT }) {
-                        CLAY_TEXT(make_string(buf_rec_raw),
-                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(channel_value_color) }));
+                // Detailed stats live behind a single button; do not crowd the
+                // narrow sidebar with waits, drops and per-buffer percentages.
+                gui_record_details_view_t *detail = &s_record_details_view[channel];
+                memset(detail, 0, sizeof(*detail));
+                detail->visible = true;
+                detail->recording = remote_active ? remote_recording : app->is_recording;
+                detail->local_save = m_record && m_record->local_save;
+                if (m_record) {
+                    detail->buffer_known = true;
+                    detail->buffer_fill_pct = m_record->rec_fill_pct[channel];
+                    detail->write_waits = m_record->rec_waits[channel];
+                    detail->dropped_blocks = m_record->rec_drops[channel];
+                    if (channel == 0 && m_record->local_save) {
+                        detail->send_queue_bytes = m_record->send_queue_bytes;
+                        detail->send_queue_capacity = m_record->send_queue_capacity;
+                    }
+                } else {
+                    buffer_id_t id = channel == 0 ? BUF_RECORD_A : BUF_RECORD_B;
+                    if (app->buffers.manager_initialized && app->buffers.initialized[id]) {
+                        buffer_stats_t bstats;
+                        bufmgr_get_stats(&app->buffers, id, &bstats);
+                        float fill = bufmgr_fill_percent(&app->buffers, id);
+                        if (fill < 0.0f) fill = 0.0f;
+                        if (fill > 1.0f) fill = 1.0f;
+                        detail->buffer_known = true;
+                        detail->buffer_fill_pct = (unsigned)roundf(fill * 100.0f);
+                        detail->write_waits = atomic_load(&bstats.write_waits);
+                        detail->dropped_blocks = atomic_load(&bstats.write_drops);
                     }
                 }
-                if (buf_rec_flac[0]) {
-                    CLAY(CLAY_IDI("RecFlacRow", channel), { .layout = STAT_ROW_LAYOUT }) {
-                        CLAY_TEXT(make_string(buf_rec_flac),
-                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(channel_value_color) }));
+                const char *buffer_health = "Buffer info";
+                Color buffer_health_color = COLOR_TEXT_DIM;
+                if (detail->buffer_known) {
+                    if (detail->dropped_blocks > 0) {
+                        buffer_health = "Data lost!";
+                        buffer_health_color = COLOR_CLIP_RED;
+                    } else if (detail->buffer_fill_pct >= 75 || detail->write_waits > 0) {
+                        buffer_health = "Buffer high";
+                        buffer_health_color = COLOR_METER_YELLOW;
+                    } else {
+                        buffer_health = "Buffer OK";
+                        buffer_health_color = COLOR_SYNC_GREEN;
+                    }
+                }
+
+                // Keep recording state and duration together in the narrow
+                // sidebar. Use a short inactive label so the 18px clock fits.
+                CLAY(CLAY_IDI("RecordingStateRow", channel), {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) },
+                        .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                        .childGap = 4,
+                        .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }
+                    }
+                }) {
+                    CLAY(CLAY_IDI("RecordingStateDot", channel), {
+                        .layout = { .sizing = { CLAY_SIZING_FIXED(7), CLAY_SIZING_FIXED(7) } },
+                        .backgroundColor = to_clay_color(detail->recording ? COLOR_SYNC_GREEN : COLOR_TEXT_DIM),
+                        .cornerRadius = CLAY_CORNER_RADIUS(8)
+                    }) {}
+                    CLAY_TEXT(detail->recording ? CLAY_STRING("Recording") : CLAY_STRING("Last rec"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 0,
+                            .textColor = to_clay_color(COLOR_TEXT_DIM),
+                            .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                    CLAY_TEXT(make_string(buf_rec_duration + 5),
+                        CLAY_TEXT_CONFIG({ .fontSize = 18, .fontId = 0,
+                            .wrapMode = CLAY_TEXT_WRAP_NONE,
+                            .textColor = to_clay_color(COLOR_TEXT) }));
+                }
+                // Full-width rows keep values readable inside the narrow
+                // channel sidebar. Two equal-sized columns forced the labels
+                // and compression readout to use tiny text.
+                if (!quarter_scale_layout) {
+                    CLAY(CLAY_IDI("RecRawRow", channel), { .layout = STAT_ROW_LAYOUT }) {
+                        CLAY(CLAY_IDI("RecRawLabel", channel), {
+                            .layout = { .sizing = { CLAY_SIZING_FIXED(52), CLAY_SIZING_FIT(0) } }
+                        }) {
+                            CLAY_TEXT(CLAY_STRING("RAW:"), CLAY_TEXT_CONFIG({
+                                .fontSize = FONT_SIZE_STATS, .fontId = 0,
+                                .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                        }
+                        CLAY_TEXT(make_string(buf_rec_raw + 5), CLAY_TEXT_CONFIG({
+                            .fontSize = 18, .fontId = 0, .wrapMode = CLAY_TEXT_WRAP_NONE,
+                            .textColor = to_clay_color(COLOR_TEXT) }));
+                    }
+                    if (buf_rec_flac[0]) {
+                        CLAY(CLAY_IDI("RecFlacRow", channel), { .layout = STAT_ROW_LAYOUT }) {
+                            CLAY(CLAY_IDI("RecFlacLabel", channel), {
+                                .layout = { .sizing = { CLAY_SIZING_FIXED(52), CLAY_SIZING_FIT(0) } }
+                            }) {
+                                CLAY_TEXT(CLAY_STRING("FLAC:"), CLAY_TEXT_CONFIG({
+                                    .fontSize = FONT_SIZE_STATS, .fontId = 0,
+                                    .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                            }
+                            CLAY_TEXT(make_string(buf_rec_flac + 6), CLAY_TEXT_CONFIG({
+                                .fontSize = 18, .fontId = 0, .wrapMode = CLAY_TEXT_WRAP_NONE,
+                                .textColor = to_clay_color(COLOR_TEXT) }));
+                        }
                     }
                 }
                 if (buf_rec_ratio[0]) {
-                    CLAY(CLAY_IDI("RecRatioRow", channel), { .layout = STAT_ROW_LAYOUT }) {
-                        CLAY_TEXT(make_string(buf_rec_ratio),
-                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(channel_value_color) }));
+                    CLAY(CLAY_IDI("RecRatioRow", channel), {
+                        .layout = {
+                            .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) },
+                            .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                            .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
+                            .childGap = 6
+                        }
+                    }) {
+                        CLAY_TEXT(CLAY_STRING("Compression"), CLAY_TEXT_CONFIG({
+                            .fontSize = FONT_SIZE_STATS, .fontId = 0,
+                            .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                        CLAY_TEXT(make_string(buf_rec_ratio + 7), CLAY_TEXT_CONFIG({
+                            .fontSize = 18, .fontId = 0, .wrapMode = CLAY_TEXT_WRAP_NONE,
+                            .textColor = to_clay_color(COLOR_SYNC_GREEN) }));
                     }
                 }
-                if (m_record) {
-                    /* Live remote record buffer and safety counters, with
-                     * persistent bounded strings (Clay uses frame pointers). */
-                    static char m_rec_buffers[2][88];
-                    snprintf(m_rec_buffers[channel],sizeof(m_rec_buffers[channel]),
-                        "REC_%c: %u%%  W:%u D:%u",
-                        channel?'B':'A',m_record->rec_fill_pct[channel],
-                        m_record->rec_waits[channel],m_record->rec_drops[channel]);
-                    CLAY(CLAY_IDI("MClientRecordBuffer",channel),{.layout=STAT_ROW_LAYOUT}){
-                        CLAY_TEXT(make_string(m_rec_buffers[channel]),
-                            CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_STATS,.fontId=1,
-                                .textColor=to_clay_color(m_record->rec_fill_pct[channel]>=80?COLOR_CLIP_RED:channel_value_color)}));
-                    }
-                    if (channel==0 && m_record->local_save) {
-                        static char m_send_buffer[96];
-                        unsigned percent=m_record->send_queue_capacity
-                            ? (unsigned)((m_record->send_queue_bytes*100)/m_record->send_queue_capacity):0;
-                        if(percent>100)percent=100;
-                        snprintf(m_send_buffer,sizeof(m_send_buffer),"Send: %u%%  %.1f/64 MiB",
-                            percent,(double)m_record->send_queue_bytes/1048576.0);
-                        CLAY(CLAY_ID("MClientLocalSendBuffer"),{.layout=STAT_ROW_LAYOUT}){
-                            CLAY_TEXT(make_string(m_send_buffer),
-                                CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_STATS,.fontId=1,
-                                    .textColor=to_clay_color(percent>=80?COLOR_CLIP_RED:channel_value_color)}));
-                        }
-                    }
+                CLAY(CLAY_IDI("RecordingDetailsButton", channel), {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(24) },
+                        .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                        .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
+                        .childGap = 4,
+                        .padding = { 4, 4, 0, 0 }
+                    },
+                    .backgroundColor = to_clay_color(COLOR_BUTTON),
+                    .cornerRadius = CLAY_CORNER_RADIUS(3)
+                }) {
+                    // Use the same size/font as the Split and Waveform controls.
+                    // Keep warning labels short so both captions fit this narrow button.
+                    CLAY_TEXT(make_string(buffer_health), CLAY_TEXT_CONFIG({
+                        .fontSize = FONT_SIZE_DROPDOWN_OPT, .fontId = 0,
+                        .textColor = to_clay_color(buffer_health_color),
+                        .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                    CLAY_TEXT(CLAY_STRING("Details >"), CLAY_TEXT_CONFIG({
+                        .fontSize = FONT_SIZE_DROPDOWN_OPT, .fontId = 0,
+                        .textColor = to_clay_color(COLOR_TEXT),
+                        .wrapMode = CLAY_TEXT_WRAP_NONE }));
                 }
             }
         }
@@ -7418,9 +7559,15 @@ static void render_channels_panel(gui_app_t *app, gui_ui_channel_spacing_t spaci
 static bool render_main_panels(gui_app_t *app) {
     int status_width = gui_ui_get_layout_width();
     int status_height = gui_ui_get_layout_height();
+    // Remote recording occupies the same status-bar space as local recording.
+    // Determine it before deciding which status layout/message to display.
+    gui_monitor_record_stats_t m_status = {0};
+    bool m_status_valid = app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT &&
+        gui_monitor_client_record_stats(&m_status);
+    bool m_recording = m_status_valid && gui_monitor_client_peer_state() == 2;
     gui_ui_status_layout_mode_t status_layout =
         gui_ui_get_status_layout_mode(status_width, status_height,
-                                      app->is_recording);
+                                      app->is_recording || m_recording);
     bool status_quarter_scale =
         status_width <= GUI_UI_STATUS_QUARTER_MAX_WIDTH &&
         status_height <= GUI_UI_STATUS_QUARTER_MAX_HEIGHT;
@@ -7451,7 +7598,15 @@ static bool render_main_panels(gui_app_t *app) {
     // readout (and widen the message budget) so the actual error text isn't
     // truncated behind the free-space label. This is what makes CXADC/USB
     // permission failures readable in the bottom bar instead of "CXADC permi...".
+    /* Preview failure is a live M-Client state, not a permanent status
+     * message.  This prevents an old failure from surviving preview recovery,
+     * Disconnect/Connect, or switching away from Monitor Client mode. */
+    const char *const preview_status = "Monitor preview error: showing last valid frame";
     const char *raw_status_gate = (app->status_message[0] != '\0') ? app->status_message : NULL;
+    if (raw_status_gate && strcmp(raw_status_gate, preview_status) == 0) {
+        /* Ignore the legacy sticky text if an older code path stored it. */
+        raw_status_gate = NULL;
+    }
     bool status_is_error = false;
     if (raw_status_gate) {
         status_is_error =
@@ -7465,11 +7620,77 @@ static bool render_main_panels(gui_app_t *app) {
             strstr(raw_status_gate, "timed out") != NULL ||
             strstr(raw_status_gate, "Capture stopped:") != NULL;
     }
+    if (!status_is_error && app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT &&
+        gui_monitor_client_running() && gui_monitor_client_preview_error()) {
+        raw_status_gate = preview_status;
+        status_is_error = true;
+    }
+    /* Network backpressure is distinct from USB/capture buffer errors.
+     * Server-reported RF queue overflow proves that the transfer path cannot
+     * sustain source rate, but not whether NIC/Wi-Fi or client CPU is to blame. */
+    bool rf_transport_banner = false;
+    bool rf_transport_critical = false;
+    static char rf_transport_banner_text[96];
+    if (!status_is_error && app->settings.net_mode == GUI_NET_MODE_SERVER) {
+        uint_fast64_t rf_drops = atomic_load(&app->net_rf_server_stream_drops);
+        uint_fast64_t au_drops = atomic_load(&app->net_audio_server_stream_drops);
+        size_t rf_q = atomic_load(&app->net_rf_server_queue_bytes);
+        size_t au_q = atomic_load(&app->net_audio_server_queue_bytes);
+        if (rf_drops) {
+            snprintf(rf_transport_banner_text, sizeof(rf_transport_banner_text),
+                     "RF TRANSFER TOO SLOW - server dropped %llu stream(s)",
+                     (unsigned long long)rf_drops);
+            rf_transport_banner = rf_transport_critical = true;
+        } else if (au_drops) {
+            snprintf(rf_transport_banner_text, sizeof(rf_transport_banner_text),
+                     "Audio stream overload - dropped %llu stream(s)",
+                     (unsigned long long)au_drops);
+            rf_transport_banner = rf_transport_critical = true;
+        } else if (rf_q >= gui_net_queue_warn_bytes(GUI_NET_RF_QUEUE_LIMIT_BYTES)) {
+            snprintf(rf_transport_banner_text, sizeof(rf_transport_banner_text),
+                     "RF NETWORK BOTTLENECK - queue %u%% of 256MiB (link/receiver)",
+                     gui_net_queue_percent(rf_q, GUI_NET_RF_QUEUE_LIMIT_BYTES));
+            rf_transport_banner = true;
+        } else if (au_q >= gui_net_queue_warn_bytes(GUI_NET_AUDIO_QUEUE_LIMIT_BYTES)) {
+            snprintf(rf_transport_banner_text, sizeof(rf_transport_banner_text),
+                     "Audio network backlog - queue %u%% of 64MiB",
+                     gui_net_queue_percent(au_q, GUI_NET_AUDIO_QUEUE_LIMIT_BYTES));
+            rf_transport_banner = true;
+        }
+    } else if (!status_is_error && app->settings.net_mode == GUI_NET_MODE_CLIENT) {
+        uint_fast64_t rf = atomic_load(&app->net_rf_client_interruptions);
+        uint_fast64_t au = atomic_load(&app->net_audio_client_interruptions);
+        uint_fast64_t server_drops = atomic_load(&app->net_rf_server_stream_drops);
+        size_t server_queue = atomic_load(&app->net_rf_server_queue_bytes);
+        if (server_drops) {
+            snprintf(rf_transport_banner_text, sizeof(rf_transport_banner_text),
+                     "RF TRANSFER TOO SLOW - server queue overflow (%llu drop(s))",
+                     (unsigned long long)server_drops);
+            rf_transport_banner = rf_transport_critical = true;
+        } else if (server_queue >= gui_net_queue_warn_bytes(GUI_NET_RF_QUEUE_LIMIT_BYTES)) {
+            snprintf(rf_transport_banner_text, sizeof(rf_transport_banner_text),
+                     "RF transfer backlog on server - %u%% (network/receiver)",
+                     gui_net_queue_percent(server_queue, GUI_NET_RF_QUEUE_LIMIT_BYTES));
+            rf_transport_banner = true;
+        } else if (rf || au) {
+            snprintf(rf_transport_banner_text, sizeof(rf_transport_banner_text),
+                     "RF/Audio stream interrupted RF:%llu Audio:%llu (check link/receiver)",
+                     (unsigned long long)rf, (unsigned long long)au);
+            rf_transport_banner = rf_transport_critical = true;
+        }
+    }
+    if (rf_transport_banner) {
+        raw_status_gate = rf_transport_banner_text;
+        if (rf_transport_critical) status_is_error = true;
+    }
     // Decide error rows below, once the complete message and fixed readout
     // widths are known. Normal recording status is redundant with the timer.
     bool status_two_rows = false;
-    bool show_status_message = status_is_error ||
-        (!status_minimal && !app->is_recording);
+    // An acknowledged remote recording supersedes the stale "start recording
+    // requested" message, just as an active local recording does. Keep
+    // transport warnings and real errors visible in either mode.
+    bool show_status_message = rf_transport_banner || status_is_error ||
+        (!status_minimal && !app->is_recording && !m_recording);
     /* Keep free-space visible by default and let the dynamic budget contract
      * gaps/widths first; only hide it as a last resort. Error status still
      * reserves the left-side for readable failure text. */
@@ -7489,6 +7710,9 @@ static bool render_main_panels(gui_app_t *app) {
     int status_right_gap = status_tiny ? 8 : 10;
     int status_left_gap = status_tiny ? 4 : 8;
     int status_font_size = FONT_SIZE_STATUS;
+    // Inter is clearer than the small Space Mono glyphs in the status bar.
+    // Use the same font for measuring, truncating and rendering readouts.
+    const int status_readout_font_id = 0;
     int device_buffer_tier_width[3] = { 0, 0, 0 };
     int device_buffer_caption_width[3] = { 0, 0, 0 };
     const char *device_buffer_caption_budget[3] = {
@@ -7500,7 +7724,7 @@ static bool render_main_panels(gui_app_t *app) {
             bool full = tier == GUI_DEVICE_BUFFER_LAYOUT_FULL;
             int inner_gap = tier == GUI_DEVICE_BUFFER_LAYOUT_TINY ? 2 : 4;
             device_buffer_caption_width[tier] = gui_ui_measure_text_width(
-                app, device_buffer_caption_budget[tier], status_font_size, 1);
+                app, device_buffer_caption_budget[tier], status_font_size, status_readout_font_id);
             device_buffer_tier_width[tier] = gui_ui_measure_text_width(
                 app, full ? "HW Buffer:" : "HW:", status_font_size, 0) +
                 device_buffer_caption_width[tier] + inner_gap;
@@ -7530,10 +7754,6 @@ static bool render_main_panels(gui_app_t *app) {
     const char *errors_label = status_compact_labels ? errors_label_compact : errors_label_full;
     update_status_free_space(app);
 
-    gui_monitor_record_stats_t m_status={0};
-    bool m_status_valid=app->settings.net_mode==GUI_NET_MODE_MONITOR_CLIENT &&
-        gui_monitor_client_record_stats(&m_status);
-    bool m_recording=m_status_valid && gui_monitor_client_peer_state()==2;
     bool show_record_indicator = (app->is_recording || m_recording) && !status_quarter_scale;
     if (show_record_indicator) {
         double rec_duration = m_recording ? (double)m_status.elapsed_ms/1000.0
@@ -7545,12 +7765,14 @@ static bool render_main_panels(gui_app_t *app) {
                  "%02d:%02d:%02d", rec_hours, rec_mins, rec_secs);
     }
 
-    const char *raw_status = (app->status_message[0] != '\0')
-        ? app->status_message
-        : (app->is_capturing ? "Capturing..." : "Ready");
+    const char *raw_status = rf_transport_banner ? rf_transport_banner_text :
+        (raw_status_gate ? raw_status_gate :
+         (app->is_capturing ? "Capturing..." : "Ready"));
     Color status_color = COLOR_TEXT_DIM;
     if (status_is_error) {
         status_color = COLOR_CLIP_RED;
+    } else if (rf_transport_banner) {
+        status_color = COLOR_METER_YELLOW;
     } else if (strstr(raw_status, "Requesting") != NULL ||
                strstr(raw_status, "Reconnecting") != NULL ||
                strstr(raw_status, "Waiting") != NULL ||
@@ -7645,7 +7867,7 @@ static bool render_main_panels(gui_app_t *app) {
     if (show_free_space) {
         for (int tier = 0; tier < 3; tier++) {
             status_free_space_tier_width[tier] = gui_ui_measure_text_width(
-                app, free_space_budget[tier], status_font_size, 1);
+                app, free_space_budget[tier], status_font_size, status_readout_font_id);
         }
     }
 
@@ -7673,12 +7895,12 @@ static bool render_main_panels(gui_app_t *app) {
                      tier < 2 ? "-- MSPS" : "--");
         }
         status_sample_rate_tier_width[tier] = gui_ui_measure_text_width(
-            app, sample_rate_budget[tier], status_font_size, 1);
+            app, sample_rate_budget[tier], status_font_size, status_readout_font_id);
         format_status_samples_tier(status_samples_tier_text[tier],
                                    sizeof(status_samples_tier_text[tier]),
                                    status_samples_raw, tier);
         status_samples_tier_width[tier] = gui_ui_measure_text_width(
-            app, samples_budget[tier], status_font_size, 1);
+            app, samples_budget[tier], status_font_size, status_readout_font_id);
     }
 
     int status_rf_pct = 0;
@@ -7691,7 +7913,7 @@ static bool render_main_panels(gui_app_t *app) {
     int fault_caption_width[4] = { 0, 0, 0, 0 };
     for (int i = 1; i < 4; i++) {
         fault_caption_width[i] = gui_ui_measure_text_width(
-            app, fault_captions[i], status_font_size, 1);
+            app, fault_captions[i], status_font_size, status_readout_font_id);
     }
     bool show_fault_summary = false;
     int fault_summary_flags = 0;
@@ -7738,13 +7960,30 @@ static bool render_main_panels(gui_app_t *app) {
     int errors_label_width_compact = gui_ui_measure_text_width(app, errors_label_compact, status_font_size, 0);
     int rf_label_width_compact = gui_ui_measure_text_width(app, rf_buffer_label_compact, status_font_size, 0);
     int audio_label_width_compact = gui_ui_measure_text_width(app, audio_buffer_label_compact, status_font_size, 0);
-    int record_timer_text_width = show_record_indicator
-        ? gui_ui_measure_text_width(app, "99:59:59", status_font_size, 1)
-        : 0;
-    int frames_text_width = gui_ui_measure_text_width(app, "999M", status_font_size, 1);
+    int record_timer_text_width = 0;
+    if (show_record_indicator) {
+        // Inter has proportional digits: measuring "88:88:88" can be narrower
+        // than the actual "00:00:42", causing the elapsed timer to be
+        // ellipsized and appear to collide with the adjacent status message.
+        // Reserve the widest six-digit clock, not a single digit pattern.
+        char timer_probe[] = "00:00:00";
+        for (char digit = '0'; digit <= '9'; digit++) {
+            timer_probe[0] = timer_probe[1] = timer_probe[3] =
+                timer_probe[4] = timer_probe[6] = timer_probe[7] = digit;
+            int width = gui_ui_measure_text_width(app, timer_probe,
+                status_font_size, status_readout_font_id);
+            if (width > record_timer_text_width) record_timer_text_width = width;
+        }
+        // Account for three-digit hour counts and renderer rounding.
+        int live_width = gui_ui_measure_text_width(app, status_record_timer_display,
+            status_font_size, status_readout_font_id);
+        if (live_width > record_timer_text_width) record_timer_text_width = live_width;
+        record_timer_text_width += 8;
+    }
+    int frames_text_width = gui_ui_measure_text_width(app, "999M", status_font_size, status_readout_font_id);
     int missed_text_width = frames_text_width;
     int errors_text_width = frames_text_width;
-    int rf_text_width = gui_ui_measure_text_width(app, "100%", status_font_size, 1);
+    int rf_text_width = gui_ui_measure_text_width(app, "100%", status_font_size, status_readout_font_id);
     int aud_text_width = rf_text_width;
     int free_space_text_width = status_free_space_tier_width[status_free_space_tier];
     int free_space_width_budget = free_space_text_width;
@@ -8037,7 +8276,7 @@ static bool render_main_panels(gui_app_t *app) {
     if (show_device_buffer_status) {
         status_device_buffer_view = device_buffer_views[device_buffer_level];
         gui_ui_ellipsize_text(app, status_device_buffer_view.caption,
-            sizeof(status_device_buffer_view.caption), status_font_size, 1,
+            sizeof(status_device_buffer_view.caption), status_font_size, status_readout_font_id,
             device_buffer_caption_width[device_buffer_level]);
     }
     gui_device_buffer_layout_t device_buffer_layout =
@@ -8075,20 +8314,20 @@ static bool render_main_panels(gui_app_t *app) {
     if (show_free_space && free_space_width_budget > 0) {
         gui_ui_ellipsize_text(app, status_free_space_display,
                               sizeof(status_free_space_display),
-                              status_font_size, 1, free_space_width_budget);
+                              status_font_size, status_readout_font_id, free_space_width_budget);
     }
     gui_ui_ellipsize_text(app, status_sample_rate_display, sizeof(status_sample_rate_display),
-                          status_font_size, 1, sample_rate_value_width);
+                          status_font_size, status_readout_font_id, sample_rate_value_width);
     gui_ui_ellipsize_text(app, status_samples_display, sizeof(status_samples_display),
-                          status_font_size, 1, samples_value_width);
+                          status_font_size, status_readout_font_id, samples_value_width);
     gui_ui_ellipsize_text(app, status_rf_buf_display, sizeof(status_rf_buf_display),
-                          status_font_size, 1, buffer_value_width);
+                          status_font_size, status_readout_font_id, buffer_value_width);
     gui_ui_ellipsize_text(app, status_aud_buf_display, sizeof(status_aud_buf_display),
-                          status_font_size, 1, buffer_value_width);
+                          status_font_size, status_readout_font_id, buffer_value_width);
     if (show_record_indicator) {
         gui_ui_ellipsize_text(app, status_record_timer_display,
                               sizeof(status_record_timer_display),
-                              status_font_size, 1, record_timer_text_width);
+                              status_font_size, status_readout_font_id, record_timer_text_width);
     }
     // DdD aliases begin only when the entire sample-rate readout is hidden.
     // Pass the same-frame choice to the toolbar and return it for its dropdown;
@@ -8144,7 +8383,7 @@ static bool render_main_panels(gui_app_t *app) {
                     .layout = { .sizing = { CLAY_SIZING_FIXED(record_timer_text_width), CLAY_SIZING_FIT(0) } }
                 }) {
                     CLAY_TEXT(make_string(status_record_timer_display),
-                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = status_readout_font_id, .textColor = to_clay_color(COLOR_TEXT), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                 }
             }
 
@@ -8169,7 +8408,7 @@ static bool render_main_panels(gui_app_t *app) {
                     }
                 }) {
                     CLAY_TEXT(make_string(status_free_space_display),
-                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(free_space_color), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = status_readout_font_id, .textColor = to_clay_color(free_space_color), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                 }
             }
         }
@@ -8218,7 +8457,7 @@ static bool render_main_panels(gui_app_t *app) {
                         .layout = { .sizing = { CLAY_SIZING_FIXED(sample_rate_value_width), CLAY_SIZING_FIT(0) } }
                     }) {
                         CLAY_TEXT(make_string(status_sample_rate_display),
-                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT_DIM), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = status_readout_font_id, .textColor = to_clay_color(COLOR_TEXT_DIM), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                     }
                 }
                 if (show_samples_count) {
@@ -8236,7 +8475,7 @@ static bool render_main_panels(gui_app_t *app) {
                             .layout = { .sizing = { CLAY_SIZING_FIXED(samples_value_width), CLAY_SIZING_FIT(0) } }
                         }) {
                             CLAY_TEXT(make_string(status_samples_display),
-                                CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                                CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = status_readout_font_id, .textColor = to_clay_color(COLOR_TEXT), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                         }
                     }
                     if (show_frame_count) {
@@ -8253,7 +8492,7 @@ static bool render_main_panels(gui_app_t *app) {
                                 .layout = { .sizing = { CLAY_SIZING_FIXED(frames_value_width), CLAY_SIZING_FIT(0) } }
                             }) {
                                 CLAY_TEXT(make_string(status_frames_display),
-                                    CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                                    CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = status_readout_font_id, .textColor = to_clay_color(COLOR_TEXT), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                             }
                         }
                     }
@@ -8273,7 +8512,7 @@ static bool render_main_panels(gui_app_t *app) {
                             .layout = { .sizing = { CLAY_SIZING_FIXED(small_counter_width), CLAY_SIZING_FIT(0) } }
                         }) {
                             CLAY_TEXT(make_string(status_missed_display),
-                                CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(missed > 0 ? COLOR_CLIP_RED : COLOR_TEXT), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                                CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = status_readout_font_id, .textColor = to_clay_color(missed > 0 ? COLOR_CLIP_RED : COLOR_TEXT), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                         }
                     }
                 }
@@ -8292,7 +8531,7 @@ static bool render_main_panels(gui_app_t *app) {
                             .layout = { .sizing = { CLAY_SIZING_FIXED(small_counter_width), CLAY_SIZING_FIT(0) } }
                         }) {
                             CLAY_TEXT(make_string(status_errors_display),
-                                CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(errors > 0 ? COLOR_CLIP_RED : COLOR_TEXT), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                                CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = status_readout_font_id, .textColor = to_clay_color(errors > 0 ? COLOR_CLIP_RED : COLOR_TEXT), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                         }
                     }
                 }
@@ -8305,7 +8544,7 @@ static bool render_main_panels(gui_app_t *app) {
                                 ? COLOR_BUTTON_HOVER : COLOR_TOOLBAR_BG)
                     }) {
                         CLAY_TEXT(make_string(fault_captions[fault_summary_flags]),
-                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1,
+                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = status_readout_font_id,
                                 .textColor = to_clay_color(COLOR_CLIP_RED), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                     }
                 }
@@ -8373,7 +8612,7 @@ static bool render_main_panels(gui_app_t *app) {
                             .layout = { .sizing = { CLAY_SIZING_FIXED(device_buffer_caption_width[device_buffer_level]), CLAY_SIZING_FIT(0) } }
                         }) {
                             CLAY_TEXT(make_string(status_device_buffer_view.caption),
-                                CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(device_buffer_color), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                                CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = status_readout_font_id, .textColor = to_clay_color(device_buffer_color), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                         }
                     }
                 }
@@ -8394,7 +8633,7 @@ static bool render_main_panels(gui_app_t *app) {
                     }) {
                         Color rf_color = (rf_pct > 90) ? COLOR_CLIP_RED : (rf_pct > 75) ? COLOR_METER_YELLOW : COLOR_TEXT;
                         CLAY_TEXT(make_string(status_rf_buf_display),
-                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(rf_color), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = status_readout_font_id, .textColor = to_clay_color(rf_color), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                     }
                 }
 
@@ -8414,7 +8653,7 @@ static bool render_main_panels(gui_app_t *app) {
                     }) {
                         Color aud_color = (aud_pct > 90) ? COLOR_CLIP_RED : (aud_pct > 75) ? COLOR_METER_YELLOW : COLOR_TEXT;
                         CLAY_TEXT(make_string(status_aud_buf_display),
-                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(aud_color), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = status_readout_font_id, .textColor = to_clay_color(aud_color), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                     }
                 }
             }
@@ -8855,8 +9094,13 @@ static void gui_ui_poll_android_results(gui_app_t *app)
     if (android_permission_pending()) {
         int granted = 0;
         if (android_poll_usb_permission_result(&granted)) {
-            if (gui_playback_is_starting(app)) {
-                // Consume the permission result without starting another source.
+            if (gui_playback_is_starting(app) ||
+                gui_ui_selected_device_is_simulated(app) ||
+                gui_ui_selected_device_is_playback(app) ||
+                gui_net_is_client(app)) {
+                /* A USB response can arrive after the user has changed
+                 * sources. Never start Test Signal, playback or a network
+                 * client as a side effect of a stale USB permission result. */
             } else if (granted && android_usb_has_fd()) {
                 gui_app_set_status(app, "USB permission granted, starting capture...");
                 gui_app_start_capture_async(app);
@@ -9828,6 +10072,42 @@ void gui_handle_interactions(gui_app_t *app) {
             return;
         }
         for (int channel = 0; channel < 2; channel++) {
+            if (s_record_details_view[channel].visible &&
+                Clay_PointerOver(CLAY_IDI("RecordingDetailsButton", channel))) {
+                const gui_record_details_view_t *detail = &s_record_details_view[channel];
+                char message[480];
+                char buffer_section[200];
+                if (detail->buffer_known) {
+                    snprintf(buffer_section, sizeof(buffer_section),
+                             "Record buffer %c: %u%%\nWrite waits: %" PRIu64
+                             "\nDropped blocks: %" PRIu64,
+                             channel == 0 ? 'A' : 'B', detail->buffer_fill_pct,
+                             detail->write_waits, detail->dropped_blocks);
+                } else {
+                    snprintf(buffer_section, sizeof(buffer_section),
+                             "Record buffer: unavailable");
+                }
+                char send_section[96] = "";
+                if (detail->local_save && channel == 0 && detail->send_queue_capacity > 0) {
+                    snprintf(send_section, sizeof(send_section),
+                             "\nLocal Save queue: %.1f / %.1f MiB",
+                             (double)detail->send_queue_bytes / 1048576.0,
+                             (double)detail->send_queue_capacity / 1048576.0);
+                }
+                snprintf(message, sizeof(message),
+                         "%s\n%s\n%s%s%s%s%s\n\n%s%s",
+                         detail->recording ? "Recording in progress" : "Last recording",
+                         stat_rec_duration[channel], stat_rec_raw[channel],
+                         stat_rec_flac[channel][0] ? "\n" : "",
+                         stat_rec_flac[channel],
+                         stat_rec_ratio[channel][0] ? "\n" : "",
+                         stat_rec_ratio[channel], buffer_section, send_section);
+                gui_dropdown_close_all();
+                gui_ui_clear_text_edit();
+                gui_popup_info("Recording details (snapshot)", message);
+                gui_ui_set_click_consumed();
+                return;
+            }
             if (Clay_PointerOver(CLAY_IDI("StatClip", channel))) {
                 char details[160];
                 uint_fast32_t positive = channel == 0 ? atomic_load(&app->clip_count_a_pos)
@@ -9989,8 +10269,15 @@ void gui_handle_interactions(gui_app_t *app) {
                     } else {
                         gui_app_set_status(app, "Waiting for remote Server connection...");
                     }
+                } else if (gui_ui_selected_device_is_simulated(app)) {
+                    /* Software generator: use the existing non-blocking
+                     * capture worker directly. No USB hardware or Android
+                     * USB permission is needed for Test Signal. */
+                    gui_app_start_capture_async(app);
+                    app->reconnect_pending = false;
+                    app->reconnect_attempts = 0;
                 } else {
-                    /* Local capture only: async Android USB permission.
+                    /* Local USB hardware only: async Android permission.
                      * Never block the render thread on the system dialog. */
                     extern int android_usb_has_fd(void);
                     extern int android_request_usb_permission_async(void);

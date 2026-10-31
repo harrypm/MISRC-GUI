@@ -2697,6 +2697,17 @@ int gui_record_start(gui_app_t *app) {
         return RECORD_ERROR;
     }
     if (existing_count && !app->settings.overwrite_files) {
+        /* Headless Server never enters the GUI frame loop which consumes
+         * overwrite popup results.  Do not leave this request pending forever,
+         * and never overwrite files without explicit permission. */
+        if (app->headless_server) {
+            gui_app_set_status(app, "Recording blocked: output file exists; use a unique name or enable overwrite");
+            fprintf(stderr,
+                    "[RECORD] Headless recording refused: %u output file(s) already exist. "
+                    "Set a new output base name, enable timestamped names, or explicitly enable overwrite_files.\n",
+                    existing_count);
+            return RECORD_ERROR;
+        }
         char message[512];
         snprintf(message, sizeof(message),
                  "%u existing output file(s) will be overwritten:\n\n%s",

@@ -1702,16 +1702,17 @@ int main(int argc, char **argv) {
                         snprintf(status_buf, sizeof(status_buf), "Reconnecting (attempt %d)...", app.reconnect_attempts);
                         gui_app_set_status(&app, status_buf);
 #if defined(__ANDROID__)
-                        /* Async permission: never block the render thread on the
-                         * USB dialog. If fd is already granted, start capture
-                         * on a worker thread (gui_app_start_capture_async) so
-                         * the render loop stays responsive; otherwise request
-                         * async permission and let the per-frame poll complete
-                         * the connect. */
+                        /* Software Test Signal must bypass USB permissions
+                         * even during watchdog/auto reconnect. Real USB
+                         * capture still waits for its Android-granted fd.
+                         * Start on a worker to keep the render loop alive. */
                         if (app.selected_device >= 0 && app.selected_device < app.device_count &&
                             app.devices[app.selected_device].type == DEVICE_TYPE_PLAYBACK) {
                             (void)gui_app_start_capture(&app);
-                        } else if (android_usb_has_fd()) {
+                        } else if ((app.selected_device >= 0 &&
+                                    app.selected_device < app.device_count &&
+                                    app.devices[app.selected_device].type == DEVICE_TYPE_SIMULATED) ||
+                                   android_usb_has_fd()) {
                             gui_app_start_capture_async(&app);
                             gui_set_reconnect_target_from_selected(&app, &reconnect_target);
                             app.reconnect_pending = false;

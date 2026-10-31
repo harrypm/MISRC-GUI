@@ -14,6 +14,13 @@ int gui_monitor_server_start(gui_app_t *app, uint16_t port);
 bool gui_monitor_server_handle_request(uintptr_t socket_handle,
                                        gui_app_t *app, const char *request_headers);
 void gui_monitor_server_stop(void);
+/* Record requests are accepted by the socket worker and executed later on
+ * the server main thread. The request id correlates the later result with
+ * the requesting M-Client; status results are kept per server session. */
+uint64_t gui_monitor_server_queue_record(gui_app_t *app, int command);
+int gui_monitor_server_take_record(gui_app_t *app, uint64_t *request_id);
+void gui_monitor_server_record_result(uint64_t request_id, unsigned result,
+                                      const char *detail);
 bool gui_monitor_server_active(void);
 uint16_t gui_monitor_server_port(void);
 int gui_monitor_client_start(gui_app_t *app, const char *host, uint16_t port);
@@ -48,6 +55,11 @@ bool gui_monitor_client_record_stats(gui_monitor_record_stats_t *out);
 void gui_monitor_client_reset_clips(int channel);
 /* 0=none/connecting, 1=unreachable, 2=legacy MISRC-M/1, 3=unknown response. */
 int gui_monitor_client_last_error(void);
+/* Per-session request error counters, independent of server capture errors.
+ * Established monitor sessions are retained through request dropouts. */
+uint32_t gui_monitor_client_status_dropouts(void);
+uint32_t gui_monitor_client_preview_dropouts(void);
+bool gui_monitor_client_preview_error(void);
 /* Read-only server filesystem navigation and server-owned Output folder.
  * Available only when connected via MISRC-M/2; no local path mixing. */
 void gui_monitor_client_browse_folders(const char *path, unsigned page);

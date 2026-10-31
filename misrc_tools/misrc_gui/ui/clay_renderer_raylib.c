@@ -10,6 +10,9 @@
 #include "../visualization/gui_panel.h"
 #include "../visualization/gui_vu_meter.h"
 #include "gui_ui.h"
+#if defined(__ANDROID__)
+#include "../core/gui_android_viewport.h"
+#endif
 #include "gui_font.h"
 #include <stdint.h>
 #include <string.h>
@@ -59,6 +62,10 @@ void Clay_Raylib_Close()
 void Clay_Raylib_Render(Clay_RenderCommandArray renderCommands, Font* fonts)
 {
     float ui_scale = gui_ui_get_scale_factor();
+    float canvas_zoom = 1.0f, canvas_x = 0.0f, canvas_y = 0.0f;
+#if defined(__ANDROID__)
+    gui_android_viewport_get_render_transform(&canvas_zoom, &canvas_x, &canvas_y);
+#endif
     Matrix outer_modelview = rlGetMatrixModelview();
     rlDrawRenderBatchActive();
     rlScalef(ui_scale, ui_scale, 1.0f);
@@ -106,10 +113,14 @@ void Clay_Raylib_Render(Clay_RenderCommandArray renderCommands, Font* fonts)
             }
             case CLAY_RENDER_COMMAND_TYPE_SCISSOR_START: {
                 Clay_BoundingBox box = renderCommand->boundingBox;
-                int left = (int)floorf(box.x * ui_scale);
-                int top = (int)floorf(box.y * ui_scale);
-                int right = (int)ceilf((box.x + box.width) * ui_scale);
-                int bottom = (int)ceilf((box.y + box.height) * ui_scale);
+                /* BeginScissorMode uses framebuffer pixels, not the GL
+                 * modelview. Match the same zoom + pan that draws the Clay
+                 * shapes, otherwise text/panels get clipped while pinching.
+                 * On desktop the transform is identity. */
+                int left = (int)floorf(canvas_x + (box.x * ui_scale) * canvas_zoom);
+                int top = (int)floorf(canvas_y + (box.y * ui_scale) * canvas_zoom);
+                int right = (int)ceilf(canvas_x + ((box.x + box.width) * ui_scale) * canvas_zoom);
+                int bottom = (int)ceilf(canvas_y + ((box.y + box.height) * ui_scale) * canvas_zoom);
                 BeginScissorMode(left, top, right - left, bottom - top);
                 break;
             }
