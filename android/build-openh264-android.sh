@@ -20,7 +20,7 @@ if [[ ! -f "$SRC/meson.build" ]]; then
 fi
 meson setup "$BUILD" "$SRC" --cross-file "$CROSS" \
   --prefix "$DEPS_PREFIX" --libdir lib --buildtype release \
-  --default-library static --wipe
+  --default-library static
 meson compile -C "$BUILD"
 meson install -C "$BUILD"
 DEPS_PREFIX="$DEPS_PREFIX" "$ROOT/android/android-pkg-config" --modversion openh264
