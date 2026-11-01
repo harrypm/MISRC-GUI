@@ -324,6 +324,13 @@ jobs:
           meson setup "$BUILD_DIR" misrc_tools --buildtype release
           meson compile -C "$BUILD_DIR" misrc_capture misrc_extract misrc_gui
           test -x "$BUILD_DIR/misrc_gui"
+          # A successful build is not sufficient: verify that the produced GUI
+          # actually links the modern codec backend rather than compiling the
+          # OpenH264-only fallback path.
+          ldd "$BUILD_DIR/misrc_gui" | tee /tmp/misrc_gui_ldd.txt
+          grep -q 'libavcodec.so' /tmp/misrc_gui_ldd.txt
+          grep -q 'libswscale.so' /tmp/misrc_gui_ldd.txt
+          grep -q 'libavutil.so' /tmp/misrc_gui_ldd.txt
 
       - name: Smoke test built binaries
         run: |
