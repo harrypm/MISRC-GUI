@@ -577,10 +577,10 @@ if raylib_dep.found()
 
   # Optional modern codecs: link FFmpeg when its headers/libs are available.
   # Existing Android and static Windows builds retain OpenH264 fallback.
-  avcodec_dep = dependency('libavcodec', required: false)
-  avutil_dep = dependency('libavutil', required: false)
-  swscale_dep = dependency('libswscale', required: false)
-  if avcodec_dep.found() and avutil_dep.found() and swscale_dep.found() and host_system != 'android' and not windows_static_deps
+  avcodec_dep = dependency('libavcodec', required: false, static: windows_static_deps or host_system == 'android')
+  avutil_dep = dependency('libavutil', required: false, static: windows_static_deps or host_system == 'android')
+  swscale_dep = dependency('libswscale', required: false, static: windows_static_deps or host_system == 'android')
+  if avcodec_dep.found() and avutil_dep.found() and swscale_dep.found()
     gui_deps += [avcodec_dep, avutil_dep, swscale_dep]
     ffmpeg_define = '-DMISRC_HAVE_FFMPEG=1'
     message('MISRC monitor AV1/VP9/HEVC FFmpeg codecs enabled')

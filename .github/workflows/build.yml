@@ -52,6 +52,19 @@ jobs:
       - name: Test missing-dependency detection
         run: |
           bash scripts/test-build-deps-check.sh
+  monitor-ffmpeg-codec-smoke:
+    name: FFmpeg AV1 VP9 HEVC codec smoke (Linux)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Install modern video codec development libraries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libavcodec-dev libavutil-dev libswscale-dev
+      - name: Build and exercise FFmpeg monitor codec backend
+        run: sh scripts/test-monitor-video-ffmpeg.sh
+
   preflight-cross-platform-guards:
     name: Cross-platform guard tests (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
