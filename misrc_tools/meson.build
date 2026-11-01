@@ -498,6 +498,14 @@ if raylib_dep.found()
     'misrc_gui/net/monitor_local_save_protocol.c',
     'misrc_gui/net/gui_remote_fs.c',
     'misrc_gui/net/gui_remote_display.c',
+    'misrc_gui/net/gui_monitor_video_wire.c',
+    'misrc_gui/net/gui_monitor_video_i420.c',
+    'misrc_gui/net/gui_monitor_video_framebox.c',
+    'misrc_gui/net/gui_monitor_video_codec.c',
+    'misrc_gui/net/gui_monitor_video_ffmpeg.c',
+    'misrc_gui/net/gui_monitor_video_mux.c',
+    'misrc_gui/net/gui_monitor_video_server.c',
+    'misrc_gui/net/gui_monitor_video_client.c',
     # Output
     'misrc_gui/output/gui_record.c',
     'misrc_gui/output/gui_record_direct.c',
@@ -543,8 +551,49 @@ if raylib_dep.found()
   zstd_dep = dependency('libzstd', required: true, static: windows_static_deps)
   gui_deps = deps + [ raylib_dep, fftw3f_dep ]
   gui_deps += [ zstd_dep ]
+  # OpenH264 is mandatory for the Monitor Client's video feature. Do not
+  # silently produce an apparently successful GUI without H.264 support.
+  openh264_dep = dependency('openh264', required: false, static: windows_static_deps or host_system == 'android')
+  if openh264_dep.found()
+    gui_deps += [openh264_dep]
+    # GUI is C, while the static OpenH264 archive uses the C++ runtime.
+    # Link the runtime AFTER OpenH264 to resolve RTTI/new/delete on MinGW
+    # and libc++ on Android. Unmodified builds stay C-only.
+    if windows_static_deps
+      # MSYS2 UCRT64/GCC uses libstdc++; CLANGARM64 uses libc++.
+      if host_cpu_family == 'aarch64'
+        gui_deps += [meson.get_compiler('c').find_library('c++', required: true)]
+      else
+        gui_deps += [meson.get_compiler('c').find_library('stdc++', required: true)]
+      endif
+    elif host_system == 'android'
+      gui_deps += [meson.get_compiler('c').find_library('c++', required: true)]
+    endif
+    message('MISRC monitor H.264 video codec enabled')
+    openh264_define = '-DMISRC_HAVE_OPENH264=1'
+  else
+    error('Missing required dependency: OpenH264 (pkg-config: openh264). Install the development library before building misrc_gui (Ubuntu/Debian: sudo apt install libopenh264-dev; macOS: brew install openh264). Monitor Client video cannot work without it.')
+  endif
 
-  gui_cflags = cflags + [
+  # Optional modern codecs: link FFmpeg when its headers/libs are available.
+  # Existing Android and static Windows builds retain OpenH264 fallback.
+  avcodec_dep = dependency('libavcodec', required: false, static: windows_static_deps or host_system == 'android')
+  avutil_dep = dependency('libavutil', required: false, static: windows_static_deps or host_system == 'android')
+  swscale_dep = dependency('libswscale', required: false, static: windows_static_deps or host_system == 'android')
+  # The Windows UCRT FFmpeg distribution is built with every codec and
+  # pulls in hundreds of unrelated static archives. This conflicts with the
+  # upstream single-EXE/no-DLL packaging contract (including duplicate
+  # rust_eh_personality definitions). Modern codecs remain optional on
+  # platforms where their binaries can be redistributed safely.
+  if avcodec_dep.found() and avutil_dep.found() and swscale_dep.found() and not windows_static_deps
+    gui_deps += [avcodec_dep, avutil_dep, swscale_dep]
+    ffmpeg_define = '-DMISRC_HAVE_FFMPEG=1'
+    message('MISRC monitor AV1/VP9/HEVC FFmpeg codecs enabled')
+  else
+    ffmpeg_define = '-DMISRC_HAVE_FFMPEG=0'
+    message('MISRC monitor modern codecs unavailable; OpenH264 fallback active')
+  endif
+  gui_cflags = cflags + [openh264_define, ffmpeg_define] + [
     '-O3',                    # Maximum optimization (should already be set by buildtype=release)
     '-funroll-loops',         # Unroll loops for better performance
     '-ftree-vectorize',       # Enable auto-vectorization

@@ -3157,6 +3157,11 @@ static void complete_field_pll(cvbs_decoder_t *decoder) {
            (size_t)frame_w * 3u * (size_t)frame_h);
     // Signal that new frame is ready for the render thread
     atomic_store(&decoder->display_ready, 1);
+    /* No network or encoder work here: optional bounded frame handoff only.
+     * The decoder owns display_back; callback must copy before returning. */
+    if (decoder->monitor_frame_sink)
+        decoder->monitor_frame_sink(decoder->monitor_frame_sink_context,
+            decoder->display_back, (unsigned)frame_w, (unsigned)frame_h, get_time_us());
     decoder->state.frame_complete = true;
     decoder->state.frames_decoded++;
     decoder->debug.fields_decoded++;
@@ -4160,6 +4165,15 @@ void gui_cvbs_process_buffer(cvbs_decoder_t *decoder,
         g_field_decode_us += spent;
         g_prof_process_us += spent;
     }
+}
+
+/* Install a sink before starting decode; caller owns the sink lifetime. */
+void gui_cvbs_set_monitor_frame_sink(cvbs_decoder_t *decoder,
+    void (*callback)(void *, const uint8_t *, unsigned, unsigned, uint64_t),
+    void *context) {
+    if (!decoder) return;
+    decoder->monitor_frame_sink = callback;
+    decoder->monitor_frame_sink_context = context;
 }
 
 //-----------------------------------------------------------------------------

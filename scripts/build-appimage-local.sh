@@ -104,6 +104,9 @@ assert_glibc_floor() {
 
 build_native() {
   require_tools git cmake meson ninja pkg-config curl convert zip unzip patchelf strings file
+  # Don't delete the existing build/deps directories if a required system
+  # codec or capture library is missing.
+  bash "$SCRIPT_DIR/check-build-deps.sh" --all
   resolve_arch
   local version
   version="$(resolve_version)"
@@ -297,9 +300,13 @@ run_container_internal() {
     git \
     imagemagick \
     libasound2-dev \
+    libavcodec-dev \
+    libavutil-dev \
+    libswscale-dev \
     libfftw3-dev \
     libflac-dev \
     libgl1-mesa-dev \
+    libopenh264-dev \
     libsoxr-dev \
     libusb-1.0-0-dev \
     libuvc-dev \

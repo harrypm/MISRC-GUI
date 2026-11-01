@@ -26,6 +26,7 @@ on:
   push:
     branches:
       - main
+      - feature/monitor-h264-video-20261101
     tags:
       - 'v*'
 
@@ -48,6 +49,22 @@ jobs:
         run: |
           set -eux
           python3 misrc_tools/test/ci_guard_tests.py
+      - name: Test missing-dependency detection
+        run: |
+          bash scripts/test-build-deps-check.sh
+  monitor-ffmpeg-codec-smoke:
+    name: FFmpeg AV1 VP9 HEVC codec smoke (Linux)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Install modern video codec development libraries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libavcodec-dev libavutil-dev libswscale-dev
+      - name: Build and exercise FFmpeg monitor codec backend
+        run: sh scripts/test-monitor-video-ffmpeg.sh
+
   preflight-cross-platform-guards:
     name: Cross-platform guard tests (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
@@ -123,9 +140,10 @@ jobs:
             linuxdeploy_arch: aarch64
             artifact_suffix: arm64
     runs-on: ${{ matrix.runner }}
+    # Run Linux video/codec packaging after baseline preflight; macOS guards
+    # are independent and may queue on scarce macOS runners.
     needs:
       - preflight-guard-tests
-      - preflight-cross-platform-guards
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -159,11 +177,15 @@ jobs:
             git \
             imagemagick \
             libasound2-dev \
+            libavcodec-dev \
+            libavutil-dev \
+            libswscale-dev \
             libfftw3-dev \
             libgl1-mesa-dev \
             libusb-1.0-0-dev \
             libuvc-dev \
             libsoxr-dev \
+            libopenh264-dev \
             libx11-dev \
             libxcursor-dev \
             libxi-dev \
@@ -283,6 +305,14 @@ jobs:
           cmake --build .deps/raylib/build --parallel
           cmake --install .deps/raylib/build
 
+      - name: Verify OpenH264 encode/decode round-trip
+        run: |
+          set -eux
+          pkg-config --modversion openh264
+          sh scripts/test-monitor-video-codec.sh
+          sh scripts/test-monitor-video-stage1.sh
+          sh scripts/test-monitor-video-framebox.sh
+
       - name: Build MISRC tools (Meson)
         env:
           MISRC_TOOLS_VERSION_OVERRIDE: ${{ steps.version.outputs.version }}
@@ -295,6 +325,13 @@ jobs:
           meson setup "$BUILD_DIR" misrc_tools --buildtype release
           meson compile -C "$BUILD_DIR" misrc_capture misrc_extract misrc_gui
           test -x "$BUILD_DIR/misrc_gui"
+          # A successful build is not sufficient: verify that the produced GUI
+          # actually links the modern codec backend rather than compiling the
+          # OpenH264-only fallback path.
+          ldd "$BUILD_DIR/misrc_gui" | tee /tmp/misrc_gui_ldd.txt
+          grep -q 'libavcodec.so' /tmp/misrc_gui_ldd.txt
+          grep -q 'libswscale.so' /tmp/misrc_gui_ldd.txt
+          grep -q 'libavutil.so' /tmp/misrc_gui_ldd.txt
 
       - name: Smoke test built binaries
         run: |
@@ -380,9 +417,10 @@ jobs:
   android-apk:
     name: Android APK build (arm64-v8a)
     runs-on: ubuntu-22.04
+    # Build independently while macOS cross-platform guards are queued;
+    # those guards remain a separate required CI job.
     needs:
       - preflight-guard-tests
-      - preflight-cross-platform-guards
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -442,6 +480,12 @@ jobs:
           export DEPS_PREFIX="$PWD/.deps/install-android-arm64"
           bash android/gen-cross-file.sh
 
+      - name: Cross-build OpenH264 for Android
+        run: |
+          set -eux
+          export DEPS_PREFIX="$PWD/.deps/install-android-arm64"
+          bash android/build-openh264-android.sh
+
       - name: Cross-compile misrc_gui (libmisrc_gui.so)
         run: |
           set -eux
@@ -486,9 +530,10 @@ jobs:
   windows-exe:
     name: Windows EXE build (x86_64)
     runs-on: windows-2022
+    # Build independently while macOS cross-platform guards are queued;
+    # those guards remain a separate required CI job.
     needs:
       - preflight-guard-tests
-      - preflight-cross-platform-guards
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -526,6 +571,7 @@ jobs:
             mingw-w64-ucrt-x86_64-libjpeg-turbo
             mingw-w64-ucrt-x86_64-libusb
             mingw-w64-ucrt-x86_64-libsoxr
+            mingw-w64-ucrt-x86_64-openh264
             mingw-w64-ucrt-x86_64-meson
             mingw-w64-ucrt-x86_64-nasm
             mingw-w64-ucrt-x86_64-ninja
@@ -547,6 +593,7 @@ jobs:
             mingw-w64-ucrt-x86_64-libjpeg-turbo
             mingw-w64-ucrt-x86_64-libusb
             mingw-w64-ucrt-x86_64-libsoxr
+            mingw-w64-ucrt-x86_64-openh264
             mingw-w64-ucrt-x86_64-meson
             mingw-w64-ucrt-x86_64-nasm
             mingw-w64-ucrt-x86_64-ninja
@@ -707,9 +754,10 @@ jobs:
   windows-exe-arm64:
     name: Windows EXE build (arm64)
     runs-on: windows-11-arm
+    # Build independently while macOS cross-platform guards are queued;
+    # those guards remain a separate required CI job.
     needs:
       - preflight-guard-tests
-      - preflight-cross-platform-guards
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -746,6 +794,7 @@ jobs:
             mingw-w64-clang-aarch64-libjpeg-turbo
             mingw-w64-clang-aarch64-libusb
             mingw-w64-clang-aarch64-libsoxr
+            mingw-w64-clang-aarch64-openh264
             mingw-w64-clang-aarch64-llvm-openmp
             mingw-w64-clang-aarch64-meson
             mingw-w64-clang-aarch64-ninja
@@ -768,6 +817,7 @@ jobs:
             mingw-w64-clang-aarch64-libjpeg-turbo
             mingw-w64-clang-aarch64-libusb
             mingw-w64-clang-aarch64-libsoxr
+            mingw-w64-clang-aarch64-openh264
             mingw-w64-clang-aarch64-llvm-openmp
             mingw-w64-clang-aarch64-meson
             mingw-w64-clang-aarch64-ninja
@@ -926,9 +976,10 @@ jobs:
           - arch: x86_64
             runner: macos-15-intel
     runs-on: ${{ matrix.runner }}
+    # Build independently while macOS cross-platform guards are queued;
+    # those guards remain a separate required CI job.
     needs:
       - preflight-guard-tests
-      - preflight-cross-platform-guards
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -976,6 +1027,9 @@ jobs:
               brew install "$formula"
             fi
           done
+          if ! brew list --versions openh264 >/dev/null 2>&1; then
+            brew install openh264
+          fi
 
       - name: Build and stage architecture app bundle
         env:
