@@ -1,6 +1,3 @@
-#if defined(_WIN32)
-#include <winsock2.h>
-#endif
 #include "gui_monitor_video_server.h"
 #include "gui_monitor_video_codec.h"
 #include "gui_monitor_video_framebox.h"
@@ -14,6 +11,15 @@
 #include <string.h>
 #include <time.h>
 #if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOGDI
+#define NOGDI
+#endif
+#ifndef NOUSER
+#define NOUSER
+#endif
 #include <winsock2.h>
 #define MVD_SEND_SOCKET(s,b,n) send((SOCKET)(s),(const char *)(b),(int)(n),0)
 #else

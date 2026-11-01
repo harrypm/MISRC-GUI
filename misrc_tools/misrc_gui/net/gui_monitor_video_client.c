@@ -10,6 +10,15 @@
 #include <string.h>
 #include <time.h>
 #if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOGDI
+#define NOGDI
+#endif
+#ifndef NOUSER
+#define NOUSER
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
 typedef SOCKET mvd_socket;
