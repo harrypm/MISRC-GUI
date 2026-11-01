@@ -331,6 +331,11 @@ typedef struct cvbs_decoder {
     uint8_t *display_back;         // Back buffer - written by display thread
     atomic_int display_ready;      // 1 when back buffer has new frame to swap
 
+    /* Optional borrowed RGB24 frame callback; set only while decode is stopped. */
+    void (*monitor_frame_sink)(void *context, const uint8_t *rgb,
+                               unsigned width, unsigned height, uint64_t timestamp_us);
+    void *monitor_frame_sink_context;
+
     // GPU resources for video display
     Image frame_image;
     Texture2D frame_texture;
@@ -484,6 +489,13 @@ typedef struct cvbs_decoder {
 // Initialize decoder with maximum dimensions
 // Returns true on success, false on allocation failure
 bool gui_cvbs_init(cvbs_decoder_t *decoder);
+
+/* Callback executes synchronously on decoder worker; must not block.
+ * Set/unset only before/after decoding, never concurrently with processing.
+ * Pixel pointer is borrowed for the duration of the callback only. */
+void gui_cvbs_set_monitor_frame_sink(cvbs_decoder_t *decoder,
+    void (*callback)(void *, const uint8_t *, unsigned, unsigned, uint64_t),
+    void *context);
 
 // Cleanup decoder resources
 void gui_cvbs_cleanup(cvbs_decoder_t *decoder);
