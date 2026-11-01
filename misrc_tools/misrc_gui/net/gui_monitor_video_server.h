@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "../processing/gui_rf_preview_worker.h"
+#include "gui_monitor_video_options.h"
 /* One bounded background decode producer per channel, separate from recording. */
 int gui_monitor_video_server_start(void);
 void gui_monitor_video_server_stop(void);
@@ -18,5 +19,5 @@ void gui_monitor_video_server_stats(char *output,size_t capacity);
  * disconnect or server stop. Channel 0=A, 1=B; mode 0=CVBS, 1=Tape, 2=VHS RF.
  * Caller sends an HTTP error if this returns false. */
 bool gui_monitor_video_server_stream(uintptr_t fd, unsigned channel,
-    unsigned mode, unsigned bitrate_bps, unsigned fps_x100);
+    unsigned mode, unsigned bitrate_bps, unsigned fps_x100, uint32_t controls);
 #endif

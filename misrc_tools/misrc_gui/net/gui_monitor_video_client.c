@@ -1,6 +1,7 @@
 #include "gui_monitor_video_client.h"
 #include "gui_monitor_video_codec.h"
 #include "gui_monitor_video_wire.h"
+#include "gui_monitor_video_options.h"
 #include "../visualization/gui_text.h"
 #include "../ui/gui_ui.h"
 #include "../../common/threading.h"
@@ -42,6 +43,7 @@ typedef struct {
     thrd_t worker;
     atomic_bool stop,active;
     atomic_uint mode;
+    atomic_uint controls;
     atomic_int video_http_status; /* 0=connecting, negative=network/response error, positive=HTTP code */
     atomic_uint_fast64_t seen_seconds;
     atomic_flag pixel_busy;
@@ -115,13 +117,13 @@ static int mvd_read_status(mvd_socket sock) {
     }
     return -1;
 }
-static int mvd_receive(unsigned channel,mvd_client_channel *ch,unsigned mode) {
+static int mvd_receive(unsigned channel,mvd_client_channel *ch,unsigned mode,uint32_t controls) {
     mvd_socket sock=mvd_connect(g_mvd_client.host,g_mvd_client.port);
     if(sock==MVD_SOCKET_BAD){atomic_store(&ch->video_http_status,-1);return -1;}
-    char request[256];
+    char request[320];
     int n=snprintf(request,sizeof(request),
-       "GET /monitor/video?channel=%u&mode=%u&bps=750000&fps=2500 HTTP/1.0\r\n"
-       "Connection: close\r\n\r\n",channel,mode);
+       "GET /monitor/video?channel=%u&mode=%u&bps=750000&fps=2500&ctl=%u HTTP/1.0\r\n"
+       "Connection: close\r\n\r\n",channel,mode,(unsigned)controls);
     if(n<1 || (size_t)n>=sizeof(request) ||
        mvd_send_full(sock,request,(size_t)n)!=0){
         atomic_store(&ch->video_http_status,-1);
@@ -146,7 +148,7 @@ static int mvd_receive(unsigned channel,mvd_client_channel *ch,unsigned mode) {
     unsigned errors=0;
     bool synced=false;
     while(!atomic_load_explicit(&ch->stop,memory_order_acquire) &&
-          mvd_visible(ch) && atomic_load(&ch->mode)==mode) {
+          mvd_visible(ch) && atomic_load(&ch->controls)==controls) {
         int bytes=recv(sock,(char *)buffer,sizeof(buffer),0);
         if(bytes==0)break;
         if(bytes<0) {
@@ -196,7 +198,10 @@ static int mvd_client_thread(void *arg) {
     mvd_client_channel *ch=(mvd_client_channel *)arg;
     unsigned channel=(unsigned)(ch-&g_mvd_client.channels[0]);
     while(!atomic_load_explicit(&ch->stop,memory_order_acquire)) {
-        if(mvd_visible(ch)) (void)mvd_receive(channel,ch,atomic_load(&ch->mode));
+        if(mvd_visible(ch)) {
+            uint32_t ctl=atomic_load(&ch->controls);
+            (void)mvd_receive(channel,ch,mvd_ctl_get(ctl,MVD_CTL_MODE,3u),ctl);
+        }
         for(int i=0;i<40 && !atomic_load(&ch->stop);i++)thrd_sleep_ms(10);
     }
     return 0;
@@ -212,6 +217,7 @@ int gui_monitor_video_client_start(const char *host,uint16_t port) {
         if(!ch->pixels)return -1;
         atomic_flag_clear(&ch->pixel_busy);
         atomic_store(&ch->mode,0);
+        atomic_store(&ch->controls,mvd_ctl_default(0));
         atomic_store(&ch->video_http_status,0);
         atomic_store(&ch->seen_seconds,0);
         atomic_store(&ch->stop,false);

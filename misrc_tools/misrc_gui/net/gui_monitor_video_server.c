@@ -1,4 +1,5 @@
 #include "gui_monitor_video_server.h"
+#include "gui_monitor_video_options.h"
 #include "gui_monitor_video_codec.h"
 #include "gui_monitor_video_framebox.h"
 #include "gui_monitor_video_i420.h"
@@ -60,6 +61,7 @@ typedef struct {
     atomic_uint_fast64_t read_idx,write_idx;
     atomic_bool viewing,gap;
     atomic_uint mode;
+    atomic_uint controls;
     bool worker_started;
 #if LIBSOXR_ENABLED
     soxr_t cvbs_resampler;
@@ -141,6 +143,7 @@ static bool mvd_cvbs_resampled(mvd_channel *ch,const int16_t *input,
 static int mvd_decode_thread(void *argument) {
     mvd_channel *ch=(mvd_channel *)argument;
     unsigned last_mode=~0u;
+    uint32_t last_controls=UINT32_MAX;
     bool have_previous=false;
     gui_rf_block_info_t previous={0};
     while (atomic_load_explicit(&s_active,memory_order_acquire)) {
@@ -154,13 +157,28 @@ static int mvd_decode_thread(void *argument) {
             continue;
         }
         unsigned mode=atomic_load_explicit(&ch->mode,memory_order_acquire);
-        if(mode!=last_mode) {
+        uint32_t controls=atomic_load_explicit(&ch->controls,memory_order_acquire);
+        if(mode!=last_mode || controls!=last_controls) {
             gui_cvbs_reset(ch->cvbs);
 #if LIBSOXR_ENABLED
             mvd_resampler_clear(ch);
 #endif
             ch->cvbs->decoder_mode=mode==1?CVBS_DECODER_MODE_TAPE:CVBS_DECODER_MODE_CVBS;
+            /* Apply only on the owning decoder worker. No HTTP or capture
+             * thread can mutate these unguarded Harry decoder fields. */
+            unsigned system=mvd_ctl_get(controls,mode==1?MVD_CTL_TAPE_SYSTEM:MVD_CTL_SYSTEM,3u);
+            gui_cvbs_set_format(ch->cvbs,(int)system);
+            ch->cvbs->frame_view_mode=mvd_ctl_get(controls,MVD_CTL_FRAME,1u)?CVBS_FRAME_VIEW_FULL:CVBS_FRAME_VIEW_ACTIVE;
+            ch->cvbs->level_mode=mvd_ctl_get(controls,MVD_CTL_LEVELS,1u)?CVBS_LEVEL_MODE_FIXED:CVBS_LEVEL_MODE_AUTO;
+            ch->cvbs->fixed_levels_valid=false;
+            ch->cvbs->sync_mode=mvd_ctl_get(controls,MVD_CTL_SYNC,1u)?CVBS_SYNC_MODE_FIXED:CVBS_SYNC_MODE_AUTO;
+            ch->cvbs->fixed_sync_locked=false;
+            ch->cvbs->colour_mode=mvd_ctl_get(controls,MVD_CTL_COLOUR,1u)?CVBS_COLOUR_AUTO:CVBS_COLOUR_OFF;
+            ch->cvbs->prev_burst_valid=0;
+            ch->cvbs->tape_format=(cvbs_tape_format_t)mvd_ctl_get(controls,MVD_CTL_TAPE_FAMILY,7u);
+            ch->cvbs->tape_mode=(cvbs_tape_mode_t)mvd_ctl_get(controls,MVD_CTL_TAPE_SPEED,3u);
             last_mode=mode;
+            last_controls=controls;
             have_previous=false;
         }
         uint64_t r=atomic_load_explicit(&ch->read_idx,memory_order_relaxed);
@@ -227,6 +245,7 @@ int gui_monitor_video_server_start(void) {
             gui_rf_preview_worker_set_paused(ch->rf,true);
             atomic_store(&ch->viewing,false);
             atomic_store(&ch->mode,0);
+            atomic_store(&ch->controls,mvd_ctl_default(0));
             atomic_store(&ch->read_idx,0);
             atomic_store(&ch->write_idx,0);
             atomic_store(&ch->gap,false);
@@ -329,8 +348,8 @@ void gui_monitor_video_server_stats(char *output,size_t capacity) {
 }
 
 bool gui_monitor_video_server_stream(uintptr_t fd,unsigned channel,
-    unsigned mode,unsigned bitrate_bps,unsigned fps_x100) {
-    if(!atomic_load(&s_active) || channel>1 || mode>3 ||
+    unsigned mode,unsigned bitrate_bps,unsigned fps_x100,uint32_t controls) {
+    if(!atomic_load(&s_active) || channel>1 || !mvd_ctl_valid(controls,mode) ||
        bitrate_bps<64000u || bitrate_bps>4000000u ||
        fps_x100<500u || fps_x100>3000u)return false;
     mvd_channel *ch=&s_channels[channel];
@@ -343,9 +362,14 @@ bool gui_monitor_video_server_stream(uintptr_t fd,unsigned channel,
 #endif
     if(atomic_exchange(&ch->viewing,true))return false;
     atomic_fetch_add(&s_stream_calls,1);
+    atomic_store(&ch->controls,controls);
     atomic_store(&ch->mode,mode);
     atomic_store(&ch->gap,true);
-    if(mode>=2)gui_rf_preview_worker_set_profile(ch->rf,mode==3?GUI_RF_PROFILE_NTSC_VHS:GUI_RF_PROFILE_PAL_VHS);
+    if(mode>=2) {
+        gui_rf_preview_worker_set_profile(ch->rf,(gui_rf_profile_t)mvd_ctl_rf_profile(controls));
+        gui_rf_preview_worker_set_frame_mode(ch->rf,mvd_ctl_get(controls,MVD_CTL_FRAME,1u)!=0);
+        gui_rf_preview_worker_set_budget(mvd_ctl_budget(controls)/100.0);
+    }
     gui_rf_preview_worker_set_paused(ch->rf,mode<2);
     const char response[]="HTTP/1.0 200 OK\r\nContent-Type: application/x-misrc-h264\r\n"
         "Cache-Control: no-store\r\nConnection: close\r\n\r\n";

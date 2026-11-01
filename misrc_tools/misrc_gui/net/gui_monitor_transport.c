@@ -2,6 +2,7 @@
  * MRD5/Zstd-1 carries original Harry waveform/FFT display values only. */
 #include "gui_monitor_transport.h"
 #include "gui_monitor_video_server.h"
+#include "gui_monitor_video_options.h"
 #include "gui_monitor_video_client.h"
 #include "gui_monitor_session_state.h"
 #include "gui_remote_display.h"
@@ -724,7 +725,13 @@ bool gui_monitor_server_handle_request(uintptr_t socket_handle,
         unsigned mode=(unsigned)mon_arg(query,"mode",-1);
         unsigned bps=(unsigned)mon_arg(query,"bps",750000);
         unsigned fps=(unsigned)mon_arg(query,"fps",2500);
-        if(!gui_monitor_video_server_stream((uintptr_t)fd,channel,mode,bps,fps))
+        int supplied=mon_arg(query,"ctl",-1);
+        uint32_t ctl=supplied<0?mvd_ctl_default(mode):(uint32_t)supplied;
+        if(!mvd_ctl_valid(ctl,mode)) {
+            mon_answer(fd,400,"text/plain","invalid video control combination\n");
+            return false;
+        }
+        if(!gui_monitor_video_server_stream((uintptr_t)fd,channel,mode,bps,fps,ctl))
             mon_answer(fd,409,"text/plain","H.264 video unavailable or channel busy\n");
         return false;
     }
