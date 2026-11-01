@@ -9,6 +9,7 @@
 
 #include "gui_extract.h"
 #include "../net/gui_monitor_transport.h"
+#include "../net/gui_monitor_video_server.h"
 #include "../net/gui_remote_display.h"
 #include "gui_rf_stream_marks.h"
 #include "../core/gui_app.h"
@@ -485,6 +486,12 @@ static int extraction_thread(void *ctx) {
         if (!s_extract_app->headless_server)
             gui_video_submit_rf(s_extract_app, mapped_a, mapped_b, stamp.counts[0], stamp.counts[1],
                                   stamp.info, atomic_load(&s_extract_app->rf_preview_input_supported));
+        /* Continuous, bounded headless video input. Capture/record never wait
+         * for a decoder, H.264 encoder, or slow monitor connection. */
+        if(gui_monitor_server_active())
+            gui_monitor_video_server_capture(mapped_a,mapped_b,
+                stamp.counts[0],stamp.counts[1],stamp.info,
+                atomic_load(&s_extract_app->rf_preview_input_supported));
         source_offset += BUFFER_READ_SIZE;
         // Update expensive UI stats at the same dynamic stride used for display.
         if ((frame_count % ui_stride) == 0) {

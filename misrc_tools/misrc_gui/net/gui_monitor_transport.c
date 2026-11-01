@@ -1,6 +1,8 @@
 /* Independent M-Server/M-Client transport. No full RF /rf or /baseband.
  * MRD5/Zstd-1 carries original Harry waveform/FFT display values only. */
 #include "gui_monitor_transport.h"
+#include "gui_monitor_video_server.h"
+#include "gui_monitor_video_client.h"
 #include "gui_monitor_session_state.h"
 #include "gui_remote_display.h"
 #include "gui_remote_fs.h"
@@ -708,6 +710,15 @@ bool gui_monitor_server_handle_request(uintptr_t socket_handle,
         }
         mon_answer(fd,200,"text/plain","clip counters cleared\n");return false;
     }
+    if(strcmp(path,"/monitor/video")==0){
+        unsigned channel=(unsigned)mon_arg(query,"channel",-1);
+        unsigned mode=(unsigned)mon_arg(query,"mode",-1);
+        unsigned bps=(unsigned)mon_arg(query,"bps",750000);
+        unsigned fps=(unsigned)mon_arg(query,"fps",2500);
+        if(!gui_monitor_video_server_stream((uintptr_t)fd,channel,mode,bps,fps))
+            mon_answer(fd,409,"text/plain","H.264 video unavailable or channel busy\n");
+        return false;
+    }
     if(strcmp(path,"/monitor/preview")==0){mon_answer_preview(fd,query);return false;}
     if(strcmp(path,"/monitor/hello")==0 || strcmp(path,"/monitor/status")==0) {
         char body[1800];
@@ -816,12 +827,15 @@ int gui_monitor_server_start(gui_app_t *app,uint16_t port) {
     snprintf(g_fs_server.current,sizeof(g_fs_server.current),"%s",app->settings.output_path);
     fs_unlock();
     atomic_store(&g_server.active,true);
+    if(gui_monitor_video_server_start()!=0)
+        fprintf(stderr,"[M-VIDEO] OpenH264 unavailable: video preview disabled\n");
     fprintf(stderr,"[M-SERVER] Monitor MISRC-M/2 endpoints enabled on shared TCP %u (Zstd-1 preview + control)\n",(unsigned)port);
     return 0;
 }
 void gui_monitor_server_stop(void){
     if(!atomic_load(&g_server.active))return;
     atomic_store(&g_server.active,false);
+    gui_monitor_video_server_stop();
     gui_monitor_local_save_server_shutdown();
     g_server.app=NULL;g_server.port=0;
 }
@@ -1216,12 +1230,15 @@ int gui_monitor_client_start(gui_app_t *app,const char *host,uint16_t port){
     for(int ch=0;ch<2;ch++) atomic_store(&g_client.reset_clips_pending[ch],false);
     if(thrd_create(&g_client.thread,mon_client_thread,NULL)!=thrd_success)return -1;
     atomic_store(&g_client.running,true);
+    if(gui_monitor_video_client_start(host,port)!=0)
+        fprintf(stderr,"[M-VIDEO] OpenH264 client unavailable; waveform/FFT unaffected\n");
     fprintf(stderr,"[M-CLIENT] Connecting to monitor %s:%u (Zstd-1 original waveform/FFT + status/control)\n",host,(unsigned)port);
     return 0;
 }
 void gui_monitor_client_stop(void){
     if(!atomic_load(&g_client.running))return;
     atomic_store(&g_client.stopping,true);
+    gui_monitor_video_client_stop();
     thrd_join(g_client.thread,NULL);
     if(g_client.app){
         /* Neither Pi settings nor its remote device indices may leak into

@@ -502,6 +502,8 @@ if raylib_dep.found()
     'misrc_gui/net/gui_monitor_video_i420.c',
     'misrc_gui/net/gui_monitor_video_framebox.c',
     'misrc_gui/net/gui_monitor_video_codec.c',
+    'misrc_gui/net/gui_monitor_video_server.c',
+    'misrc_gui/net/gui_monitor_video_client.c',
     # Output
     'misrc_gui/output/gui_record.c',
     'misrc_gui/output/gui_record_direct.c',

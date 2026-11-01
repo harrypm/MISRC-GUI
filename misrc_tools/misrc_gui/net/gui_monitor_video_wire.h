@@ -22,6 +22,7 @@ extern "C" {
 #define MVD_CODEC_H264_ANNEXB 1u
 #define MVD_FLAG_KEYFRAME 0x01u
 #define MVD_FLAG_CODEC_CONFIG 0x02u
+#define MVD_FLAG_HEARTBEAT 0x04u
 
 /* Every frame is self-described. SPS/PPS must be supplied with each IDR. */
 typedef struct {
