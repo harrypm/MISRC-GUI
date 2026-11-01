@@ -352,11 +352,13 @@ void gui_monitor_video_server_stats(char *output,size_t capacity) {
     const mvd_channel *a=&s_channels[0], *b=&s_channels[1];
     unsigned enabled=gui_monitor_video_server_available()?1u:0u;
     snprintf(output,capacity,
-        "{\"openh264\":%u,\"active\":%u,\"ch\":["
-        "{\"viewing\":%u,\"mode\":%u,\"input_blocks\":%llu,\"dropped_blocks\":%llu,\"decoded_frames\":%llu,\"sent_frames\":%llu,\"encoder_attempts\":%llu,\"rc_skips\":%llu,\"encoded_bytes\":%llu,\"queue\":%llu},"
-        "{\"viewing\":%u,\"mode\":%u,\"input_blocks\":%llu,\"dropped_blocks\":%llu,\"decoded_frames\":%llu,\"sent_frames\":%llu,\"encoder_attempts\":%llu,\"rc_skips\":%llu,\"encoded_bytes\":%llu,\"queue\":%llu}]}",
+        "{\"openh264\":%u,\"active\":%u,\"encode_hw\":%u,\"encode_sw\":%u,\"ch\":["
+        "{\"viewing\":%u,\"mode\":%u,\"codec\":%u,\"hardware\":%u,\"input_blocks\":%llu,\"dropped_blocks\":%llu,\"decoded_frames\":%llu,\"sent_frames\":%llu,\"encoder_attempts\":%llu,\"rc_skips\":%llu,\"encoded_bytes\":%llu,\"queue\":%llu},"
+        "{\"viewing\":%u,\"mode\":%u,\"codec\":%u,\"hardware\":%u,\"input_blocks\":%llu,\"dropped_blocks\":%llu,\"decoded_frames\":%llu,\"sent_frames\":%llu,\"encoder_attempts\":%llu,\"rc_skips\":%llu,\"encoded_bytes\":%llu,\"queue\":%llu}]}",
         gui_mvd_codec_available()?1u:0u,enabled,
+        (unsigned)mvd_video_encoder_mask(1),(unsigned)mvd_video_encoder_mask(0),
         (unsigned)atomic_load(&a->viewing),(unsigned)atomic_load(&a->mode),
+        (unsigned)atomic_load(&s_codec_choice[0]),(unsigned)atomic_load(&s_codec_hardware[0]),
         (unsigned long long)atomic_load(&s_input_blocks[0]),
         (unsigned long long)atomic_load(&s_queue_drops[0]),
         (unsigned long long)gui_monitor_video_framebox_published(a->box),
@@ -366,6 +368,7 @@ void gui_monitor_video_server_stats(char *output,size_t capacity) {
         (unsigned long long)atomic_load(&s_encoded_bytes[0]),
         (unsigned long long)(atomic_load(&a->write_idx)-atomic_load(&a->read_idx)),
         (unsigned)atomic_load(&b->viewing),(unsigned)atomic_load(&b->mode),
+        (unsigned)atomic_load(&s_codec_choice[1]),(unsigned)atomic_load(&s_codec_hardware[1]),
         (unsigned long long)atomic_load(&s_input_blocks[1]),
         (unsigned long long)atomic_load(&s_queue_drops[1]),
         (unsigned long long)gui_monitor_video_framebox_published(b->box),
