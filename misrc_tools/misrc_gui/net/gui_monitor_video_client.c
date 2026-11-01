@@ -56,6 +56,10 @@ typedef struct {
     unsigned texture_width,texture_height;
     uint8_t *scratch;
     uint64_t drawn_generation;
+    /* UI-thread only; each decoder remembers its own choices. */
+    uint32_t cvbs_settings,rf_settings;
+    bool chrome_hidden;
+    double last_click;
 } mvd_client_channel;
 static struct {
     char host[128];uint16_t port;
@@ -218,6 +222,9 @@ int gui_monitor_video_client_start(const char *host,uint16_t port) {
         atomic_flag_clear(&ch->pixel_busy);
         atomic_store(&ch->mode,0);
         atomic_store(&ch->controls,mvd_ctl_default(0));
+        ch->cvbs_settings=mvd_ctl_default(0);
+        ch->rf_settings=mvd_ctl_default(2);
+        ch->chrome_hidden=false;ch->last_click=0;
         atomic_store(&ch->video_http_status,0);
         atomic_store(&ch->seen_seconds,0);
         atomic_store(&ch->stop,false);
@@ -244,21 +251,26 @@ void gui_monitor_video_client_stop(void) {
          * freeing OpenGL resources is only safe on the render thread. */
     }
 }
+/* Monitor owns only UI chrome and H.264 display. Every setting that affects
+ * DSP is sent as an explicit, validated server control word. Do not add a
+ * separate local CVBS/VHS decode path. */
+static bool mvd_option_button(Rectangle panel,float *y,const char *label,Vector2 mouse,bool click) {
+    float w=(float)gui_text_measure(label,14)+16.f;
+    if(w<118.f)w=118.f;
+    if(w>panel.width-16.f)w=panel.width-16.f;
+    if(w<0)return false;
+    Rectangle r={panel.x+panel.width-w-8.f,*y,w,18.f};
+    DrawRectangleRounded(r,0.15f,4,(Color){36,46,57,235});
+    gui_text_draw(label,r.x+8.f,r.y+2.f,14,WHITE);
+    *y+=24.f;
+    return click && CheckCollisionPointRec(mouse,r);
+}
 void gui_monitor_video_client_draw(unsigned channel,Rectangle bounds) {
     if(channel>1)return;
     mvd_client_channel *ch=&g_mvd_client.channels[channel];
     atomic_store_explicit(&ch->seen_seconds,(uint64_t)time(NULL),memory_order_release);
-    const char *modes[]={"CVBS","Tape Decode","VHS PAL","VHS NTSC"};
-    unsigned mode=atomic_load(&ch->mode);
-    if(mode>3)mode=0;
-    Rectangle selector={bounds.x+bounds.width-132,bounds.y+8,124,27};
-    if(IsMouseButtonPressed(MOUSE_BUTTON_LEFT) &&
-       CheckCollisionPointRec(gui_ui_get_mouse_position(),selector)) {
-        mode=(mode+1)%4;
-        atomic_store(&ch->mode,mode);
-        ch->drawn_generation=0;
-        atomic_store(&ch->video_http_status,0);
-    }
+    uint32_t ctl=atomic_load_explicit(&ch->controls,memory_order_acquire);
+    bool rf=mvd_ctl_get(ctl,MVD_CTL_MODE,3u)>=2;
     DrawRectangleRec(bounds,(Color){18,18,20,255});
     if(!ch->scratch)ch->scratch=malloc(MVD_PIXEL_CAP);
     if(ch->scratch && !atomic_flag_test_and_set_explicit(&ch->pixel_busy,memory_order_acquire)){
@@ -301,6 +313,103 @@ void gui_monitor_video_client_draw(unsigned channel,Rectangle bounds) {
             "Connecting to H.264 video preview...";
         gui_text_draw(message,bounds.x+12,bounds.y+50,14,LIGHTGRAY);
     }
-    DrawRectangleRec(selector,(Color){35,43,54,235});
-    gui_text_draw(modes[mode],selector.x+8,selector.y+6,14,WHITE);
+    Vector2 mouse=gui_ui_get_mouse_position();
+    bool click=IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
+    bool used=false,changed=false;
+    char label[96];float y=bounds.y+8.f;
+    static const char *const systems[]={"PAL","NTSC","SECAM"};
+    if(!ch->chrome_hidden){
+        if(mvd_option_button(bounds,&y,rf?"Decoder: RF Preview":"Decoder: CVBS",mouse,click)){
+            if(rf){
+                ch->rf_settings=ctl;ctl=ch->cvbs_settings;
+            }else{
+                ch->cvbs_settings=ctl;ctl=ch->rf_settings;
+            }
+            rf=!rf;used=changed=true;
+        }
+        if(rf){
+            unsigned tape=mvd_ctl_get(ctl,MVD_CTL_TAPE,1u);
+            if(mvd_option_button(bounds,&y,tape?"Tape: Betamax":"Tape: VHS",mouse,click)){
+                ctl=mvd_ctl_set(ctl,MVD_CTL_TAPE,1u,!tape);
+                if(!tape)ctl=mvd_ctl_set(ctl,MVD_CTL_SYSTEM,3u,1);
+                used=changed=true;
+            }
+            unsigned system=mvd_ctl_get(ctl,MVD_CTL_SYSTEM,3u);
+            snprintf(label,sizeof(label),tape?"NTSC (fixed)":"System: %s",systems[system]);
+            if(mvd_option_button(bounds,&y,label,mouse,click) && !tape){
+                ctl=mvd_ctl_set(ctl,MVD_CTL_SYSTEM,3u,(system+1)%3);
+                used=changed=true;
+            }
+            if(!tape && system==2){
+                unsigned mesecam=mvd_ctl_get(ctl,MVD_CTL_MESECAM,1u);
+                if(mvd_option_button(bounds,&y,mesecam?"MESECAM: On":"MESECAM: Off",mouse,click)){
+                    ctl=mvd_ctl_set(ctl,MVD_CTL_MESECAM,1u,!mesecam);
+                    used=changed=true;
+                }
+            }
+            if(tape){
+                static const char *const beta[]={"Betamax","Betamax Hi-Fi","SuperBeta","ED Beta"};
+                unsigned preset=mvd_ctl_get(ctl,MVD_CTL_BETA,3u);
+                snprintf(label,sizeof(label),"Preset: %s",beta[preset]);
+                if(mvd_option_button(bounds,&y,label,mouse,click)){
+                    ctl=mvd_ctl_set(ctl,MVD_CTL_BETA,3u,(preset+1)%4);
+                    used=changed=true;
+                }
+            }
+            unsigned full=mvd_ctl_get(ctl,MVD_CTL_FRAME,1u);
+            if(mvd_option_button(bounds,&y,full?"Frame: Full":"Frame: Active",mouse,click)){
+                ctl=mvd_ctl_set(ctl,MVD_CTL_FRAME,1u,!full);
+                used=changed=true;
+            }
+            snprintf(label,sizeof(label),"Budget: %.2f core (shared)",mvd_ctl_budget(ctl)/100.0);
+            if(mvd_option_button(bounds,&y,label,mouse,click)){
+                ctl=mvd_ctl_set(ctl,MVD_CTL_BUDGET,7u,(mvd_ctl_get(ctl,MVD_CTL_BUDGET,7u)+1)%6);
+                used=changed=true;
+            }
+            static const char *const stats[]={"All","Basic","Off"};
+            unsigned view=mvd_ctl_get(ctl,MVD_CTL_STATS,3u);
+            snprintf(label,sizeof(label),"Stats: %s",stats[view]);
+            if(mvd_option_button(bounds,&y,label,mouse,click)){
+                ctl=mvd_ctl_set(ctl,MVD_CTL_STATS,3u,(view+1)%3);
+                used=changed=true;
+            }
+        }else{
+            static const char *const osd[]={"Off","Minimal","Stats"};
+            unsigned value=mvd_ctl_get(ctl,MVD_CTL_OSD,3u);
+            snprintf(label,sizeof(label),"OSD: %s",osd[value]);
+            if(mvd_option_button(bounds,&y,label,mouse,click)){
+                ctl=mvd_ctl_set(ctl,MVD_CTL_OSD,3u,(value+1)%3);
+                used=changed=true;
+            }
+            static const unsigned bits[]={MVD_CTL_FRAME,MVD_CTL_LEVELS,MVD_CTL_SYNC,MVD_CTL_COLOUR};
+            static const char *const keys[]={"Frame","Levels","Sync","Colour"};
+            static const char *const low[]={"Active","Auto","Auto","Off"};
+            static const char *const high[]={"Full","Fixed","Fixed","Auto"};
+            for(unsigned i=0;i<4;i++){
+                unsigned val=mvd_ctl_get(ctl,bits[i],1u);
+                snprintf(label,sizeof(label),"%s: %s",keys[i],val?high[i]:low[i]);
+                if(mvd_option_button(bounds,&y,label,mouse,click)){
+                    ctl=mvd_ctl_set(ctl,bits[i],1u,!val);
+                    used=changed=true;
+                }
+            }
+            unsigned system=mvd_ctl_get(ctl,MVD_CTL_SYSTEM,3u);
+            if(mvd_option_button(bounds,&y,systems[system],mouse,click)){
+                ctl=mvd_ctl_set(ctl,MVD_CTL_SYSTEM,3u,(system+1)%3);
+                used=changed=true;
+            }
+        }
+    }
+    if(click && !used && CheckCollisionPointRec(mouse,bounds)){
+        double now=GetTime();
+        if(ch->last_click>0 && now-ch->last_click<0.36){
+            ch->chrome_hidden=!ch->chrome_hidden;ch->last_click=0;
+        }else ch->last_click=now;
+    }else if(used)ch->last_click=0;
+    if(changed && mvd_ctl_valid(ctl,mvd_ctl_get(ctl,MVD_CTL_MODE,3u))){
+        atomic_store_explicit(&ch->controls,ctl,memory_order_release);
+        atomic_store(&ch->mode,mvd_ctl_get(ctl,MVD_CTL_MODE,3u));
+        if(rf)ch->rf_settings=ctl;else ch->cvbs_settings=ctl;
+        atomic_store(&ch->video_http_status,0);
+    }
 }
