@@ -340,11 +340,7 @@ static void rf_clear_frame(gui_rf_preview_worker_t *w, const char *reason, bool 
     w->stats.resets++;
     w->stats.decode_ms = 0.0;
     w->stats.latency_ms = 0.0;
-    /* Use the callback outside frame_mutex to avoid delaying UI readers. */
-    void (*sink)(void *, const uint8_t *, unsigned, unsigned, uint64_t) = w->monitor_frame_sink;
-    void *sink_context = w->monitor_frame_sink_context;
     rf_mutex_unlock(&w->frame_mutex);
-    if (sink) sink(sink_context, rgba, (unsigned)width, (unsigned)height, now);
     w->work_since_frame_us = 0;
 }
 
@@ -455,7 +451,11 @@ static void rf_frame_callback(void *context, const uint8_t *rgba, int width,
     w->stats.generation = ++w->generation;
     w->stats.decode_ms = elapsed_ms;
     w->stats.latency_ms = latency_ms;
+    /* Never hold frame_mutex while copying into a monitor's latest-frame box. */
+    void (*sink)(void *, const uint8_t *, unsigned, unsigned, uint64_t) = w->monitor_frame_sink;
+    void *sink_context = w->monitor_frame_sink_context;
     rf_mutex_unlock(&w->frame_mutex);
+    if(sink) sink(sink_context,rgba,(unsigned)width,(unsigned)height,now);
     w->work_since_frame_us = 0;
     w->work_segment_us = rf_now_us(w);
 }
