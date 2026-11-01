@@ -176,6 +176,9 @@ jobs:
             git \
             imagemagick \
             libasound2-dev \
+            libavcodec-dev \
+            libavutil-dev \
+            libswscale-dev \
             libfftw3-dev \
             libgl1-mesa-dev \
             libusb-1.0-0-dev \

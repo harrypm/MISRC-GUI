@@ -300,6 +300,9 @@ run_container_internal() {
     git \
     imagemagick \
     libasound2-dev \
+    libavcodec-dev \
+    libavutil-dev \
+    libswscale-dev \
     libfftw3-dev \
     libflac-dev \
     libgl1-mesa-dev \
