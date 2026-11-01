@@ -82,6 +82,7 @@ static atomic_uint s_capture_calls,s_stream_calls;
 static atomic_uint_fast64_t s_input_blocks[2],s_queue_drops[2],s_encoded_frames[2];
 static atomic_uint_fast64_t s_encoder_attempts[2],s_rc_skips[2],s_encoded_bytes[2];
 static atomic_uint s_codec_choice[2];
+static atomic_uint s_codec_hardware[2];
 static atomic_bool s_initialized;
 static void mvd_wait(void) { thrd_sleep_ms(1); }
 
@@ -493,6 +494,7 @@ bool gui_monitor_video_server_stream(uintptr_t fd,unsigned channel,
     uint8_t *i420=malloc(mvd_i420_buffer_size(640,480));
     uint8_t *encoded=malloc(MVD_MAX_PAYLOAD);
     mvd_codec_encoder *encoder=NULL;
+    uint32_t permitted_codecs=client_codecs & MVD_CODEC_ALL;
     unsigned enc_w=0,enc_h=0,sequence=0;
     uint64_t previous_gen=gui_monitor_video_framebox_published(ch->box);
     uint64_t last_submitted_us=0;
@@ -546,11 +548,12 @@ bool gui_monitor_video_server_stream(uintptr_t fd,unsigned channel,
             if(w<2 || h<2)continue;
             if(!encoder || enc_w!=w || enc_h!=h){
                 mvd_video_encoder_free(encoder);
-                encoder=mvd_video_encoder_best(client_codecs & MVD_CODEC_ALL,
+                encoder=mvd_video_encoder_best(permitted_codecs,
                                                  w,h,fps_x100,bitrate_bps);
                 enc_w=w;enc_h=h;
                 if(!encoder)break;
                 atomic_store(&s_codec_choice[channel],mvd_video_encoder_codec(encoder));
+                atomic_store(&s_codec_hardware[channel],mvd_video_encoder_hardware(encoder));
             }
             size_t src_size=(size_t)info.width*info.height*info.channels;
             size_t start=((size_t)crop_y*info.width+crop_x)*info.channels;
@@ -563,7 +566,23 @@ bool gui_monitor_video_server_stream(uintptr_t fd,unsigned channel,
             atomic_fetch_add_explicit(&s_encoder_attempts[channel],1,memory_order_relaxed);
             int rc=mvd_video_encoder_frame(encoder,i420,dst_size,info.timestamp_us,
                                         encoded,MVD_MAX_PAYLOAD,&bytes,&key);
-            if(rc<0)break;
+            if(rc<0){
+                /* A hardware encoder may open but fail when it sees a real
+                 * frame. Negotiate down inside the same stream; the new
+                 * codec announces itself in the frame header and starts at
+                 * its first keyframe. Never strand the client on errors. */
+                unsigned failed=mvd_video_encoder_codec(encoder);
+                fprintf(stderr,"[M-VIDEO] CH%u %s encode failed; trying fallback\n",
+                        channel+1,mvd_codec_name(failed));
+                permitted_codecs &= ~MVD_CODEC_BIT(failed);
+                mvd_video_encoder_free(encoder);encoder=NULL;
+                enc_w=enc_h=0;
+                atomic_store(&s_codec_choice[channel],0);
+                atomic_store(&s_codec_hardware[channel],0);
+                if(!(permitted_codecs & mvd_video_encoder_mask(0)) &&
+                   !(permitted_codecs & mvd_video_encoder_mask(1)))break;
+                continue;
+            }
             if(rc==0){
                 atomic_fetch_add_explicit(&s_rc_skips[channel],1,memory_order_relaxed);
                 continue;
@@ -589,6 +608,7 @@ bool gui_monitor_video_server_stream(uintptr_t fd,unsigned channel,
     }
     mvd_video_encoder_free(encoder);
     atomic_store(&s_codec_choice[channel],0);
+    atomic_store(&s_codec_hardware[channel],0);
     free(source);free(i420);free(encoded);
     gui_rf_preview_worker_set_paused(ch->rf,true);
     atomic_store(&ch->viewing,false);
