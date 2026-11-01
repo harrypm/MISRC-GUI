@@ -558,7 +558,12 @@ if raylib_dep.found()
     # Link the runtime AFTER OpenH264 to resolve RTTI/new/delete on MinGW
     # and libc++ on Android. Unmodified builds stay C-only.
     if windows_static_deps
-      gui_deps += [meson.get_compiler('c').find_library('stdc++', required: true)]
+      # MSYS2 UCRT64/GCC uses libstdc++; CLANGARM64 uses libc++.
+      if host_cpu_family == 'aarch64'
+        gui_deps += [meson.get_compiler('c').find_library('c++', required: true)]
+      else
+        gui_deps += [meson.get_compiler('c').find_library('stdc++', required: true)]
+      endif
     elif host_system == 'android'
       gui_deps += [meson.get_compiler('c').find_library('c++', required: true)]
     endif
