@@ -509,6 +509,9 @@ void gui_monitor_video_client_draw(unsigned channel,Rectangle bounds) {
                 for(unsigned other=0;other<2;other++){
                     mvd_client_channel *peer=&g_mvd_client.channels[other];
                     uint32_t setting=atomic_load(&peer->controls);
+                    /* CVBS does not use the RF budget: do not reconnect its
+                     * perfectly good H.264 stream when RF budget changes. */
+                    if(mvd_ctl_get(setting,MVD_CTL_MODE,3u)<2)continue;
                     setting=mvd_ctl_set(setting,MVD_CTL_BUDGET,7u,next);
                     atomic_store_explicit(&peer->controls,setting,memory_order_release);
                 }
