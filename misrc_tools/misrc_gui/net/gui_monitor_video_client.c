@@ -38,6 +38,8 @@ typedef int mvd_socket;
 #endif
 #define MVD_PIXEL_CAP ((size_t)MVD_MAX_WIDTH*MVD_MAX_HEIGHT*4u)
 #define MVD_CLIENT_TIMEOUT_MS 1200u
+/* Local-only OSD/Stats choices must not tear down a live H.264 stream. */
+#define MVD_DSP_MASK (~((3u<<MVD_CTL_OSD)|(3u<<MVD_CTL_STATS)))
 
 typedef struct {
     thrd_t worker;
@@ -60,11 +62,16 @@ typedef struct {
     uint32_t cvbs_settings,rf_settings;
     bool chrome_hidden;
     double last_click;
+    atomic_flag stats_busy;
+    char stats_text[1024];
 } mvd_client_channel;
 static struct {
     char host[128];uint16_t port;
     mvd_client_channel channels[2];
     atomic_bool active;
+    atomic_bool stats_stop;
+    bool stats_started;
+    thrd_t stats_worker;
 } g_mvd_client;
 
 static int mvd_send_full(mvd_socket sock,const char *bytes,size_t n) {
@@ -152,7 +159,7 @@ static int mvd_receive(unsigned channel,mvd_client_channel *ch,unsigned mode,uin
     unsigned errors=0;
     bool synced=false;
     while(!atomic_load_explicit(&ch->stop,memory_order_acquire) &&
-          mvd_visible(ch) && atomic_load(&ch->controls)==controls) {
+          mvd_visible(ch) && (atomic_load(&ch->controls)&MVD_DSP_MASK)==controls) {
         int bytes=recv(sock,(char *)buffer,sizeof(buffer),0);
         if(bytes==0)break;
         if(bytes<0) {
@@ -203,13 +210,99 @@ static int mvd_client_thread(void *arg) {
     unsigned channel=(unsigned)(ch-&g_mvd_client.channels[0]);
     while(!atomic_load_explicit(&ch->stop,memory_order_acquire)) {
         if(mvd_visible(ch)) {
-            uint32_t ctl=atomic_load(&ch->controls);
+            uint32_t ctl=atomic_load(&ch->controls)&MVD_DSP_MASK;
             (void)mvd_receive(channel,ch,mvd_ctl_get(ctl,MVD_CTL_MODE,3u),ctl);
         }
         for(int i=0;i<40 && !atomic_load(&ch->stop);i++)thrd_sleep_ms(10);
     }
     return 0;
 }
+/* HTTP poll runs outside the render and the H.264 receiver threads.
+ * It fetches real, server-owned DSP metrics once per second, never sampling
+ * local RF or decoding analogue video on Monitor Client. */
+static void mvd_poll_one(unsigned channel) {
+    mvd_client_channel *ch=&g_mvd_client.channels[channel];
+    if(!mvd_visible(ch))return;
+    uint32_t ctl=atomic_load(&ch->controls);
+    bool rf=mvd_ctl_get(ctl,MVD_CTL_MODE,3u)>=2;
+    unsigned detail=rf?(2u-mvd_ctl_get(ctl,MVD_CTL_STATS,3u))
+                      :mvd_ctl_get(ctl,MVD_CTL_OSD,3u);
+    if(detail==0){
+        if(!atomic_flag_test_and_set_explicit(&ch->stats_busy,memory_order_acquire)){
+            ch->stats_text[0]=0;
+            atomic_flag_clear_explicit(&ch->stats_busy,memory_order_release);
+        }
+        return;
+    }
+    mvd_socket sock=mvd_connect(g_mvd_client.host,g_mvd_client.port);
+    if(sock==MVD_SOCKET_BAD)return;
+    char request[180];
+    int n=snprintf(request,sizeof(request),
+        "GET /monitor/video/osd?channel=%u&detail=%u HTTP/1.0\r\n"
+        "Connection: close\r\n\r\n",channel,detail);
+    if(n<=0 || (size_t)n>=sizeof(request) ||
+       mvd_send_full(sock,request,(size_t)n)!=0){MVD_CLOSE(sock);return;}
+    char response[1536];
+    size_t used=0;
+    while(used+1<sizeof(response) && !atomic_load(&g_mvd_client.stats_stop)){
+        int count=recv(sock,response+used,(int)(sizeof(response)-used-1),0);
+        if(count<=0)break;
+        used+=(size_t)count;
+    }
+    MVD_CLOSE(sock);
+    response[used]=0;
+    if(strncmp(response,"HTTP/1.0 200 ",13) &&
+       strncmp(response,"HTTP/1.1 200 ",13))return;
+    char *body=strstr(response,"\r\n\r\n");
+    if(!body)return;
+    body+=4;
+    if(!atomic_flag_test_and_set_explicit(&ch->stats_busy,memory_order_acquire)){
+        snprintf(ch->stats_text,sizeof(ch->stats_text),"%s",body);
+        atomic_flag_clear_explicit(&ch->stats_busy,memory_order_release);
+    }
+}
+static int mvd_stats_thread(void *argument) {
+    (void)argument;
+    while(!atomic_load(&g_mvd_client.stats_stop)) {
+        if(atomic_load(&g_mvd_client.active))
+            for(unsigned channel=0;channel<2;channel++)mvd_poll_one(channel);
+        for(unsigned i=0;i<10 && !atomic_load(&g_mvd_client.stats_stop);i++)
+            thrd_sleep_ms(100);
+    }
+    return 0;
+}
+
+static void mvd_draw_stats(mvd_client_channel *ch,Rectangle bounds,uint32_t ctl) {
+    bool rf=mvd_ctl_get(ctl,MVD_CTL_MODE,3u)>=2;
+    unsigned detail=rf?(2u-mvd_ctl_get(ctl,MVD_CTL_STATS,3u)):
+                       mvd_ctl_get(ctl,MVD_CTL_OSD,3u);
+    if(!detail || ch->chrome_hidden)return;
+    char message[1024];
+    if(atomic_flag_test_and_set_explicit(&ch->stats_busy,memory_order_acquire))return;
+    snprintf(message,sizeof(message),"%s",ch->stats_text);
+    atomic_flag_clear_explicit(&ch->stats_busy,memory_order_release);
+    if(!message[0])return;
+    char *lines[8]={0};
+    unsigned n=0;lines[n++]=message;
+    for(char *p=message;*p && n<8;p++)if(*p=='\n'){*p=0;lines[n++]=p+1;}
+    float line_h=20.f,base=bounds.y+bounds.height-8.f-(float)n*line_h;
+    if(base<bounds.y+8.f)base=bounds.y+8.f;
+    DrawRectangleRec((Rectangle){bounds.x+6.f,base-3.f,bounds.width-12.f,
+        bounds.y+bounds.height-base-5.f},(Color){0,0,0,116});
+    for(unsigned i=0;i<n;i++){
+        float y=base+(float)i*line_h;
+        if(y>bounds.y+bounds.height-20.f)break;
+        char *line=lines[i];
+        /* Keep long OSD lines inside split panels. */
+        while(*line && gui_text_measure_mono(line,14)>bounds.width-24.f){
+            size_t len=strlen(line);
+            if(!len)break;
+            line[len-1]=0;
+        }
+        gui_text_draw_mono(line,bounds.x+10.f,y,14,(Color){255,230,120,255});
+    }
+}
+
 int gui_monitor_video_client_start(const char *host,uint16_t port) {
     if(!host || !*host || !port || !gui_mvd_codec_available())return -1;
     if(atomic_load(&g_mvd_client.active))gui_monitor_video_client_stop();
@@ -225,6 +318,8 @@ int gui_monitor_video_client_start(const char *host,uint16_t port) {
         ch->cvbs_settings=mvd_ctl_default(0);
         ch->rf_settings=mvd_ctl_default(2);
         ch->chrome_hidden=false;ch->last_click=0;
+        atomic_flag_clear(&ch->stats_busy);
+        ch->stats_text[0]=0;
         atomic_store(&ch->video_http_status,0);
         atomic_store(&ch->seen_seconds,0);
         atomic_store(&ch->stop,false);
@@ -238,11 +333,18 @@ int gui_monitor_video_client_start(const char *host,uint16_t port) {
         atomic_store(&ch->active,true);
     }
     atomic_store(&g_mvd_client.active,true);
+    atomic_store(&g_mvd_client.stats_stop,false);
+    g_mvd_client.stats_started=(thrd_create(&g_mvd_client.stats_worker,mvd_stats_thread,NULL)==thrd_success);
     return 0;
 }
 void gui_monitor_video_client_stop(void) {
     if(!atomic_exchange(&g_mvd_client.active,false))return;
+    atomic_store(&g_mvd_client.stats_stop,true);
     for(unsigned c=0;c<2;c++) atomic_store(&g_mvd_client.channels[c].stop,true);
+    if(g_mvd_client.stats_started){
+        thrd_join(g_mvd_client.stats_worker,NULL);
+        g_mvd_client.stats_started=false;
+    }
     for(unsigned c=0;c<2;c++){
         mvd_client_channel *ch=&g_mvd_client.channels[c];
         if(atomic_exchange(&ch->active,false))thrd_join(ch->worker,NULL);
@@ -406,6 +508,7 @@ void gui_monitor_video_client_draw(unsigned channel,Rectangle bounds) {
             ch->chrome_hidden=!ch->chrome_hidden;ch->last_click=0;
         }else ch->last_click=now;
     }else if(used)ch->last_click=0;
+    mvd_draw_stats(ch,bounds,ctl);
     if(changed && mvd_ctl_valid(ctl,mvd_ctl_get(ctl,MVD_CTL_MODE,3u))){
         atomic_store_explicit(&ch->controls,ctl,memory_order_release);
         atomic_store(&ch->mode,mvd_ctl_get(ctl,MVD_CTL_MODE,3u));
