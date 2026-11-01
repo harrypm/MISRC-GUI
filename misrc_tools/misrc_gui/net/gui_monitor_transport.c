@@ -739,7 +739,7 @@ bool gui_monitor_server_handle_request(uintptr_t socket_handle,
         /* Clients without the capability extension are AVC-only. */
         uint32_t client_codecs=offered<0?MVD_CODEC_AVC_BIT:(uint32_t)offered;
         if(!(client_codecs & MVD_CODEC_ALL)){
-            mon_answer(fd,406,"text/plain","no common video codec\\n");
+            mon_answer(fd,406,"text/plain","no common video codec\n");
             return false;
         }
         int supplied=mon_arg(query,"ctl",-1);

@@ -130,14 +130,18 @@ static mvd_ff_encoder *create_one(const AVCodec *codec,unsigned w,unsigned h,
         av_opt_set(s->ctx->priv_data,"deadline","realtime",0);
         av_opt_set(s->ctx->priv_data,"cpu-used","8",0);
         av_opt_set(s->ctx->priv_data,"row-mt","1",0);
+        av_opt_set(s->ctx->priv_data,"lag-in-frames","0",0);
+        av_opt_set(s->ctx->priv_data,"auto-alt-ref","0",0);
     } else if(codec->id==AV_CODEC_ID_AV1){
         av_opt_set(s->ctx->priv_data,"preset","12",0);
         av_opt_set(s->ctx->priv_data,"cpu-used","8",0);
         av_opt_set(s->ctx->priv_data,"usage","realtime",0);
+        av_opt_set(s->ctx->priv_data,"lag-in-frames","0",0);
     } else if(codec->id==AV_CODEC_ID_HEVC){
         av_opt_set(s->ctx->priv_data,"preset","ultrafast",0);
         av_opt_set(s->ctx->priv_data,"tune","zerolatency",0);
-        av_opt_set(s->ctx->priv_data,"x265-params","repeat-headers=1:aud=1",0);
+        av_opt_set(s->ctx->priv_data,"x265-params",
+                   "repeat-headers=1:aud=1:rc-lookahead=0:bframes=0:frame-threads=1:pools=none",0);
     }
     if(avcodec_open2(s->ctx,codec,NULL)<0)goto fail;
     s->frame->width=(int)w;s->frame->height=(int)h;

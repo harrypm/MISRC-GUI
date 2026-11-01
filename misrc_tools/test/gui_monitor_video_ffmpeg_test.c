@@ -35,7 +35,7 @@ static void exercise(unsigned codec) {
             decoded_frames++;
         }
     }
-    printf("[ffmpeg-test] %s frames: encoded=%u decoded=%u\n",
+    fprintf(stderr,"[ffmpeg-test] %s frames: encoded=%u decoded=%u\n",
            mvd_codec_name(codec),encoded_frames,decoded_frames);
     /* Some AV1 encoders queue more than one second of frames. VP9 / HEVC
      * low-latency codecs must emit and decode actual frames. */
