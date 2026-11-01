@@ -26,6 +26,7 @@ on:
   push:
     branches:
       - main
+      - feature/monitor-h264-video-20261101
     tags:
       - 'v*'
 
@@ -164,6 +165,7 @@ jobs:
             libusb-1.0-0-dev \
             libuvc-dev \
             libsoxr-dev \
+            libopenh264-dev \
             libx11-dev \
             libxcursor-dev \
             libxi-dev \
@@ -282,6 +284,14 @@ jobs:
             -DCMAKE_INSTALL_PREFIX="$DEPS_PREFIX"
           cmake --build .deps/raylib/build --parallel
           cmake --install .deps/raylib/build
+
+      - name: Verify OpenH264 encode/decode round-trip
+        run: |
+          set -eux
+          pkg-config --modversion openh264
+          sh scripts/test-monitor-video-codec.sh
+          sh scripts/test-monitor-video-stage1.sh
+          sh scripts/test-monitor-video-framebox.sh
 
       - name: Build MISRC tools (Meson)
         env:
@@ -526,6 +536,7 @@ jobs:
             mingw-w64-ucrt-x86_64-libjpeg-turbo
             mingw-w64-ucrt-x86_64-libusb
             mingw-w64-ucrt-x86_64-libsoxr
+            mingw-w64-ucrt-x86_64-openh264
             mingw-w64-ucrt-x86_64-meson
             mingw-w64-ucrt-x86_64-nasm
             mingw-w64-ucrt-x86_64-ninja
@@ -547,6 +558,7 @@ jobs:
             mingw-w64-ucrt-x86_64-libjpeg-turbo
             mingw-w64-ucrt-x86_64-libusb
             mingw-w64-ucrt-x86_64-libsoxr
+            mingw-w64-ucrt-x86_64-openh264
             mingw-w64-ucrt-x86_64-meson
             mingw-w64-ucrt-x86_64-nasm
             mingw-w64-ucrt-x86_64-ninja
@@ -746,6 +758,7 @@ jobs:
             mingw-w64-clang-aarch64-libjpeg-turbo
             mingw-w64-clang-aarch64-libusb
             mingw-w64-clang-aarch64-libsoxr
+            mingw-w64-clang-aarch64-openh264
             mingw-w64-clang-aarch64-llvm-openmp
             mingw-w64-clang-aarch64-meson
             mingw-w64-clang-aarch64-ninja
@@ -768,6 +781,7 @@ jobs:
             mingw-w64-clang-aarch64-libjpeg-turbo
             mingw-w64-clang-aarch64-libusb
             mingw-w64-clang-aarch64-libsoxr
+            mingw-w64-clang-aarch64-openh264
             mingw-w64-clang-aarch64-llvm-openmp
             mingw-w64-clang-aarch64-meson
             mingw-w64-clang-aarch64-ninja
@@ -971,7 +985,7 @@ jobs:
             /usr/local/Homebrew/Library/Taps/hashicorp/homebrew-tap; do
             rm -rf "$tap_dir"
           done
-          for formula in cmake fftw flac libusb libuvc meson nasm ninja pkgconf libsoxr; do
+          for formula in cmake fftw flac libusb libuvc meson nasm ninja pkgconf libsoxr openh264; do
             if ! brew list --versions "$formula" >/dev/null 2>&1; then
               brew install "$formula"
             fi
