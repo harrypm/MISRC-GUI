@@ -63,8 +63,17 @@ static const char * const *names(unsigned wire,int hardware) {
     }
 }
 static int usable_pixel_format(const AVCodec *codec,enum AVPixelFormat format) {
-    if(!codec->pix_fmts)return format==AV_PIX_FMT_YUV420P;
-    for(const enum AVPixelFormat *p=codec->pix_fmts;*p!=AV_PIX_FMT_NONE;p++)
+    const enum AVPixelFormat *formats=NULL;
+#if LIBAVCODEC_VERSION_MAJOR >= 62
+    /* FFmpeg 9 removed AVCodec.pix_fmts. Query the supported configuration
+     * through the stable libavcodec 7.1+ API instead. */
+    if(avcodec_get_supported_config(NULL,codec,AV_CODEC_CONFIG_PIX_FORMAT,0,
+                                    (const void **)&formats,NULL)<0)return 0;
+#else
+    formats=codec->pix_fmts;
+#endif
+    if(!formats)return format==AV_PIX_FMT_YUV420P;
+    for(const enum AVPixelFormat *p=formats;*p!=AV_PIX_FMT_NONE;p++)
         if(*p==format)return 1;
     return 0;
 }
