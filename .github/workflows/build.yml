@@ -140,9 +140,10 @@ jobs:
             linuxdeploy_arch: aarch64
             artifact_suffix: arm64
     runs-on: ${{ matrix.runner }}
+    # Run Linux video/codec packaging after baseline preflight; macOS guards
+    # are independent and may queue on scarce macOS runners.
     needs:
       - preflight-guard-tests
-      - preflight-cross-platform-guards
     steps:
       - name: Checkout
         uses: actions/checkout@v6
