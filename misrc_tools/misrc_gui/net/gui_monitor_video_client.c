@@ -75,6 +75,7 @@ static struct {
     mvd_client_channel channels[2];
     atomic_bool active;
     atomic_bool stats_stop;
+    atomic_uint failed_video_codecs; /* Client decoder failure mask. */
     atomic_uint global_budget; /* shared logical-core budget, same as Local */
     bool stats_started;
     thrd_t stats_worker;
@@ -141,7 +142,8 @@ static int mvd_receive(unsigned channel,mvd_client_channel *ch,unsigned mode,uin
     int n=snprintf(request,sizeof(request),
        "GET /monitor/video?channel=%u&mode=%u&bps=750000&fps=2500&ctl=%u&codecs=%u HTTP/1.0\r\n"
        "Connection: close\r\n\r\n",channel,mode,(unsigned)controls,
-       (unsigned)mvd_video_decoder_mask());
+       (unsigned)(mvd_video_decoder_mask() &
+                  ~atomic_load(&g_mvd_client.failed_video_codecs)));
     if(n<1 || (size_t)n>=sizeof(request) ||
        mvd_send_full(sock,request,(size_t)n)!=0){
         atomic_store(&ch->video_http_status,-1);
@@ -197,7 +199,14 @@ static int mvd_receive(unsigned channel,mvd_client_channel *ch,unsigned mode,uin
                     errors=10;break;
                 }
                 decoder=mvd_video_decoder_new(h.codec);
-                if(!decoder){errors=10;break;}
+                if(!decoder){
+                    if(h.codec!=MVD_CODEC_H264_ANNEXB)
+                        atomic_fetch_or(&g_mvd_client.failed_video_codecs,
+                                        MVD_CODEC_BIT(h.codec));
+                    fprintf(stderr,"[M-VIDEO] CH%u %s decoder unavailable; retry fallback\n",
+                            channel+1,mvd_codec_name(h.codec));
+                    errors=10;break;
+                }
             }
             if((h.flags&MVD_FLAG_KEYFRAME)!=0)synced=true;
             if(synced && h.stream_id==channel+1 && h.payload_bytes<=MVD_MAX_PAYLOAD) {
@@ -213,7 +222,14 @@ static int mvd_receive(unsigned channel,mvd_client_channel *ch,unsigned mode,uin
                     atomic_fetch_add(&ch->published,1);
                     atomic_flag_clear_explicit(&ch->pixel_busy,memory_order_release);
                 }
-                if(produced<0){errors=10;break;}
+                if(produced<0){
+                    if(h.codec!=MVD_CODEC_H264_ANNEXB)
+                        atomic_fetch_or(&g_mvd_client.failed_video_codecs,
+                                        MVD_CODEC_BIT(h.codec));
+                    fprintf(stderr,"[M-VIDEO] CH%u %s decoder failed; retry fallback\n",
+                            channel+1,mvd_codec_name(h.codec));
+                    errors=10;break;
+                }
             }
             mvd_reader_reset(&reader);
         }
@@ -357,6 +373,7 @@ int gui_monitor_video_client_start(const char *host,uint16_t port) {
         }
         atomic_store(&ch->active,true);
     }
+    atomic_store(&g_mvd_client.failed_video_codecs,0);
     atomic_store(&g_mvd_client.global_budget,2);
     atomic_store(&g_mvd_client.active,true);
     atomic_store(&g_mvd_client.stats_stop,false);
