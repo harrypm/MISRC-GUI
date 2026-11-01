@@ -985,11 +985,14 @@ jobs:
             /usr/local/Homebrew/Library/Taps/hashicorp/homebrew-tap; do
             rm -rf "$tap_dir"
           done
-          for formula in cmake fftw flac libusb libuvc meson nasm ninja pkgconf libsoxr openh264; do
+          for formula in cmake fftw flac libusb libuvc meson nasm ninja pkgconf libsoxr; do
             if ! brew list --versions "$formula" >/dev/null 2>&1; then
               brew install "$formula"
             fi
           done
+          if ! brew list --versions openh264 >/dev/null 2>&1; then
+            brew install openh264
+          fi
 
       - name: Build and stage architecture app bundle
         env:
