@@ -2108,8 +2108,9 @@ def check_local_guard_gate_contract(repo_root: Path) -> int:
         if "CI guard tests failed" not in text:
             return fail(f"{label} must FAIL the build when the CI guard tests fail ('CI guard tests failed')")
     workflow_text = read_text(workflow_path)
-    push_main = "push:\n    branches:\n      - main\n    tags:\n      - 'v*'"
-    if push_main not in workflow_text:
+    push_main = "push:\n    branches:\n      - main\n"
+    tags = "    tags:\n      - 'v*'"
+    if push_main not in workflow_text or tags not in workflow_text:
         return fail(
             "build.yml must run CI on direct pushes to main (push: branches: [main] "
             "alongside the v* tags trigger); a tags-only push trigger let a guard "
