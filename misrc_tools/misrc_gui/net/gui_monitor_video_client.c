@@ -61,6 +61,7 @@ typedef struct {
     /* UI-thread only; each decoder remembers its own choices. */
     uint32_t cvbs_settings,rf_settings;
     bool chrome_hidden;
+    unsigned popup;
     double last_click;
     atomic_flag stats_busy;
     char stats_text[1024];
@@ -317,7 +318,7 @@ int gui_monitor_video_client_start(const char *host,uint16_t port) {
         atomic_store(&ch->controls,mvd_ctl_default(0));
         ch->cvbs_settings=mvd_ctl_default(0);
         ch->rf_settings=mvd_ctl_default(2);
-        ch->chrome_hidden=false;ch->last_click=0;
+        ch->chrome_hidden=false;ch->last_click=0;ch->popup=0;
         atomic_flag_clear(&ch->stats_busy);
         ch->stats_text[0]=0;
         atomic_store(&ch->video_http_status,0);
@@ -366,6 +367,23 @@ static bool mvd_option_button(Rectangle panel,float *y,const char *label,Vector2
     gui_text_draw(label,r.x+8.f,r.y+2.f,14,WHITE);
     *y+=24.f;
     return click && CheckCollisionPointRec(mouse,r);
+}
+static bool mvd_dropdown(Rectangle panel,float button_y,const char *label,
+                          const char *const *names,unsigned n,Vector2 mouse,
+                          bool click,unsigned *value) {
+    float w=(float)gui_text_measure(label,14)+16.f;
+    if(w<118.f)w=118.f;
+    if(w>panel.width-16.f)w=panel.width-16.f;
+    if(w<=0.f)return false;
+    float y=button_y+18.f;
+    if(y+20.f*n>panel.y+panel.height-8.f)y=button_y-20.f*n;
+    for(unsigned i=0;i<n;i++) {
+        Rectangle rect={panel.x+panel.width-w-8.f,y+20.f*i,w,20.f};
+        DrawRectangleRec(rect,i==*value?(Color){65,84,104,248}:(Color){28,37,48,248});
+        gui_text_draw(names[i],rect.x+8.f,rect.y+3.f,14,WHITE);
+        if(click && CheckCollisionPointRec(mouse,rect)){*value=i;return true;}
+    }
+    return false;
 }
 void gui_monitor_video_client_draw(unsigned channel,Rectangle bounds) {
     if(channel>1)return;
@@ -427,7 +445,7 @@ void gui_monitor_video_client_draw(unsigned channel,Rectangle bounds) {
             }else{
                 ch->cvbs_settings=ctl;ctl=ch->rf_settings;
             }
-            rf=!rf;used=changed=true;
+            rf=!rf;used=changed=true;ch->popup=0;
         }
         if(rf){
             unsigned tape=mvd_ctl_get(ctl,MVD_CTL_TAPE,1u);
@@ -471,9 +489,13 @@ void gui_monitor_video_client_draw(unsigned channel,Rectangle bounds) {
             static const char *const stats[]={"All","Basic","Off"};
             unsigned view=mvd_ctl_get(ctl,MVD_CTL_STATS,3u);
             snprintf(label,sizeof(label),"Stats: %s",stats[view]);
+            float menu_y=y;
             if(mvd_option_button(bounds,&y,label,mouse,click)){
-                ctl=mvd_ctl_set(ctl,MVD_CTL_STATS,3u,(view+1)%3);
-                used=changed=true;
+                ch->popup=ch->popup==2?0:2;used=true;
+            }
+            if(ch->popup==2 && mvd_dropdown(bounds,menu_y,label,stats,3,mouse,click,&view)){
+                ctl=mvd_ctl_set(ctl,MVD_CTL_STATS,3u,view);
+                ch->popup=0;used=changed=true;
             }
         }else{
             static const char *const osd[]={"Off","Minimal","Stats"};
@@ -496,16 +518,20 @@ void gui_monitor_video_client_draw(unsigned channel,Rectangle bounds) {
                 }
             }
             unsigned system=mvd_ctl_get(ctl,MVD_CTL_SYSTEM,3u);
+            float menu_y=y;
             if(mvd_option_button(bounds,&y,systems[system],mouse,click)){
-                ctl=mvd_ctl_set(ctl,MVD_CTL_SYSTEM,3u,(system+1)%3);
-                used=changed=true;
+                ch->popup=ch->popup==1?0:1;used=true;
+            }
+            if(ch->popup==1 && mvd_dropdown(bounds,menu_y,systems[system],systems,3,mouse,click,&system)){
+                ctl=mvd_ctl_set(ctl,MVD_CTL_SYSTEM,3u,system);
+                ch->popup=0;used=changed=true;
             }
         }
     }
     if(click && !used && CheckCollisionPointRec(mouse,bounds)){
         double now=GetTime();
         if(ch->last_click>0 && now-ch->last_click<0.36){
-            ch->chrome_hidden=!ch->chrome_hidden;ch->last_click=0;
+            ch->chrome_hidden=!ch->chrome_hidden;ch->last_click=0;ch->popup=0;
         }else ch->last_click=now;
     }else if(used)ch->last_click=0;
     mvd_draw_stats(ch,bounds,ctl);
