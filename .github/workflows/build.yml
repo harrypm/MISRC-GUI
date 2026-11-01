@@ -452,6 +452,12 @@ jobs:
           export DEPS_PREFIX="$PWD/.deps/install-android-arm64"
           bash android/gen-cross-file.sh
 
+      - name: Cross-build OpenH264 for Android
+        run: |
+          set -eux
+          export DEPS_PREFIX="$PWD/.deps/install-android-arm64"
+          bash android/build-openh264-android.sh
+
       - name: Cross-compile misrc_gui (libmisrc_gui.so)
         run: |
           set -eux

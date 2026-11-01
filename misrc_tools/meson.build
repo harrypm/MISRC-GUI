@@ -551,7 +551,7 @@ if raylib_dep.found()
   gui_deps += [ zstd_dep ]
   # OpenH264 is required for encoded monitor video but optional for legacy
   # waveform/FFT-only builds. Explicitly report disabled video when absent.
-  openh264_dep = dependency('openh264', required: false, static: windows_static_deps)
+  openh264_dep = dependency('openh264', required: false, static: windows_static_deps or host_system == 'android')
   if openh264_dep.found()
     gui_deps += [openh264_dep]
     message('MISRC monitor H.264 video codec enabled')
