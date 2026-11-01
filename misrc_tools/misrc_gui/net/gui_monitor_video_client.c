@@ -63,6 +63,8 @@ typedef struct {
     bool chrome_hidden;
     unsigned popup;
     double last_click;
+    unsigned display_frame_count;
+    double display_window_started,display_fps;
     atomic_flag stats_busy;
     char stats_text[1024];
 } mvd_client_channel;
@@ -71,6 +73,7 @@ static struct {
     mvd_client_channel channels[2];
     atomic_bool active;
     atomic_bool stats_stop;
+    atomic_uint global_budget; /* shared logical-core budget, same as Local */
     bool stats_started;
     thrd_t stats_worker;
 } g_mvd_client;
@@ -283,8 +286,12 @@ static void mvd_draw_stats(mvd_client_channel *ch,Rectangle bounds,uint32_t ctl)
     snprintf(message,sizeof(message),"%s",ch->stats_text);
     atomic_flag_clear_explicit(&ch->stats_busy,memory_order_release);
     if(!message[0])return;
+    char frame_info[120];
+    snprintf(frame_info,sizeof(frame_info),"Display %.1f fps | H.264 monitor video",
+             ch->display_fps);
     char *lines[8]={0};
-    unsigned n=0;lines[n++]=message;
+    unsigned n=0;lines[n++]=frame_info;
+    lines[n++]=message;
     for(char *p=message;*p && n<8;p++)if(*p=='\n'){*p=0;lines[n++]=p+1;}
     float line_h=20.f,base=bounds.y+bounds.height-8.f-(float)n*line_h;
     if(base<bounds.y+8.f)base=bounds.y+8.f;
@@ -319,6 +326,7 @@ int gui_monitor_video_client_start(const char *host,uint16_t port) {
         ch->cvbs_settings=mvd_ctl_default(0);
         ch->rf_settings=mvd_ctl_default(2);
         ch->chrome_hidden=false;ch->last_click=0;ch->popup=0;
+        ch->display_frame_count=0;ch->display_window_started=0;ch->display_fps=0;
         atomic_flag_clear(&ch->stats_busy);
         ch->stats_text[0]=0;
         atomic_store(&ch->video_http_status,0);
@@ -333,6 +341,7 @@ int gui_monitor_video_client_start(const char *host,uint16_t port) {
         }
         atomic_store(&ch->active,true);
     }
+    atomic_store(&g_mvd_client.global_budget,2);
     atomic_store(&g_mvd_client.active,true);
     atomic_store(&g_mvd_client.stats_stop,false);
     g_mvd_client.stats_started=(thrd_create(&g_mvd_client.stats_worker,mvd_stats_thread,NULL)==thrd_success);
@@ -400,6 +409,7 @@ void gui_monitor_video_client_draw(unsigned channel,Rectangle bounds) {
            w>=2 && h>=2 && w<=MVD_MAX_WIDTH && h<=MVD_MAX_HEIGHT){
             memcpy(ch->scratch,ch->pixels,(size_t)w*h*4);
             ch->drawn_generation=generation;
+            ch->display_frame_count++;
             atomic_flag_clear_explicit(&ch->pixel_busy,memory_order_release);
             if(ch->texture.id && (w!=ch->texture_width || h!=ch->texture_height)){
                 UnloadTexture(ch->texture);memset(&ch->texture,0,sizeof(ch->texture));
@@ -410,6 +420,14 @@ void gui_monitor_video_client_draw(unsigned channel,Rectangle bounds) {
                 ch->texture_width=w;ch->texture_height=h;
             }else UpdateTexture(ch->texture,ch->scratch);
         }else atomic_flag_clear_explicit(&ch->pixel_busy,memory_order_release);
+    }
+    { double now=GetTime();
+      if(ch->display_window_started<=0)ch->display_window_started=now;
+      if(now-ch->display_window_started>=1.0){
+          ch->display_fps=ch->display_frame_count/(now-ch->display_window_started);
+          ch->display_frame_count=0;
+          ch->display_window_started=now;
+      }
     }
     if(ch->texture.id){
         float scale=bounds.width/(float)ch->texture_width;
@@ -481,9 +499,20 @@ void gui_monitor_video_client_draw(unsigned channel,Rectangle bounds) {
                 ctl=mvd_ctl_set(ctl,MVD_CTL_FRAME,1u,!full);
                 used=changed=true;
             }
+            unsigned budget=mvd_ctl_get(ctl,MVD_CTL_BUDGET,7u);
             snprintf(label,sizeof(label),"Budget: %.2f core (shared)",mvd_ctl_budget(ctl)/100.0);
             if(mvd_option_button(bounds,&y,label,mouse,click)){
-                ctl=mvd_ctl_set(ctl,MVD_CTL_BUDGET,7u,(mvd_ctl_get(ctl,MVD_CTL_BUDGET,7u)+1)%6);
+                unsigned next=(budget+1)%6;
+                atomic_store(&g_mvd_client.global_budget,next);
+                /* A shared budget must be reflected in both channel
+                 * requests, never applied twice as independent settings. */
+                for(unsigned other=0;other<2;other++){
+                    mvd_client_channel *peer=&g_mvd_client.channels[other];
+                    uint32_t setting=atomic_load(&peer->controls);
+                    setting=mvd_ctl_set(setting,MVD_CTL_BUDGET,7u,next);
+                    atomic_store_explicit(&peer->controls,setting,memory_order_release);
+                }
+                ctl=mvd_ctl_set(ctl,MVD_CTL_BUDGET,7u,next);
                 used=changed=true;
             }
             static const char *const stats[]={"All","Basic","Off"};
@@ -535,6 +564,10 @@ void gui_monitor_video_client_draw(unsigned channel,Rectangle bounds) {
         }else ch->last_click=now;
     }else if(used)ch->last_click=0;
     mvd_draw_stats(ch,bounds,ctl);
+    if(changed){
+        ctl=mvd_ctl_set(ctl,MVD_CTL_BUDGET,7u,
+                        atomic_load(&g_mvd_client.global_budget));
+    }
     if(changed && mvd_ctl_valid(ctl,mvd_ctl_get(ctl,MVD_CTL_MODE,3u))){
         atomic_store_explicit(&ch->controls,ctl,memory_order_release);
         atomic_store(&ch->mode,mvd_ctl_get(ctl,MVD_CTL_MODE,3u));
