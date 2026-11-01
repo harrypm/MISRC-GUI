@@ -62,6 +62,10 @@ typedef struct {
     atomic_bool viewing,gap;
     atomic_uint mode;
     atomic_uint controls;
+    /* A private, non-blocking snapshot: decoder state itself is NOT safe
+     * to read from an HTTP thread while the CVBS worker is processing. */
+    atomic_flag osd_busy;
+    char cvbs_osd[640];
     bool worker_started;
 #if LIBSOXR_ENABLED
     soxr_t cvbs_resampler;
@@ -144,6 +148,7 @@ static int mvd_decode_thread(void *argument) {
     mvd_channel *ch=(mvd_channel *)argument;
     unsigned last_mode=~0u;
     uint32_t last_controls=UINT32_MAX;
+    unsigned osd_tick=0;
     bool have_previous=false;
     gui_rf_block_info_t previous={0};
     while (atomic_load_explicit(&s_active,memory_order_acquire)) {
@@ -213,6 +218,25 @@ static int mvd_decode_thread(void *argument) {
             previous=item->info;
             previous.start_sample+=item->n;
             have_previous=true;
+            if((++osd_tick & 127u)==0 &&
+               !atomic_flag_test_and_set_explicit(&ch->osd_busy,memory_order_acquire)) {
+                cvbs_decoder_t *d=ch->cvbs;
+                snprintf(ch->cvbs_osd,sizeof(ch->cvbs_osd),
+                    "%s | %s | source %.2f MHz\n"
+                    "frames:%d sync_err:%d jumps:%d hsync/field:%d\n"
+                    "VBI accepted:%d candidates:%d rejected:%d (cad:%d/par:%d)\n"
+                    "rate %.1f MHz | VBI rej: %.120s",
+                    gui_cvbs_get_format_name(d),d->last_weave?"weave":"bob",
+                    item->info.sample_rate_hz/1000000.0,
+                    d->state.frames_decoded,d->sync_errors,d->stream_jumps,
+                    d->debug.hsyncs_last_field,
+                    d->vsync.fields_accepted,d->vsync.vsync_candidates,
+                    d->vsync.fields_rejected,d->vsync.reject_cadence,
+                    d->vsync.reject_parity,
+                    d->sample_rate_hz/1000000.0,
+                    d->vsync.last_reject_reason[0]?d->vsync.last_reject_reason:"none");
+                atomic_flag_clear_explicit(&ch->osd_busy,memory_order_release);
+            }
         }
         atomic_store_explicit(&ch->read_idx,r+1,memory_order_release);
     }
@@ -249,6 +273,8 @@ int gui_monitor_video_server_start(void) {
             atomic_store(&ch->read_idx,0);
             atomic_store(&ch->write_idx,0);
             atomic_store(&ch->gap,false);
+            atomic_flag_clear(&ch->osd_busy);
+            ch->cvbs_osd[0]=0;
         }
         atomic_store(&s_initialized,true);
     }
@@ -345,6 +371,64 @@ void gui_monitor_video_server_stats(char *output,size_t capacity) {
         (unsigned long long)atomic_load(&s_rc_skips[1]),
         (unsigned long long)atomic_load(&s_encoded_bytes[1]),
         (unsigned long long)(atomic_load(&b->write_idx)-atomic_load(&b->read_idx)));
+}
+
+/* Compact human-readable OSD wire view of the server's REAL decoder
+ * statistics. This endpoint runs on an HTTP worker, never the capture thread.
+ * The client merely draws these lines; no duplicate DSP logic lives there. */
+bool gui_monitor_video_server_osd(unsigned channel,unsigned detail,
+                                  char *output,size_t capacity) {
+    if(!output || !capacity || channel>1 || detail>2)return false;
+    output[0]=0;
+    if(!detail || !atomic_load(&s_active))return true;
+    mvd_channel *ch=&s_channels[channel];
+    if(!atomic_load(&ch->viewing))return true;
+    unsigned mode=atomic_load(&ch->mode);
+    if(mode<2) {
+        if(!atomic_flag_test_and_set_explicit(&ch->osd_busy,memory_order_acquire)) {
+            snprintf(output,capacity,"%s",ch->cvbs_osd);
+            atomic_flag_clear_explicit(&ch->osd_busy,memory_order_release);
+        }
+        if(detail==1) {
+            char *line=strchr(output,'\n');
+            if(line)*line=0;
+        }
+        return true;
+    }
+    gui_rf_preview_stats_t stats={0};
+    gui_rf_preview_worker_get_stats(ch->rf,&stats);
+    const gui_rf_decode_status_t *st=&stats.decode;
+    uint32_t controls=atomic_load(&ch->controls);
+    gui_rf_profile_t profile=(gui_rf_profile_t)mvd_ctl_rf_profile(controls);
+    snprintf(output,capacity,
+        "%s | %.3f -> %.0f MHz | H:%s V:%s Color:%s\n"
+        "Decode %.1f fps | DSP %.1f ms | Age %.1f ms",
+        gui_rf_profile_name(profile),
+        stats.source_rate_hz/1000000.0,
+        gui_rf_profile_video_rate_hz(profile)/1000000.0,
+        st->h_locked?"LOCK":"SCAN",st->v_locked?"LOCK":"SCAN",
+        st->color_locked?"LOCK":"OFF",
+        stats.fps,stats.decode_ms,stats.latency_ms);
+    if(detail<2)return true;
+    size_t used=strlen(output);
+    if(used<capacity)snprintf(output+used,capacity-used,
+        "\nV candidates %llu | Fields %llu | Reject %llu (cad %llu/par %llu/map %llu)"
+        "\nQueue drops %llu | Pressure skips %llu | Color loss %llu | CPU %.0f%% core"
+        "\nLast field rejection: %.90s"
+        "\n%s",
+        (unsigned long long)stats.total_vsync_candidates,
+        (unsigned long long)stats.total_fields_accepted,
+        (unsigned long long)stats.total_fields_rejected,
+        (unsigned long long)stats.total_reject_cadence,
+        (unsigned long long)stats.total_reject_parity,
+        (unsigned long long)stats.total_reject_line_map,
+        (unsigned long long)stats.blocks_dropped,
+        (unsigned long long)stats.pause_drops,
+        (unsigned long long)stats.total_color_losses,stats.cpu_percent,
+        st->last_reject_reason[0]?st->last_reject_reason:"none",
+        stats.paused?"Preview paused: capture/recording pressure":
+        stats.budget_waiting?"Preview yielding to shared processing budget":st->reason);
+    return true;
 }
 
 bool gui_monitor_video_server_stream(uintptr_t fd,unsigned channel,

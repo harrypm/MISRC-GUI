@@ -711,6 +711,16 @@ bool gui_monitor_server_handle_request(uintptr_t socket_handle,
         }
         mon_answer(fd,200,"text/plain","clip counters cleared\n");return false;
     }
+    if(strcmp(path,"/monitor/video/osd")==0){
+        int channel=mon_arg(query,"channel",-1),detail=mon_arg(query,"detail",2);
+        char body[1024];
+        if(channel<0 || channel>1 || detail<0 || detail>2 ||
+           !gui_monitor_video_server_osd((unsigned)channel,(unsigned)detail,body,sizeof(body))) {
+            mon_answer(fd,400,"text/plain","invalid video OSD request\n");return false;
+        }
+        mon_answer(fd,200,"text/plain",body);
+        return false;
+    }
     if(strcmp(path,"/monitor/video/status")==0){
         char json[1024];
         gui_monitor_video_server_stats(json,sizeof(json));

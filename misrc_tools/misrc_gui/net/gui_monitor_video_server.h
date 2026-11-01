@@ -15,6 +15,9 @@ void gui_monitor_video_server_capture(const int16_t *a, const int16_t *b,
 /* Exposes server codec/stream health without sample data or blocking RF. */
 bool gui_monitor_video_server_available(void);
 void gui_monitor_video_server_stats(char *output,size_t capacity);
+/* UI-only display snapshot of the headless decoder; 0=Off,1=Basic,2=All. */
+bool gui_monitor_video_server_osd(unsigned channel,unsigned detail,
+                                  char *output,size_t capacity);
 /* Called by an existing HTTP connection worker. Owns no socket, returns after
  * disconnect or server stop. Channel 0=A, 1=B; mode 0=CVBS, 1=Tape, 2=VHS RF.
  * Caller sends an HTTP error if this returns false. */
