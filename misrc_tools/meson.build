@@ -498,6 +498,10 @@ if raylib_dep.found()
     'misrc_gui/net/monitor_local_save_protocol.c',
     'misrc_gui/net/gui_remote_fs.c',
     'misrc_gui/net/gui_remote_display.c',
+    'misrc_gui/net/gui_monitor_video_wire.c',
+    'misrc_gui/net/gui_monitor_video_i420.c',
+    'misrc_gui/net/gui_monitor_video_framebox.c',
+    'misrc_gui/net/gui_monitor_video_codec.c',
     # Output
     'misrc_gui/output/gui_record.c',
     'misrc_gui/output/gui_record_direct.c',
@@ -543,8 +547,19 @@ if raylib_dep.found()
   zstd_dep = dependency('libzstd', required: true, static: windows_static_deps)
   gui_deps = deps + [ raylib_dep, fftw3f_dep ]
   gui_deps += [ zstd_dep ]
+  # OpenH264 is required for encoded monitor video but optional for legacy
+  # waveform/FFT-only builds. Explicitly report disabled video when absent.
+  openh264_dep = dependency('openh264', required: false, static: windows_static_deps)
+  if openh264_dep.found()
+    gui_deps += [openh264_dep]
+    message('MISRC monitor H.264 video codec enabled')
+    openh264_define = '-DMISRC_HAVE_OPENH264=1'
+  else
+    warning('OpenH264 development package missing: monitor video is unavailable')
+    openh264_define = '-DMISRC_HAVE_OPENH264=0'
+  endif
 
-  gui_cflags = cflags + [
+  gui_cflags = cflags + [openh264_define] + [
     '-O3',                    # Maximum optimization (should already be set by buildtype=release)
     '-funroll-loops',         # Unroll loops for better performance
     '-ftree-vectorize',       # Enable auto-vectorization
