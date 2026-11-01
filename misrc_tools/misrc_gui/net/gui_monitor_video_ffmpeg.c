@@ -6,6 +6,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <limits.h>
+#include <stdatomic.h>
 #ifndef MISRC_HAVE_FFMPEG
 #define MISRC_HAVE_FFMPEG 0
 #endif
@@ -32,7 +33,10 @@ struct mvd_ff_decoder {
     struct SwsContext *sws;
     AVBufferRef *device;
     enum AVPixelFormat hw_format;
+    unsigned wire_codec;
 };
+/* A failed GPU decoder must not be retried forever on every reconnect. */
+static atomic_uint s_decoder_hw_failures;
 static enum AVCodecID codec_id(unsigned wire) {
     switch(wire) {
         case MVD_CODEC_HEVC_ANNEXB: return AV_CODEC_ID_HEVC;
@@ -238,6 +242,7 @@ mvd_ff_decoder *mvd_ff_decoder_create(unsigned wire) {
     if(!codec)return NULL;
     mvd_ff_decoder *d=calloc(1,sizeof(*d));
     if(!d)return NULL;
+    d->wire_codec=wire;
     d->ctx=avcodec_alloc_context3(codec);
     d->frame=av_frame_alloc();
     d->software=av_frame_alloc();
@@ -246,7 +251,7 @@ mvd_ff_decoder *mvd_ff_decoder_create(unsigned wire) {
     d->hw_format=AV_PIX_FMT_NONE;
     /* Use real hardware decoding when a device can actually be opened;
      * otherwise FFmpeg's software decoder is always retained. */
-    for(int i=0;;i++){
+    for(int i=0;!(atomic_load(&s_decoder_hw_failures)&MVD_CODEC_BIT(wire));i++){
         const AVCodecHWConfig *hw=avcodec_get_hw_config(codec,i);
         if(!hw)break;
         if(!(hw->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX))continue;
@@ -261,7 +266,20 @@ mvd_ff_decoder *mvd_ff_decoder_create(unsigned wire) {
         }
     }
     d->ctx->thread_count=2;
-    if(avcodec_open2(d->ctx,codec,NULL)<0)goto fail;
+    if(avcodec_open2(d->ctx,codec,NULL)<0) {
+        if(!d->device)goto fail;
+        /* Driver reports a supported codec but refuses to initialize.
+         * Try software on this same connection and suppress further GPU
+         * retries for this codec until the next process start. */
+        atomic_fetch_or(&s_decoder_hw_failures,MVD_CODEC_BIT(wire));
+        avcodec_free_context(&d->ctx);
+        av_buffer_unref(&d->device);
+        d->hw_format=AV_PIX_FMT_NONE;
+        d->ctx=avcodec_alloc_context3(codec);
+        if(!d->ctx)goto fail;
+        d->ctx->thread_count=2;
+        if(avcodec_open2(d->ctx,codec,NULL)<0)goto fail;
+    }
     return d;
 fail:
     mvd_ff_decoder_free(d);return NULL;
@@ -285,14 +303,21 @@ int mvd_ff_decoder_frame(mvd_ff_decoder *d,const uint8_t *packet,size_t len,
     memcpy(d->packet->data,packet,len);
     int rc=avcodec_send_packet(d->ctx,d->packet);
     av_packet_unref(d->packet);
-    if(rc<0)return -1;
+    if(rc<0){
+        if(d->device)atomic_fetch_or(&s_decoder_hw_failures,MVD_CODEC_BIT(d->wire_codec));
+        return -1;
+    }
     rc=avcodec_receive_frame(d->ctx,d->frame);
     if(rc==AVERROR(EAGAIN) || rc==AVERROR_EOF)return 0;
-    if(rc<0)return -1;
+    if(rc<0){
+        if(d->device)atomic_fetch_or(&s_decoder_hw_failures,MVD_CODEC_BIT(d->wire_codec));
+        return -1;
+    }
     AVFrame *frame=d->frame;
     if(d->device && d->frame->format==d->hw_format){
         av_frame_unref(d->software);
         if(av_hwframe_transfer_data(d->software,d->frame,0)<0){
+            atomic_fetch_or(&s_decoder_hw_failures,MVD_CODEC_BIT(d->wire_codec));
             av_frame_unref(d->frame);return -1;
         }
         frame=d->software;
