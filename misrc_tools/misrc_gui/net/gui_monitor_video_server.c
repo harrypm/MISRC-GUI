@@ -431,6 +431,34 @@ bool gui_monitor_video_server_osd(unsigned channel,unsigned detail,
     return true;
 }
 
+/* Reproduce the current Harry Local CVBS Active/Full render selection on
+ * the SERVER, before RGB->I420 conversion. These timing constants are a
+ * Monitor-only compatibility adapter: future upstream decoder geometry
+ * changes must be re-integrated here, never in the Monitor Client. */
+static void mvd_cvbs_active_crop(uint32_t controls,unsigned width,unsigned height,
+                                unsigned *left,unsigned *top,
+                                unsigned *crop_width,unsigned *crop_height) {
+    *left=0;*top=0;*crop_width=width;*crop_height=height;
+    if(mvd_ctl_get(controls,MVD_CTL_FRAME,1u) || width<32 || height<32)return;
+    bool ntsc=mvd_ctl_get(controls,MVD_CTL_SYSTEM,3u)==1;
+    const double line_us=ntsc?63.55555555555556:64.0;
+    const double ax0_us=ntsc?9.45:10.5;
+    const double ax1_us=ntsc?62.55555555555556:62.5;
+    /* The Local 4fsc resampler emits 14.3/17.9 MSPS on this path. */
+    const double rate=ntsc?14300000.0:17900000.0;
+    const double edge_delay_us=8000000.0/rate;
+    int x0=(int)((ax0_us-edge_delay_us)*width/line_us+0.5);
+    int x1=(int)((ax1_us-edge_delay_us)*width/line_us+0.5);
+    unsigned y0=ntsc?40u:44u;
+    unsigned rh=ntsc?484u:576u;
+    if(x0<0)x0=0;
+    if(x1>(int)width)x1=(int)width;
+    if(y0>=height || x0>=x1 || y0+rh>height)return;
+    *left=(unsigned)x0;*top=y0;
+    *crop_width=(unsigned)(x1-x0);
+    *crop_height=rh;
+}
+
 bool gui_monitor_video_server_stream(uintptr_t fd,unsigned channel,
     unsigned mode,unsigned bitrate_bps,unsigned fps_x100,uint32_t controls) {
     if(!atomic_load(&s_active) || channel>1 || !mvd_ctl_valid(controls,mode) ||
@@ -504,8 +532,12 @@ bool gui_monitor_video_server_stream(uintptr_t fd,unsigned channel,
                 info.timestamp_us-last_submitted_us<100000000ULL/fps_x100))
                 continue;
             last_submitted_us=info.timestamp_us;
-            unsigned w=info.width>640?640:info.width;
-            unsigned h=info.height>480?480:info.height;
+            unsigned crop_x=0,crop_y=0,crop_w=info.width,crop_h=info.height;
+            if(mode<2 && mode==0)
+                mvd_cvbs_active_crop(controls,info.width,info.height,
+                                     &crop_x,&crop_y,&crop_w,&crop_h);
+            unsigned w=crop_w>640?640:crop_w;
+            unsigned h=crop_h>480?480:crop_h;
             w &= ~1u;h &= ~1u;
             if(w<2 || h<2)continue;
             if(!encoder || enc_w!=w || enc_h!=h){
@@ -516,8 +548,10 @@ bool gui_monitor_video_server_stream(uintptr_t fd,unsigned channel,
                 gui_mvd_encoder_request_keyframe(encoder);
             }
             size_t src_size=(size_t)info.width*info.height*info.channels;
+            size_t start=((size_t)crop_y*info.width+crop_x)*info.channels;
             size_t dst_size=mvd_i420_buffer_size(w,h);
-            if(mvd_rgb_to_i420(source,src_size,info.width,info.height,
+            if(start>=src_size ||
+               mvd_rgb_to_i420(source+start,src_size-start,crop_w,crop_h,
                     (size_t)info.width*info.channels,(mvd_rgb_format)info.channels,
                     i420,mvd_i420_buffer_size(640,480),w,h)!=0)break;
             size_t bytes=0;int key=0;
