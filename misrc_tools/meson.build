@@ -580,25 +580,13 @@ if raylib_dep.found()
   avcodec_dep = dependency('libavcodec', required: false, static: windows_static_deps or host_system == 'android')
   avutil_dep = dependency('libavutil', required: false, static: windows_static_deps or host_system == 'android')
   swscale_dep = dependency('libswscale', required: false, static: windows_static_deps or host_system == 'android')
-  if avcodec_dep.found() and avutil_dep.found() and swscale_dep.found()
-    if windows_static_deps
-      # MSYS2 FFmpeg's static pkg-config closure lists -ldl even though
-      # Windows has no libdl and the required LoadLibrary APIs reside in
-      # kernel32. Preserve every other transitive static dependency.
-      ff_flags_raw = run_command('pkg-config', '--static', '--libs',
-        'libavcodec', 'libavutil', 'libswscale', check: true).stdout().strip().split()
-      ff_flags = []
-      foreach flag : ff_flags_raw
-        if flag != '-ldl'
-          ff_flags += flag
-        endif
-      endforeach
-      ff_cflags = run_command('pkg-config', '--static', '--cflags',
-        'libavcodec', 'libavutil', 'libswscale', check: true).stdout().strip().split()
-      gui_deps += [declare_dependency(compile_args: ff_cflags, link_args: ff_flags)]
-    else
-      gui_deps += [avcodec_dep, avutil_dep, swscale_dep]
-    endif
+  # The Windows UCRT FFmpeg distribution is built with every codec and
+  # pulls in hundreds of unrelated static archives. This conflicts with the
+  # upstream single-EXE/no-DLL packaging contract (including duplicate
+  # rust_eh_personality definitions). Modern codecs remain optional on
+  # platforms where their binaries can be redistributed safely.
+  if avcodec_dep.found() and avutil_dep.found() and swscale_dep.found() and not windows_static_deps
+    gui_deps += [avcodec_dep, avutil_dep, swscale_dep]
     ffmpeg_define = '-DMISRC_HAVE_FFMPEG=1'
     message('MISRC monitor AV1/VP9/HEVC FFmpeg codecs enabled')
   else

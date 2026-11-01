@@ -36,11 +36,14 @@ FFmpeg licensing and HEVC patent/license terms depend on the chosen
 packages/platform. Do not distribute additional codec binaries without
 reviewing their license and redistribution requirements.
 
-Android or Windows builds without FFmpeg development libraries retain H.264
-and can still connect to a multi-codec server through capability negotiation.
-They will not claim AV1/VP9/HEVC support unless built with the optional
-libraries. The CPU budget and codec choice are separate from the upstream
-CVBS/VHS decoder algorithms, which are not changed.
+Android builds and the existing Windows single-EXE builds negotiate H.264
+unless a separately packaged modern-codec backend is provided. The MSYS2
+all-codec static FFmpeg distribution does not link as a self-contained EXE
+because it pulls in unrelated transitive modules (e.g. JPEG XL, librsvg,
+Rust runtime object collisions). Do not silently ship non-system runtime
+DLLs to work around the release's one-EXE constraint. Linux builds with
+the FFmpeg development libraries enabled negotiate AV1/VP9/HEVC. The
+CPU budget and codec selection are independent of upstream CVBS/VHS DSP.
 
 ## Tests
 
