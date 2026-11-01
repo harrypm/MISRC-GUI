@@ -41,6 +41,26 @@ int main(void) {
         if(d==1){ assert(ow==w && oh==h); assert(rgba[3]==255); decoded++; }
     }
     assert(keys>=1 && decoded>=1);
+    /* Regression: monitor sources can deliver irregular frame intervals,
+     * not exactly the codec's nominal 25 FPS. Exercise timestamp-based RC. */
+    uint64_t variable_pts=1000000;
+    int variable_encoded=0;
+    for(int k=0;k<32;k++){
+        variable_pts+=(k%3==0)?80000u:33000u;
+        size_t bytes=0;
+        int key=0;
+        int rc=gui_mvd_encoder_frame(enc,input,size,variable_pts,
+                                     encoded,MVD_MAX_PAYLOAD,&bytes,&key);
+        assert(rc>=0);
+        if(rc==0)continue;
+        variable_encoded++;
+        unsigned ow=0,oh=0;
+        int d=gui_mvd_decoder_frame(dec,encoded,bytes,rgba,
+                                    (size_t)MVD_MAX_WIDTH*MVD_MAX_HEIGHT*4,&ow,&oh);
+        assert(d>=0);
+        if(d==1)assert(ow==w && oh==h);
+    }
+    assert(variable_encoded>0);
     gui_mvd_encoder_destroy(enc);gui_mvd_decoder_destroy(dec);
     free(input);free(encoded);free(rgba);
     puts("OpenH264 encode/decode roundtrip PASS");
