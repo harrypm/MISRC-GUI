@@ -49,6 +49,9 @@ jobs:
         run: |
           set -eux
           python3 misrc_tools/test/ci_guard_tests.py
+      - name: Test missing-dependency detection
+        run: |
+          bash scripts/test-build-deps-check.sh
   preflight-cross-platform-guards:
     name: Cross-platform guard tests (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}

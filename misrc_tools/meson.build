@@ -549,8 +549,8 @@ if raylib_dep.found()
   zstd_dep = dependency('libzstd', required: true, static: windows_static_deps)
   gui_deps = deps + [ raylib_dep, fftw3f_dep ]
   gui_deps += [ zstd_dep ]
-  # OpenH264 is required for encoded monitor video but optional for legacy
-  # waveform/FFT-only builds. Explicitly report disabled video when absent.
+  # OpenH264 is mandatory for the Monitor Client's video feature. Do not
+  # silently produce an apparently successful GUI without H.264 support.
   openh264_dep = dependency('openh264', required: false, static: windows_static_deps or host_system == 'android')
   if openh264_dep.found()
     gui_deps += [openh264_dep]
@@ -570,8 +570,7 @@ if raylib_dep.found()
     message('MISRC monitor H.264 video codec enabled')
     openh264_define = '-DMISRC_HAVE_OPENH264=1'
   else
-    warning('OpenH264 development package missing: monitor video is unavailable')
-    openh264_define = '-DMISRC_HAVE_OPENH264=0'
+    error('Missing required dependency: OpenH264 (pkg-config: openh264). Install the development library before building misrc_gui (Ubuntu/Debian: sudo apt install libopenh264-dev; macOS: brew install openh264). Monitor Client video cannot work without it.')
   endif
 
   gui_cflags = cflags + [openh264_define] + [

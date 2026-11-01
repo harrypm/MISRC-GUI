@@ -72,6 +72,10 @@ python3 "$GUARD_SCRIPT" --static-only || fail "CI guard tests failed (see output
 # deps prefix and hides system modules like fftw3f/libusb/alsa/soxr.
 # Override with MISRC_PKG_CONFIG if a different native pkg-config is needed.
 export PKG_CONFIG="${MISRC_PKG_CONFIG:-pkg-config}"
+# Detect the H.264 dependency before building vendored deps or touching a
+# pre-existing build directory. Missing OpenH264 must never yield a GUI that
+# silently falls back to a black video preview.
+bash "$SCRIPT_DIR/check-build-deps.sh" --codec
 
 # Locate a vendored deps prefix that provides hsdaoh.pc.
 DEPS_PREFIX=""
@@ -124,12 +128,10 @@ done
 export PKG_CONFIG_PATH="$DEPS_PREFIX/lib/pkgconfig:$DEPS_PREFIX/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
 export CMAKE_PREFIX_PATH="$DEPS_PREFIX:${CMAKE_PREFIX_PATH:-}"
 
-# fftw3f is the one hard-required dep that is NOT vendored (comes from the
-# system). Fail early with a clear message instead of a meson configure error.
-if ! pkg-config --exists fftw3f; then
-  fail "Missing fftw3f pkg-config module. Install FFTW3 dev files (e.g. libfftw3-dev) and retry."
-fi
-log "fftw3f: $(pkg-config --modversion fftw3f)"
+# Check all native libraries (and the vendored GUI libraries) BEFORE Meson
+# setup/compile. The preflight reports every missing package in one pass.
+bash "$SCRIPT_DIR/check-build-deps.sh" --gui
+log "OpenH264: $("$PKG_CONFIG" --modversion openh264)"
 
 # Handle absolute BUILD_DIR (e.g. leaked BUILD_DIR=.../build-android) as-is;
 # otherwise resolve relative to the repo root.
