@@ -502,6 +502,8 @@ if raylib_dep.found()
     'misrc_gui/net/gui_monitor_video_i420.c',
     'misrc_gui/net/gui_monitor_video_framebox.c',
     'misrc_gui/net/gui_monitor_video_codec.c',
+    'misrc_gui/net/gui_monitor_video_ffmpeg.c',
+    'misrc_gui/net/gui_monitor_video_mux.c',
     'misrc_gui/net/gui_monitor_video_server.c',
     'misrc_gui/net/gui_monitor_video_client.c',
     # Output
@@ -573,7 +575,20 @@ if raylib_dep.found()
     error('Missing required dependency: OpenH264 (pkg-config: openh264). Install the development library before building misrc_gui (Ubuntu/Debian: sudo apt install libopenh264-dev; macOS: brew install openh264). Monitor Client video cannot work without it.')
   endif
 
-  gui_cflags = cflags + [openh264_define] + [
+  # Optional modern codecs: link FFmpeg when its headers/libs are available.
+  # Existing Android and static Windows builds retain OpenH264 fallback.
+  avcodec_dep = dependency('libavcodec', required: false)
+  avutil_dep = dependency('libavutil', required: false)
+  swscale_dep = dependency('libswscale', required: false)
+  if avcodec_dep.found() and avutil_dep.found() and swscale_dep.found() and host_system != 'android' and not windows_static_deps
+    gui_deps += [avcodec_dep, avutil_dep, swscale_dep]
+    ffmpeg_define = '-DMISRC_HAVE_FFMPEG=1'
+    message('MISRC monitor AV1/VP9/HEVC FFmpeg codecs enabled')
+  else
+    ffmpeg_define = '-DMISRC_HAVE_FFMPEG=0'
+    message('MISRC monitor modern codecs unavailable; OpenH264 fallback active')
+  endif
+  gui_cflags = cflags + [openh264_define, ffmpeg_define] + [
     '-O3',                    # Maximum optimization (should already be set by buildtype=release)
     '-funroll-loops',         # Unroll loops for better performance
     '-ftree-vectorize',       # Enable auto-vectorization

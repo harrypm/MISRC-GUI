@@ -1,5 +1,6 @@
 #include "gui_monitor_video_client.h"
 #include "gui_monitor_video_codec.h"
+#include "gui_monitor_video_mux.h"
 #include "gui_monitor_video_wire.h"
 #include "gui_monitor_video_options.h"
 #include "../visualization/gui_text.h"
@@ -46,7 +47,8 @@ typedef struct {
     atomic_bool stop,active;
     atomic_uint mode;
     atomic_uint controls;
-    atomic_int video_http_status; /* 0=connecting, negative=network/response error, positive=HTTP code */
+    atomic_int video_http_status;
+    atomic_uint video_codec; /* Actual decoder codec, never UI guess. */ /* 0=connecting, negative=network/response error, positive=HTTP code */
     atomic_uint_fast64_t seen_seconds;
     atomic_flag pixel_busy;
     atomic_uint_fast64_t published;
@@ -137,8 +139,9 @@ static int mvd_receive(unsigned channel,mvd_client_channel *ch,unsigned mode,uin
     if(sock==MVD_SOCKET_BAD){atomic_store(&ch->video_http_status,-1);return -1;}
     char request[320];
     int n=snprintf(request,sizeof(request),
-       "GET /monitor/video?channel=%u&mode=%u&bps=750000&fps=2500&ctl=%u HTTP/1.0\r\n"
-       "Connection: close\r\n\r\n",channel,mode,(unsigned)controls);
+       "GET /monitor/video?channel=%u&mode=%u&bps=750000&fps=2500&ctl=%u&codecs=%u HTTP/1.0\r\n"
+       "Connection: close\r\n\r\n",channel,mode,(unsigned)controls,
+       (unsigned)mvd_video_decoder_mask());
     if(n<1 || (size_t)n>=sizeof(request) ||
        mvd_send_full(sock,request,(size_t)n)!=0){
         atomic_store(&ch->video_http_status,-1);
@@ -151,11 +154,13 @@ static int mvd_receive(unsigned channel,mvd_client_channel *ch,unsigned mode,uin
         fprintf(stderr,"[M-VIDEO] CH%u HTTP %d; %s\n",channel+1,http_status,hint);
         MVD_CLOSE(sock);return -1;
     }
-    gui_mvd_decoder_t *decoder=gui_mvd_decoder_create();
+    mvd_codec_decoder *decoder=NULL;
+    unsigned current_codec=0;
+    atomic_store(&ch->video_codec,0);
     uint8_t *packet=malloc(MVD_MAX_PAYLOAD);
     uint8_t *output=malloc(MVD_PIXEL_CAP);
-    if(!decoder || !packet || !output){
-        gui_mvd_decoder_destroy(decoder);free(packet);free(output);MVD_CLOSE(sock);return -1;
+    if(!packet || !output){
+        free(packet);free(output);MVD_CLOSE(sock);return -1;
     }
     mvd_frame_reader reader;
     mvd_reader_init(&reader,packet,MVD_MAX_PAYLOAD);
@@ -185,16 +190,26 @@ static int mvd_receive(unsigned channel,mvd_client_channel *ch,unsigned mode,uin
                 mvd_reader_reset(&reader);
                 continue;
             }
+            if(h.codec!=current_codec) {
+                mvd_video_decoder_free(decoder);decoder=NULL;
+                current_codec=h.codec;synced=false;
+                if(!(mvd_video_decoder_mask() & MVD_CODEC_BIT(h.codec))){
+                    errors=10;break;
+                }
+                decoder=mvd_video_decoder_new(h.codec);
+                if(!decoder){errors=10;break;}
+            }
             if((h.flags&MVD_FLAG_KEYFRAME)!=0)synced=true;
             if(synced && h.stream_id==channel+1 && h.payload_bytes<=MVD_MAX_PAYLOAD) {
                 unsigned w=0,ht=0;
-                int produced=gui_mvd_decoder_frame(decoder,packet,h.payload_bytes,
+                int produced=mvd_video_decoder_frame(decoder,packet,h.payload_bytes,
                                                     output,MVD_PIXEL_CAP,&w,&ht);
                 if(produced==1 && w==h.width && ht==h.height &&
                    !atomic_flag_test_and_set_explicit(&ch->pixel_busy,memory_order_acquire)){
                     memcpy(ch->pixels,output,(size_t)w*ht*4u);
                     ch->width=w;ch->height=ht;
                     ch->generation++;
+                    atomic_store(&ch->video_codec,h.codec);
                     atomic_fetch_add(&ch->published,1);
                     atomic_flag_clear_explicit(&ch->pixel_busy,memory_order_release);
                 }
@@ -204,7 +219,7 @@ static int mvd_receive(unsigned channel,mvd_client_channel *ch,unsigned mode,uin
         }
         if(errors>=10)break;
     }
-    gui_mvd_decoder_destroy(decoder);
+    mvd_video_decoder_free(decoder);
     free(packet);free(output);
     MVD_CLOSE(sock);
     return 0;
@@ -287,8 +302,8 @@ static void mvd_draw_stats(mvd_client_channel *ch,Rectangle bounds,uint32_t ctl)
     atomic_flag_clear_explicit(&ch->stats_busy,memory_order_release);
     if(!message[0])return;
     char frame_info[120];
-    snprintf(frame_info,sizeof(frame_info),"Display %.1f fps | H.264 monitor video",
-             ch->display_fps);
+    snprintf(frame_info,sizeof(frame_info),"Display %.1f fps | %s monitor video",
+             ch->display_fps,mvd_codec_name(atomic_load(&ch->video_codec)));
     char *lines[8]={0};
     unsigned n=0;lines[n++]=frame_info;
     lines[n++]=message;
@@ -330,6 +345,7 @@ int gui_monitor_video_client_start(const char *host,uint16_t port) {
         atomic_flag_clear(&ch->stats_busy);
         ch->stats_text[0]=0;
         atomic_store(&ch->video_http_status,0);
+        atomic_store(&ch->video_codec,0);
         atomic_store(&ch->seen_seconds,0);
         atomic_store(&ch->stop,false);
         if(thrd_create(&ch->worker,mvd_client_thread,ch)!=thrd_success){

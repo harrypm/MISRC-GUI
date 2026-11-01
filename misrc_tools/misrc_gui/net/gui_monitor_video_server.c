@@ -1,6 +1,7 @@
 #include "gui_monitor_video_server.h"
 #include "gui_monitor_video_options.h"
 #include "gui_monitor_video_codec.h"
+#include "gui_monitor_video_mux.h"
 #include "gui_monitor_video_framebox.h"
 #include "gui_monitor_video_i420.h"
 #include "gui_monitor_video_wire.h"
@@ -80,6 +81,7 @@ static atomic_uint s_capture_calls,s_stream_calls;
 /* Monotonic, lock-free diagnostic counters; never used in the RF hot path for I/O. */
 static atomic_uint_fast64_t s_input_blocks[2],s_queue_drops[2],s_encoded_frames[2];
 static atomic_uint_fast64_t s_encoder_attempts[2],s_rc_skips[2],s_encoded_bytes[2];
+static atomic_uint s_codec_choice[2];
 static atomic_bool s_initialized;
 static void mvd_wait(void) { thrd_sleep_ms(1); }
 
@@ -460,8 +462,10 @@ static void mvd_cvbs_active_crop(uint32_t controls,unsigned width,unsigned heigh
 }
 
 bool gui_monitor_video_server_stream(uintptr_t fd,unsigned channel,
-    unsigned mode,unsigned bitrate_bps,unsigned fps_x100,uint32_t controls) {
-    if(!atomic_load(&s_active) || channel>1 || !mvd_ctl_valid(controls,mode) ||
+    unsigned mode,unsigned bitrate_bps,unsigned fps_x100,uint32_t controls,
+    uint32_t client_codecs) {
+    if(!atomic_load(&s_active) || channel>1 || !(client_codecs & MVD_CODEC_ALL) ||
+       !mvd_ctl_valid(controls,mode) ||
        bitrate_bps<64000u || bitrate_bps>4000000u ||
        fps_x100<500u || fps_x100>3000u)return false;
     mvd_channel *ch=&s_channels[channel];
@@ -483,12 +487,12 @@ bool gui_monitor_video_server_stream(uintptr_t fd,unsigned channel,
         gui_rf_preview_worker_set_budget(mvd_ctl_budget(controls)/100.0);
     }
     gui_rf_preview_worker_set_paused(ch->rf,mode<2);
-    const char response[]="HTTP/1.0 200 OK\r\nContent-Type: application/x-misrc-h264\r\n"
+    const char response[]="HTTP/1.0 200 OK\r\nContent-Type: application/x-misrc-video\r\n"
         "Cache-Control: no-store\r\nConnection: close\r\n\r\n";
     uint8_t *source=malloc(MVD_PIXEL_CAP);
     uint8_t *i420=malloc(mvd_i420_buffer_size(640,480));
     uint8_t *encoded=malloc(MVD_MAX_PAYLOAD);
-    gui_mvd_encoder_t *encoder=NULL;
+    mvd_codec_encoder *encoder=NULL;
     unsigned enc_w=0,enc_h=0,sequence=0;
     uint64_t previous_gen=gui_monitor_video_framebox_published(ch->box);
     uint64_t last_submitted_us=0;
@@ -509,7 +513,7 @@ bool gui_monitor_video_server_stream(uintptr_t fd,unsigned channel,
                 }
                 if(now>last_heartbeat && now-last_heartbeat>=1){
                     mvd_frame_header keep={0};
-                    keep.codec=MVD_CODEC_H264_ANNEXB;
+                    keep.codec=(uint8_t)(encoder?mvd_video_encoder_codec(encoder):MVD_CODEC_H264_ANNEXB);
                     keep.flags=MVD_FLAG_HEARTBEAT;
                     keep.stream_id=channel+1;
                     keep.sequence=sequence++;
@@ -541,11 +545,12 @@ bool gui_monitor_video_server_stream(uintptr_t fd,unsigned channel,
             w &= ~1u;h &= ~1u;
             if(w<2 || h<2)continue;
             if(!encoder || enc_w!=w || enc_h!=h){
-                gui_mvd_encoder_destroy(encoder);
-                encoder=gui_mvd_encoder_create(w,h,fps_x100,bitrate_bps);
+                mvd_video_encoder_free(encoder);
+                encoder=mvd_video_encoder_best(client_codecs & MVD_CODEC_ALL,
+                                                 w,h,fps_x100,bitrate_bps);
                 enc_w=w;enc_h=h;
                 if(!encoder)break;
-                gui_mvd_encoder_request_keyframe(encoder);
+                atomic_store(&s_codec_choice[channel],mvd_video_encoder_codec(encoder));
             }
             size_t src_size=(size_t)info.width*info.height*info.channels;
             size_t start=((size_t)crop_y*info.width+crop_x)*info.channels;
@@ -556,7 +561,7 @@ bool gui_monitor_video_server_stream(uintptr_t fd,unsigned channel,
                     i420,mvd_i420_buffer_size(640,480),w,h)!=0)break;
             size_t bytes=0;int key=0;
             atomic_fetch_add_explicit(&s_encoder_attempts[channel],1,memory_order_relaxed);
-            int rc=gui_mvd_encoder_frame(encoder,i420,dst_size,info.timestamp_us,
+            int rc=mvd_video_encoder_frame(encoder,i420,dst_size,info.timestamp_us,
                                         encoded,MVD_MAX_PAYLOAD,&bytes,&key);
             if(rc<0)break;
             if(rc==0){
@@ -564,7 +569,7 @@ bool gui_monitor_video_server_stream(uintptr_t fd,unsigned channel,
                 continue;
             }
             mvd_frame_header hdr={0};
-            hdr.codec=MVD_CODEC_H264_ANNEXB;
+            hdr.codec=(uint8_t)mvd_video_encoder_codec(encoder);
             hdr.flags=key?(MVD_FLAG_KEYFRAME|MVD_FLAG_CODEC_CONFIG):0;
             hdr.stream_id=channel+1;
             hdr.sequence=sequence++;
@@ -582,7 +587,8 @@ bool gui_monitor_video_server_stream(uintptr_t fd,unsigned channel,
             last_frame_log=last_heartbeat;
         }
     }
-    gui_mvd_encoder_destroy(encoder);
+    mvd_video_encoder_free(encoder);
+    atomic_store(&s_codec_choice[channel],0);
     free(source);free(i420);free(encoded);
     gui_rf_preview_worker_set_paused(ch->rf,true);
     atomic_store(&ch->viewing,false);

@@ -22,5 +22,6 @@ bool gui_monitor_video_server_osd(unsigned channel,unsigned detail,
  * disconnect or server stop. Channel 0=A, 1=B; mode 0=CVBS, 1=Tape, 2=VHS RF.
  * Caller sends an HTTP error if this returns false. */
 bool gui_monitor_video_server_stream(uintptr_t fd, unsigned channel,
-    unsigned mode, unsigned bitrate_bps, unsigned fps_x100, uint32_t controls);
+    unsigned mode, unsigned bitrate_bps, unsigned fps_x100, uint32_t controls,
+    uint32_t client_codecs);
 #endif

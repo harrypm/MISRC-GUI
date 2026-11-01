@@ -735,13 +735,20 @@ bool gui_monitor_server_handle_request(uintptr_t socket_handle,
         unsigned mode=(unsigned)mon_arg(query,"mode",-1);
         unsigned bps=(unsigned)mon_arg(query,"bps",750000);
         unsigned fps=(unsigned)mon_arg(query,"fps",2500);
+        int offered=mon_arg(query,"codecs",-1);
+        /* Clients without the capability extension are AVC-only. */
+        uint32_t client_codecs=offered<0?MVD_CODEC_AVC_BIT:(uint32_t)offered;
+        if(!(client_codecs & MVD_CODEC_ALL)){
+            mon_answer(fd,406,"text/plain","no common video codec\\n");
+            return false;
+        }
         int supplied=mon_arg(query,"ctl",-1);
         uint32_t ctl=supplied<0?mvd_ctl_default(mode):(uint32_t)supplied;
         if(!mvd_ctl_valid(ctl,mode)) {
             mon_answer(fd,400,"text/plain","invalid video control combination\n");
             return false;
         }
-        if(!gui_monitor_video_server_stream((uintptr_t)fd,channel,mode,bps,fps,ctl))
+        if(!gui_monitor_video_server_stream((uintptr_t)fd,channel,mode,bps,fps,ctl,client_codecs))
             mon_answer(fd,409,"text/plain","H.264 video unavailable or channel busy\n");
         return false;
     }
