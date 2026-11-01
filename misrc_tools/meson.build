@@ -554,6 +554,14 @@ if raylib_dep.found()
   openh264_dep = dependency('openh264', required: false, static: windows_static_deps or host_system == 'android')
   if openh264_dep.found()
     gui_deps += [openh264_dep]
+    # GUI is C, while the static OpenH264 archive uses the C++ runtime.
+    # Link the runtime AFTER OpenH264 to resolve RTTI/new/delete on MinGW
+    # and libc++ on Android. Unmodified builds stay C-only.
+    if windows_static_deps
+      gui_deps += [meson.get_compiler('c').find_library('stdc++', required: true)]
+    elif host_system == 'android'
+      gui_deps += [meson.get_compiler('c').find_library('c++', required: true)]
+    endif
     message('MISRC monitor H.264 video codec enabled')
     openh264_define = '-DMISRC_HAVE_OPENH264=1'
   else
