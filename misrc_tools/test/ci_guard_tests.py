@@ -33,6 +33,43 @@ def run_checked(command: List[str], *, env: Optional[Dict[str, str]] = None) -> 
     return subprocess.run(command, check=True, capture_output=True, text=True, env=env)
 
 
+def check_shell_script_git_modes(repo_root: Path) -> int:
+    """Protect executable Git index bits, including on Windows checkouts.
+
+    The index is authoritative: os.stat().st_mode is not reliable on Windows,
+    where checkout files may all appear readable/executable irrespective of
+    the Git tree mode. Skip source tarballs with no .git metadata.
+    """
+    if not (repo_root / ".git").exists():
+        return 0
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "ls-files", "--stage", "-z"],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        return fail(f"Cannot validate Git executable bits for shell scripts: {exc}")
+    wrong = []
+    shell_scripts = 0
+    for record in result.stdout.split(b"\x00"):
+        if not record or b"\t" not in record:
+            continue
+        metadata, name = record.split(b"\t", 1)
+        if not name.endswith(b".sh"):
+            continue
+        shell_scripts += 1
+        mode = metadata.split(b" ", 1)[0].decode("ascii", "replace")
+        if mode != "100755":
+            wrong.append(f"{name.decode('utf-8', 'replace')} ({mode})")
+    if shell_scripts == 0:
+        return fail("No tracked shell scripts were found for Git executable-bit verification")
+    if wrong:
+        return fail("Tracked shell scripts must be executable in Git (100755), "
+                    "fix with git update-index --chmod=+x <path>: "
+                    + ", ".join(wrong))
+    return 0
+
+
 def check_cross_platform_workflow_coverage(workflow_path: Path) -> int:
     workflow_text = read_text(workflow_path)
     required_snippets = [
@@ -3019,6 +3056,7 @@ def main() -> int:
 
     checks: List[Tuple[str, Callable[[], int]]] = [
         ("cross-platform workflow coverage", lambda: check_cross_platform_workflow_coverage(workflow_path)),
+        ("shell script Git executable modes", lambda: check_shell_script_git_modes(repo_root)),
         ("actions runtime policy", lambda: check_actions_runtime_policy(workflow_path)),
         ("macOS brew install policy", lambda: check_macos_brew_install_policy(workflow_path)),
         ("workflow FFT dependency policy", lambda: check_workflow_fft_dependency_policy(workflow_path)),
