@@ -30,7 +30,9 @@ gui_mvd_encoder_t *gui_mvd_encoder_create(unsigned w,unsigned h,
     p.iPicWidth=(int)w;
     p.iPicHeight=(int)h;
     p.iTargetBitrate=(int)bitrate_bps;
-    p.iRCMode=RC_BITRATE_MODE;
+    /* Timestamp rate control accounts for variable PAL/VHS decoder cadence.
+     * Keep frame skipping enabled to preserve the configured bitrate budget. */
+    p.iRCMode=RC_TIMESTAMP_MODE;
     p.fMaxFrameRate=(float)fps_x100 / 100.0f;
     if ((*ctx->encoder)->Initialize(ctx->encoder,&p)!=0) {
         WelsDestroySVCEncoder(ctx->encoder);free(ctx);return NULL;

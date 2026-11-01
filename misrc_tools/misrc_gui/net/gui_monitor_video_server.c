@@ -73,6 +73,7 @@ static atomic_bool s_active;
 static atomic_uint s_capture_calls,s_stream_calls;
 /* Monotonic, lock-free diagnostic counters; never used in the RF hot path for I/O. */
 static atomic_uint_fast64_t s_input_blocks[2],s_queue_drops[2],s_encoded_frames[2];
+static atomic_uint_fast64_t s_encoder_attempts[2],s_rc_skips[2],s_encoded_bytes[2];
 static atomic_bool s_initialized;
 static void mvd_wait(void) { thrd_sleep_ms(1); }
 
@@ -304,20 +305,26 @@ void gui_monitor_video_server_stats(char *output,size_t capacity) {
     unsigned enabled=gui_monitor_video_server_available()?1u:0u;
     snprintf(output,capacity,
         "{\"openh264\":%u,\"active\":%u,\"ch\":["
-        "{\"viewing\":%u,\"mode\":%u,\"input_blocks\":%llu,\"dropped_blocks\":%llu,\"decoded_frames\":%llu,\"sent_frames\":%llu,\"queue\":%llu},"
-        "{\"viewing\":%u,\"mode\":%u,\"input_blocks\":%llu,\"dropped_blocks\":%llu,\"decoded_frames\":%llu,\"sent_frames\":%llu,\"queue\":%llu}]}",
+        "{\"viewing\":%u,\"mode\":%u,\"input_blocks\":%llu,\"dropped_blocks\":%llu,\"decoded_frames\":%llu,\"sent_frames\":%llu,\"encoder_attempts\":%llu,\"rc_skips\":%llu,\"encoded_bytes\":%llu,\"queue\":%llu},"
+        "{\"viewing\":%u,\"mode\":%u,\"input_blocks\":%llu,\"dropped_blocks\":%llu,\"decoded_frames\":%llu,\"sent_frames\":%llu,\"encoder_attempts\":%llu,\"rc_skips\":%llu,\"encoded_bytes\":%llu,\"queue\":%llu}]}",
         gui_mvd_codec_available()?1u:0u,enabled,
         (unsigned)atomic_load(&a->viewing),(unsigned)atomic_load(&a->mode),
         (unsigned long long)atomic_load(&s_input_blocks[0]),
         (unsigned long long)atomic_load(&s_queue_drops[0]),
         (unsigned long long)gui_monitor_video_framebox_published(a->box),
         (unsigned long long)atomic_load(&s_encoded_frames[0]),
+        (unsigned long long)atomic_load(&s_encoder_attempts[0]),
+        (unsigned long long)atomic_load(&s_rc_skips[0]),
+        (unsigned long long)atomic_load(&s_encoded_bytes[0]),
         (unsigned long long)(atomic_load(&a->write_idx)-atomic_load(&a->read_idx)),
         (unsigned)atomic_load(&b->viewing),(unsigned)atomic_load(&b->mode),
         (unsigned long long)atomic_load(&s_input_blocks[1]),
         (unsigned long long)atomic_load(&s_queue_drops[1]),
         (unsigned long long)gui_monitor_video_framebox_published(b->box),
         (unsigned long long)atomic_load(&s_encoded_frames[1]),
+        (unsigned long long)atomic_load(&s_encoder_attempts[1]),
+        (unsigned long long)atomic_load(&s_rc_skips[1]),
+        (unsigned long long)atomic_load(&s_encoded_bytes[1]),
         (unsigned long long)(atomic_load(&b->write_idx)-atomic_load(&b->read_idx)));
 }
 
@@ -348,7 +355,7 @@ bool gui_monitor_video_server_stream(uintptr_t fd,unsigned channel,
     gui_mvd_encoder_t *encoder=NULL;
     unsigned enc_w=0,enc_h=0,sequence=0;
     uint64_t previous_gen=gui_monitor_video_framebox_published(ch->box);
-    uint64_t last_sent_us=0;
+    uint64_t last_submitted_us=0;
     time_t last_heartbeat=time(NULL),last_frame_log=last_heartbeat;
     if(source && i420 && encoded &&
        mvd_send_all(fd,(const uint8_t *)response,sizeof(response)-1)==0){
@@ -381,8 +388,14 @@ bool gui_monitor_video_server_stream(uintptr_t fd,unsigned channel,
                 }
                 thrd_sleep_ms(2);continue;
             }
-            if(last_sent_us && info.timestamp_us>last_sent_us &&
-               info.timestamp_us-last_sent_us < 100000000ULL/fps_x100)continue;
+            /* Limit actual ENCODER INPUT to the requested FPS. A skipped
+             * compressed frame must not cause an immediate retry of the
+             * next source frame (which previously led to >25 FPS bursts). */
+            if(last_submitted_us &&
+               (info.timestamp_us<=last_submitted_us ||
+                info.timestamp_us-last_submitted_us<100000000ULL/fps_x100))
+                continue;
+            last_submitted_us=info.timestamp_us;
             unsigned w=info.width>640?640:info.width;
             unsigned h=info.height>480?480:info.height;
             w &= ~1u;h &= ~1u;
@@ -400,10 +413,14 @@ bool gui_monitor_video_server_stream(uintptr_t fd,unsigned channel,
                     (size_t)info.width*info.channels,(mvd_rgb_format)info.channels,
                     i420,mvd_i420_buffer_size(640,480),w,h)!=0)break;
             size_t bytes=0;int key=0;
+            atomic_fetch_add_explicit(&s_encoder_attempts[channel],1,memory_order_relaxed);
             int rc=gui_mvd_encoder_frame(encoder,i420,dst_size,info.timestamp_us,
                                         encoded,MVD_MAX_PAYLOAD,&bytes,&key);
             if(rc<0)break;
-            if(rc==0)continue;
+            if(rc==0){
+                atomic_fetch_add_explicit(&s_rc_skips[channel],1,memory_order_relaxed);
+                continue;
+            }
             mvd_frame_header hdr={0};
             hdr.codec=MVD_CODEC_H264_ANNEXB;
             hdr.flags=key?(MVD_FLAG_KEYFRAME|MVD_FLAG_CODEC_CONFIG):0;
@@ -417,8 +434,8 @@ bool gui_monitor_video_server_stream(uintptr_t fd,unsigned channel,
             if(mvd_header_encode(head,&hdr)!=0 ||
                mvd_send_all(fd,head,sizeof(head))!=0 ||
                mvd_send_all(fd,encoded,bytes)!=0)break;
-            last_sent_us=info.timestamp_us;
             atomic_fetch_add_explicit(&s_encoded_frames[channel],1,memory_order_relaxed);
+            atomic_fetch_add_explicit(&s_encoded_bytes[channel],bytes,memory_order_relaxed);
             last_heartbeat=time(NULL);
             last_frame_log=last_heartbeat;
         }
