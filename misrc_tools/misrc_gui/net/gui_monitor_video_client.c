@@ -42,6 +42,7 @@ typedef struct {
     thrd_t worker;
     atomic_bool stop,active;
     atomic_uint mode;
+    atomic_int video_http_status; /* 0=connecting, negative=network/response error, positive=HTTP code */
     atomic_uint_fast64_t seen_seconds;
     atomic_flag pixel_busy;
     atomic_uint_fast64_t published;
@@ -108,21 +109,29 @@ static int mvd_read_status(mvd_socket sock) {
         header[used++]=b;
         if(used>=4 && !memcmp(header+used-4,"\r\n\r\n",4)){
             header[used]=0;
-            return !strncmp(header,"HTTP/1.0 200 ",13) ||
-                   !strncmp(header,"HTTP/1.1 200 ",13) ? 0:-1;
+            int status=0;
+            return sscanf(header,"HTTP/%*u.%*u %d",&status)==1 ? status:-1;
         }
     }
     return -1;
 }
 static int mvd_receive(unsigned channel,mvd_client_channel *ch,unsigned mode) {
     mvd_socket sock=mvd_connect(g_mvd_client.host,g_mvd_client.port);
-    if(sock==MVD_SOCKET_BAD)return -1;
+    if(sock==MVD_SOCKET_BAD){atomic_store(&ch->video_http_status,-1);return -1;}
     char request[256];
     int n=snprintf(request,sizeof(request),
        "GET /monitor/video?channel=%u&mode=%u&bps=750000&fps=2500 HTTP/1.0\r\n"
        "Connection: close\r\n\r\n",channel,mode);
     if(n<1 || (size_t)n>=sizeof(request) ||
-       mvd_send_full(sock,request,(size_t)n)!=0 || mvd_read_status(sock)!=0){
+       mvd_send_full(sock,request,(size_t)n)!=0){
+        atomic_store(&ch->video_http_status,-1);
+        MVD_CLOSE(sock);return -1;
+    }
+    int http_status=mvd_read_status(sock);
+    atomic_store(&ch->video_http_status,http_status);
+    if(http_status!=200){
+        static const char *hint="check server OpenH264 and version";
+        fprintf(stderr,"[M-VIDEO] CH%u HTTP %d; %s\n",channel+1,http_status,hint);
         MVD_CLOSE(sock);return -1;
     }
     gui_mvd_decoder_t *decoder=gui_mvd_decoder_create();
@@ -203,6 +212,7 @@ int gui_monitor_video_client_start(const char *host,uint16_t port) {
         if(!ch->pixels)return -1;
         atomic_flag_clear(&ch->pixel_busy);
         atomic_store(&ch->mode,0);
+        atomic_store(&ch->video_http_status,0);
         atomic_store(&ch->seen_seconds,0);
         atomic_store(&ch->stop,false);
         if(thrd_create(&ch->worker,mvd_client_thread,ch)!=thrd_success){
@@ -241,6 +251,7 @@ void gui_monitor_video_client_draw(unsigned channel,Rectangle bounds) {
         mode=(mode+1)%4;
         atomic_store(&ch->mode,mode);
         ch->drawn_generation=0;
+        atomic_store(&ch->video_http_status,0);
     }
     DrawRectangleRec(bounds,(Color){18,18,20,255});
     if(!ch->scratch)ch->scratch=malloc(MVD_PIXEL_CAP);
@@ -273,8 +284,16 @@ void gui_monitor_video_client_draw(unsigned channel,Rectangle bounds) {
            (Rectangle){0,0,(float)ch->texture_width,(float)ch->texture_height},
            dst,(Vector2){0,0},0,WHITE);
     }else{
-        gui_text_draw(gui_mvd_codec_available()?"Connecting to H.264 video preview...":
-            "OpenH264 not available in this build",bounds.x+12,bounds.y+50,14,LIGHTGRAY);
+        int status=atomic_load(&ch->video_http_status);
+        const char *message = !gui_mvd_codec_available() ?
+            "OpenH264 unavailable in this client build" :
+            status==503 ? "Server OpenH264 unavailable: rebuild headless server" :
+            status==404 ? "Server lacks /monitor/video: update headless server" :
+            status==409 ? "Server video channel busy: disconnect other viewer" :
+            status<0 ? "H.264 video connection failed: check server and port" :
+            status==200 ? "Connected: waiting for decoded video frames..." :
+            "Connecting to H.264 video preview...";
+        gui_text_draw(message,bounds.x+12,bounds.y+50,14,LIGHTGRAY);
     }
     DrawRectangleRec(selector,(Color){35,43,54,235});
     gui_text_draw(modes[mode],selector.x+8,selector.y+6,14,WHITE);

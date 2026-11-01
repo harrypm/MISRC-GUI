@@ -710,7 +710,16 @@ bool gui_monitor_server_handle_request(uintptr_t socket_handle,
         }
         mon_answer(fd,200,"text/plain","clip counters cleared\n");return false;
     }
+    if(strcmp(path,"/monitor/video/status")==0){
+        char json[1024];
+        gui_monitor_video_server_stats(json,sizeof(json));
+        mon_answer(fd,200,"application/json",json);return false;
+    }
     if(strcmp(path,"/monitor/video")==0){
+        if(!gui_monitor_video_server_available()) {
+            mon_answer(fd,503,"text/plain","OpenH264 video disabled on server; install OpenH264 development package and rebuild server\n");
+            return false;
+        }
         unsigned channel=(unsigned)mon_arg(query,"channel",-1);
         unsigned mode=(unsigned)mon_arg(query,"mode",-1);
         unsigned bps=(unsigned)mon_arg(query,"bps",750000);
@@ -828,7 +837,7 @@ int gui_monitor_server_start(gui_app_t *app,uint16_t port) {
     fs_unlock();
     atomic_store(&g_server.active,true);
     if(gui_monitor_video_server_start()!=0)
-        fprintf(stderr,"[M-VIDEO] OpenH264 unavailable: video preview disabled\n");
+        fprintf(stderr,"[M-VIDEO] Video startup failed: check server OpenH264 dependency and decoder resources; /monitor/video/status reports state\n");
     fprintf(stderr,"[M-SERVER] Monitor MISRC-M/2 endpoints enabled on shared TCP %u (Zstd-1 preview + control)\n",(unsigned)port);
     return 0;
 }

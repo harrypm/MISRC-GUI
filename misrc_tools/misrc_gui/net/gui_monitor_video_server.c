@@ -55,6 +55,8 @@ typedef struct {
 static mvd_channel s_channels[2];
 static atomic_bool s_active;
 static atomic_uint s_capture_calls,s_stream_calls;
+/* Monotonic, lock-free diagnostic counters; never used in the RF hot path for I/O. */
+static atomic_uint_fast64_t s_input_blocks[2],s_queue_drops[2],s_encoded_frames[2];
 static atomic_bool s_initialized;
 static void mvd_wait(void) { thrd_sleep_ms(1); }
 
@@ -174,14 +176,15 @@ void gui_monitor_video_server_capture(const int16_t *a,const int16_t *b,
                 (void)gui_rf_preview_worker_submit(ch->rf,src[c],counts[c],&info[c]);
             continue;
         }
-        if(counts[c]>MVD_INPUT_SAMPLES){atomic_store(&ch->gap,true);continue;}
+        if(counts[c]>MVD_INPUT_SAMPLES){atomic_fetch_add(&s_queue_drops[c],1);atomic_store(&ch->gap,true);continue;}
         uint64_t w=atomic_load_explicit(&ch->write_idx,memory_order_relaxed);
         uint64_t r=atomic_load_explicit(&ch->read_idx,memory_order_acquire);
-        if(w-r>=MVD_INPUT_SLOTS){atomic_store(&ch->gap,true);continue;}
+        if(w-r>=MVD_INPUT_SLOTS){atomic_fetch_add(&s_queue_drops[c],1);atomic_store(&ch->gap,true);continue;}
         mvd_input_slot *slot=&ch->slots[w%MVD_INPUT_SLOTS];
         memcpy(slot->samples,src[c],counts[c]*sizeof(int16_t));
         slot->n=counts[c];slot->info=info[c];
         atomic_store_explicit(&ch->write_idx,w+1,memory_order_release);
+        atomic_fetch_add_explicit(&s_input_blocks[c],1,memory_order_relaxed);
     }
     atomic_fetch_sub(&s_capture_calls,1);
 }
@@ -193,6 +196,33 @@ static int mvd_send_all(uintptr_t fd,const uint8_t *data,size_t size) {
         data+=(size_t)sent;size-=(size_t)sent;
     }
     return 0;
+}
+
+bool gui_monitor_video_server_available(void) {
+    return atomic_load_explicit(&s_active,memory_order_acquire);
+}
+
+void gui_monitor_video_server_stats(char *output,size_t capacity) {
+    if(!output || !capacity)return;
+    const mvd_channel *a=&s_channels[0], *b=&s_channels[1];
+    unsigned enabled=gui_monitor_video_server_available()?1u:0u;
+    snprintf(output,capacity,
+        "{\"openh264\":%u,\"active\":%u,\"ch\":["
+        "{\"viewing\":%u,\"mode\":%u,\"input_blocks\":%llu,\"dropped_blocks\":%llu,\"decoded_frames\":%llu,\"sent_frames\":%llu,\"queue\":%llu},"
+        "{\"viewing\":%u,\"mode\":%u,\"input_blocks\":%llu,\"dropped_blocks\":%llu,\"decoded_frames\":%llu,\"sent_frames\":%llu,\"queue\":%llu}]}",
+        gui_mvd_codec_available()?1u:0u,enabled,
+        (unsigned)atomic_load(&a->viewing),(unsigned)atomic_load(&a->mode),
+        (unsigned long long)atomic_load(&s_input_blocks[0]),
+        (unsigned long long)atomic_load(&s_queue_drops[0]),
+        (unsigned long long)gui_monitor_video_framebox_published(a->box),
+        (unsigned long long)atomic_load(&s_encoded_frames[0]),
+        (unsigned long long)(atomic_load(&a->write_idx)-atomic_load(&a->read_idx)),
+        (unsigned)atomic_load(&b->viewing),(unsigned)atomic_load(&b->mode),
+        (unsigned long long)atomic_load(&s_input_blocks[1]),
+        (unsigned long long)atomic_load(&s_queue_drops[1]),
+        (unsigned long long)gui_monitor_video_framebox_published(b->box),
+        (unsigned long long)atomic_load(&s_encoded_frames[1]),
+        (unsigned long long)(atomic_load(&b->write_idx)-atomic_load(&b->read_idx)));
 }
 
 bool gui_monitor_video_server_stream(uintptr_t fd,unsigned channel,
@@ -223,7 +253,7 @@ bool gui_monitor_video_server_stream(uintptr_t fd,unsigned channel,
     unsigned enc_w=0,enc_h=0,sequence=0;
     uint64_t previous_gen=gui_monitor_video_framebox_published(ch->box);
     uint64_t last_sent_us=0;
-    time_t last_heartbeat=time(NULL);
+    time_t last_heartbeat=time(NULL),last_frame_log=last_heartbeat;
     if(source && i420 && encoded &&
        mvd_send_all(fd,(const uint8_t *)response,sizeof(response)-1)==0){
         while(atomic_load(&s_active)){
@@ -231,6 +261,13 @@ bool gui_monitor_video_server_stream(uintptr_t fd,unsigned channel,
             if(!gui_monitor_video_framebox_take(ch->box,source,MVD_PIXEL_CAP,
                                                &previous_gen,&info)) {
                 time_t now=time(NULL);
+                if(now>last_frame_log && now-last_frame_log>=10){
+                    fprintf(stderr,"[M-VIDEO] CH%u mode %u: awaiting decoded frames; input blocks=%llu queue drops=%llu decoded=%llu\n",
+                        channel+1,mode,(unsigned long long)atomic_load(&s_input_blocks[channel]),
+                        (unsigned long long)atomic_load(&s_queue_drops[channel]),
+                        (unsigned long long)gui_monitor_video_framebox_published(ch->box));
+                    last_frame_log=now;
+                }
                 if(now>last_heartbeat && now-last_heartbeat>=1){
                     mvd_frame_header keep={0};
                     keep.codec=MVD_CODEC_H264_ANNEXB;
@@ -285,7 +322,9 @@ bool gui_monitor_video_server_stream(uintptr_t fd,unsigned channel,
                mvd_send_all(fd,head,sizeof(head))!=0 ||
                mvd_send_all(fd,encoded,bytes)!=0)break;
             last_sent_us=info.timestamp_us;
+            atomic_fetch_add_explicit(&s_encoded_frames[channel],1,memory_order_relaxed);
             last_heartbeat=time(NULL);
+            last_frame_log=last_heartbeat;
         }
     }
     gui_mvd_encoder_destroy(encoder);
