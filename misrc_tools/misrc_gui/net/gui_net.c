@@ -2147,6 +2147,9 @@ int gui_net_apply_mode(gui_app_t *app) {
     }
     /* Stop whatever is running if it doesn't match the desired mode. */
     if (s_server && want != GUI_NET_MODE_SERVER) {
+        /* Persistent /monitor/video sockets live in HTTP workers. Signal
+         * video workers to stop BEFORE server_stop() joins those workers. */
+        gui_monitor_server_stop();
         server_stop(s_server);
     }
     if (s_client && !((want == GUI_NET_MODE_CLIENT && !s_client->monitor_only) ||

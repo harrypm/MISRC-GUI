@@ -195,6 +195,13 @@ bool gui_monitor_video_server_stream(uintptr_t fd,unsigned channel,
        bitrate_bps<64000u || bitrate_bps>4000000u ||
        fps_x100<500u || fps_x100>3000u)return false;
     mvd_channel *ch=&s_channels[channel];
+#if defined(SO_NOSIGPIPE)
+    /* macOS: do not terminate the entire capture process if a monitor
+     * viewer disconnects during a send(). MSG_NOSIGNAL covers Linux. */
+    { int no_sigpipe=1;
+      (void)setsockopt((int)fd,SOL_SOCKET,SO_NOSIGPIPE,
+                      (const void *)&no_sigpipe,sizeof(no_sigpipe)); }
+#endif
     if(atomic_exchange(&ch->viewing,true))return false;
     atomic_fetch_add(&s_stream_calls,1);
     atomic_store(&ch->mode,mode);
