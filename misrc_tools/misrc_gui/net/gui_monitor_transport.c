@@ -3,6 +3,7 @@
 #include "gui_monitor_transport.h"
 #include "gui_monitor_video_server.h"
 #include "gui_monitor_video_options.h"
+#include "gui_monitor_video_wire.h"
 #include "gui_monitor_video_client.h"
 #include "gui_monitor_session_state.h"
 #include "gui_remote_display.h"
