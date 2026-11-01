@@ -1921,7 +1921,8 @@ def check_build_workflow_entrypoint_contract(build_workflow_path: Path) -> int:
         # CI must also run on direct pushes to main (regression e34dce9: a
         # guard break was pushed straight to main and ran no CI for a day;
         # the tags-only push trigger never fired).
-        "push:\n    branches:\n      - main\n    tags:\n      - 'v*'",
+        "push:\n    branches:\n      - main\n",
+        "    tags:\n      - 'v*'",
         "preflight-guard-tests:",
         "linux-appimage:",
         "windows-exe:",
