@@ -6,6 +6,28 @@
 #include <stdlib.h>
 #include <string.h>
 
+static void test_codec_negotiation(void) {
+    const uint32_t avc=MVD_CODEC_BIT(MVD_CODEC_H264_ANNEXB);
+    const uint32_t vp9=MVD_CODEC_BIT(MVD_CODEC_VP9);
+    const uint32_t hevc=MVD_CODEC_BIT(MVD_CODEC_HEVC_ANNEXB);
+    const uint32_t av1=MVD_CODEC_BIT(MVD_CODEC_AV1);
+    assert(mvd_codec_select(MVD_CODEC_ALL, av1|vp9|hevc|avc, avc)==MVD_CODEC_AV1);
+    assert(mvd_codec_select(MVD_CODEC_ALL, hevc, av1|vp9|avc)==MVD_CODEC_HEVC_ANNEXB);
+    assert(mvd_codec_select(MVD_CODEC_ALL, 0, av1|vp9|avc)==MVD_CODEC_AV1);
+    assert(mvd_codec_select(avc, av1|vp9|hevc, avc)==MVD_CODEC_H264_ANNEXB);
+    assert(mvd_codec_select(vp9, av1|hevc, avc)==0);
+    assert(mvd_codec_select(0, MVD_CODEC_ALL, MVD_CODEC_ALL)==0);
+    assert(mvd_codec_select(1u<<30, MVD_CODEC_ALL, MVD_CODEC_ALL)==0);
+    assert(!mvd_codec_valid(0) && !mvd_codec_valid(5));
+    for(unsigned codec=1;codec<=4;codec++){
+        mvd_frame_header h={0},o={0};
+        uint8_t wire[MVD_HEADER_BYTES];
+        h.codec=(uint8_t)codec;h.width=640;h.height=480;
+        h.fps_x100=2500;h.payload_bytes=40;
+        assert(mvd_header_encode(wire,&h)==0);
+        assert(mvd_header_decode(&o,wire)==0 && o.codec==codec);
+    }
+}
 static void test_headers(void) {
     const mvd_frame_header f = {MVD_CODEC_H264_ANNEXB, MVD_FLAG_KEYFRAME,
          0x01234567u, 77u, UINT64_C(1234567890123), 720, 576, 2500, 128};
@@ -148,7 +170,7 @@ static void test_monitor_remote_controls(void) {
 }
 
 int main(void) {
-    test_headers(); test_fragmented_reader(); test_multi_frame(); test_i420();
+    test_codec_negotiation(); test_headers(); test_fragmented_reader(); test_multi_frame(); test_i420();
     test_monitor_remote_controls();
     puts("monitor video stage 1 tests: PASS");
     return 0;

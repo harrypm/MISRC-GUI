@@ -3,7 +3,7 @@
 
 /*
  * MISRC-M monitor video extension, revision 1.
- * Transport framing only: H.264 Annex B access units, not RF samples.
+ * Transport framing of H.264/HEVC Annex B, VP9 or AV1 access units; never RF samples.
  * All multi-byte fields are big-endian, independent of host ABI.
  * This module does not perform network I/O and never owns the payload buffer.
  */
@@ -20,11 +20,51 @@ extern "C" {
 #define MVD_MAX_WIDTH 1920u
 #define MVD_MAX_HEIGHT 1080u
 #define MVD_CODEC_H264_ANNEXB 1u
+#define MVD_CODEC_HEVC_ANNEXB 2u
+#define MVD_CODEC_VP9 3u
+#define MVD_CODEC_AV1 4u
+/* Bitmap on the optional ?codecs= request. Legacy requests imply AVC-only. */
+#define MVD_CODEC_BIT(codec) (1u << (codec))
+#define MVD_CODEC_ALL (MVD_CODEC_BIT(MVD_CODEC_H264_ANNEXB) | \
+    MVD_CODEC_BIT(MVD_CODEC_HEVC_ANNEXB) | MVD_CODEC_BIT(MVD_CODEC_VP9) | \
+    MVD_CODEC_BIT(MVD_CODEC_AV1))
+#define MVD_CODEC_AVC_BIT MVD_CODEC_BIT(MVD_CODEC_H264_ANNEXB)
+static inline int mvd_codec_valid(unsigned codec) {
+    return codec>=MVD_CODEC_H264_ANNEXB && codec<=MVD_CODEC_AV1;
+}
+/* Hardware AV1/VP9/HEVC preferred over AVC, then a software fallback.
+ * The caller supplies actually usable encoder and client decoder masks. */
+static inline unsigned mvd_codec_select(uint32_t client, uint32_t hw, uint32_t sw) {
+    static const unsigned preference[] = {
+        MVD_CODEC_AV1, MVD_CODEC_VP9, MVD_CODEC_HEVC_ANNEXB,
+        MVD_CODEC_H264_ANNEXB
+    };
+    const uint32_t allowed = client & MVD_CODEC_ALL;
+    for(unsigned i=0;i<sizeof(preference)/sizeof(preference[0]);i++) {
+        const unsigned id=preference[i];
+        if((allowed & hw & MVD_CODEC_BIT(id))!=0)return id;
+    }
+    for(unsigned i=0;i<sizeof(preference)/sizeof(preference[0]);i++) {
+        const unsigned id=preference[i];
+        if((allowed & sw & MVD_CODEC_BIT(id))!=0)return id;
+    }
+    return 0;
+}
+static inline const char *mvd_codec_name(unsigned codec) {
+    switch(codec) {
+        case MVD_CODEC_H264_ANNEXB: return "H.264";
+        case MVD_CODEC_HEVC_ANNEXB: return "HEVC";
+        case MVD_CODEC_VP9: return "VP9";
+        case MVD_CODEC_AV1: return "AV1";
+        default: return "unknown";
+    }
+}
 #define MVD_FLAG_KEYFRAME 0x01u
 #define MVD_FLAG_CODEC_CONFIG 0x02u
 #define MVD_FLAG_HEARTBEAT 0x04u
 
-/* Every frame is self-described. SPS/PPS must be supplied with each IDR. */
+/* Every frame is self-described. New codecs start on a keyframe.
+ * AVC and HEVC must include parameter sets at their keyframes. */
 typedef struct {
     uint8_t codec;
     uint8_t flags;

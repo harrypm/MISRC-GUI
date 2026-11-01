@@ -27,7 +27,7 @@ static uint64_t get64(const uint8_t *p) {
     return ((uint64_t)get32(p) << 32) | get32(p + 4);
 }
 static int valid(const mvd_frame_header *f) {
-    return f && f->codec == MVD_CODEC_H264_ANNEXB &&
+    return f && mvd_codec_valid(f->codec) &&
            (f->flags & (uint8_t)~(MVD_FLAG_KEYFRAME | MVD_FLAG_CODEC_CONFIG | MVD_FLAG_HEARTBEAT)) == 0 &&
            f->width >= 2 && f->height >= 2 &&
            f->width <= MVD_MAX_WIDTH && f->height <= MVD_MAX_HEIGHT &&
