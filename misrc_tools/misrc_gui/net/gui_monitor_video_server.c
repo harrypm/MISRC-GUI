@@ -9,6 +9,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
+#ifndef LIBSOXR_ENABLED
+#define LIBSOXR_ENABLED 0
+#endif
+#if LIBSOXR_ENABLED
+#include <soxr.h>
+#endif
 #include <time.h>
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -31,6 +38,9 @@
 #define MSG_NOSIGNAL 0
 #endif
 #define MVD_INPUT_SAMPLES 65536u
+/* Local GUI CVBS path reduces 40 MSPS to a fixed 4fsc-ish rate. Mirror
+ * that DSP preprocessing on the headless server, on the decode worker ONLY. */
+#define MVD_RESAMPLE_CAP (MVD_INPUT_SAMPLES + 16384u)
 #define MVD_INPUT_SLOTS 64u
 #define MVD_PIXEL_CAP ((size_t)MVD_MAX_WIDTH*MVD_MAX_HEIGHT*4u)
 #define MVD_DEFAULT_BITRATE 750000u
@@ -51,6 +61,12 @@ typedef struct {
     atomic_bool viewing,gap;
     atomic_uint mode;
     bool worker_started;
+#if LIBSOXR_ENABLED
+    soxr_t cvbs_resampler;
+    uint32_t cvbs_input_rate,cvbs_output_rate;
+    float *cvbs_float;
+    int16_t *cvbs_samples;
+#endif
 } mvd_channel;
 static mvd_channel s_channels[2];
 static atomic_bool s_active;
@@ -59,6 +75,67 @@ static atomic_uint s_capture_calls,s_stream_calls;
 static atomic_uint_fast64_t s_input_blocks[2],s_queue_drops[2],s_encoded_frames[2];
 static atomic_bool s_initialized;
 static void mvd_wait(void) { thrd_sleep_ms(1); }
+
+
+#if LIBSOXR_ENABLED
+/* Runs only on the per-channel decode thread. No allocation or DSP on capture. */
+static void mvd_resampler_clear(mvd_channel *ch) {
+    if(ch->cvbs_resampler)soxr_delete(ch->cvbs_resampler);
+    ch->cvbs_resampler=NULL;
+    ch->cvbs_input_rate=ch->cvbs_output_rate=0;
+}
+static bool mvd_cvbs_resampled(mvd_channel *ch,const int16_t *input,
+                               size_t count,uint32_t input_rate) {
+    if(input_rate<1000000u || input_rate>100000000u) return false;
+    uint32_t target=ch->cvbs->state.format==CVBS_FORMAT_NTSC ? 14300000u:17900000u;
+    if(input_rate==target)return false;
+    if(!ch->cvbs_resampler || ch->cvbs_input_rate!=input_rate ||
+       ch->cvbs_output_rate!=target) {
+        mvd_resampler_clear(ch);
+        soxr_io_spec_t io=soxr_io_spec(SOXR_INT16_I,SOXR_FLOAT32_I);
+        soxr_quality_spec_t quality=soxr_quality_spec(SOXR_HQ,0);
+        quality.passband_end=0.95;
+        quality.stopband_begin=1.0;
+        quality.phase_response=50.0;
+        soxr_runtime_spec_t runtime=soxr_runtime_spec(1);
+        soxr_error_t error=NULL;
+        ch->cvbs_resampler=soxr_create(input_rate,target,1,&error,&io,&quality,&runtime);
+        if(error || !ch->cvbs_resampler) {
+            mvd_resampler_clear(ch);
+            return false;
+        }
+        ch->cvbs_input_rate=input_rate;
+        ch->cvbs_output_rate=target;
+    }
+    if(!ch->cvbs_float)ch->cvbs_float=malloc(MVD_RESAMPLE_CAP*sizeof(float));
+    if(!ch->cvbs_samples)ch->cvbs_samples=malloc(MVD_RESAMPLE_CAP*sizeof(int16_t));
+    if(!ch->cvbs_float || !ch->cvbs_samples)return false;
+    size_t consumed=0,produced=0;
+    while(consumed<count) {
+        size_t in_done=0,out_done=0;
+        soxr_error_t err=soxr_process(ch->cvbs_resampler,
+            input+consumed,count-consumed,&in_done,
+            ch->cvbs_float+produced,MVD_RESAMPLE_CAP-produced,&out_done);
+        if(err || (!in_done && !out_done) || produced+out_done>MVD_RESAMPLE_CAP) {
+            mvd_resampler_clear(ch);
+            return false;
+        }
+        consumed+=in_done;
+        produced+=out_done;
+    }
+    /* Match Local GUI's deterministic FLOAT32->INT16 conversion: INT16
+     * soxr output dither is nondeterministic and can disturb sync locking. */
+    for(size_t i=0;i<produced;i++) {
+        long v=lrintf(ch->cvbs_float[i]*32768.0f);
+        if(v>32767)v=32767;
+        if(v< -32768)v= -32768;
+        ch->cvbs_samples[i]=(int16_t)v;
+    }
+    ch->cvbs->rate_trusted=true;
+    if(produced)gui_cvbs_process_buffer(ch->cvbs,ch->cvbs_samples,produced,target);
+    return true;
+}
+#endif
 
 static int mvd_decode_thread(void *argument) {
     mvd_channel *ch=(mvd_channel *)argument;
@@ -78,6 +155,9 @@ static int mvd_decode_thread(void *argument) {
         unsigned mode=atomic_load_explicit(&ch->mode,memory_order_acquire);
         if(mode!=last_mode) {
             gui_cvbs_reset(ch->cvbs);
+#if LIBSOXR_ENABLED
+            mvd_resampler_clear(ch);
+#endif
             ch->cvbs->decoder_mode=mode==1?CVBS_DECODER_MODE_TAPE:CVBS_DECODER_MODE_CVBS;
             last_mode=mode;
             have_previous=false;
@@ -94,16 +174,32 @@ static int mvd_decode_thread(void *argument) {
              previous.start_sample!=item->info.start_sample)) ||
            item->info.discontinuity) {
             gui_cvbs_reset(ch->cvbs);
+#if LIBSOXR_ENABLED
+            mvd_resampler_clear(ch);
+#endif
             have_previous=false;
         }
         if(item->n) {
-            gui_cvbs_process_buffer(ch->cvbs,item->samples,item->n,item->info.sample_rate_hz);
+            bool converted=false;
+#if LIBSOXR_ENABLED
+            /* Tape Decode intentionally retains its existing native-rate DSP
+             * path. CVBS matches the Local GUI soxr resampling strategy. */
+            if(mode==0)
+                converted=mvd_cvbs_resampled(ch,item->samples,item->n,item->info.sample_rate_hz);
+#endif
+            if(!converted) {
+                ch->cvbs->rate_trusted=false;
+                gui_cvbs_process_buffer(ch->cvbs,item->samples,item->n,item->info.sample_rate_hz);
+            }
             previous=item->info;
             previous.start_sample+=item->n;
             have_previous=true;
         }
         atomic_store_explicit(&ch->read_idx,r+1,memory_order_release);
     }
+#if LIBSOXR_ENABLED
+    mvd_resampler_clear(ch);
+#endif
     return 0;
 }
 
