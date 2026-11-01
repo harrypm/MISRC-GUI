@@ -1,4 +1,5 @@
 #include "../misrc_gui/net/gui_monitor_video_wire.h"
+#include "../misrc_gui/net/gui_monitor_video_options.h"
 #include "../misrc_gui/net/gui_monitor_video_i420.h"
 #include <assert.h>
 #include <stdio.h>
@@ -104,8 +105,51 @@ static void test_i420(void) {
     for (int i=0;i<16;i++) assert(yuv[i] == 235);
     for (int i=16;i<24;i++) assert(yuv[i] == 128);
 }
+static void test_monitor_remote_controls(void) {
+    uint32_t c=mvd_ctl_default(0);
+    assert(mvd_ctl_valid(c,0));
+    assert(!mvd_ctl_valid(c,2));
+    assert(mvd_ctl_get(c,MVD_CTL_SYNC,1u)==1);
+    assert(mvd_ctl_get(c,MVD_CTL_COLOUR,1u)==1);
+    assert(mvd_ctl_get(c,MVD_CTL_OSD,3u)==1);
+    assert(mvd_ctl_budget(c)==100);
+    c=mvd_ctl_set(c,MVD_CTL_SYSTEM,3u,2);
+    c=mvd_ctl_set(c,MVD_CTL_FRAME,1u,1);
+    c=mvd_ctl_set(c,MVD_CTL_COLOUR,1u,0);
+    assert(mvd_ctl_valid(c,0));
+    assert(mvd_ctl_get(c,MVD_CTL_SYSTEM,3u)==2);
+    assert(mvd_ctl_get(c,MVD_CTL_FRAME,1u)==1);
+    assert(mvd_ctl_get(c,MVD_CTL_COLOUR,1u)==0);
+    c=mvd_ctl_set(c,MVD_CTL_BUDGET,7u,6);
+    assert(!mvd_ctl_valid(c,0));
+    static const unsigned budget[]={50,75,100,150,200,300};
+    for(unsigned i=0;i<6;i++){
+        c=mvd_ctl_set(c,MVD_CTL_BUDGET,7u,i);
+        assert(mvd_ctl_valid(c,0));
+        assert(mvd_ctl_budget(c)==budget[i]);
+    }
+    c=mvd_ctl_default(2);
+    assert(mvd_ctl_rf_profile(c)==0); /* PAL VHS */
+    c=mvd_ctl_set(c,MVD_CTL_SYSTEM,3u,1);
+    assert(mvd_ctl_rf_profile(c)==1); /* NTSC VHS */
+    c=mvd_ctl_set(c,MVD_CTL_SYSTEM,3u,2);
+    assert(mvd_ctl_rf_profile(c)==6); /* SECAM VHS */
+    c=mvd_ctl_set(c,MVD_CTL_MESECAM,1u,1);
+    assert(mvd_ctl_rf_profile(c)==7); /* MESECAM VHS */
+    c=mvd_ctl_set(c,MVD_CTL_TAPE,1u,1);
+    for(unsigned i=0;i<4;i++){
+        static const unsigned expected[]={2,3,5,8};
+        c=mvd_ctl_set(c,MVD_CTL_BETA,3u,i);
+        assert(mvd_ctl_rf_profile(c)==expected[i]);
+    }
+    c=mvd_ctl_set(c,MVD_CTL_TAPE_FAMILY,7u,7);
+    assert(!mvd_ctl_valid(c,2));
+    assert(mvd_ctl_rf_profile(mvd_ctl_default(3))==1); /* older NTSC client */
+}
+
 int main(void) {
     test_headers(); test_fragmented_reader(); test_multi_frame(); test_i420();
+    test_monitor_remote_controls();
     puts("monitor video stage 1 tests: PASS");
     return 0;
 }
