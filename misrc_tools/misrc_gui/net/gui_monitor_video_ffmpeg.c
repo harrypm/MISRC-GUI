@@ -11,13 +11,15 @@
 #endif
 #if MISRC_HAVE_FFMPEG
 #include <libavcodec/avcodec.h>
+#include <errno.h>
 #include <libavutil/opt.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
 struct mvd_ff_encoder {
     AVCodecContext *ctx;
-    AVFrame *frame;
+    AVFrame *frame,*gpu_frame;
+    AVBufferRef *gpu_device,*gpu_frames;
     AVPacket *packet;
     struct SwsContext *sws;
     unsigned w,h;
@@ -39,12 +41,12 @@ static enum AVCodecID codec_id(unsigned wire) {
         default: return AV_CODEC_ID_NONE;
     }
 }
-/* Prefer hardware encoders only when their selected pixel format accepts
- * host I420/NV12. Device-only VAAPI/QSV require an uploaded surface; no
- * misleading hw claim unless device initialization actually succeeds. */
-static const char * const hw_av1[]={"av1_nvenc","av1_amf","av1_videotoolbox",NULL};
-static const char * const hw_vp9[]={"vp9_mf",NULL};
-static const char * const hw_hevc[]={"hevc_nvenc","hevc_amf","hevc_videotoolbox",NULL};
+/* CUDA/NVENC, VideoToolbox, AMF accept host-side YUV input. VAAPI and QSV
+ * use NV12 staging frames uploaded to a real hardware frame pool. A codec
+ * is selected only AFTER its device and encoder context have opened. */
+static const char * const hw_av1[]={"av1_nvenc","av1_amf","av1_videotoolbox","av1_vaapi","av1_qsv",NULL};
+static const char * const hw_vp9[]={"vp9_vaapi","vp9_qsv","vp9_mf",NULL};
+static const char * const hw_hevc[]={"hevc_nvenc","hevc_amf","hevc_videotoolbox","hevc_vaapi","hevc_qsv",NULL};
 static const char * const sw_av1[]={"libsvtav1","libaom-av1","librav1e",NULL};
 static const char * const sw_vp9[]={"libvpx-vp9",NULL};
 static const char * const sw_hevc[]={"libx265",NULL};
@@ -65,6 +67,8 @@ static int usable_pixel_format(const AVCodec *codec,enum AVPixelFormat format) {
 static enum AVPixelFormat input_format(const AVCodec *codec) {
     if(usable_pixel_format(codec,AV_PIX_FMT_YUV420P))return AV_PIX_FMT_YUV420P;
     if(usable_pixel_format(codec,AV_PIX_FMT_NV12))return AV_PIX_FMT_NV12;
+    if(usable_pixel_format(codec,AV_PIX_FMT_VAAPI))return AV_PIX_FMT_VAAPI;
+    if(usable_pixel_format(codec,AV_PIX_FMT_QSV))return AV_PIX_FMT_QSV;
     return AV_PIX_FMT_NONE;
 }
 uint32_t mvd_ff_encode_mask(int hardware) {
@@ -98,8 +102,26 @@ static mvd_ff_encoder *create_one(const AVCodec *codec,unsigned w,unsigned h,
     s->ctx->width=(int)w;s->ctx->height=(int)h;
     s->ctx->time_base=(AVRational){1,1000000};
     s->ctx->framerate=(AVRational){(int)fps_x100,100};
-    s->ctx->pix_fmt=input_format(codec);
+    enum AVPixelFormat encoder_format=input_format(codec);
+    s->ctx->pix_fmt=encoder_format;
     s->ctx->bit_rate=(int64_t)bitrate;
+    if(encoder_format==AV_PIX_FMT_VAAPI || encoder_format==AV_PIX_FMT_QSV) {
+        enum AVHWDeviceType kind=encoder_format==AV_PIX_FMT_VAAPI
+                    ? AV_HWDEVICE_TYPE_VAAPI : AV_HWDEVICE_TYPE_QSV;
+        if(av_hwdevice_ctx_create(&s->gpu_device,kind,NULL,NULL,0)<0)goto fail;
+        s->gpu_frames=av_hwframe_ctx_alloc(s->gpu_device);
+        if(!s->gpu_frames)goto fail;
+        AVHWFramesContext *frames=(AVHWFramesContext *)s->gpu_frames->data;
+        frames->format=encoder_format;
+        frames->sw_format=AV_PIX_FMT_NV12;
+        frames->width=(int)w;frames->height=(int)h;
+        frames->initial_pool_size=8;
+        if(av_hwframe_ctx_init(s->gpu_frames)<0)goto fail;
+        s->ctx->hw_frames_ctx=av_buffer_ref(s->gpu_frames);
+        if(!s->ctx->hw_frames_ctx)goto fail;
+        s->gpu_frame=av_frame_alloc();
+        if(!s->gpu_frame)goto fail;
+    }
     s->ctx->gop_size=(int)(fps_x100/100u)*2;
     if(s->ctx->gop_size<1)s->ctx->gop_size=25;
     s->ctx->max_b_frames=0; /* Low latency, one access unit per packet. */
@@ -119,7 +141,7 @@ static mvd_ff_encoder *create_one(const AVCodec *codec,unsigned w,unsigned h,
     }
     if(avcodec_open2(s->ctx,codec,NULL)<0)goto fail;
     s->frame->width=(int)w;s->frame->height=(int)h;
-    s->frame->format=s->ctx->pix_fmt;
+    s->frame->format=s->gpu_frames?AV_PIX_FMT_NV12:s->ctx->pix_fmt;
     if(av_frame_get_buffer(s->frame,32)<0)goto fail;
     s->w=w;s->h=h;s->first=1;
     return s;
@@ -146,6 +168,9 @@ mvd_ff_encoder *mvd_ff_encoder_create(unsigned wire,unsigned w,unsigned h,
 void mvd_ff_encoder_free(mvd_ff_encoder *s) {
     if(!s)return;
     sws_freeContext(s->sws);
+    av_frame_free(&s->gpu_frame);
+    av_buffer_unref(&s->gpu_frames);
+    av_buffer_unref(&s->gpu_device);
     av_packet_free(&s->packet);
     av_frame_free(&s->frame);
     avcodec_free_context(&s->ctx);
@@ -162,14 +187,23 @@ int mvd_ff_encoder_frame(mvd_ff_encoder *s,const uint8_t *i420,size_t bytes,
                            i420+(size_t)s->w*s->h*5u/4u,NULL};
     int stride[4]={(int)s->w,(int)s->w/2,(int)s->w/2,0};
     s->sws=sws_getCachedContext(s->sws,(int)s->w,(int)s->h,AV_PIX_FMT_YUV420P,
-                  (int)s->w,(int)s->h,s->ctx->pix_fmt,SWS_FAST_BILINEAR,
+                  (int)s->w,(int)s->h,(enum AVPixelFormat)s->frame->format,SWS_FAST_BILINEAR,
                   NULL,NULL,NULL);
     if(!s->sws || sws_scale(s->sws,src,stride,0,(int)s->h,
                            s->frame->data,s->frame->linesize)!=(int)s->h)return -1;
     s->frame->pts=(int64_t)pts_us;
     s->frame->pict_type=s->first?AV_PICTURE_TYPE_I:AV_PICTURE_TYPE_NONE;
     s->first=0;
-    if(avcodec_send_frame(s->ctx,s->frame)<0)return -1;
+    AVFrame *to_send=s->frame;
+    if(s->gpu_frames){
+        av_frame_unref(s->gpu_frame);
+        if(av_hwframe_get_buffer(s->gpu_frames,s->gpu_frame,0)<0 ||
+           av_hwframe_transfer_data(s->gpu_frame,s->frame,0)<0)return -1;
+        s->gpu_frame->pts=s->frame->pts;
+        s->gpu_frame->pict_type=s->frame->pict_type;
+        to_send=s->gpu_frame;
+    }
+    if(avcodec_send_frame(s->ctx,to_send)<0)return -1;
     int rc=avcodec_receive_packet(s->ctx,s->packet);
     if(rc==AVERROR(EAGAIN) || rc==AVERROR_EOF)return 0;
     if(rc<0)return -1;
