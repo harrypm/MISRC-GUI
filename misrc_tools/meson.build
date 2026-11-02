@@ -577,15 +577,13 @@ if raylib_dep.found()
 
   # Optional modern codecs: link FFmpeg when its headers/libs are available.
   # Existing Android and static Windows builds retain OpenH264 fallback.
-  avcodec_dep = dependency('libavcodec', required: false, static: windows_static_deps or host_system == 'android')
-  avutil_dep = dependency('libavutil', required: false, static: windows_static_deps or host_system == 'android')
-  swscale_dep = dependency('libswscale', required: false, static: windows_static_deps or host_system == 'android')
-  # The Windows UCRT FFmpeg distribution is built with every codec and
-  # pulls in hundreds of unrelated static archives. This conflicts with the
-  # upstream single-EXE/no-DLL packaging contract (including duplicate
-  # rust_eh_personality definitions). Modern codecs remain optional on
-  # platforms where their binaries can be redistributed safely.
-  if avcodec_dep.found() and avutil_dep.found() and swscale_dep.found() and not windows_static_deps
+  modern_codecs = get_option('modern_monitor_codecs')
+  avcodec_dep = dependency('libavcodec', required: modern_codecs, static: windows_static_deps or host_system == 'android')
+  avutil_dep = dependency('libavutil', required: modern_codecs, static: windows_static_deps or host_system == 'android')
+  swscale_dep = dependency('libswscale', required: modern_codecs, static: windows_static_deps or host_system == 'android')
+  # Windows and Android CI link a minimal static FFmpeg built with just the
+  # required native AV1/VP9/HEVC decoders; no full MSYS2 dependency closure.
+  if not modern_codecs.disabled() and avcodec_dep.found() and avutil_dep.found() and swscale_dep.found()
     gui_deps += [avcodec_dep, avutil_dep, swscale_dep]
     ffmpeg_define = '-DMISRC_HAVE_FFMPEG=1'
     message('MISRC monitor AV1/VP9/HEVC FFmpeg codecs enabled')

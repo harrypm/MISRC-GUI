@@ -55,3 +55,16 @@ sh scripts/test-monitor-video-ffmpeg.sh
 The second test compiles the **real** FFmpeg backend and performs VP9/HEVC/AV1
 encoder/decoder smoke checks when those codec implementations are installed.
 The GitHub Linux CI codec job installs FFmpeg development packages explicitly.
+
+## Minimal Windows and Android FFmpeg decoders
+
+`scripts/build-monitor-ffmpeg-minimal.sh windows|android` cross-builds pinned
+FFmpeg n7.1.3 as static libavcodec/libavutil/libswscale with only native AV1,
+VP9 and HEVC decoders. Windows uses MSYS2 UCRT64/CLANGARM64; Android uses the
+NDK arm64 API 30. Meson `-Dmodern_monitor_codecs=enabled` fails early when
+these libraries are not linked. No additional runtime DLLs are required.
+
+This is full **client decoding** support but not software AV1/VP9/HEVC
+**encoding** on Windows/Android servers: the lean FFmpeg intentionally omits
+libaom/libvpx/libx265; these servers still encode H.264 via OpenH264.
+Linux/macOS servers retain native host FFmpeg software/hardware encoders.
