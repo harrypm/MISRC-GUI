@@ -83,6 +83,13 @@ static atomic_uint_fast64_t s_input_blocks[2],s_queue_drops[2],s_encoded_frames[
 static atomic_uint_fast64_t s_encoder_attempts[2],s_rc_skips[2],s_encoded_bytes[2];
 static atomic_uint s_codec_choice[2];
 static atomic_uint s_codec_hardware[2];
+/* CVBS worker diagnostics: all are written by the owning decoder thread.
+ * Socket/network threads must never read Harry's mutable decoder structs. */
+static atomic_uint_fast64_t s_cvbs_blocks_processed[2],s_cvbs_gap_resets[2];
+static atomic_uint_fast64_t s_cvbs_discontinuity_resets[2],s_cvbs_sample_mismatch_resets[2];
+static atomic_uint_fast64_t s_cvbs_fields[2],s_cvbs_vbi_candidates[2];
+static atomic_uint_fast64_t s_cvbs_sync_errors[2];
+static atomic_uint s_cvbs_last_rate[2];
 static atomic_bool s_initialized;
 static void mvd_wait(void) { thrd_sleep_ms(1); }
 
@@ -149,6 +156,7 @@ static bool mvd_cvbs_resampled(mvd_channel *ch,const int16_t *input,
 
 static int mvd_decode_thread(void *argument) {
     mvd_channel *ch=(mvd_channel *)argument;
+    unsigned channel=(unsigned)(ch-s_channels);
     unsigned last_mode=~0u;
     uint32_t last_controls=UINT32_MAX;
     unsigned osd_tick=0;
@@ -194,12 +202,16 @@ static int mvd_decode_thread(void *argument) {
             mvd_wait(); continue;
         }
         mvd_input_slot *item=&ch->slots[r%MVD_INPUT_SLOTS];
-        if(atomic_exchange_explicit(&ch->gap,false,memory_order_acq_rel) ||
-           (have_previous &&
+        bool gap=atomic_exchange_explicit(&ch->gap,false,memory_order_acq_rel);
+        bool mismatch=have_previous &&
             (previous.epoch!=item->info.epoch ||
              previous.sample_rate_hz!=item->info.sample_rate_hz ||
-             previous.start_sample!=item->info.start_sample)) ||
-           item->info.discontinuity) {
+             previous.start_sample!=item->info.start_sample);
+        bool flagged=item->info.discontinuity;
+        if(gap || mismatch || flagged) {
+            if(gap)atomic_fetch_add(&s_cvbs_gap_resets[channel],1);
+            if(mismatch)atomic_fetch_add(&s_cvbs_sample_mismatch_resets[channel],1);
+            if(flagged)atomic_fetch_add(&s_cvbs_discontinuity_resets[channel],1);
             gui_cvbs_reset(ch->cvbs);
 #if LIBSOXR_ENABLED
             mvd_resampler_clear(ch);
@@ -221,6 +233,13 @@ static int mvd_decode_thread(void *argument) {
             previous=item->info;
             previous.start_sample+=item->n;
             have_previous=true;
+            atomic_fetch_add(&s_cvbs_blocks_processed[channel],1);
+            atomic_store(&s_cvbs_last_rate[channel],item->info.sample_rate_hz);
+            if((osd_tick & 127u)==0) {
+                atomic_store(&s_cvbs_fields[channel],ch->cvbs->vsync.fields_accepted);
+                atomic_store(&s_cvbs_vbi_candidates[channel],ch->cvbs->vsync.vsync_candidates);
+                atomic_store(&s_cvbs_sync_errors[channel],ch->cvbs->sync_errors);
+            }
             if((++osd_tick & 127u)==0 &&
                !atomic_flag_test_and_set_explicit(&ch->osd_busy,memory_order_acquire)) {
                 cvbs_decoder_t *d=ch->cvbs;
@@ -510,10 +529,22 @@ bool gui_monitor_video_server_stream(uintptr_t fd,unsigned channel,
                                                &previous_gen,&info)) {
                 time_t now=time(NULL);
                 if(now>last_frame_log && now-last_frame_log>=10){
-                    fprintf(stderr,"[M-VIDEO] CH%u mode %u: awaiting decoded frames; input blocks=%llu queue drops=%llu decoded=%llu\n",
+                    fprintf(stderr,
+                        "[M-VIDEO] CH%u mode %u: waiting for decoder; "
+                        "input=%llu processed=%llu dropped=%llu published_total=%llu "
+                        "reset(gap/sequence/flag)=%llu/%llu/%llu "
+                        "rate=%u VBI(fields/candidates)=%llu/%llu sync_err=%llu\n",
                         channel+1,mode,(unsigned long long)atomic_load(&s_input_blocks[channel]),
+                        (unsigned long long)atomic_load(&s_cvbs_blocks_processed[channel]),
                         (unsigned long long)atomic_load(&s_queue_drops[channel]),
-                        (unsigned long long)gui_monitor_video_framebox_published(ch->box));
+                        (unsigned long long)gui_monitor_video_framebox_published(ch->box),
+                        (unsigned long long)atomic_load(&s_cvbs_gap_resets[channel]),
+                        (unsigned long long)atomic_load(&s_cvbs_sample_mismatch_resets[channel]),
+                        (unsigned long long)atomic_load(&s_cvbs_discontinuity_resets[channel]),
+                        (unsigned)atomic_load(&s_cvbs_last_rate[channel]),
+                        (unsigned long long)atomic_load(&s_cvbs_fields[channel]),
+                        (unsigned long long)atomic_load(&s_cvbs_vbi_candidates[channel]),
+                        (unsigned long long)atomic_load(&s_cvbs_sync_errors[channel]));
                     last_frame_log=now;
                 }
                 if(now>last_heartbeat && now-last_heartbeat>=1){

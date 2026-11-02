@@ -32,8 +32,9 @@ extern "C" {
 static inline int mvd_codec_valid(unsigned codec) {
     return codec>=MVD_CODEC_H264_ANNEXB && codec<=MVD_CODEC_AV1;
 }
-/* Hardware AV1/VP9/HEVC preferred over AVC, then a software fallback.
- * The caller supplies actually usable encoder and client decoder masks. */
+/* Prefer AV1/VP9/HEVC hardware acceleration. For LIVE software video
+ * prefer low-delay VP9/HEVC to SVT-AV1, which can buffer many initial frames.
+ * H.264 is retained only as a compatibility fallback. */
 static inline unsigned mvd_codec_select(uint32_t client, uint32_t hw, uint32_t sw) {
     static const unsigned preference[] = {
         MVD_CODEC_AV1, MVD_CODEC_VP9, MVD_CODEC_HEVC_ANNEXB,
@@ -44,8 +45,12 @@ static inline unsigned mvd_codec_select(uint32_t client, uint32_t hw, uint32_t s
         const unsigned id=preference[i];
         if((allowed & hw & MVD_CODEC_BIT(id))!=0)return id;
     }
-    for(unsigned i=0;i<sizeof(preference)/sizeof(preference[0]);i++) {
-        const unsigned id=preference[i];
+    static const unsigned realtime_software[] = {
+        MVD_CODEC_VP9, MVD_CODEC_HEVC_ANNEXB, MVD_CODEC_AV1,
+        MVD_CODEC_H264_ANNEXB
+    };
+    for(unsigned i=0;i<sizeof(realtime_software)/sizeof(realtime_software[0]);i++) {
+        const unsigned id=realtime_software[i];
         if((allowed & sw & MVD_CODEC_BIT(id))!=0)return id;
     }
     return 0;

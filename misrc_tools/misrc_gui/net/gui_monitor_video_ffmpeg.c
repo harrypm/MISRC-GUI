@@ -139,18 +139,24 @@ static mvd_ff_encoder *create_one(const AVCodec *codec,unsigned w,unsigned h,
     if(s->ctx->gop_size<1)s->ctx->gop_size=25;
     s->ctx->max_b_frames=0; /* Low latency, one access unit per packet. */
     s->ctx->thread_count=2; /* Do not overload the capture/DSP server. */
-    if(codec->id==AV_CODEC_ID_VP9){
+    /* FFmpeg shares codec IDs among completely different implementations:
+     * QSV/VAAPI/NVENC do NOT accept SVT-AV1's "preset=12" or x265's
+     * "preset=ultrafast". Send vendor options by encoder NAME only. */
+    if(!strcmp(codec->name,"libvpx-vp9")){
         av_opt_set(s->ctx->priv_data,"deadline","realtime",0);
         av_opt_set(s->ctx->priv_data,"cpu-used","8",0);
         av_opt_set(s->ctx->priv_data,"row-mt","1",0);
         av_opt_set(s->ctx->priv_data,"lag-in-frames","0",0);
         av_opt_set(s->ctx->priv_data,"auto-alt-ref","0",0);
-    } else if(codec->id==AV_CODEC_ID_AV1){
+    } else if(!strcmp(codec->name,"libsvtav1")){
         av_opt_set(s->ctx->priv_data,"preset","12",0);
+        /* SVT-AV1 typically uses lookahead and reordered mini-GOPs; it is
+         * not our first choice for a low-latency software preview. */
+    } else if(!strcmp(codec->name,"libaom-av1")){
         av_opt_set(s->ctx->priv_data,"cpu-used","8",0);
         av_opt_set(s->ctx->priv_data,"usage","realtime",0);
         av_opt_set(s->ctx->priv_data,"lag-in-frames","0",0);
-    } else if(codec->id==AV_CODEC_ID_HEVC){
+    } else if(!strcmp(codec->name,"libx265")){
         av_opt_set(s->ctx->priv_data,"preset","ultrafast",0);
         av_opt_set(s->ctx->priv_data,"tune","zerolatency",0);
         av_opt_set(s->ctx->priv_data,"x265-params",

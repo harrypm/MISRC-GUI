@@ -13,7 +13,9 @@ static void test_codec_negotiation(void) {
     const uint32_t av1=MVD_CODEC_BIT(MVD_CODEC_AV1);
     assert(mvd_codec_select(MVD_CODEC_ALL, av1|vp9|hevc|avc, avc)==MVD_CODEC_AV1);
     assert(mvd_codec_select(MVD_CODEC_ALL, hevc, av1|vp9|avc)==MVD_CODEC_HEVC_ANNEXB);
-    assert(mvd_codec_select(MVD_CODEC_ALL, 0, av1|vp9|avc)==MVD_CODEC_AV1);
+    assert(mvd_codec_select(MVD_CODEC_ALL, 0, av1|vp9|avc)==MVD_CODEC_VP9);
+    assert(mvd_codec_select(MVD_CODEC_ALL, 0, av1|hevc|avc)==MVD_CODEC_HEVC_ANNEXB);
+    assert(mvd_codec_select(MVD_CODEC_ALL, 0, av1|avc)==MVD_CODEC_AV1);
     assert(mvd_codec_select(avc, av1|vp9|hevc, avc)==MVD_CODEC_H264_ANNEXB);
     assert(mvd_codec_select(vp9, av1|hevc, avc)==0);
     assert(mvd_codec_select(0, MVD_CODEC_ALL, MVD_CODEC_ALL)==0);
