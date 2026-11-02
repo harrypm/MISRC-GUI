@@ -1333,16 +1333,41 @@ jobs:
           mkdir -p dist
           cp -R stage-arm64/MISRC.app dist/MISRC.app
 
+          # FFmpeg's Homebrew dependency trees can legitimately differ
+          # between arm64 and x86_64 (OpenSSL, codecs, etc). Merge the UNION
+          # of both bundles. Lipo only Mach-O libraries present for both
+          # architectures; preserve single-arch dylibs when only one needs
+          # them, and carry across x86-only symlinks as well.
           while IFS= read -r rel; do
             ARM_FILE="stage-arm64/${rel}"
             X86_FILE="stage-x86_64/${rel}"
             OUT_FILE="dist/${rel}"
-            if file "$ARM_FILE" | grep -q "Mach-O"; then
-              lipo -create "$ARM_FILE" "$X86_FILE" -output "$OUT_FILE"
-            else
+            mkdir -p "$(dirname "$OUT_FILE")"
+            if [[ -f "$ARM_FILE" && -f "$X86_FILE" ]]; then
+              if file "$ARM_FILE" | grep -q 'Mach-O' &&
+                 file "$X86_FILE" | grep -q 'Mach-O'; then
+                lipo -create "$ARM_FILE" "$X86_FILE" -output "$OUT_FILE"
+              else
+                cp "$ARM_FILE" "$OUT_FILE"
+              fi
+            elif [[ -f "$ARM_FILE" ]]; then
               cp "$ARM_FILE" "$OUT_FILE"
+            elif [[ -f "$X86_FILE" ]]; then
+              cp "$X86_FILE" "$OUT_FILE"
+            else
+              echo "Missing both source files: $rel" >&2
+              exit 1
             fi
-          done < <(cd stage-arm64 && find MISRC.app -type f | sort)
+          done < <(
+            { (cd stage-arm64 && find MISRC.app -type f)
+              (cd stage-x86_64 && find MISRC.app -type f); } | sort -u
+          )
+          while IFS= read -r rel; do
+            if [[ ! -e "dist/${rel}" && ! -L "dist/${rel}" ]]; then
+              mkdir -p "$(dirname "dist/${rel}")"
+              cp -P "stage-x86_64/${rel}" "dist/${rel}"
+            fi
+          done < <(cd stage-x86_64 && find MISRC.app -type l)
           chmod +x dist/MISRC.app/Contents/MacOS/MISRC dist/MISRC.app/Contents/MacOS/misrc_capture dist/MISRC.app/Contents/MacOS/misrc_extract
 
           codesign --force --deep --sign - dist/MISRC.app
