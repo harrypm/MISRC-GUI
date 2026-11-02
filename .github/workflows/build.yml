@@ -571,6 +571,7 @@ jobs:
           cache: true
           install: >-
             git
+            diffutils
             mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-fftw
             mingw-w64-ucrt-x86_64-flac
@@ -594,6 +595,7 @@ jobs:
           cache: false
           install: >-
             git
+            diffutils
             mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-fftw
             mingw-w64-ucrt-x86_64-flac
@@ -798,6 +800,7 @@ jobs:
           # omp_init_lock from libsoxr.a).
           install: >-
             git
+            diffutils
             mingw-w64-clang-aarch64-binutils
             mingw-w64-clang-aarch64-clang
             mingw-w64-clang-aarch64-cmake
@@ -822,6 +825,7 @@ jobs:
           cache: false
           install: >-
             git
+            diffutils
             mingw-w64-clang-aarch64-binutils
             mingw-w64-clang-aarch64-clang
             mingw-w64-clang-aarch64-cmake
