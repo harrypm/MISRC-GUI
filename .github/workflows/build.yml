@@ -498,7 +498,7 @@ jobs:
           set -eux
           export DEPS_PREFIX="$PWD/.deps/install-android-arm64"
           export PKG_CONFIG="$PWD/android/android-pkg-config"
-          meson setup --cross-file android/aarch64-linux-android.ini -Dbuildtype=release -Dmodern_monitor_codecs=disabled build-android misrc_tools
+          meson setup --cross-file android/aarch64-linux-android.ini -Dbuildtype=release -Dmodern_monitor_codecs=enabled build-android misrc_tools
           meson compile -C build-android misrc_gui
           test -f build-android/libmisrc_gui.so
 
