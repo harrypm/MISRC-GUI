@@ -1022,7 +1022,7 @@ jobs:
             /usr/local/Homebrew/Library/Taps/hashicorp/homebrew-tap; do
             rm -rf "$tap_dir"
           done
-          for formula in cmake fftw flac libusb libuvc meson nasm ninja pkgconf libsoxr; do
+          for formula in cmake fftw flac libusb libuvc meson nasm ninja pkgconf libsoxr ffmpeg; do
             if ! brew list --versions "$formula" >/dev/null 2>&1; then
               brew install "$formula"
             fi
@@ -1082,8 +1082,13 @@ jobs:
           export PKG_CONFIG_PATH="$DEPS_PREFIX/lib/pkgconfig:$DEPS_PREFIX/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
           export CMAKE_PREFIX_PATH="$DEPS_PREFIX:${CMAKE_PREFIX_PATH:-}"
           pkg-config --modversion fftw3f
+          # The standalone .app must contain modern codecs; never silently
+          # publish an OpenH264-only build on either macOS architecture.
+          pkg-config --modversion libavcodec libavutil libswscale
           meson setup "$BUILD_DIR" misrc_tools --buildtype release
           meson compile -C "$BUILD_DIR" misrc_capture misrc_extract misrc_gui
+          otool -L "$BUILD_DIR/misrc_gui" | grep -q libavcodec
+          otool -L "$BUILD_DIR/misrc_gui" | grep -q libswscale
 
           "$BUILD_DIR/misrc_gui" --smoke-test
           set +e
@@ -1239,6 +1244,12 @@ jobs:
             patch_macho_refs "$DYLIB"
           done
 
+          # The recursive Mach-O dependency bundler above must also capture
+          # every FFmpeg dylib into the app's Frameworks directory; the
+          # app should work without the target machine having Homebrew.
+          find "$FW_DIR" -maxdepth 1 -name 'libavcodec*.dylib' | grep -q .
+          find "$FW_DIR" -maxdepth 1 -name 'libavutil*.dylib' | grep -q .
+          find "$FW_DIR" -maxdepth 1 -name 'libswscale*.dylib' | grep -q .
           if otool -L "$APP_ROOT/MacOS/MISRC" | grep -E '/opt/homebrew|/usr/local/opt'; then
             echo "Found non-portable Homebrew dylib path in MISRC binary" >&2
             exit 1
