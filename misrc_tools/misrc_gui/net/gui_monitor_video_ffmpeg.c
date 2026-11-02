@@ -24,7 +24,7 @@ struct mvd_ff_encoder {
     AVPacket *packet;
     struct SwsContext *sws;
     unsigned w,h;
-    int first;
+    int first,opened,submitted;
 };
 struct mvd_ff_decoder {
     AVCodecContext *ctx;
@@ -163,6 +163,7 @@ static mvd_ff_encoder *create_one(const AVCodec *codec,unsigned w,unsigned h,
                    "repeat-headers=1:aud=1:rc-lookahead=0:bframes=0:frame-threads=1:pools=none",0);
     }
     if(avcodec_open2(s->ctx,codec,NULL)<0)goto fail;
+    s->opened=1;
     s->frame->width=(int)w;s->frame->height=(int)h;
     s->frame->format=s->gpu_frames?AV_PIX_FMT_NV12:s->ctx->pix_fmt;
     if(av_frame_get_buffer(s->frame,32)<0)goto fail;
@@ -190,6 +191,17 @@ mvd_ff_encoder *mvd_ff_encoder_create(unsigned wire,unsigned w,unsigned h,
 }
 void mvd_ff_encoder_free(mvd_ff_encoder *s) {
     if(!s)return;
+    if(s->opened && s->submitted && s->ctx && s->packet) {
+        /* Close the codec properly instead of tearing down SVT-AV1 before
+         * signalling EOS. Encoded frames are discarded on disconnect. */
+        if(avcodec_send_frame(s->ctx,NULL)>=0) {
+            for(unsigned i=0;i<128;i++) {
+                int rc=avcodec_receive_packet(s->ctx,s->packet);
+                if(rc<0)break;
+                av_packet_unref(s->packet);
+            }
+        }
+    }
     sws_freeContext(s->sws);
     av_frame_free(&s->gpu_frame);
     av_buffer_unref(&s->gpu_frames);
@@ -227,6 +239,7 @@ int mvd_ff_encoder_frame(mvd_ff_encoder *s,const uint8_t *i420,size_t bytes,
         to_send=s->gpu_frame;
     }
     if(avcodec_send_frame(s->ctx,to_send)<0)return -1;
+    s->submitted=1;
     int rc=avcodec_receive_packet(s->ctx,s->packet);
     if(rc==AVERROR(EAGAIN) || rc==AVERROR_EOF)return 0;
     if(rc<0)return -1;

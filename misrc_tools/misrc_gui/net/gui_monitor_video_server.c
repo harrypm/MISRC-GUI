@@ -518,6 +518,8 @@ bool gui_monitor_video_server_stream(uintptr_t fd,unsigned channel,
     mvd_codec_encoder *encoder=NULL;
     uint32_t permitted_codecs=client_codecs & MVD_CODEC_ALL;
     unsigned enc_w=0,enc_h=0,sequence=0;
+    unsigned startup_no_packets=0;
+    bool encoder_has_output=false;
     uint64_t previous_gen=gui_monitor_video_framebox_published(ch->box);
     uint64_t last_submitted_us=0;
     time_t last_heartbeat=time(NULL),last_frame_log=last_heartbeat;
@@ -586,6 +588,7 @@ bool gui_monitor_video_server_stream(uintptr_t fd,unsigned channel,
                                                  w,h,fps_x100,bitrate_bps);
                 enc_w=w;enc_h=h;
                 if(!encoder)break;
+                startup_no_packets=0;encoder_has_output=false;
                 atomic_store(&s_codec_choice[channel],mvd_video_encoder_codec(encoder));
                 atomic_store(&s_codec_hardware[channel],mvd_video_encoder_hardware(encoder));
             }
@@ -619,8 +622,23 @@ bool gui_monitor_video_server_stream(uintptr_t fd,unsigned channel,
             }
             if(rc==0){
                 atomic_fetch_add_explicit(&s_rc_skips[channel],1,memory_order_relaxed);
+                /* Don't strand the display on a codec that queues its first
+                 * 20 input frames without producing an access unit. */
+                if(!encoder_has_output && ++startup_no_packets>=20) {
+                    unsigned stalled=mvd_video_encoder_codec(encoder);
+                    fprintf(stderr,"[M-VIDEO] CH%u %s: no packet after 20 submitted frames, trying fallback\n",
+                            channel+1,mvd_codec_name(stalled));
+                    permitted_codecs &= ~MVD_CODEC_BIT(stalled);
+                    mvd_video_encoder_free(encoder);encoder=NULL;
+                    enc_w=enc_h=0;startup_no_packets=0;
+                    atomic_store(&s_codec_choice[channel],0);
+                    atomic_store(&s_codec_hardware[channel],0);
+                    if(!(permitted_codecs & (mvd_video_encoder_mask(0)|
+                                           mvd_video_encoder_mask(1))))break;
+                }
                 continue;
             }
+            encoder_has_output=true;startup_no_packets=0;
             mvd_frame_header hdr={0};
             hdr.codec=(uint8_t)mvd_video_encoder_codec(encoder);
             hdr.flags=key?(MVD_FLAG_KEYFRAME|MVD_FLAG_CODEC_CONFIG):0;
