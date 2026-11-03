@@ -146,7 +146,7 @@ def check_macos_brew_install_policy(workflow_path: Path) -> int:
         if snippet in workflow_text:
             return fail(f"Workflow contains non-conditional brew install that emits warning annotations: {snippet}")
     required_snippets = [
-        "for formula in cmake fftw flac libusb libuvc meson nasm ninja pkgconf libsoxr; do",
+        "for formula in cmake fftw flac libusb libuvc meson nasm ninja pkgconf libsoxr opus; do",
         "if ! brew list --versions \"$formula\" >/dev/null 2>&1; then",
         "brew install \"$formula\"",
     ]
@@ -206,7 +206,7 @@ def check_workflow_fft_dependency_policy(workflow_path: Path) -> int:
         "libfftw3-dev",
         "mingw-w64-ucrt-x86_64-fftw",
         "mingw-w64-clang-aarch64-fftw",
-        "for formula in cmake fftw flac libusb libuvc meson nasm ninja pkgconf libsoxr; do",
+        "for formula in cmake fftw flac libusb libuvc meson nasm ninja pkgconf libsoxr opus; do",
     ]
     for snippet in required_snippets:
         if snippet not in workflow_text:
