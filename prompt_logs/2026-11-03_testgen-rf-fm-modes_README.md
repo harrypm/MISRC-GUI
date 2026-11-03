@@ -607,6 +607,57 @@ valid-launch paths verified with Start-Process + redirected streams (the
 GUI-subsystem exe's exit code does not read back through pwsh's `&` —
 use Start-Process for scripted checks).
 
+### Committed (rounds 12-14)
+
+- `586c8a7` "Test Gen: borderless F11, UI-scale fixes, drag snaps,
+  automation flags + rule (rounds 12-14)" pushed to harrypm/MISRC-GUI main
+  (8 files; restore point
+  `restore_points/2026-11-03_testgen-rf-rounds12-14-good.zip`). The
+  throw-at-top snap issue rides along as PARKED (see Not yet done).
+
+## Round 15 — toolbar AudioLevelBars: uniform borders around the level meters
+
+User report: "audio monitor the right side has a litle extra so the
+bordering is not unifrom for the contrasting window the levels sit in".
+
+Root cause (gui_ui.c): the AudioLevelBars panel (the contrasting
+{25,25,30} toolbar box the four audio level meters sit in) used the
+profile's FIXED bars_panel_width, but its content is 4 fixed meter
+columns + 3 gaps. The FULL tier was also MISSING its .meter_gap (memset
+-> 0), so at full width the panel was 240 wide with only 216 of content
+-> 16 px of dead space on the RIGHT (NARROW/VERY_NARROW had the same bug
+at 4 px; ULTRA/TINY were exact). The columns are left-aligned, so all
+the slack landed on the right border.
+
+Fix:
+- FULL profile gains its missing `.meter_gap = 4` (same spacing as every
+  other non-tiny tier).
+- The panel width is now DERIVED from the content (8 + gap*3 + col*4) in
+  both render_toolbar and gui_ui_toolbar_required_width — the same
+  formula the two-row overflow path already used — so the contrasting
+  background wraps the meters with uniform 4 px borders at every tier
+  and cannot drift again. TINY/ULTRA widths are unchanged by
+  construction (their constants already matched the formula).
+
+Validation: build clean; gui_testgen_rf, gui_cvbs_baseband,
+gui_waveform_overlay all OK. Needs GUI visual confirmation of the
+toolbar audio monitor box (and at a couple of window widths/tiers).
+
+### Upstream pull (2026-11-03 08:24)
+
+- `git pull --ff-only` -> `e2045af` (merge of PR #21
+  feature/monitor-h264-video-20261101: monitor H.264/AV1/VP9/HEVC video
+  streaming, ~3.8k insertions, new gui_monitor_video_* stack).
+- The merge made OpenH264 a HARD GUI build dependency (meson error() when
+  missing), which broke the local build at regeneration. Fixed by
+  installing the MSYS2 package `mingw-w64-x86_64-openh264` 2.6.0 (static
+  archive + .pc; matches the local mingw64 toolchain; CI uses the UCRT64
+  flavor of the same package). Modern FFmpeg codecs stay off locally
+  (optional; `scripts/build-monitor-ffmpeg-minimal.sh windows` builds the
+  lean static FFmpeg if wanted) - OpenH264 fallback active.
+- Full rebuild clean; gui_testgen_rf, gui_cvbs_baseband,
+  gui_waveform_overlay all OK against the merged sources.
+
 ### Test Gen autoload/config state (user question 2026-11-03)
 
 "did new CLI args get added for the autoload config for test gen modes

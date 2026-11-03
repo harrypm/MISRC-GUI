@@ -34,6 +34,7 @@ Use lowercase with underscores:
 | `cxadc_win_lockstep_notes.md` | CXADC-Win (Windows driver) lock-step dev notes |
 | `gui_automation_flags_rules.md` | HARD rule: every GUI element carries a CLI flag / config key for automated testing (inventory + gaps) |
 | `gui_output_verification_rules.md` | HARD rule: headless verification must read what the GUI displays (render-path conversion contracts) |
+| `gui_uniform_border_rules.md` | HARD rule: visible Clay containers derive width from content (uniform borders) — AudioLevelBars incident |
 
 ### When starting a new prompt
 

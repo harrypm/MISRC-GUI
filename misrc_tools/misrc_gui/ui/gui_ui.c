@@ -5688,7 +5688,9 @@ typedef struct gui_ui_toolbar_profile {
     int mode_max_width;
     int audio_mon_width;
     int audio_ch_width;
-    int bars_panel_width;
+    int bars_panel_width;   // Historical constant; the ACTUAL panel width is
+                            // derived (8 + meter_gap*3 + meter_col_width*4) so
+                            // the AudioLevelBars background has uniform borders
     int meter_col_width;
     int meter_width;
     int meter_height;
@@ -5774,6 +5776,7 @@ static gui_ui_toolbar_profile_t gui_ui_toolbar_profile_for_tier(int tier)
             .mode_min_width = 112, .mode_max_width = 230,
             .audio_mon_width = 90, .audio_ch_width = 70, .bars_panel_width = 240,
             .meter_col_width = 54, .meter_width = 50, .meter_height = 8,
+            .meter_gap = 4,
             .record_width = 80, .dropdown_padding = 10,
             .show_audio_meter_labels = true, .show_version_icon = true,
             .show_device_label = true,
@@ -5800,7 +5803,11 @@ static int gui_ui_toolbar_required_width(const gui_ui_toolbar_profile_t *p,
         (show_metadata_icon ? 8 : (p->show_version_icon ? 4 : 0)) +
         device_label_width + dd_width +
         p->connect_width + mode_width + (mode_width > 0 ? p->gap : 0) +
-        p->audio_mon_width + p->audio_ch_width + p->bars_panel_width +
+        // AudioLevelBars exact content width (2*4 padding + 4 columns +
+        // 3 gaps) - keep in lock-step with the derived panel width in
+        // render_toolbar so the tier fit matches what actually renders.
+        p->audio_mon_width + p->audio_ch_width +
+        (8 + p->meter_gap * 3 + p->meter_col_width * 4) +
         (p->gap * 2) +
         p->record_width + (p->icon_button_size * 2) +
         // All actual gaps and the fixed spacer are already counted above.
@@ -6026,7 +6033,14 @@ static void render_toolbar(gui_app_t *app, bool ddd_compact_labels) {
     int dropdown_padding = prof.dropdown_padding;
     // The tiny profile still shows all four meters, but compresses them enough
     // for the 640px minimum window at 200% scale (320 logical pixels).
-    int audio_bars_panel_width = prof.bars_panel_width;
+    // AudioLevelBars panel: derive the EXACT width from its content
+    // (2*4 padding + 4 meter columns + 3 gaps) so the contrasting background
+    // wraps the meters with UNIFORM borders. The profile constants were up to
+    // 16 px wider than the content (the FULL tier was also missing its meter
+    // gap), leaving dead space on the right side of the box (user report
+    // 2026-11-03: "the right side has a little extra, the bordering is not
+    // uniform"). Same formula the two-row overflow path below already uses.
+    int audio_bars_panel_width = 8 + prof.meter_gap * 3 + prof.meter_col_width * 4;
     int audio_meter_col_width = prof.meter_col_width;
     int audio_meter_width = prof.meter_width;
     int audio_meter_height = prof.meter_height;
