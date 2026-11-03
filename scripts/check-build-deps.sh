@@ -3,9 +3,9 @@
 set -euo pipefail
 mode="${1:---all}"
 case "$mode" in
-  --codec) modules=(openh264) ;;
-  --all) modules=(openh264 fftw3f flac libusb-1.0 soxr libuvc libzstd) ;;
-  --gui) modules=(openh264 fftw3f flac libusb-1.0 soxr libuvc libzstd hsdaoh raylib) ;;
+  --codec) modules=(openh264 opus) ;;
+  --all) modules=(openh264 opus fftw3f flac libusb-1.0 soxr libuvc libzstd) ;;
+  --gui) modules=(openh264 opus fftw3f flac libusb-1.0 soxr libuvc libzstd hsdaoh raylib) ;;
   *) echo "[build-deps-check] ERROR: Usage: $0 [--codec|--all|--gui]" >&2; exit 2 ;;
 esac
 
@@ -18,6 +18,7 @@ fi
 apt_name() {
   case "$1" in
     openh264) echo libopenh264-dev ;;
+    opus) echo libopus-dev ;;
     fftw3f) echo libfftw3-dev ;;
     flac) echo libflac-dev ;;
     libusb-1.0) echo libusb-1.0-0-dev ;;
