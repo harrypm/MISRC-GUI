@@ -7,6 +7,7 @@
 #include "gui_monitor_video_client.h"
 #include "gui_monitor_session_state.h"
 #include "gui_monitor_audio_levels.h"
+#include "gui_monitor_audio.h"
 #include "gui_remote_display.h"
 #include "gui_remote_fs.h"
 #include "gui_monitor_settings.h"
@@ -566,6 +567,9 @@ static int mon_send(mon_sock_t s, const char *data, size_t n) {
     }
     return 0;
 }
+static int mon_audio_send(uintptr_t sock, const char *bytes, size_t size) {
+    return mon_send((mon_sock_t)sock,bytes,size);
+}
 static void mon_answer(mon_sock_t s, int code, const char *type, const char *body) {
     char hdr[320];
     size_t n=strlen(body);
@@ -712,6 +716,20 @@ bool gui_monitor_server_handle_request(uintptr_t socket_handle,
             atomic_store(&app->clip_count_b_neg,0);
         }
         mon_answer(fd,200,"text/plain","clip counters cleared\n");return false;
+    }
+    if(strcmp(path,"/monitor/audio")==0){
+        int pair=mon_arg(query,"pair",-1);
+        if(pair!=0 && pair!=1){
+            mon_answer(fd,400,"text/plain","invalid audio channel pair\n");return false;
+        }
+        if(!app->is_capturing){
+            mon_answer(fd,409,"text/plain","server capture not active\n");return false;
+        }
+        /* Own this request worker until the low-latency Opus stream ends.
+         * The shared listener still serves other /monitor requests. */
+        mon_timeouts(fd,1000);
+        (void)gui_monitor_audio_server_stream((uintptr_t)fd,app,(unsigned)pair,mon_audio_send);
+        return false;
     }
     if(strcmp(path,"/monitor/video/osd")==0){
         int channel=mon_arg(query,"channel",-1),detail=mon_arg(query,"detail",2);
@@ -864,6 +882,7 @@ int gui_monitor_server_start(gui_app_t *app,uint16_t port) {
     g_record_result.detail[0]=0;
     mon_record_unlock();
     gui_monitor_local_save_server_init();
+    gui_monitor_audio_server_reset();
     memset(&g_cfg_server,0,sizeof(g_cfg_server));
     mon_cfg_snapshot(app);
     g_server.app=app;g_server.port=port;
@@ -880,6 +899,7 @@ void gui_monitor_server_stop(void){
     if(!atomic_load(&g_server.active))return;
     atomic_store(&g_server.active,false);
     gui_monitor_video_server_stop();
+    gui_monitor_audio_server_reset();
     gui_monitor_local_save_server_shutdown();
     g_server.app=NULL;g_server.port=0;
 }
@@ -1288,12 +1308,15 @@ int gui_monitor_client_start(gui_app_t *app,const char *host,uint16_t port){
     atomic_store(&g_client.running,true);
     if(gui_monitor_video_client_start(host,port)!=0)
         fprintf(stderr,"[M-VIDEO] OpenH264 client unavailable; waveform/FFT unaffected\n");
+    if(gui_monitor_audio_client_start(app,host,port)!=0)
+        fprintf(stderr,"[M-AUDIO] Failed to start Monitor Opus audio receiver\n");
     fprintf(stderr,"[M-CLIENT] Connecting to monitor %s:%u (Zstd-1 original waveform/FFT + status/control)\n",host,(unsigned)port);
     return 0;
 }
 void gui_monitor_client_stop(void){
     if(!atomic_load(&g_client.running))return;
     atomic_store(&g_client.stopping,true);
+    gui_monitor_audio_client_stop();
     gui_monitor_video_client_stop();
     thrd_join(g_client.thread,NULL);
     if(g_client.app){
