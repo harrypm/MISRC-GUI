@@ -49,6 +49,7 @@
 #include "../output/gui_audio.h"
 #include "../net/gui_net.h"
 #include "../net/gui_monitor_transport.h"
+#include "../net/gui_monitor_audio.h"
 #include "../net/gui_remote_display.h"
 #include <hsdaoh.h>
 #include "../../common/hsdaoh_compat.h"
@@ -1639,6 +1640,7 @@ static void gui_capture_flush_upstream_audio_pairs(gui_app_t *app)
             }
             bufmgr_write_end(&app->buffers, BUF_CAPTURE_AUDIO, interleaved_len);
             bufmgr_signal_data(&app->buffers, BUF_CAPTURE_AUDIO);
+            gui_monitor_audio_server_tap(app,out,interleaved_len);
         }
 
         gui_capture_pop_upstream_audio(&s_upstream_audio1_queue);
@@ -1840,6 +1842,7 @@ static void gui_capture_upstream_callback(hsdaoh_data_info_t *data_info) //
 
             bufmgr_write_end(&app->buffers, BUF_CAPTURE_AUDIO, padded_len);
             bufmgr_signal_data(&app->buffers, BUF_CAPTURE_AUDIO);
+            gui_monitor_audio_server_tap(app,out,padded_len);
         }
         
         if (data_info->srate > 0) {
