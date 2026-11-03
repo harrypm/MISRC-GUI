@@ -1994,6 +1994,8 @@ int main(int argc, char **argv) {
 
     // Save settings before cleanup
     gui_settings_save(&app.settings);
+    // Raylib output must be destroyed on the GUI thread before net cleanup.
+    gui_monitor_audio_client_update(NULL);
     
     gui_app_cleanup(&app);
     free(clay_memory);
