@@ -6214,6 +6214,71 @@ static const panel_vtable_t s_cvbs_vtable = {
 };
 
 //-----------------------------------------------------------------------------
+// Generator System Follow
+//-----------------------------------------------------------------------------
+
+// Switch EVERY Video panel's decoder previews to the Test Gen system
+// (0=PAL, 1=NTSC, 2=SECAM): the CVBS composite decoder, the Tape Decode
+// plugin (same value space) and the VHS FM RF preview profile (with worker
+// rebinding). Called from the Gen box on the waveform panel (UI thread)
+// after it updates settings.video_system. The user can override any panel
+// manually at any time (the panel selectors keep working); the NEXT Gen
+// change flips the panels again — "switch to the generator mode when the
+// signal changes, allow user override once flipped". Also makes newly
+// created panels start in the generator's system.
+void gui_video_follow_generator_system(gui_app_t *app, int system) {
+    if (!app || system < 0 || system > 2) return;
+
+    bool any = false;
+    while (atomic_flag_test_and_set(&app->panel_config_lock)) {
+        /* spin */
+    }
+    channel_panel_config_t *configs[2] = { &app->panel_config_a,
+                                           &app->panel_config_b };
+    for (int ch = 0; ch < 2; ch++) {
+        channel_panel_config_t *cfg = configs[ch];
+        for (int slot = 0; slot < 2; slot++) {
+            if (slot == 1 && !cfg->split) continue;
+            panel_view_type_t view = slot ? cfg->right_view : cfg->left_view;
+            void *state = slot ? cfg->right_state : cfg->left_state;
+            if (view != PANEL_VIEW_CVBS || !state) continue;
+            video_panel_state_t *panel = (video_panel_state_t *)state;
+
+            /* CVBS composite decoder: mirror the System dropdown action. */
+            panel->cvbs.decoder.overlay.selected_system = system;
+            gui_cvbs_set_format(&panel->cvbs.decoder, system);
+
+            /* Tape Decode plugin: same value space + runtime args. */
+            panel->tape_decode.decoder.overlay.selected_system = system;
+            panel->tape_decode.decoder.overlay.selected_tape_format = system;
+            video_tape_apply_runtime_args(&panel->tape_decode,
+                                          "generator_follow");
+
+            /* VHS FM RF preview: follows the system while the tape family
+             * allows it (Betamax stays NTSC by design). */
+            int profile_before = (int)gui_vhs_fm_get_profile(&panel->vhs_fm.decoder);
+            gui_vhs_fm_set_format(&panel->vhs_fm.decoder, system);
+            int profile_after = (int)gui_vhs_fm_get_profile(&panel->vhs_fm.decoder);
+            TraceLog(LOG_INFO,
+                     "GEN FOLLOW: ch=%d slot=%d system=%d rf_profile %d -> %d",
+                     ch, slot, system, profile_before, profile_after);
+            any = true;
+        }
+    }
+    atomic_flag_clear(&app->panel_config_lock);
+
+    /* Re-derive the per-channel RF preview worker routes so a changed VHS
+     * FM profile rebinds its worker. Same call the overlay clicks rely on
+     * the main loop for; invoked here on the UI thread. */
+    if (any) {
+        gui_video_update_rf_routes(app);
+    }
+
+    /* Panels created later this session start in the generator's system. */
+    gui_cvbs_set_default_system(system);
+}
+
+//-----------------------------------------------------------------------------
 // Registration
 //-----------------------------------------------------------------------------
 

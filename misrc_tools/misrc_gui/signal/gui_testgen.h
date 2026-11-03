@@ -45,4 +45,15 @@ size_t gui_testgen_frame_samples(gui_testgen_system_t system, uint32_t sample_ra
 size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
                          uint32_t sample_rate, uint32_t frame_index);
 
+/* Generate one full interlaced frame of VHS-family tape RF into out[cap].
+ * Same slot-grid timing as gui_testgen_frame; PAL/NTSC carry FM luma plus
+ * color-under QAM, native SECAM carries FM luma plus the divided-by-four
+ * SECAM chroma FM. Physical parameters match the RF preview decoder
+ * profiles, so the VHS FM panel decodes this signal. frame_index drives the
+ * SECAM D'r/D'b cadence identically to the composite generator.
+ * Returns the number of int16 samples written (same count as the composite
+ * frame), 0 if cap is too small. Output amplitude ~0.72-0.87 of full scale. */
+size_t gui_testgen_rf_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
+                             uint32_t sample_rate, uint32_t frame_index);
+
 #endif /* GUI_TESTGEN_H */

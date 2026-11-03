@@ -1,15 +1,19 @@
 /*
- * MISRC GUI - Simulated Device
+ * MISRC GUI - Simulated Device (Test Signal Generator)
  *
- * Provides a simulated capture device for development and testing without hardware.
- * Generates NTSC CVBS video on Channel A and VHS RF head signal on Channel B.
+ * Provides a simulated capture device for development and testing without
+ * hardware. Streams the Test Gen signal through the full capture pipeline
+ * (waveform, FFT, Video panel decode, VHS FM preview, recording) like a
+ * live capture:
  *
- * Features:
- * - Proper 2-field (525-line) interlaced NTSC video timing
- * - SMPTE color bars test pattern with chroma
- * - VHS RF signal with FM luminance and 629 kHz chroma-under
- * - Head switching noise simulation at field boundaries
- * - Recording support (RAW and FLAC)
+ * - Channel A: hacktv-accurate composite CVBS (PAL/NTSC/SECAM colour bars)
+ * - Channel B: VHS-family tape RF (FM luma + color-under QAM, or the
+ *   divided-by-four SECAM chroma FM), matching the RF preview decoder
+ *   profiles so the VHS FM panel decodes it live
+ *
+ * Both channels follow app->settings.video_system and hot-swap when it
+ * changes (PAL -> NTSC -> SECAM via the Gen box on the waveform panel).
+ * Recording support (RAW and FLAC) works like any live capture.
  */
 
 #ifndef GUI_SIMULATED_H

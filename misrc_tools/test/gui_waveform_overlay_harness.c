@@ -190,6 +190,18 @@ void gui_settings_save(const gui_settings_t *settings) { (void)settings; }
  * module. */
 void gui_app_set_status(gui_app_t *app, const char *message) { (void)app; (void)message; }
 
+/* Stub: the Gen box click handler switches the Video panel decoders via
+ * gui_video_follow_generator_system (gui_cvbs.c); the harness doesn't link
+ * the video panel, so record the requested system for assertions. */
+static int test_follow_system = -1;
+static int test_follow_calls = 0;
+void gui_video_follow_generator_system(gui_app_t *app, int system)
+{
+    (void)app;
+    test_follow_system = system;
+    test_follow_calls++;
+}
+
 /* Stub: the production overlay scales text measurements to logical units via
  * gui_ui_get_scale_factor(); the harness doesn't link gui_ui_scale.c,
  * so return 1.0 (no scaling in the test). */

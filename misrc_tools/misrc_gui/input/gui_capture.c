@@ -1962,6 +1962,10 @@ int gui_app_start_capture(gui_app_t *app) {
         int sim_rc = gui_simulated_start(app);
         if (sim_rc == 0) {
             gui_capture_hold_power_assertions();
+            // Default the waveform monitors to the generator's channel
+            // mapping (CH1 CVBS / CH2 FM RF) without overwriting any
+            // user signal-type selections.
+            gui_waveform_apply_generator_defaults(app);
         }
         return sim_rc;
     }

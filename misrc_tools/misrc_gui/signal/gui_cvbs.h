@@ -537,6 +537,13 @@ void gui_cvbs_set_format(cvbs_decoder_t *decoder, int format_select);
 // click handler persists the user's pick back into the settings.
 void gui_cvbs_set_default_system(int system_select);
 
+// Switch every Video panel's decoder previews (CVBS, Tape Decode, VHS FM
+// RF) to the Test Gen system (0=PAL, 1=NTSC, 2=SECAM). Called by the Gen
+// box on the waveform panel after it changes settings.video_system.
+// Manual panel selections keep working between generator changes; the
+// next Gen change flips the panels again.
+void gui_video_follow_generator_system(gui_app_t *app, int system);
+
 //-----------------------------------------------------------------------------
 // Status
 //-----------------------------------------------------------------------------

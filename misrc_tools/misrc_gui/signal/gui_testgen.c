@@ -326,14 +326,39 @@ typedef enum {
     SL_BROAD        /* vertical broad pulse (27.3us) */
 } sl_pulse_t;
 
-size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
-                         uint32_t sample_rate, uint32_t frame_index) {
-    if ((int)system < 0 || (int)system >= GUI_TESTGEN_SYSTEM_COUNT) return 0;
-    if (!out || sample_rate == 0) return 0;
-    const ht_config_t *c = &HT_CONF[system];
-    size_t need = gui_testgen_frame_samples(system, sample_rate);
-    if (cap < need) return 0;
+/* --- Shared interlaced slot grid ------------------------------------------
+ * Built once per frame by BOTH frame generators (composite CVBS and tape
+ * RF) so their timing geometry can never drift apart. Pure extraction of
+ * the setup that used to live inline in gui_testgen_frame; the composite
+ * output is byte-identical (verified with a before/after harness, see the
+ * prompt log). */
+typedef struct {
+    int slots_total;
+    int mid;                  /* 625 / 525 slots: field 2 boundary */
+    size_t *slot_start;       /* slots_total + 1 sample boundaries */
+    uint8_t *slot_type;       /* sl_pulse_t per slot */
+    int *slot_hidx;           /* per-field H index, -1 for non-H slots */
+    /* Derived per-line constants (hacktv vid_init) */
+    int active_left;          /* active area start, samples within the line */
+    int active_width;         /* active area width in samples */
+    int line_smp;             /* nominal samples per H line (two slots) */
+    int hsync_smp;            /* H sync pulse width, samples */
+    int eq_smp;               /* equalizing pulse width, samples */
+    int broad_smp;            /* broad pulse width, samples */
+} ht_grid_t;
 
+static void ht_grid_free(ht_grid_t *g) {
+    if (!g) return;
+    free(g->slot_start);
+    free(g->slot_type);
+    free(g->slot_hidx);
+    g->slot_start = NULL;
+    g->slot_type = NULL;
+    g->slot_hidx = NULL;
+}
+
+static bool ht_grid_build(const ht_config_t *c, size_t need,
+                          uint32_t sample_rate, ht_grid_t *g) {
     const int slots_total = c->slots;
     const int train_len = 3 * c->eq_count;      /* EQ + broad + EQ, every slot */
     const int mid = slots_total / 2;            /* 625 / 525: field 2 boundary */
@@ -341,30 +366,26 @@ size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
      * the last H (parity 0) -> H grid on ODD slots; NTSC's first EQ must sit
      * at an INTEGER offset (parity 0) -> H grid on EVEN slots. */
     const int hpar = (c->lines == 525) ? 0 : 1;
-    if (need < (size_t)slots_total) return 0;
+    if (need < (size_t)slots_total) return false;
 
     /* Slot boundaries spread over the frame so every slot is need/slots +-1
      * samples: the line period stays exact at any rate and the frame has no
      * short last line (a half-line stream jump every frame otherwise). */
-    size_t *slot_start = (size_t *)malloc((size_t)(slots_total + 1) * sizeof(size_t));
-    int16_t *base_buf = (int16_t *)calloc(need, sizeof(int16_t));
-    int16_t *chroma_buf = (int16_t *)calloc(need, sizeof(int16_t));
-    uint8_t *slot_type = (uint8_t *)malloc((size_t)slots_total);
-    int *slot_hidx = (int *)malloc((size_t)slots_total * sizeof(int));
-    if (!slot_start || !base_buf || !chroma_buf || !slot_type || !slot_hidx) {
-        free(slot_start);
-        free(base_buf);
-        free(chroma_buf);
-        free(slot_type);
-        free(slot_hidx);
-        return 0;
+    g->slots_total = slots_total;
+    g->mid = mid;
+    g->slot_start = (size_t *)malloc((size_t)(slots_total + 1) * sizeof(size_t));
+    g->slot_type = (uint8_t *)malloc((size_t)slots_total);
+    g->slot_hidx = (int *)malloc((size_t)slots_total * sizeof(int));
+    if (!g->slot_start || !g->slot_type || !g->slot_hidx) {
+        ht_grid_free(g);
+        return false;
     }
     for (int s = 0; s <= slots_total; s++) {
         double t = (double)need * (double)s / (double)slots_total;
-        slot_start[s] = (size_t)(t + 0.5);
+        g->slot_start[s] = (size_t)(t + 0.5);
     }
-    slot_start[0] = 0;
-    slot_start[slots_total] = need;
+    g->slot_start[0] = 0;
+    g->slot_start[slots_total] = need;
 
     /* Per-slot pulse classification and per-field H-line index. The H index
      * (reset at each field boundary) drives the PAL V-switch and SECAM line
@@ -375,27 +396,66 @@ size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
             bool in_train = (s < train_len) || (s >= mid && s < mid + train_len);
             if (in_train) {
                 int k = (s < train_len) ? s : s - mid;
-                slot_type[s] = (uint8_t)((k < c->eq_count) ? SL_EQ
-                             : (k < 2 * c->eq_count) ? SL_BROAD : SL_EQ);
-                slot_hidx[s] = -1;
+                g->slot_type[s] = (uint8_t)((k < c->eq_count) ? SL_EQ
+                                 : (k < 2 * c->eq_count) ? SL_BROAD : SL_EQ);
+                g->slot_hidx[s] = -1;
             } else if ((s & 1) == hpar) {
-                slot_type[s] = SL_H;
-                slot_hidx[s] = (s < mid) ? h1++ : h2++;
+                g->slot_type[s] = SL_H;
+                g->slot_hidx[s] = (s < mid) ? h1++ : h2++;
             } else {
-                slot_type[s] = SL_BLANK;
-                slot_hidx[s] = -1;
+                g->slot_type[s] = SL_BLANK;
+                g->slot_hidx[s] = -1;
             }
         }
     }
 
     /* hacktv vid_init: active area in samples (per 64us line) */
-    int active_left = (int)(c->active_left_us * (double)sample_rate / 1e6 + 0.5);
-    int active_width = (int)ceil(c->active_width_us * (double)sample_rate / 1e6);
+    g->active_left = (int)(c->active_left_us * (double)sample_rate / 1e6 + 0.5);
+    g->active_width = (int)ceil(c->active_width_us * (double)sample_rate / 1e6);
     /* An H line spans two slots; clamp the active window inside it. */
-    int line_smp = 2 * (int)(slot_start[1] - slot_start[0]);
-    if (line_smp > 0 && active_left + active_width > line_smp) {
-        active_width = line_smp - active_left;
+    g->line_smp = 2 * (int)(g->slot_start[1] - g->slot_start[0]);
+    if (g->line_smp > 0 && g->active_left + g->active_width > g->line_smp) {
+        g->active_width = g->line_smp - g->active_left;
     }
+
+    /* hacktv vid_init: sync pulse sample counts */
+    g->hsync_smp = (int)(c->hsync_us * (double)sample_rate / 1e6 + 0.5);
+    g->eq_smp = (int)(c->vsync_short_us * (double)sample_rate / 1e6 + 0.5);
+    g->broad_smp = (int)(c->vsync_long_us * (double)sample_rate / 1e6 + 0.5);
+    return true;
+}
+
+size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
+                         uint32_t sample_rate, uint32_t frame_index) {
+    if ((int)system < 0 || (int)system >= GUI_TESTGEN_SYSTEM_COUNT) return 0;
+    if (!out || sample_rate == 0) return 0;
+    const ht_config_t *c = &HT_CONF[system];
+    size_t need = gui_testgen_frame_samples(system, sample_rate);
+    if (cap < need) return 0;
+
+    ht_grid_t grid;
+    if (!ht_grid_build(c, need, sample_rate, &grid)) return 0;
+
+    int16_t *base_buf = (int16_t *)calloc(need, sizeof(int16_t));
+    int16_t *chroma_buf = (int16_t *)calloc(need, sizeof(int16_t));
+    if (!base_buf || !chroma_buf) {
+        free(base_buf);
+        free(chroma_buf);
+        ht_grid_free(&grid);
+        return 0;
+    }
+    /* Local aliases so the passes below keep using the original names. */
+    const int slots_total = grid.slots_total;
+    const int mid = grid.mid;
+    size_t *slot_start = grid.slot_start;
+    uint8_t *slot_type = grid.slot_type;
+    int *slot_hidx = grid.slot_hidx;
+    const int active_left = grid.active_left;
+    const int active_width = grid.active_width;
+    const int line_smp = grid.line_smp;
+    const int hsync_smp = grid.hsync_smp;
+    const int eq_smp = grid.eq_smp;
+    const int broad_smp = grid.broad_smp;
 
     /* hacktv vid_init: 16-bit signal levels */
     double level = 1.0;
@@ -403,11 +463,6 @@ size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
     double black16 = c->black_level * level;
     double blank16 = c->blanking_level * level;
     double sync16 = c->sync_level * level;
-
-    /* hacktv vid_init: sync pulse sample counts */
-    int hsync_smp = (int)(c->hsync_us * (double)sample_rate / 1e6 + 0.5);
-    int eq_smp = (int)(c->vsync_short_us * (double)sample_rate / 1e6 + 0.5);
-    int broad_smp = (int)(c->vsync_long_us * (double)sample_rate / 1e6 + 0.5);
 
     /* hacktv vid_init: burst parameters (plus the chain gain) */
     int burst_left_smp = (int)(c->burst_left_us * (double)sample_rate / 1e6 + 0.5);
@@ -574,7 +629,7 @@ size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
 
         if (!d_line || !d_src) {
             free(d_line); free(d_src);
-            free(slot_type); free(slot_hidx); free(slot_start);
+            ht_grid_free(&grid);
             free(base_buf); free(chroma_buf);
             return 0;
         }
@@ -721,6 +776,7 @@ size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
     if (!kern) {
         free(base_buf);
         free(chroma_buf);
+        ht_grid_free(&grid);
         return 0;
     }
     {
@@ -790,9 +846,7 @@ size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
         }
     }
 
-    free(slot_type);
-    free(slot_hidx);
-    free(slot_start);
+    ht_grid_free(&grid);
 
     /* Chroma add (PAL/NTSC QAM from PASS 1; SECAM FM from PASS 1.5) */
     for (size_t n = 0; n < need; n++) {
@@ -837,5 +891,259 @@ size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
         }
     }
 
+    return need;
+}
+
+/* --- Tape RF frame generation ---------------------------------------------
+ * One full interlaced frame of VHS-family tape RF for the Simulated device's
+ * Channel B, built on the SAME slot grid as the composite generator (the
+ * ht_grid_t extraction above) so both channels share identical timing
+ * geometry. The physical modulation follows this repo's own validated
+ * synthetic RF oracles - test/gui_rf_preview_test.c make_rf_signal_profile()
+ * for PAL/NTSC VHS and test/gui_rf_secam_test.c make_source() for native
+ * SECAM VHS - so the generated RF decodes in the GUI's VHS FM preview panel
+ * (the gui_rf_preview.c profiles):
+ *
+ *   - FM luma: sync tip at sync_hz, blanking at blank_hz, active luma at
+ *     blank_hz + 100 * hz_ire * Y, all through the record pre-emphasis that
+ *     is the inverse of the decoder's de-emphasis shelf (PAL/SECAM 100/400
+ *     ns, NTSC 120/320 ns). Endpoints per the rf_profiles table: PAL/SECAM
+ *     3.8/4.1/4.8 MHz at 7000 Hz/IRE, NTSC 3.4/3.6857/4.4 MHz at
+ *     7142.857 Hz/IRE.
+ *   - PAL/NTSC color-under: QAM at the profile carrier (PAL 626953 Hz,
+ *     NTSC 629370.63 Hz) with the per-field track rotation (PAL 0 / -90
+ *     degrees per line, NTSC -90 / +90), PAL swinging burst + V-switch,
+ *     burst window from the composite config (PAL 5.6..7.85 us, NTSC
+ *     5.3..7.8 us), amplitudes 0.72 FM + 0.20 chroma.
+ *   - Native SECAM VHS: luma as PAL; line-sequential D'R/D'B through the
+ *     85/255 kHz LF pre-correction one-pole with the composite ident
+ *     bottles, chroma FM at the studio frequencies DIVIDED BY FOUR (rests
+ *     1.0625 / 1.1015625 MHz on tape), carrier envelope from 5.6 us
+ *     through the active area, amplitudes 0.72 FM + 0.15 chroma. No PAL
+ *     burst or head phase rotation.
+ *
+ * The composite chain's HackDAC calibrations (0.75x chroma gain and the
+ * AC-coupling bump) are deliberately NOT applied here: they model the
+ * composite capture card, not the tape RF chain, and the RF decoder
+ * calibrates its display levels from the FM deviation itself. */
+size_t gui_testgen_rf_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
+                             uint32_t sample_rate, uint32_t frame_index) {
+    if ((int)system < 0 || (int)system >= GUI_TESTGEN_SYSTEM_COUNT) return 0;
+    if (!out || sample_rate == 0) return 0;
+    const ht_config_t *c = &HT_CONF[system];
+    size_t need = gui_testgen_frame_samples(system, sample_rate);
+    if (cap < need) return 0;
+
+    ht_grid_t grid;
+    if (!ht_grid_build(c, need, sample_rate, &grid)) return 0;
+
+    const bool pal_family = (c->lines == 625);
+    const bool secam = (c->colour_mode == HT_SECAM);
+
+    /* Physical VHS endpoints (rf_profiles / the synthetic RF oracles). */
+    const double blank_hz = pal_family ? 4100000.0 : 3685714.2857142854;
+    const double sync_hz  = pal_family ? 3800000.0 : 3400000.0;
+    const double hz_ire   = pal_family ? 7000.0    : 7142.857142857143;
+    const double carrier  = pal_family ? 626953.0  : 629370.6293706294;
+    const double fm_amp = 0.72;
+    const double cu_amp = 0.20;   /* PAL/NTSC color-under amplitude */
+    const double se_amp = 0.15;   /* native SECAM chroma FM amplitude */
+
+    /* Record pre-emphasis: the inverse of the decoder's de-emphasis shelf
+     * (first-order bilinear, zero/pole swapped). PAL/SECAM 100/400 ns,
+     * NTSC 120/320 ns - the oracle constants. */
+    const double tau_zero = pal_family ? 100e-9 : 120e-9;
+    const double tau_pole = pal_family ? 400e-9 : 320e-9;
+    const double pk = 2.0 * (double)sample_rate;
+    const double pe_den = 1.0 + pk * tau_zero;
+    const double pe_b0 = (1.0 + pk * tau_pole) / pe_den;
+    const double pe_b1 = (1.0 - pk * tau_pole) / pe_den;
+    const double pe_a1 = (1.0 - pk * tau_zero) / pe_den;
+
+    /* Native SECAM chroma chain constants: LF pre-correction one-pole at
+     * 255 kHz; studio rests/deviations; divided-by-four tape frequencies. */
+    const double secam_decay = exp(-2.0 * M_PI * HT_SECAM_PE_FP
+                                   / (double)sample_rate);
+    const double cu_burst_u = pal_family ? -(150.0 / 700.0) / 1.41421356237309515
+                                         : -(150.0 / 700.0);
+    const double cu_burst_v = pal_family ?  (150.0 / 700.0) / 1.41421356237309515
+                                         : 0.0;
+    const double burst_end_us = c->burst_left_us + c->burst_width_us;
+
+    /* Per-sample state (frame-local). Phases and filter states restart at
+     * each frame boundary; the FM demod is phase-insensitive and the
+     * color-under decode is burst-referenced per line, exactly as with the
+     * composite generator's per-frame subcarrier phase. */
+    double prev_base = 0.0, prev_pre = 0.0;
+    double fm_phase = 0.0;
+    double cc_phase = 0.0;
+    double colour_state = 0.0;
+    const double dt = 1.0 / (double)sample_rate;
+
+    for (int s = 0; s < grid.slots_total; s++) {
+        const size_t ss = grid.slot_start[s];
+        if (ss >= need) break;
+        const size_t se = grid.slot_start[s + 1];
+
+        /* The SL_H pass below spans TWO slots (the line plus the following
+         * blank slot). Unlike the composite generator - where blank slots
+         * write nothing - this generator must write every sample (the FM
+         * carriers are continuous), so a blank slot that is already covered
+         * by the preceding H pass must be skipped here or it would overwrite
+         * the second half of every H line with blank-level RF. Standalone
+         * blank slots (field boundaries) still write. */
+        if (grid.slot_type[s] == SL_BLANK && s > 0 &&
+            grid.slot_type[s - 1] == SL_H) {
+            continue;
+        }
+
+        /* Per-slot sync-tip window and line extent. */
+        size_t sync_width;
+        size_t line_end;
+        int hidx = -1;
+        int field = 0;
+        bool picture = false;
+        switch (grid.slot_type[s]) {
+            case SL_EQ:    sync_width = (size_t)grid.eq_smp;    line_end = se; break;
+            case SL_BROAD: sync_width = (size_t)grid.broad_smp; line_end = se; break;
+            case SL_BLANK: sync_width = 0;                      line_end = se; break;
+            default: {  /* SL_H: one full line across two slots */
+                sync_width = (size_t)grid.hsync_smp;
+                hidx = grid.slot_hidx[s];
+                field = (s < grid.mid) ? 0 : 1;
+                line_end = (s + 2 <= grid.slots_total) ? grid.slot_start[s + 2]
+                                                       : need;
+                int a0 = c->act_first[field];
+                int a1 = a0 + 2 * (c->act_lines - 1);
+                picture = (s >= a0 && s <= a1);
+                break;
+            }
+        }
+        if (line_end > need) line_end = need;
+
+        /* Per-line constants. SECAM D'R/D'B cadence: the RF decoder's
+         * identification flywheel (gui_rf_preview.c, matching the synthetic
+         * RF oracle and ITU-R BT.470-6) expects the line parity to be the
+         * SAME for both fields of a frame and to flip with the odd 625-line
+         * frame stride. The RF decoder numbers each field's H lines with a
+         * one-line interlace offset (field 1's hidx k sits one decoder line
+         * later than field 0's), so (hidx + field) is the decoder-line
+         * parity basis; the composite CH1 generator uses its own validated
+         * cadence, which is why the two channels differ here. */
+        const bool ident = (hidx >= 0 && hidx < 9);
+        bool dr = false;
+        if (hidx >= 0) {
+            bool parity_basis = ((hidx + field) & 1) == 0;
+            bool frame_flip = (frame_index & 1) != 0;
+            dr = parity_basis != frame_flip;
+        }
+        const int vswitch = (pal_family && hidx > 0 && (hidx & 1)) ? -1 : 1;
+        const double track_rot = (hidx < 0) ? 0.0
+            : (pal_family ? (field ? -M_PI / 2.0 : 0.0)
+                         : (field ?  M_PI / 2.0 : -M_PI / 2.0));
+
+        for (size_t n = ss; n < line_end && n < need; n++) {
+            const size_t x = n - ss;
+            const bool in_sync = (x < sync_width);
+            const double x_us = (double)x * 1e6 / (double)sample_rate;
+            const double t = (double)n * dt;
+
+            /* Active picture content: the same 75% bars as CH1. */
+            double y = 0.0, u = 0.0, v = 0.0, dr_y = 0.0, db_y = 0.0;
+            bool active_px = false;
+            if (hidx >= 0 && picture && !in_sync &&
+                x >= (size_t)grid.active_left &&
+                x < (size_t)grid.active_left + (size_t)grid.active_width) {
+                int ax = (int)x - grid.active_left;
+                int bar = (ax * 8) / grid.active_width;
+                if (bar > 7) bar = 7;
+                if (bar < 0) bar = 0;
+                double r = HT_BARS[bar].r, g = HT_BARS[bar].g, b = HT_BARS[bar].b;
+                y = 0.299 * r + 0.587 * g + 0.114 * b;
+                u = 0.492 * (b - y);
+                v = 0.877 * (r - y);
+                dr_y = r - y;
+                db_y = b - y;
+                active_px = true;
+            }
+
+            /* --- FM luma through the record pre-emphasis --- */
+            double base = in_sync ? (sync_hz - blank_hz) : (100.0 * hz_ire * y);
+            double pre = pe_b0 * base + pe_b1 * prev_base - pe_a1 * prev_pre;
+            prev_base = base;
+            prev_pre = pre;
+            double fm_hz = blank_hz + pre;
+            if (fm_hz < 2400000.0) fm_hz = 2400000.0;
+            if (fm_hz > (secam ? 6500000.0 : 6800000.0)) {
+                fm_hz = secam ? 6500000.0 : 6800000.0;
+            }
+            fm_phase += 2.0 * M_PI * fm_hz * dt;
+            if (fm_phase > 2.0 * M_PI) fm_phase = fmod(fm_phase, 2.0 * M_PI);
+            double rf = fm_amp * cos(fm_phase);
+
+            if (secam) {
+                /* --- native SECAM VHS chroma FM, divided by four --- */
+                double d = active_px ? (dr ? -1.902 * dr_y : 1.505 * db_y) : 0.0;
+                colour_state = secam_decay * colour_state
+                             + (1.0 - secam_decay) * d;
+                double pre_d = 3.0 * d - 2.0 * colour_state;
+                /* Ident bottle ramp on the composite ident lines (inserted
+                 * after LF pre-correction, from the active area start). */
+                if (ident && x_us >= c->active_left_us) {
+                    double ramp = (x_us - c->active_left_us)
+                                / (dr ? 15.0 : 18.0);
+                    if (ramp < 0.0) ramp = 0.0;
+                    if (ramp > 1.0) ramp = 1.0;
+                    pre_d = dr ? 1.25 * ramp : -1.52 * ramp;
+                }
+                double nominal = dr ? 4406250.0 : 4250000.0;
+                double deviation = dr ? 280000.0 : 230000.0;
+                double studio_hz = nominal + deviation * pre_d;
+                if (studio_hz < 3900000.0) studio_hz = 3900000.0;
+                if (studio_hz > 4756250.0) studio_hz = 4756250.0;
+                cc_phase += 2.0 * M_PI * (studio_hz / 4.0) * dt;
+                if (cc_phase > 2.0 * M_PI) cc_phase = fmod(cc_phase, 2.0 * M_PI);
+                /* Carrier envelope: ident + picture lines, 5.6 us through
+                 * the active area (the porch carries the rest frequency,
+                 * which is the decoder's H identification). */
+                if (hidx >= 0 && !in_sync && (ident || picture) &&
+                    x_us >= 5.6 && x_us < 62.5) {
+                    rf += se_amp * cos(cc_phase);
+                }
+            } else {
+                /* --- PAL/NTSC VHS color-under QAM --- */
+                double cu = 0.0, cv = 0.0;
+                bool cu_on = false;
+                if (hidx >= 0 && !in_sync) {
+                    if (x_us >= c->burst_left_us && x_us < burst_end_us) {
+                        /* Swinging burst (PAL) / 180-degree burst (NTSC),
+                         * down-converted into the color-under band. */
+                        cu = cu_burst_u;
+                        cv = cu_burst_v;
+                        cu_on = true;
+                    } else if (active_px) {
+                        cu = u;
+                        cv = v;
+                        cu_on = true;
+                    }
+                }
+                if (cu_on) {
+                    double phase = 2.0 * M_PI * carrier * t
+                                 + track_rot * (double)hidx + 0.37;
+                    double color = cu * cos(phase)
+                                 + (pal_family ? -(double)vswitch : 1.0)
+                                   * cv * sin(phase);
+                    rf += cu_amp * color;
+                }
+            }
+
+            double value = rf * 32767.0;
+            if (value > 32767.0) value = 32767.0;
+            if (value < -32768.0) value = -32768.0;
+            out[n] = (int16_t)lrint(value);
+        }
+    }
+
+    ht_grid_free(&grid);
     return need;
 }

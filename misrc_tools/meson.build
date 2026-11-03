@@ -1020,6 +1020,11 @@ rf_mesecam_test = executable('gui_rf_mesecam_test',
   ['test/gui_rf_mesecam_test.c', 'misrc_gui/signal/gui_rf_preview.c'],
   dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
 test('gui_rf_mesecam', rf_mesecam_test, timeout: 180)
+rf_testgen_test = executable('gui_testgen_rf_test',
+  ['test/gui_testgen_rf_test.c', 'misrc_gui/signal/gui_rf_preview.c',
+   'misrc_gui/signal/gui_testgen.c'],
+  dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
+test('gui_testgen_rf', rf_testgen_test, timeout: 120)
 rf_resampler_test = executable('gui_rf_resampler_test',
   ['test/gui_rf_resampler_test.c', 'misrc_gui/signal/gui_rf_resampler.c'],
   dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)

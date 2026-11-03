@@ -153,7 +153,12 @@ static void vhs_draw_stat_fitted(const char *text, float dx, float dy, int font_
 
 void gui_vhs_fm_render_frame(vhs_fm_decoder_t *decoder, float x, float y,
                              float width, float height, bool controls_hidden) {
-    DrawRectangleRec((Rectangle){x, y, width, height}, (Color){20, 20, 20, 255});
+    // Letterbox: the standard panel background (COLOR_PANEL_BG) so the
+    // area outside the picture matches the rest of the GUI while still
+    // reading clearly against the picture's own black/VBI — the previous
+    // near-black fill made the sides indistinguishable from the picture
+    // (user feedback 2026-11-03).
+    DrawRectangleRec((Rectangle){x, y, width, height}, COLOR_PANEL_BG);
     if (!decoder) return;
     const gui_rf_decode_status_t *status = &decoder->stats.decode;
     bool supported = atomic_load(&decoder->input_supported);
@@ -171,6 +176,16 @@ void gui_vhs_fm_render_frame(vhs_fm_decoder_t *decoder, float x, float y,
         }
         decoder->texture_dirty = false;
     }
+    // Fit rect (also drawn as the picture outline while acquiring, so the
+    // future frame area is delineated even before the first lock).
+    gui_rf_preview_rect_t frame = gui_rf_preview_fit_frame(
+        decoder->width, decoder->height, x, y, width, height);
+    if (decoder->width > 0 && decoder->height > 0 && frame.width > 0) {
+        DrawRectangleLinesEx(
+            (Rectangle){frame.x, frame.y, frame.width, frame.height},
+            1.0f, COLOR_GRID_MAJOR);
+    }
+
     // Display both original fields, in their original alternating rows.
     if (decoder->texture_valid && supported && (status->v_locked || decoder->stats.paused)) {
         if (decoder->generation != decoder->displayed_generation) {
@@ -179,8 +194,6 @@ void gui_vhs_fm_render_frame(vhs_fm_decoder_t *decoder, float x, float y,
         }
         /* Full widens the sampled horizontal window as well as adding VBI.
          * Correct its display pixels so the active picture keeps its shape. */
-        gui_rf_preview_rect_t frame = gui_rf_preview_fit_frame(
-            decoder->width, decoder->height, x, y, width, height);
         DrawTexturePro(decoder->texture,
                        (Rectangle){0, 0, (float)decoder->width, (float)decoder->height},
                        (Rectangle){frame.x, frame.y, frame.width, frame.height},

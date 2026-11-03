@@ -19,6 +19,7 @@
 #include "../ui/gui_chrome_hide.h"  // double-click overlay toggle (shared helper)
 #include "../input/gui_capture.h"  // gui_app_level_autostop_vpp for mV scale
 #include "../input/gui_playback.h" // DAW-style pause: re-process on config change
+#include "../signal/gui_cvbs.h"    // gui_video_follow_generator_system (Gen box)
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -53,6 +54,25 @@ static const char *s_trigger_source_labels[] = {
 static const char *s_render_mode_labels[] = {
     [WAVEFORM_MODE_LINE] = "Line",
     [WAVEFORM_MODE_PHOSPHOR] = "Phosphor",
+};
+
+// Per-panel signal type, assigned through the Signal overlay dropdown.
+// Drives the channel label (e.g. "CH1 CVBS", "CH2 FM RF") and the trigger
+// defaults for that panel. Matches the Test Gen channel mapping (CH1 =
+// composite CVBS, CH2 = tape RF) but stays useful for any source.
+typedef enum {
+    WAVE_SIGNAL_RAW = 0,   // Plain channel view (default, label "CH A"/"CH B")
+    WAVE_SIGNAL_CVBS,      // Composite video (CVBS H-sync trigger default)
+    WAVE_SIGNAL_FM_RF,     // Tape FM RF (rising-edge trigger default)
+    WAVE_SIGNAL_AUDIO,     // Audio-band signal (rising-edge trigger default)
+    WAVE_SIGNAL_COUNT
+} waveform_signal_type_t;
+
+static const char *s_signal_labels[WAVE_SIGNAL_COUNT] = {
+    [WAVE_SIGNAL_RAW] = "Raw",
+    [WAVE_SIGNAL_CVBS] = "CVBS",
+    [WAVE_SIGNAL_FM_RF] = "FM RF",
+    [WAVE_SIGNAL_AUDIO] = "Audio",
 };
 
 //-----------------------------------------------------------------------------
@@ -106,6 +126,15 @@ typedef struct {
     Rectangle scale_btn_rect;
     Rectangle scale_opts_rect[5];
     bool scale_dropdown_open;
+
+    // Signal type dropdown (leftmost of the right-anchored overlay group).
+    // Raw keeps the legacy "CH A"/"CH B" label; CVBS / FM RF / Audio
+    // relabel to "CH1 CVBS" / "CH2 FM RF" / "CHn Audio" and apply the
+    // matching trigger defaults.
+    waveform_signal_type_t signal_type;
+    Rectangle signal_btn_rect;
+    Rectangle signal_opts_rect[WAVE_SIGNAL_COUNT];
+    bool signal_dropdown_open;
 
     // Double-click chrome-hide tracker (see ui/gui_chrome_hide.h): toggles
     // ALL overlay chrome (Scale/Mode/Trig dropdowns + labels); the grid,
@@ -648,6 +677,84 @@ static void draw_panel_trigger_markers(float x, float y, float w, float h,
 
 
 //-----------------------------------------------------------------------------
+// Signal Type Helpers
+//-----------------------------------------------------------------------------
+
+// Test mode = the Simulated Test Gen device is the ACTIVE capture source
+// (selected, not recording, no playback session). The CVBS/FM RF/Audio
+// signal-type labels and the generator option row only apply in test mode;
+// every other source (real capture devices, FLAC playback) falls back to
+// the plain CH A/CH B names.
+static bool waveform_test_mode_active(gui_app_t *app) {
+    if (!app || app->selected_device < 0 ||
+        app->selected_device >= app->device_count) {
+        return false;
+    }
+    return app->devices[app->selected_device].type == DEVICE_TYPE_SIMULATED &&
+           !app->is_recording &&
+           !atomic_load(&app->playback_running);
+}
+
+// Channel label shown in the panel grid, derived from the assigned signal
+// type. Raw (or any source outside test mode) keeps the legacy
+// "CH A"/"CH B" names; a typed channel uses the "CH1"/"CH2" numbering
+// with the signal appended (e.g. "CH1 CVBS").
+static void waveform_channel_label(char *buf, size_t len, int channel,
+                                    waveform_signal_type_t type,
+                                    bool type_active) {
+    if (!buf || len == 0) return;
+    if (!type_active) {
+        snprintf(buf, len, "%s", (channel == 0) ? "CH A" : "CH B");
+        return;
+    }
+    switch (type) {
+        case WAVE_SIGNAL_CVBS:
+            snprintf(buf, len, "CH%d CVBS", channel + 1);
+            break;
+        case WAVE_SIGNAL_FM_RF:
+            snprintf(buf, len, "CH%d FM RF", channel + 1);
+            break;
+        case WAVE_SIGNAL_AUDIO:
+            snprintf(buf, len, "CH%d Audio", channel + 1);
+            break;
+        case WAVE_SIGNAL_RAW:
+        default:
+            snprintf(buf, len, "%s", (channel == 0) ? "CH A" : "CH B");
+            break;
+    }
+}
+
+// Apply the trigger defaults for a signal type selection. Raw leaves the
+// current trigger configuration untouched. Trigger fields are shared with
+// the display thread, so the change is made under the panel data lock with
+// config_dirty set (live re-render while playback is paused).
+static void waveform_apply_signal_defaults(waveform_panel_state_t *state,
+                                           waveform_signal_type_t type) {
+    if (!state) return;
+    waveform_state_lock(state);
+    switch (type) {
+        case WAVE_SIGNAL_CVBS:
+            // Composite video: auto-detected CVBS H-sync trigger
+            state->trigger_enabled = true;
+            state->trigger_mode = TRIGGER_MODE_CVBS_HSYNC;
+            break;
+        case WAVE_SIGNAL_FM_RF:
+        case WAVE_SIGNAL_AUDIO:
+            // RF / audio carriers: plain rising-edge trigger at mid-scale
+            state->trigger_enabled = true;
+            state->trigger_mode = TRIGGER_MODE_RISING;
+            state->trigger_level = 0;
+            break;
+        case WAVE_SIGNAL_RAW:
+        default:
+            break;
+    }
+    state->signal_type = type;
+    state->config_dirty = true;
+    waveform_state_unlock(state);
+}
+
+//-----------------------------------------------------------------------------
 // Waveform Panel Rendering (using panel state)
 //-----------------------------------------------------------------------------
 
@@ -656,7 +763,9 @@ static void render_waveform_line_internal(waveform_panel_state_t *state,
                                            gui_app_t *app, int channel,
                                            Rectangle bounds, Color color) {
     float x = bounds.x, y = bounds.y, w = bounds.width, h = bounds.height;
-    const char *label = (channel == 0) ? "CH A" : "CH B";
+    char label_buf[32];
+    waveform_channel_label(label_buf, sizeof(label_buf), channel,
+                           state->signal_type, waveform_test_mode_active(app));
     waveform_render_snapshot_t snap = {0};
     waveform_sample_t render_samples[DISPLAY_BUFFER_SIZE];
     waveform_capture_render_snapshot(state, &snap, render_samples);
@@ -669,7 +778,7 @@ static void render_waveform_line_internal(waveform_panel_state_t *state,
 
     // Draw grid with labels first
     uint32_t sample_rate = atomic_load(&app->sample_rate);
-    draw_channel_grid(x, y, w, h, label, color, app->settings.show_grid,
+    draw_channel_grid(x, y, w, h, label_buf, color, app->settings.show_grid,
                       snap.zoom_scale, sample_rate,
                       snap.trigger_enabled, snap.trigger_display_pos, &state->time_div_rect,
                       app->settings.waveform_scale_mode, channel);
@@ -708,7 +817,9 @@ static void render_waveform_phosphor_internal(waveform_panel_state_t *state,
                                                gui_app_t *app, int channel,
                                                Rectangle bounds, Color color) {
     float x = bounds.x, y = bounds.y, w = bounds.width, h = bounds.height;
-    const char *label = (channel == 0) ? "CH A" : "CH B";
+    char label_buf[32];
+    waveform_channel_label(label_buf, sizeof(label_buf), channel,
+                           state->signal_type, waveform_test_mode_active(app));
     waveform_render_snapshot_t snap = {0};
     waveform_sample_t render_samples[DISPLAY_BUFFER_SIZE];
     waveform_capture_render_snapshot(state, &snap, render_samples);
@@ -721,7 +832,7 @@ static void render_waveform_phosphor_internal(waveform_panel_state_t *state,
 
     // Draw grid with labels first
     uint32_t sample_rate = atomic_load(&app->sample_rate);
-    draw_channel_grid(x, y, w, h, label, color, app->settings.show_grid,
+    draw_channel_grid(x, y, w, h, label_buf, color, app->settings.show_grid,
                       snap.zoom_scale, sample_rate,
                       snap.trigger_enabled, snap.trigger_display_pos, &state->time_div_rect,
                       app->settings.waveform_scale_mode, channel);
@@ -1146,6 +1257,8 @@ static void *waveform_create(void) {
     state->trigger_dropdown_open = false;
     state->scale_dropdown_open = false;
     state->scale_mode = 0;  // Basic (matches the settings default)
+    state->signal_type = WAVE_SIGNAL_RAW;
+    state->signal_dropdown_open = false;
     state->dragging = false;
     atomic_flag_clear(&state->data_lock);
 
@@ -1300,6 +1413,7 @@ static void waveform_render_overlay(void *state_ptr, Rectangle bounds) {
 
     // Re-derive button x positions from the right edge, skipping
     // hidden label gaps (buttons slide right to fill freed space).
+    // Group, right to left: [Trig] [Mode] [Scale].
     float group_right = bounds.x + bounds.width - 8;
     trig_btn_x = group_right - trig_btn_w;
     render_btn_x = trig_btn_x - (trig_label_hidden ? 0 : (trig_prefix_w + 4)) - render_btn_w - 4;
@@ -1529,6 +1643,10 @@ static void waveform_render_overlay(void *state_ptr, Rectangle bounds) {
             }
         }
     }
+
+    // The Signal Type dropdown is NOT part of this row-1 group: it lives on
+    // the test-mode-only generator row below (see waveform_render), next to
+    // the Gen system box. Outside test mode it is not rendered at all.
 #undef TEXT_W
 }
 
@@ -1551,10 +1669,38 @@ static bool waveform_handle_control_click(waveform_panel_state_t *state, struct 
     trigger_menu.height = (TRIGGER_MODE_COUNT + 2 + TRIGGER_SOURCE_COUNT) * 20;
     Rectangle scale_menu = state->scale_opts_rect[0];
     scale_menu.height = 5 * 20;
+    Rectangle signal_menu = state->signal_opts_rect[0];
+    signal_menu.height = WAVE_SIGNAL_COUNT * 20;
     bool click_on_menu =
         (state->render_mode_dropdown_open && CheckCollisionPointRec(click, render_menu)) ||
         (state->trigger_dropdown_open && CheckCollisionPointRec(click, trigger_menu)) ||
-        (state->scale_dropdown_open && CheckCollisionPointRec(click, scale_menu));
+        (state->scale_dropdown_open && CheckCollisionPointRec(click, scale_menu)) ||
+        (state->signal_dropdown_open && CheckCollisionPointRec(click, signal_menu));
+
+    //-------------------------------------------------------------------------
+    // Signal Type Dropdown (leftmost of the group)
+    //-------------------------------------------------------------------------
+    if (!click_on_menu && CheckCollisionPointRec(click, state->signal_btn_rect)) {
+        state->signal_dropdown_open = !state->signal_dropdown_open;
+        state->scale_dropdown_open = false;  // Close other dropdowns
+        state->render_mode_dropdown_open = false;
+        state->trigger_dropdown_open = false;
+        return true;
+    }
+
+    if (state->signal_dropdown_open) {
+        for (int i = 0; i < WAVE_SIGNAL_COUNT; i++) {
+            Rectangle opt_rect = state->signal_opts_rect[i];
+            if (CheckCollisionPointRec(click, opt_rect)) {
+                waveform_apply_signal_defaults(state, (waveform_signal_type_t)i);
+                state->signal_dropdown_open = false;
+                return true;
+            }
+        }
+        // Click outside closes dropdown
+        state->signal_dropdown_open = false;
+        return true;
+    }
 
     //-------------------------------------------------------------------------
     // Amplitude Scale Dropdown (left side)
@@ -1563,6 +1709,7 @@ static bool waveform_handle_control_click(waveform_panel_state_t *state, struct 
         state->scale_dropdown_open = !state->scale_dropdown_open;
         state->render_mode_dropdown_open = false;  // Close other dropdowns
         state->trigger_dropdown_open = false;
+        state->signal_dropdown_open = false;
         return true;
     }
 
@@ -1589,6 +1736,7 @@ static bool waveform_handle_control_click(waveform_panel_state_t *state, struct 
         state->render_mode_dropdown_open = !state->render_mode_dropdown_open;
         state->trigger_dropdown_open = false;  // Close other dropdown
         state->scale_dropdown_open = false;
+        state->signal_dropdown_open = false;
         return true;
     }
 
@@ -1613,6 +1761,7 @@ static bool waveform_handle_control_click(waveform_panel_state_t *state, struct 
         state->trigger_dropdown_open = !state->trigger_dropdown_open;
         state->render_mode_dropdown_open = false;  // Close other dropdown
         state->scale_dropdown_open = false;
+        state->signal_dropdown_open = false;
         return true;
     }
 
@@ -1681,14 +1830,18 @@ static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, in
         return false;
     }
 
-    // Simulated-device system selector button (rendered by waveform_render):
-    // cycles PAL -> NTSC -> SECAM; the simulated capture thread detects the
-    // settings.video_system change on its next batch and regenerates the frame.
+    // Simulated-device system selector button (rendered by waveform_render,
+    // test mode only): cycles PAL -> NTSC -> SECAM; the simulated capture
+    // thread detects the settings.video_system change on its next batch and
+    // regenerates both channels. Video panels still following the generator
+    // switch their decoder previews to the new system (user selections on a
+    // panel stop that panel from following).
     if (state->sim_sys_btn_rect.width > 0 &&
         CheckCollisionPointRec(click, state->sim_sys_btn_rect)) {
         int next = (app->settings.video_system + 1) % 3;
         app->settings.video_system = next;
         gui_settings_save(&app->settings);
+        gui_video_follow_generator_system(app, next);
         gui_app_set_status(app, next == 0 ? "Test Gen: PAL" :
                                  next == 1 ? "Test Gen: NTSC" :
                                             "Test Gen: SECAM");
@@ -1705,12 +1858,13 @@ static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, in
     }
 
     // Double-click anywhere else on the panel toggles ALL overlay
-    // chrome (Scale/Mode/Trig dropdowns + labels) for a clean
+    // chrome (Signal/Scale/Mode/Trig dropdowns + labels) for a clean
     // waveform view.
     if (gui_chrome_hide_feed_click(&state->chrome_hide, click)) {
         state->render_mode_dropdown_open = false;
         state->trigger_dropdown_open = false;
         state->scale_dropdown_open = false;
+        state->signal_dropdown_open = false;
         return true;
     }
 
@@ -1873,35 +2027,80 @@ static void waveform_render(void *state_ptr, gui_app_t *app, int channel,
         render_waveform_line_internal(state, app, channel, bounds, channel_color);
     }
 
-    // Simulated-device system selector: rendered AFTER the waveform so the
-    // phosphor texture and grid drawing cannot cover it. Visible only when
-    // the Simulated device is the selected capture source. Cycles
-    // PAL -> NTSC -> SECAM on click (updates settings.video_system; the
-    // simulated capture thread detects the change and regenerates).
+    // Generator option row: rendered AFTER the waveform so the phosphor
+    // texture and grid drawing cannot cover it, one row BELOW the
+    // Scale/Mode/Trig group, right-aligned at the same margin:
+    //     [Signal: Raw/CVBS/FM RF/Audio]  [Gen: PAL/NTSC/SECAM]
+    // TEST MODE ONLY (Simulated device active, not recording, no playback
+    // session — see waveform_test_mode_active): the generator options never
+    // appear on real capture devices or FLAC playback. The Gen button
+    // cycles the system (the simulated capture thread regenerates both
+    // channels; following Video panels switch decoders). The Signal button
+    // assigns this channel's signal type (label + trigger defaults).
     {
-        bool is_sim = (app->selected_device >= 0 &&
-                       app->selected_device < app->device_count &&
-                       app->devices[app->selected_device].type == DEVICE_TYPE_SIMULATED);
-        if (is_sim && !gui_chrome_hide_hidden(&state->chrome_hide)) {
+        if (waveform_test_mode_active(app) &&
+            !gui_chrome_hide_hidden(&state->chrome_hide)) {
+            const float btn_h = 18.0f;
+            const float row_y = bounds.y + 8.0f + btn_h + 6.0f;
+            const float x_right = bounds.x + bounds.width - 8.0f;
+
+            // Gen system button (rightmost on the row)
             const char *sys_labels[] = {"PAL", "NTSC", "SECAM"};
             int sys = app->settings.video_system;
             if (sys < 0 || sys > 2) sys = 0;
-            char btn_label[24];
-            snprintf(btn_label, sizeof(btn_label), "Gen: %s", sys_labels[sys]);
-            float btn_h = 18.0f;
-            float btn_w = (float)gui_text_measure(btn_label, FONT_SIZE_DROPDOWN_OPT) + 16.0f;
-            if (btn_w < 90.0f) btn_w = 90.0f;
-            /* Right-aligned, one row BELOW the Scale/Mode/Trig group —
-             * in-line with the other controls, same right margin. */
-            float btn_x = bounds.x + bounds.width - btn_w - 8.0f;
-            float btn_y = bounds.y + 8.0f + btn_h + 6.0f;
-            state->sim_sys_btn_rect = (Rectangle){btn_x, btn_y, btn_w, btn_h};
+            char gen_label[24];
+            snprintf(gen_label, sizeof(gen_label), "Gen: %s", sys_labels[sys]);
+            float gen_w = (float)gui_text_measure(gen_label, FONT_SIZE_DROPDOWN_OPT) + 16.0f;
+            if (gen_w < 90.0f) gen_w = 90.0f;
+            float gen_x = x_right - gen_w;
+            state->sim_sys_btn_rect = (Rectangle){gen_x, row_y, gen_w, btn_h};
             DrawRectangleRounded(state->sim_sys_btn_rect, 0.15f, 4, COLOR_BUTTON_ACTIVE);
-            gui_text_draw(btn_label, btn_x + 8.0f,
-                          btn_y + (btn_h - FONT_SIZE_DROPDOWN_OPT) * 0.5f,
+            gui_text_draw(gen_label, gen_x + 8.0f,
+                          row_y + (btn_h - FONT_SIZE_DROPDOWN_OPT) * 0.5f,
                           FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+
+            // Signal type dropdown (to the left of the Gen button)
+            char signal_label[40];
+            snprintf(signal_label, sizeof(signal_label), "Signal: %s",
+                     s_signal_labels[state->signal_type]);
+            float sig_w = (float)gui_text_measure(signal_label, FONT_SIZE_DROPDOWN_OPT) + 28.0f;
+            if (sig_w < 110.0f) sig_w = 110.0f;
+            float sig_x = gen_x - 8.0f - sig_w;
+            if (sig_x < bounds.x + 8.0f) sig_x = bounds.x + 8.0f;
+            state->signal_btn_rect = (Rectangle){sig_x, row_y, sig_w, btn_h};
+            draw_dropdown_button(state->signal_btn_rect, signal_label,
+                                 state->signal_dropdown_open);
+
+            // Signal dropdown options (below the button, clamped in-bounds)
+            if (state->signal_dropdown_open) {
+                const float opt_h = 20.0f;
+                float opt_y = fmaxf(bounds.y,
+                    fminf(row_y + btn_h,
+                          bounds.y + bounds.height - opt_h * WAVE_SIGNAL_COUNT - 4.0f));
+                DrawRectangleRounded(
+                    (Rectangle){sig_x, opt_y, sig_w, opt_h * WAVE_SIGNAL_COUNT},
+                    0.1f, 4, COLOR_PANEL_BG);
+                Vector2 mouse = gui_ui_get_mouse_position();
+                for (int i = 0; i < WAVE_SIGNAL_COUNT; i++) {
+                    Rectangle opt_rect = {sig_x, opt_y + i * opt_h, sig_w, opt_h};
+                    state->signal_opts_rect[i] = opt_rect;
+                    bool is_selected = (state->signal_type == (waveform_signal_type_t)i);
+                    bool hover = CheckCollisionPointRec(mouse, opt_rect);
+                    DrawRectangleRec(opt_rect, gui_dropdown_option_color(is_selected, hover));
+                    int opt_w = gui_text_measure(s_signal_labels[i],
+                                                 FONT_SIZE_DROPDOWN_OPT);
+                    gui_text_draw(s_signal_labels[i],
+                                  sig_x + sig_w / 2.0f - opt_w / 2.0f,
+                                  opt_y + i * opt_h +
+                                      (opt_h - FONT_SIZE_DROPDOWN_OPT) / 2.0f,
+                                  FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+                }
+            }
         } else {
             state->sim_sys_btn_rect = (Rectangle){0};
+            state->signal_btn_rect = (Rectangle){0};
+            // No stale open popup once the generator row is hidden.
+            state->signal_dropdown_open = false;
         }
     }
 }
@@ -1926,6 +2125,48 @@ static const panel_vtable_t s_waveform_vtable = {
 
 void gui_waveform_panel_register(void) {
     panel_register(PANEL_VIEW_WAVEFORM, &s_waveform_vtable);
+}
+
+//-----------------------------------------------------------------------------
+// Generator Default Channel Mapping
+//-----------------------------------------------------------------------------
+
+// Default the waveform monitors to the Test Gen channel mapping (CH1 = CVBS
+// on channel A, CH2 = FM RF on channel B) when the Simulated device starts.
+// Only waveform panels still in Raw state are assigned, so a user selection
+// is never overwritten. Called from gui_app_start_capture after
+// gui_simulated_start() succeeds (UI thread or the capture-start worker);
+// takes the panel config lock to serialize against the display thread and
+// view switching (same lock panel_registry.c uses for panel processing).
+void gui_waveform_apply_generator_defaults(gui_app_t *app) {
+    if (!app) return;
+
+    while (atomic_flag_test_and_set(&app->panel_config_lock)) {
+        /* spin */
+    }
+
+    const waveform_signal_type_t want[2] = { WAVE_SIGNAL_CVBS, WAVE_SIGNAL_FM_RF };
+    channel_panel_config_t *configs[2] = { &app->panel_config_a, &app->panel_config_b };
+
+    for (int ch = 0; ch < 2; ch++) {
+        channel_panel_config_t *cfg = configs[ch];
+
+        if (cfg->left_view == PANEL_VIEW_WAVEFORM && cfg->left_state) {
+            waveform_panel_state_t *st = (waveform_panel_state_t *)cfg->left_state;
+            if (st->initialized && st->signal_type == WAVE_SIGNAL_RAW) {
+                waveform_apply_signal_defaults(st, want[ch]);
+            }
+        }
+
+        if (cfg->split && cfg->right_view == PANEL_VIEW_WAVEFORM && cfg->right_state) {
+            waveform_panel_state_t *st = (waveform_panel_state_t *)cfg->right_state;
+            if (st->initialized && st->signal_type == WAVE_SIGNAL_RAW) {
+                waveform_apply_signal_defaults(st, want[ch]);
+            }
+        }
+    }
+
+    atomic_flag_clear(&app->panel_config_lock);
 }
 
 /* v5: server uses EXACT Local waveform processing (including SOXR + trigger),

@@ -28,6 +28,17 @@ void gui_waveform_panel_register(void);
 #define SCOPE_BLOOM             2.0f    // Bloom factor
 
 //-----------------------------------------------------------------------------
+// Generator Default Channel Mapping
+//-----------------------------------------------------------------------------
+
+// Default the waveform monitors to the Test Gen channel mapping (CH1 = CVBS
+// on channel A, CH2 = FM RF on channel B) when the Simulated device starts.
+// Only waveform panels still in Raw state are assigned; user selections are
+// never overwritten. Called from gui_app_start_capture after
+// gui_simulated_start() succeeds.
+void gui_waveform_apply_generator_defaults(gui_app_t *app);
+
+//-----------------------------------------------------------------------------
 // Cleanup
 //-----------------------------------------------------------------------------
 
