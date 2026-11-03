@@ -643,6 +643,14 @@ Validation: build clean; gui_testgen_rf, gui_cvbs_baseband,
 gui_waveform_overlay all OK. Needs GUI visual confirmation of the
 toolbar audio monitor box (and at a couple of window widths/tiers).
 
+### Committed (round 15)
+
+- `b75f325` "Toolbar: uniform AudioLevelBars borders + HARD dev note
+  (round 15)" pushed to harrypm/MISRC-GUI main (4 files; restore point
+  `restore_points/2026-11-03_testgen-rf-round15-good.zip`). User
+  confirmed the fix ("cleanly fixed") in the GUI before committing.
+  New hard rule: `dev/gui_uniform_border_rules.md`.
+
 ### Upstream pull (2026-11-03 08:24)
 
 - `git pull --ff-only` -> `e2045af` (merge of PR #21

@@ -210,6 +210,20 @@ bool gui_playback_handle_dropped_files(gui_app_t *app, const char *const *paths,
 void gui_playback_set_loop(gui_app_t *app, bool loop);
 bool gui_playback_get_loop(gui_app_t *app);
 
+// Per-channel transport + link mode (player). Link: Synced (default) keeps
+// ONE shared transport for both files; Separate gives each file its own
+// play/pause + loop next to its file input row. True per-channel pipelines
+// exist only in independent mixed-rate mode (both files, different rates);
+// every other session shape maps the per-channel controls onto the shared
+// transport so the buttons always behave coherently.
+void gui_playback_set_link_separate(gui_app_t *app, bool separate);
+bool gui_playback_get_link_separate(gui_app_t *app);
+// channel: 0=A, 1=B. In Synced mode these drive the shared transport.
+void gui_playback_toggle_pause_channel(gui_app_t *app, int channel);
+bool gui_playback_is_channel_paused(gui_app_t *app, int channel);
+void gui_playback_set_channel_loop(gui_app_t *app, int channel, bool loop);
+bool gui_playback_get_channel_loop(gui_app_t *app, int channel);
+
 //-----------------------------------------------------------------------------
 // DAW-Style Paused Analysis Window (direct file random access)
 //-----------------------------------------------------------------------------

@@ -36,7 +36,8 @@ struct buffer_manager;
 typedef struct {
     int16_t *samples_a;          /* Channel A samples (DISPLAY_SAMPLE_COUNT) */
     int16_t *samples_b;          /* Channel B samples (DISPLAY_SAMPLE_COUNT) */
-    size_t sample_count;         /* Number of valid samples */
+    size_t sample_count;         /* Valid A-side samples in the latest publish */
+    size_t sample_count_b;       /* Valid B-side samples (independent mode) */
     uint32_t sample_rate;        /* Sample rate for display calculations */
     atomic_bool ready;           /* New samples available for render thread */
     atomic_uint_fast64_t frame;  /* Frame counter for debugging */

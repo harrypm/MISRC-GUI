@@ -75,9 +75,16 @@ recording channel presence and mapping using available capture information.
 
 FLAC uses actual decoded sample counts; final-block padding is not decoded as
 RF. Its physical rate is retained independently of whether length is known.
-The paired reader currently requires equal physical clocks for both channels.
-Mixed-rate pairs show an explicit unsupported message; independent channel
-cursors/resampling are outside this change.
+Same-rate pairs share the paired reader and FIFO. A MIXED-RATE pair (both
+files loaded, different resolved rates) runs the player's INDEPENDENT mode
+(2026-11-03, user request: "Player should run files independently"): each
+file feeds its own per-channel RF FIFO at its own true clock, the preview
+workers are fed per channel with honest rate/position metadata, and both
+decoders run time-correctly. Link mode: Synced (default) keeps one shared
+transport; Separate gives each file its own Play/Pause + Loop next to its
+file input row. A channel reaching its end without loop pauses only that
+channel. Recording stays impossible during playback, so the archival paths
+never see the independent streams.
 
 ## Processing and ownership
 

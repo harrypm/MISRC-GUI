@@ -35,6 +35,7 @@ Use lowercase with underscores:
 | `gui_automation_flags_rules.md` | HARD rule: every GUI element carries a CLI flag / config key for automated testing (inventory + gaps) |
 | `gui_output_verification_rules.md` | HARD rule: headless verification must read what the GUI displays (render-path conversion contracts) |
 | `gui_uniform_border_rules.md` | HARD rule: visible Clay containers derive width from content (uniform borders) — AudioLevelBars incident |
+| `gui_signal_default_rules.md` | HARD rule: mode-scoped default configs — device defaults (test-gen triggers etc.) never leak across modes; user picks never overwritten |
 
 ### When starting a new prompt
 

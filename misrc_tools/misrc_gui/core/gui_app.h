@@ -426,6 +426,20 @@ typedef struct gui_app {
 
     // Playback device state
     atomic_bool playback_running;  // Flag for playback mode
+    /* Independent mixed-rate playback mode (player only): both files loaded
+     * with DIFFERENT rates. The producer feeds BUF_CAPTURE_RF_A/B and the
+     * extraction/display pipelines consume per-channel FIFOs
+     * (BUF_DISPLAY_A/B) so each file plays at its own true rate and the RF
+     * Preview decoders run on both channels. Same-rate sets and capture
+     * devices keep the paired BUF_CAPTURE_RF/BUF_DISPLAY paths. Set once at
+     * playback commit; read by extraction/display threads. */
+    atomic_bool playback_independent_mode;
+    /* Per-channel transport (player Link: Separate mode): true pauses that
+     * channel's file while the other keeps playing. Ignored in Synced mode. */
+    atomic_bool playback_channel_paused[2];
+    /* Player link mode: false = Synced (default, one shared transport),
+     * true = Separate (per-channel transport). Session state, not persisted. */
+    atomic_bool playback_link_separate;
 
 #ifdef ENABLE_FX3
     // FX3 device state
@@ -491,6 +505,13 @@ typedef struct gui_app {
     // describe independent hardware/file clocks even when preview is gated.
     atomic_uint_fast32_t rf_source_rate_hz[2];
     atomic_bool rf_preview_input_supported;
+    // Per-channel FULL SCALE of the display-sample container (the magnitude
+    // that rails the panel). Playback decode normalizes EVERY input
+    // convention into the 12-bit container (in = out at 8/12/16-bit; user
+    // rule 2026-11-03), so playback sessions keep 2048 here; capture
+    // backends with a different container (DdD 512) publish their own scale
+    // (see gui_app_level_autostop_full_scale).
+    atomic_uint_fast32_t rf_display_full_scale[2];
     atomic_uint_fast64_t rf_stream_epoch;
     atomic_uint_fast32_t audio_sample_rate;
 

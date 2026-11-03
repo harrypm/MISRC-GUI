@@ -1,5 +1,217 @@
 # MISRC GUI development notes
 
+## 2026-11-03 Waveform: test-gen stock trigger configs no longer leak into record/playback (USER-VERIFIED)
+
+- User request: "remove the stock triggers on config from record/playback
+  that was applied over from test signal mode". Root cause:
+  `waveform_apply_channel_signal_default` assigned the Test-Gen mapping
+  (CH1 -> CVBS with CVBS H-SYNC trigger ENABLED, CH2 -> FM RF with RISING
+  trigger ENABLED) on a panel's first render/click UNCONDITIONALLY - device
+  irrelevant - so record/playback panels inherited the generator's stock
+  trigger configs.
+- Fix (gui_oscilloscope.c): the generator mapping now applies ONLY while
+  `waveform_test_mode_active(app)`; outside test mode any
+  generator-applied (non-user-picked) signal config is cleared back to the
+  stock trigger (off / rising / level 0, plain CH A / CH B). A signal type
+  the user picked from the dropdown is tracked (`signal_user_picked`) and
+  never overwritten. The simulated-start hook
+  (`gui_waveform_apply_generator_defaults`) stays test-scoped as before.
+- Verified: build + link OK (13:04 exe); 44/46 meson (only the two
+  PRE-EXISTING baseline failures); overlay harness 2348/2348; the testgen
+  RF suite passes. USER-VERIFIED in the real GUI 2026-11-03 ("fixed").
+- HARD rule recorded per user request ("make it a hard defaults rule for
+  base dev config"): `dev/gui_signal_default_rules.md` (mode-scoped
+  default configs; device defaults never leak across modes; user picks
+  never overwritten). Restore point:
+  `restore_points/2026-11-03_player-display-trigger-defaults-good.zip`.
+
+## 2026-11-03 Player decode: EVERY convention normalizes into the 12-bit container - in = out at 8/12/16-bit (NOT yet user-verified)
+
+- User rule (final, 2026-11-03): "captures should always look like live ...
+  8/12/16-bit in/out should match." The stock design already normalizes
+  8-bit (<<4), 12-bit (as-is) and recorder-16-bit (>>4) into the 12-bit
+  display container - those always round-tripped level-exact. The ONE
+  convention that broke in = out was conv16 PASS (raw 16-bit passthrough
+  with no container normalization).
+- FINAL fix (after two superseded attempts - a per-channel-4096 display
+  scale, then a "13-bit >>1 HALF" class, both WRONG for the real file
+  class): the Tape_03 file is an 8-BIT capture externally RESAMPLED to
+  20msps (user: "it is 8-bit data") - container-domain values stored raw
+  in 16-bit, off the 16-grid (resample broke it) with ~+9% resampler
+  ripple past the capture rails. Decode normalizes EVERY 16-bit convention
+  into the container via the single shared `gui_playback_apply_conv16`
+  (both FLAC write callbacks + the raw s16/WAV16 reader):
+  - recorder 16-grid -> >>4 restore; container-domain raw (incl. resampled
+    captures) -> pass through with overshoot CLAMPED to the container
+    rails, mirroring the recorder's own resample clamp
+    (convert_i16_to_flac_i32: "the soxr resampler can overshoot the 12-bit
+    range ... Clamp to the signed 12-bit range"); full-range generic
+    (peak > 4096) -> >>4 downscale.
+  - Display/clip/VU/trigger consumers are on the SINGLE stock 2048
+    reference everywhere (both session shapes identical);
+    `rf_display_full_scale` stays 2048 for playback.
+- New MISRC_DEBUG diagnostics (gated): [WFDISP] per-panel display values,
+  [STATS] live peak/clip counters, [CLIPDBG] clip forensics (counted vs
+  re-read values), [PACKDBG] packed word vs extracted value, conv16
+  decision lines. These enabled fully automated playback verification
+  without the GUI.
+- Superseded experiments of 2026-11-03 (all REVERTED before this commit):
+  waveform Res/Range dropdowns + levels axis + peak-detect (reverted to
+  stock after user reports), per-channel 4096 display full scale,
+  "13-bit HALF >>1" conv16 class, conv16 promotion-on-hot-block.
+- Verified: build OK (13:23+ exe); 44/46 meson (only the two PRE-EXISTING
+  baseline failures); gui_playback_resolve 1206/1206 with the new contracts
+  (recorder >>4, <=2047 pass-through, 13-bit >>1, full-range >>4, silent-lead
+  stickiness, raw/WAV readers). User real-GUI confirmation pending: Tape_03
+  chop must show the SAME trace height loaded alone and in a mixed-rate set,
+  clip counters at zero on the clean tape.
+- TEST-FILE FORENSICS (user's Tape_03 file, 2026-11-03, hard data):
+  `Diamler_Chrysler_NTSC_SP_Tape_03_video_rf_20msps.flac` (10.3 GB, mono
+  FLAC16, header rate 20000 kHz-domain, NO Vorbis tags, wrapped STREAMINFO
+  total): peaks -27 dBFS (max +1258/-1448), ZERO samples at any rail across
+  0-390 s, 93.75% non-mod-16 -> 12-bit-domain values stored raw (Tape_03
+  class -> decode pass-through = live container scale). Rate resolution
+  verified correct: the msps hint parser only accepts a digit run
+  immediately followed by "msps" (L:\000 and Tape_03 cannot win) ->
+  20 MHz. 30-real-second chop for testing:
+  `DC_NTSC_SP_head_20msps.flac` (600M samples; NOTE: ffmpeg -t is in HEADER
+  seconds - 30 real s = -t 30000). Production decoder probe
+  (gui_rf_preview_file, 20 MHz, unscaled): second 0 = no lock (tape
+  head/pre-roll, "vertical broad pulses lack EQ cadence"); 15 s in =
+  PERFECT (h/v/color locked, 119/119 fields, "NTSC VHS SP color locked",
+  identical with/without x1.41 gain - the demod is amplitude-invariant).
+  Instrumented GUI session (MISRC_DEBUG=1, --auto-capture): transport clean
+  end-to-end (20 MHz runtime, true values, buffers 0%, clean loop/stop).
+  VU meters normalize by 2048 (correct). Decoded picture luma histogram
+  healthy (10-255 spread, mean 146) - picture levels fine.
+- TEST-FILE FORENSICS (user's Tape_03 file, 2026-11-03, hard data):
+  `Diamler_Chrysler_NTSC_SP_Tape_03_video_rf_20msps.flac` (10.3 GB, mono
+  FLAC16, header rate 20000 kHz-domain, NO Vorbis tags, wrapped STREAMINFO
+  total): peaks -27 dBFS (max +1258/-1448), ZERO samples at any rail across
+  0-390 s, 93.75% non-mod-16 -> DIRECT-DOMAIN 16-bit (conv16 PASS). Rate
+  resolution verified correct: the msps hint parser only accepts a digit
+  run immediately followed by "msps" (L:\000 and Tape_03 cannot win) ->
+  20 MHz. 30-real-second chop made for testing:
+  `DC_NTSC_SP_head_20msps.flac` (600M samples; NOTE: ffmpeg -t is in HEADER
+  seconds - 30 real s = -t 30000).
+  Production decoder probe (gui_rf_preview_file, 20 MHz, unscaled):
+  second 0 = NO lock ("vertical broad pulses lack EQ cadence" - tape
+  head/pre-roll); 15 s in = PERFECT (h/v/color locked, 119/119 fields,
+  "NTSC VHS SP color locked", unscaled AND x1.41 gain both fine - amplitude
+  is NOT the issue). Paired-path value chain verified in code: decode PASS
+  (+-1450) -> encode_raw_sample (no clamp at this amplitude) -> PLAIN
+  extraction (get_conv_function(pad=0) = 2047-field, NO <<4) -> display
+  70% height, clip counters 0. Verdict: the file and the current pipeline
+  are clean; the tape's first seconds genuinely have no stable video
+  (expect mush at position 0, color lock after the pre-roll).
+
+## 2026-11-03 Waveform Res/Range + levels axis REVERTED and reimplemented source-scale-aware (NOT yet user-verified)
+
+- User reports after the first implementation round: "completely broke it",
+  "clipping is still wrong", and the key fact: "not all samples will be 12-bit
+  why is this some baseline assumption?" - correct: the 12-bit assumption WAS
+  the bug. The stock display pipeline crushes everything into a 12-bit
+  container (paired playback clamps in encode_raw_sample), but the new
+  INDEPENDENT mixed-rate pipeline carries native-domain samples, so a
+  DIRECT-DOMAIN 16-bit file (conv16 PASS, +-2190-peak tape FLAC) overflowed a
+  /2048 display -> pinned trace = the false clipping. The first round also
+  changed the trace look drastically (soxr->peak-detect envelope) without
+  real-GUI data.
+- Action: reverted gui_oscilloscope.c/.h, gui_phosphor_rt.c/.h and the
+  overlay harness to stock main, then reimplemented from the source truth:
+  - NEW per-channel full scale `app->rf_display_full_scale[2]` (2048 12-bit
+    container; 4096 when the playback conv16 detector resolves PASS on that
+    channel; published by the producer; capture keeps the
+    gui_app_level_autostop_full_scale backend value, e.g. DdD 512).
+  - The waveform panel mirrors the per-channel full scale each render and
+    uses it EVERYWHERE it used to hardcode 2048: resampler normalization,
+    trigger-level/CVBS marker math, grid tick labels, clip rails.
+  - Clip counters (independent extraction path) judge clipping against the
+    channel's own rails; VU peak atomics stay normalized to the 12-bit
+    convention for the existing meters.
+  - Res dropdown = decimation scale: `None` (full resolution, one point per
+    pixel) + `2x..128x` (Coarse: None/16x/64x; Fine: full ladder); factor D
+    shows display_width/D points across the SAME time window (total
+    decimation = zoom x D). NO peak-detect this time - the stock soxr
+    resampling look is preserved at every setting.
+  - Levels axis (Scale: Levels/Expanded/Full) ticks raw container levels
+    (full_scale/16 units: 0, +-half, +-full; quarters; sixteenths),
+    amplitude-scale aware, with dashed CLIP rails at the true full-scale
+    boundary (clamped to the panel edge when the gain pushes them out).
+  - pts/div readout next to time/div when a decimation Res is active.
+- Verified: build + link OK (12:27 exe); 44/46 meson (only the two
+  PRE-EXISTING baseline failures); overlay harness 2348/2348. User real-GUI
+  confirmation pending - especially a DIRECT-DOMAIN 16-bit tape in the
+  mixed-rate set (trace must sit inside the rails, clip counters must stay
+  at zero on a clean tape).
+
+## 2026-11-03 Player: independent per-file playback + per-channel transport (NOT yet user-verified)
+
+- Bug (user report): a MIXED-RATE playback file set (CH A / CH B at different
+  rates) stopped the RF Preview decoder from running. Root cause: the paired
+  reader zipped both files sample-for-sample into one RF FIFO paced at the
+  faster rate, so per-channel time was inconsistent and the session was
+  deliberately gated (`rf_preview_input_supported=false`, OSD: "Mixed-rate
+  pair: independent input reader required").
+- Fix (user decision: "Player should run files independently ... either in
+  sync or separate with controls on each panel"): INDEPENDENT mode activates
+  at playback commit when both files have resolved, different rates:
+  - Buffer manager gains per-channel FIFOs (lazy): `BUF_CAPTURE_RF_A/B`,
+    `BUF_DISPLAY_A/B`. Capture devices and same-rate playback keep the paired
+    paths unchanged.
+  - The playback producer writes each file's display-domain int16 samples to
+    its own RF FIFO at its own true clock (batch axis = the faster file;
+    slower channel consumes a proportional count with remainder accumulators)
+    and stamps per-channel rate/position metadata.
+  - Extraction runs `extraction_thread_independent` (no unpacking, per-channel
+    stats via `independent_channel_stats`, per-channel preview submit with
+    true metadata, record path skipped - recording is impossible during
+    playback). The display thread runs `display_thread_independent` and
+    dispatches `panel_process_all` per channel with that channel's own rate.
+  - Per-channel transport + Link mode: `Link: Synced|Separate` toggle plus
+    Play/Pause + Loop buttons NEXT TO EACH playback file input row (settings
+    panel, Playback device only). Synced = shared transport (legacy); Separate
+    = per-file pause/loop via `playback_channel_paused[2]`/`channel_loop[2]`;
+    a channel reaching EOF without loop pauses only itself. Per-channel freeze
+    comes free from producer starvation (no worker changes). Scrub stays
+    per-timeline in both modes (timeline rows are already per channel).
+- Verified: build + link OK (44/46 meson: only the two PRE-EXISTING baseline
+  failures `update_cli` + `gui_rf_routes`, reproduced on stashed baseline;
+  `gui_rf_playback_start` + `gui_rf_preview` suites pass). User real-GUI
+  confirmation pending.
+- Prompt log: `prompt_logs/2026-11-03_mixed-rate-playback-rf-preview-bug.md`.
+
+## 2026-11-03 Waveform monitor: render-resolution (Res) + Range presets, playback only (NOT yet user-verified)
+
+- Feature (user request: "samples resolution selection mode ... only to the player
+  side for now"): the waveform panel's resample domain is now POINTS ACROSS THE
+  PANEL, selected by two overlay dropdowns on a second row (same slot as the
+  test-mode Gen row, so the two are mutually exclusive):
+  - `Range:` which preset group the Res dropdown lists - Coarse (256/512/1024/
+    2048/4096) or Fine (64..32768, 10 presets). Default Coarse.
+  - `Res:` how many waveform points the frame holds - Auto (= one point per
+    pixel, the stock behaviour and the default) or the group's preset count.
+- Playback device ONLY (`waveform_playback_res_visible`: selected device is
+  DEVICE_TYPE_PLAYBACK and not test mode). Other sources zero the rects
+  (click-inert) and process in Auto; the trace still covers the full panel at
+  any Res (points are stretched across the panel width, phosphor via the new
+  `phosphor_rt_draw_waveform_xstep`).
+- Key mechanic (`waveform_process_display`): zoom_scale stays samples-per-pixel
+  (scroll semantics unchanged, grid time/div unchanged); the resampler decimation
+  is scaled by display_width/point_count and the trigger x position is computed
+  in the point domain, then mapped back to pixels for the grid t=0 and the
+  marker (the marker guard is `pos < samples_available`, NOT `< width`).
+- State model: per-panel runtime state only (`res_range`, `res_points`), no
+  `gui_settings_t` key -> automation rule 6 exemption; recorded in
+  `gui_automation_flags_rules.md` Known gaps. Res changes set `config_dirty`
+  so DAW-style paused re-processing keeps rendering live.
+- Verification status: build + link OK (build-local, 88/88), overlay harness
+  test OK; `gui_rf_routes` + `update_cli` meson failures are PRE-EXISTING
+  (reproduced on stashed baseline); `gui_rf_playback_start` is flaky (failed
+  once, passed twice with the feature in the exe; playback seek paths untouched
+  by this change). User real-GUI confirmation still pending.
+- Prompt log: `prompt_logs/2026-11-03_waveform-render-resolution_README.md`.
+
 ## 2026-10-20 SECAM FM-chroma decoder shipped (colour user-verified; one open follow-up)
 
 - The tbc-tools secamdecoder pipeline ported to the streaming per-line decode

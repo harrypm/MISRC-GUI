@@ -57,8 +57,15 @@ GUI autoload trigger flag.**
 ## Known gaps (backlog under this rule — do not grow this list)
 
 - Panel view/split selection, waveform Signal/Mode/Scale/Trig dropdowns,
+  waveform playback Res/Range render-resolution dropdowns (per-panel runtime
+  state: `res_points`/`res_range`, no settings key),
   CVBS/RF decoder-mode cycle, OSD/Frame/Levels/Sync selectors: per-panel
-  runtime state, no launch key today (rule 6 exemption).
+  runtime state, no launch key today (rule 6 exemption). [Res/Range added
+  2026-11-03, playback device only]
+- Player Link mode + per-file transport (PlaybackLinkToggle /
+  PlaybackPauseBtn/PlaybackLoopBtn next to the file input rows): per-session
+  runtime state (atomics, no settings key) — rule 6 exemption. [added
+  2026-11-03; a `--config` key would be required the moment these persist]
 - Fullscreen (F11) / borderless mode: no launch flag.
 - The M-Client remote settings table (`gui_monitor_settings.c`) does not
   include `video_system` / `gen_tape_format` — remote runs cannot set the

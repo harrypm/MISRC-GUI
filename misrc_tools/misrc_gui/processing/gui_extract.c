@@ -118,6 +118,39 @@ static bool read_rf_stamp(rf_input_stamp_t *stamp) {
     atomic_store_explicit(&s_stamp_read, read+1, memory_order_release);
     return true;
 }
+/* Independent mixed-rate playback: one stamp ring per channel. The producer
+ * publishes each channel's block info into its own ring so the extraction
+ * thread can feed the preview workers honest per-channel rate/position
+ * metadata (there is no shared paired axis in this mode). */
+typedef struct { gui_rf_block_info_t info; size_t count; } rf_channel_stamp_t;
+static rf_channel_stamp_t s_channel_stamps[2][RF_STAMP_CAPACITY];
+static atomic_uint_fast64_t s_channel_stamp_write[2], s_channel_stamp_read[2];
+bool gui_extract_stamp_playback_channel(int channel,
+                                        const gui_rf_block_info_t *info,
+                                        size_t count) {
+    if (channel < 0 || channel > 1 || !info) return false;
+    uint64_t write = atomic_load_explicit(&s_channel_stamp_write[channel],
+                                          memory_order_relaxed);
+    uint64_t read = atomic_load_explicit(&s_channel_stamp_read[channel],
+                                         memory_order_acquire);
+    if (!s_tagged_input || write-read >= RF_STAMP_CAPACITY) return false;
+    rf_channel_stamp_t *stamp = &s_channel_stamps[channel][write % RF_STAMP_CAPACITY];
+    stamp->info = *info;
+    stamp->count = count;
+    atomic_store_explicit(&s_channel_stamp_write[channel], write+1,
+                          memory_order_release);
+    return true;
+}
+static bool read_rf_stamp_channel(int channel, rf_channel_stamp_t *stamp) {
+    uint64_t read = atomic_load_explicit(&s_channel_stamp_read[channel],
+                                         memory_order_relaxed);
+    if (read == atomic_load_explicit(&s_channel_stamp_write[channel],
+                                     memory_order_acquire)) return false;
+    *stamp = s_channel_stamps[channel][read % RF_STAMP_CAPACITY];
+    atomic_store_explicit(&s_channel_stamp_read[channel], read+1,
+                          memory_order_release);
+    return true;
+}
 static gui_rf_stream_marks_t *s_rf_marks;
 static bool s_rf_observer_seen, s_rf_seen_b;
 static uint32_t s_rf_seen_parser, s_rf_seen_missed, s_rf_seen_drops;
@@ -152,12 +185,27 @@ void gui_extract_prepare_stream(gui_app_t *app) {
     bufmgr_reset(&app->buffers,BUF_CAPTURE_RF);
     bufmgr_reset(&app->buffers,BUF_DISPLAY);
     atomic_store(&s_stamp_write,0); atomic_store(&s_stamp_read,0);
+    for (int ch = 0; ch < 2; ++ch) {
+        atomic_store(&s_channel_stamp_write[ch], 0);
+        atomic_store(&s_channel_stamp_read[ch], 0);
+        bufmgr_reset(&app->buffers, ch ? BUF_CAPTURE_RF_B : BUF_CAPTURE_RF_A);
+        bufmgr_reset(&app->buffers, ch ? BUF_DISPLAY_B : BUF_DISPLAY_A);
+    }
+    // A new session starts in the paired pipeline; the playback commit
+    // re-enables independent mode for a mixed-rate set after this returns.
+    atomic_store(&app->playback_independent_mode, false);
+    atomic_store(&app->playback_channel_paused[0], false);
+    atomic_store(&app->playback_channel_paused[1], false);
     if (!s_rf_marks) s_rf_marks = gui_rf_stream_marks_create();
     gui_rf_stream_marks_reset(s_rf_marks);
     s_rf_observer_seen = false;
     atomic_fetch_add(&app->rf_stream_epoch,1);
     atomic_store(&app->rf_source_rate_hz[0],0); atomic_store(&app->rf_source_rate_hz[1],0);
     atomic_store(&app->rf_preview_input_supported,true);
+    // Stock display container until a producer publishes a per-channel value
+    // (playback commit/detector raises a direct-domain 16-bit channel to 4096).
+    atomic_store(&app->rf_display_full_scale[0],2048);
+    atomic_store(&app->rf_display_full_scale[1],2048);
     // No extraction producer is running here. Clear pressure from the prior
     // session so a new capture does not inherit its frozen-preview state.
     const gui_rf_block_info_t empty_info[2] = {{0}};
@@ -165,6 +213,142 @@ void gui_extract_prepare_stream(gui_app_t *app) {
     app->buffers.rf_write_observer = observe_rf_write;
     app->buffers.rf_write_observer_context = app;
 }
+// Per-channel clip/peak counters for the independent loop (gui_extract_update_stats
+// always touches BOTH channels' atomics, so a single-channel call would zero
+// the other channel's peaks).
+static void independent_channel_stats(gui_app_t *app, int channel,
+                                      const int16_t *samples, size_t num_samples) {
+    size_t clip_pos = 0, clip_neg = 0;
+    uint16_t peak_pos = 0, peak_neg = 0;
+    size_t peak_samples = (num_samples < 1000) ? num_samples : 1000;
+    // This channel's REAL container full scale (a direct-domain 16-bit file
+    // is NOT 12-bit: clip must be judged against its own rails, not 2047).
+    uint32_t full_scale = atomic_load(&app->rf_display_full_scale[channel]);
+    if (full_scale < 1) full_scale = 2048;
+    int32_t clip_hi = (int32_t)full_scale - 1;
+    int32_t clip_lo = -(int32_t)full_scale;
+    // Peak atomics stay on the common 12-bit convention (VU meters and the
+    // level-autostop helpers normalize against 2048), so native-domain peaks
+    // are rescaled into that container for the meters only.
+    float meter_scale = 2048.0f / (float)full_scale;
+    for (size_t i = 0; i < num_samples; i++) {
+        int16_t v = samples[i];
+        if (v >= clip_hi) clip_pos++;
+        else if (v <= clip_lo) clip_neg++;
+        if (i < peak_samples) {
+            if (v > 0 && (uint16_t)v > peak_pos) peak_pos = (uint16_t)v;
+            if (v < 0 && (uint16_t)(-v) > peak_neg) peak_neg = (uint16_t)(-v);
+        }
+    }
+    uint16_t meter_pos = (uint16_t)((float)peak_pos * meter_scale + 0.5f);
+    uint16_t meter_neg = (uint16_t)((float)peak_neg * meter_scale + 0.5f);
+    if (channel == 0) {
+        atomic_fetch_add(&app->clip_count_a_pos, clip_pos);
+        atomic_fetch_add(&app->clip_count_a_neg, clip_neg);
+        atomic_store(&app->peak_a_pos, meter_pos);
+        atomic_store(&app->peak_a_neg, meter_neg);
+    } else {
+        atomic_fetch_add(&app->clip_count_b_pos, clip_pos);
+        atomic_fetch_add(&app->clip_count_b_neg, clip_neg);
+        atomic_store(&app->peak_b_pos, meter_pos);
+        atomic_store(&app->peak_b_neg, meter_neg);
+    }
+}
+
+// Independent mixed-rate playback extraction (player only).
+//
+// The producer wrote each file's display-domain int16 samples to its own
+// FIFO (BUF_CAPTURE_RF_A/B) at that file's true rate. There is no shared
+// sample axis and no 32-bit packing: this loop consumes each channel
+// independently, forwards per-channel blocks to the display FIFOs and the
+// RF preview workers with honest per-channel rate/position stamps, and
+// skips the record path entirely (recording is impossible during
+// playback - the Record control is the pause toggle there).
+static int extraction_thread_independent(void *ctx) {
+    gui_app_t *app = (gui_app_t *)ctx;
+    const size_t read_bytes = BUFFER_READ_SIZE * sizeof(int16_t);
+    uint32_t frame_count = 0;
+
+    fprintf(stderr, "[EXTRACT] Independent mixed-rate playback extraction started\n");
+
+    while (1) {
+        if (atomic_load(&s_extract_stop_requested) || atomic_load(&do_exit)) break;
+        if (!s_extract_app || !s_extract_app->is_capturing) break;
+
+        bool any_data = false;
+        for (int ch = 0; ch < 2; ++ch) {
+            buffer_id_t rf_id = ch ? BUF_CAPTURE_RF_B : BUF_CAPTURE_RF_A;
+            buffer_id_t disp_id = ch ? BUF_DISPLAY_B : BUF_DISPLAY_A;
+            void *buf = bufmgr_read_begin(&s_extract_app->buffers, rf_id,
+                                          read_bytes, 10);
+            if (!buf) continue;
+            any_data = true;
+
+            rf_channel_stamp_t stamp = {0};
+            bool preview_safe = read_rf_stamp_channel(ch, &stamp);
+            size_t count = preview_safe ? stamp.count : 0;
+            if (!preview_safe) {
+                stamp.info.discontinuity = true;
+                count = 0;
+            }
+
+            const int16_t *samples = (const int16_t *)buf;
+
+            // Preview feed with THIS channel's true rate/position metadata.
+            gui_rf_block_info_t info[2] = {{0}, {0}};
+            info[ch] = stamp.info;
+            gui_video_submit_rf(s_extract_app,
+                                ch == 0 ? samples : NULL,
+                                ch == 1 ? samples : NULL,
+                                ch == 0 ? count : 0,
+                                ch == 1 ? count : 0,
+                                info,
+                                true);
+
+            // Per-channel stats (clips/peaks/counters)
+            if (count > 0) {
+                independent_channel_stats(s_extract_app, ch, samples, count);
+                if (ch == 0) {
+                    atomic_fetch_add(&s_extract_app->samples_a, count);
+                } else {
+                    atomic_fetch_add(&s_extract_app->samples_b, count);
+                }
+                atomic_fetch_add(&s_extract_app->total_samples, count);
+            }
+
+            // Display FIFO (lossy): forward the block for the display thread.
+            // Zero-count (metadata failure) blocks are dropped like the
+            // paired path's preview-unsafe ranges.
+            if (count > 0) {
+                size_t write_bytes = count * sizeof(int16_t);
+                uint8_t *disp = (uint8_t *)bufmgr_write_begin(
+                    &s_extract_app->buffers, disp_id, write_bytes, NULL);
+                if (disp) {
+                    memcpy(disp, samples, write_bytes);
+                    bufmgr_write_end(&s_extract_app->buffers, disp_id, write_bytes);
+                }
+            }
+
+            bufmgr_read_end(&s_extract_app->buffers, rf_id, read_bytes);
+        }
+
+        if (!any_data) {
+            // Both FIFOs idle (paused channels / EOF): keep the loop alive
+            // while the session is active.
+            thrd_sleep_ms(5);
+            continue;
+        }
+
+        frame_count++;
+        if (frame_count % BUFMGR_LOG_INTERVAL == 0) {
+            bufmgr_log_periodic(&s_extract_app->buffers);
+        }
+    }
+
+    fprintf(stderr, "[EXTRACT] Independent mixed-rate playback extraction exiting\n");
+    return 0;
+}
+
 // Extraction thread - runs continuously from capture start to stop
 // Always updates display/stats, conditionally writes to record ringbuffers
 static int extraction_thread(void *ctx) {
@@ -223,6 +407,32 @@ static int extraction_thread(void *ctx) {
         // preview-only metadata failures must not silence the recorded B data.
         s_b_present = block_has_b;
         s_extract_fn((uint32_t*)buf, BUFFER_READ_SIZE, clip, s_buf_aux, s_buf_a, s_buf_b, peak);
+
+        // Gated packed-word forensics (MISRC_DEBUG): immediately after the
+        // extraction, compare any rail-valued OUTPUT against its SOURCE word
+        // in the still-mapped ringbuffer read - pinpoints whether rails enter
+        // via the producer's words or the extraction itself.
+        if (misrc_debug_enabled()) {
+            static int s_pack_left = 5;
+            if (s_pack_left > 0) {
+                int found = 0;
+                for (size_t i = 0; i < BUFFER_READ_SIZE && found < 4; i++) {
+                    if (s_buf_a[i] >= 2047 || s_buf_a[i] <= -2048) {
+                        if (found == 0) s_pack_left--;
+                        uint32_t w = ((const uint32_t *)buf)[i];
+                        fprintf(stderr,
+                                "[PACKDBG] i=%zu out=%d word=0x%08x afield=%u (decodes %d) aux=%u bfield=%u\n",
+                                i, (int)s_buf_a[i], (unsigned)w,
+                                (unsigned)(w & 0xFFFu),
+                                (int)(2047 - (int)(w & 0xFFFu)),
+                                (unsigned)((w >> 12) & 0xFFu),
+                                (unsigned)((w >> 20) & 0xFFFu));
+                        found++;
+                    }
+                }
+            }
+        }
+
         if (!s_b_present) {
             // Prevent stale/uninitialized data from driving CH-B meters/display
             memset(s_buf_b, 0, BUFFER_READ_SIZE * sizeof(int16_t));
@@ -499,6 +709,22 @@ static int extraction_thread(void *ctx) {
             gui_extract_update_stats(s_extract_app, mapped_a, mapped_b, BUFFER_READ_SIZE);
         }
 
+        // Gated diagnostics (~2 s): the live peak/clip counters exactly as
+        // the status bar reads them (MISRC_DEBUG; automated level/clip
+        // verification - dev note 2026-11-03).
+        if ((frame_count % 560) == 0 && misrc_debug_enabled()) {
+            fprintf(stderr,
+                    "[STATS] A peak=%u/%u clip=%llu/%llu B peak=%u/%u clip=%llu/%llu\n",
+                    (unsigned)atomic_load(&s_extract_app->peak_a_pos),
+                    (unsigned)atomic_load(&s_extract_app->peak_a_neg),
+                    (unsigned long long)atomic_load(&s_extract_app->clip_count_a_pos),
+                    (unsigned long long)atomic_load(&s_extract_app->clip_count_a_neg),
+                    (unsigned)atomic_load(&s_extract_app->peak_b_pos),
+                    (unsigned)atomic_load(&s_extract_app->peak_b_neg),
+                    (unsigned long long)atomic_load(&s_extract_app->clip_count_b_pos),
+                    (unsigned long long)atomic_load(&s_extract_app->clip_count_b_neg));
+        }
+
         // Sample counters always updated (cheap atomic ops)
         atomic_fetch_add(&s_extract_app->total_samples, BUFFER_READ_SIZE);
         atomic_fetch_add(&s_extract_app->samples_a, BUFFER_READ_SIZE);
@@ -635,6 +861,10 @@ static int extract_start_internal(gui_app_t *app, bool tagged) {
     s_tagged_input = tagged;
     atomic_store(&s_stamp_write, 0);
     atomic_store(&s_stamp_read, 0);
+    for (int ch = 0; ch < 2; ++ch) {
+        atomic_store(&s_channel_stamp_write[ch], 0);
+        atomic_store(&s_channel_stamp_read[ch], 0);
+    }
 
     atomic_store(&s_recording_enabled, false);
     atomic_store(&s_use_flac, false);
@@ -646,17 +876,21 @@ static int extract_start_internal(gui_app_t *app, bool tagged) {
         return -1;
     }
 
-    // Start extraction thread
+    // Start extraction thread. Independent mixed-rate playback (player only)
+    // runs the per-channel loop; every other session uses the paired loop.
+    bool independent = app && atomic_load(&app->playback_independent_mode);
     if (thrd_create_with_priority(&s_extract_thread,
-                                  extraction_thread,
-                                  NULL,
+                                  independent ? extraction_thread_independent
+                                              : extraction_thread,
+                                  app,
                                   THRD_PRIORITY_CRITICAL) != thrd_success) {
         fprintf(stderr, "[EXTRACT] Failed to create extraction thread\n");
         return -1;
     }
 
     s_extract_thread_running = true;
-    fprintf(stderr, "[EXTRACT] Started continuous extraction thread\n");
+    fprintf(stderr, "[EXTRACT] Started %s extraction thread\n",
+            independent ? "independent mixed-rate" : "continuous");
     return 0;
 }
 
@@ -755,6 +989,11 @@ uint8_t *gui_extract_get_buf_aux(void) {
 
 void gui_extract_update_stats(gui_app_t *app, const int16_t *buf_a,
                               const int16_t *buf_b, size_t num_samples) {
+    // Gated clip forensics (MISRC_DEBUG): the first few frames that count
+    // any clip dump the offending values + positions + the buffer extremes,
+    // so a false counter has a direct paper trail (dev note 2026-11-03:
+    // playback counted 59k clips on a provably clean file).
+    static int s_clip_forensics_left = 5;
     size_t clip_a_pos = 0, clip_a_neg = 0;
     size_t clip_b_pos = 0, clip_b_neg = 0;
     uint16_t peak_a_pos = 0, peak_a_neg = 0;
@@ -763,12 +1002,24 @@ void gui_extract_update_stats(gui_app_t *app, const int16_t *buf_a,
     // Peak detection uses first 1000 samples
     size_t peak_samples = (num_samples < 1000) ? num_samples : 1000;
 
+    // Forensics capture: record offending (index, value) DURING the count
+    // loop, then re-read them at print time - a value that changes between
+    // the two reads proves a concurrent writer with hard indices.
+    size_t dbg_idx[8];
+    int16_t dbg_val[8];
+    int dbg_n = 0;
+
      for (size_t i = 0; i < num_samples; i++) {
         int16_t sa = buf_a[i];
 
         // Clipping detection (12-bit ADC: +2047 is positive clip, -2048 is negative clip)
         if (sa >= 2047) clip_a_pos++;
         else if (sa <= -2048) clip_a_neg++;
+        if ((sa >= 2047 || sa <= -2048) && dbg_n < 8) {
+            dbg_idx[dbg_n] = i;
+            dbg_val[dbg_n] = sa;
+            dbg_n++;
+        }
 
         // Peak detection (first N samples only) - A
         if (i < peak_samples) {
@@ -790,6 +1041,26 @@ void gui_extract_update_stats(gui_app_t *app, const int16_t *buf_a,
         }
     }
 
+
+    // Gated clip forensics dump (see the note at the top of this function)
+    if (misrc_debug_enabled() && s_clip_forensics_left > 0 &&
+        (clip_a_pos > 0 || clip_a_neg > 0) && buf_a) {
+        s_clip_forensics_left--;
+        int16_t bmn = buf_a[0], bmx = buf_a[0];
+        for (size_t i = 1; i < num_samples; i++) {
+            if (buf_a[i] < bmn) bmn = buf_a[i];
+            if (buf_a[i] > bmx) bmx = buf_a[i];
+        }
+        fprintf(stderr,
+                "[CLIPDBG] n=%zu clips=%zu/%zu buf_minmax=[%d, %d] buf_a=%p\n",
+                num_samples, clip_a_pos, clip_a_neg, (int)bmn, (int)bmx,
+                (const void *)buf_a);
+        for (int k = 0; k < dbg_n; k++) {
+            fprintf(stderr, "[CLIPDBG]  idx=%zu counted=%d now=%d (changed=%s)\n",
+                    dbg_idx[k], (int)dbg_val[k], (int)buf_a[dbg_idx[k]],
+                    buf_a[dbg_idx[k]] != dbg_val[k] ? "YES" : "no");
+        }
+    }
 
     // Update atomic counters
     atomic_fetch_add(&app->clip_count_a_pos, clip_a_pos);

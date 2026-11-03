@@ -21,6 +21,7 @@
 #include "../input/gui_capture.h"  // gui_app_level_autostop_vpp for mV scale
 #include "../input/gui_playback.h" // DAW-style pause: re-process on config change
 #include "../signal/gui_cvbs.h"    // gui_video_follow_generator_system (Gen box)
+#include "../../common/misrc_debug.h"  // gated [WFDISP] display-value diagnostics
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -137,6 +138,14 @@ typedef struct {
     Rectangle scale_opts_rect[5];
     bool scale_dropdown_open;
 
+    // Mirror of THIS channel's display-container full scale (2048 for the
+    // common 12-bit container - 8-bit/12-bit/16-bit-shift4 playback all
+    // land there - 4096 for a direct-domain 16-bit playback channel, 512
+    // DdD), synced from app in waveform_render (which has app + channel).
+    // NOT all sources are 12-bit; consumers must not hardcode 2048 (user
+    // report 2026-11-03: "not all samples will be 12-bit").
+    uint32_t display_full_scale;
+
     // Signal type dropdown (leftmost of the right-anchored overlay group).
     // Raw keeps the legacy "CH A"/"CH B" label; CVBS / FM RF / Audio
     // relabel to "CH1 CVBS" / "CH2 FM RF" / "CHn Audio" and apply the
@@ -145,6 +154,11 @@ typedef struct {
     Rectangle signal_btn_rect;
     Rectangle signal_opts_rect[WAVE_SIGNAL_COUNT];
     bool signal_dropdown_open;
+    // True once the user picked this panel's signal type from the dropdown
+    // (test mode only UI). Distinguishes a USER selection from the
+    // generator-applied default so leaving test mode can clear the stock
+    // trigger config without ever overwriting a user pick.
+    bool signal_user_picked;
 
     // Double-click chrome-hide tracker (see ui/gui_chrome_hide.h): toggles
     // ALL overlay chrome (Scale/Mode/Trig dropdowns + labels); the grid,
@@ -193,6 +207,9 @@ typedef struct {
     // Protects shared state accessed by both display and render threads.
     atomic_flag data_lock;
 
+    // MISRC_DEBUG [WFDISP] tick counter (per panel, so every panel logs).
+    uint64_t diag_disp_count;
+
     // Initialization flag
     bool initialized;
     bool trigger_source_defaulted_by_channel;
@@ -205,6 +222,7 @@ typedef struct {
     trigger_mode_t trigger_mode;
     trigger_source_t trigger_source;
     float zoom_scale;
+    uint32_t full_scale;        // Display-container full scale (NOT always 2048)
 } waveform_runtime_cfg_t;
 
 typedef struct {
@@ -217,6 +235,7 @@ typedef struct {
     int16_t cvbs_threshold;
     bool cvbs_levels_valid;
     float zoom_scale;
+    uint32_t full_scale;        // Display-container full scale for markers
     size_t samples_available;
 } waveform_render_snapshot_t;
 
@@ -226,7 +245,8 @@ static size_t waveform_resample_to_buffer(waveform_panel_state_t *state,
                                            waveform_sample_t *dest,
                                            const int16_t *buf, size_t num_samples,
                                            size_t start_idx, float decimation,
-                                           size_t target_width);
+                                           size_t target_width,
+                                           float norm_scale);
 static bool waveform_process_display(waveform_panel_state_t *state,
                                       const waveform_runtime_cfg_t *cfg,
                                       const int16_t *buf, size_t num_samples,
@@ -256,6 +276,7 @@ static waveform_runtime_cfg_t waveform_capture_runtime_cfg(waveform_panel_state_
     cfg.trigger_mode = state->trigger_mode;
     cfg.trigger_source = state->trigger_source;
     cfg.zoom_scale = state->zoom_scale;
+    cfg.full_scale = state->display_full_scale ? state->display_full_scale : 2048;
     waveform_state_unlock(state);
     return cfg;
 }
@@ -276,6 +297,7 @@ static void waveform_capture_render_snapshot(waveform_panel_state_t *state,
     snap->cvbs_threshold = state->cvbs_threshold;
     snap->cvbs_levels_valid = state->cvbs_levels_valid;
     snap->zoom_scale = state->zoom_scale;
+    snap->full_scale = state->display_full_scale ? state->display_full_scale : 2048;
     snap->samples_available = state->display_samples_available;
     if (snap->samples_available > DISPLAY_BUFFER_SIZE) {
         snap->samples_available = DISPLAY_BUFFER_SIZE;
@@ -622,10 +644,12 @@ static void draw_panel_trigger_markers(float x, float y, float w, float h,
         Color blank_color = { 100, 255, 100, 140 };   // Green-ish for blanking
         Color thresh_color = { color.r, color.g, color.b, 180 };  // Channel color for threshold
 
-        // Convert levels to Y positions (levels are -2048 to +2047)
-        float sync_y = center_y - (snap->cvbs_sync_level / 2048.0f) * scale;
-        float blank_y = center_y - (snap->cvbs_blank_level / 2048.0f) * scale;
-        float thresh_y = center_y - (snap->cvbs_threshold / 2048.0f) * scale;
+        // Convert levels to Y positions (raw counts of THIS channel's
+        // container; full-scale aware - not all sources are 12-bit)
+        float fs = (float)(snap->full_scale ? snap->full_scale : 2048);
+        float sync_y = center_y - (snap->cvbs_sync_level / fs) * scale;
+        float blank_y = center_y - (snap->cvbs_blank_level / fs) * scale;
+        float thresh_y = center_y - (snap->cvbs_threshold / fs) * scale;
 
         // Clamp to bounds
         if (sync_y < y) sync_y = y;
@@ -668,8 +692,9 @@ static void draw_panel_trigger_markers(float x, float y, float w, float h,
         return;
     }
 
-    // Normal trigger mode: draw single trigger level line
-    float level_norm = snap->trigger_level / 2048.0f;
+    // Normal trigger mode: draw single trigger level line (full-scale aware)
+    float fs = (float)(snap->full_scale ? snap->full_scale : 2048);
+    float level_norm = snap->trigger_level / fs;
     float level_y = center_y - level_norm * scale;
 
     // Clamp to panel bounds
@@ -754,16 +779,38 @@ static void waveform_apply_signal_defaults(waveform_panel_state_t *state,
                                            waveform_signal_type_t type);
 
 // Channel default signal type: CH1 = composite CVBS, CH2 = tape FM RF
-// (the Test Gen channel mapping). Applied once, at the panel's first
-// render/click, so the waveform monitors open with the generator mapping
+// (the Test Gen channel mapping). TEST SIGNAL MODE ONLY: applied once, at
+// the panel's first render/click while the Simulated generator is the
+// active source, so the waveform monitors open with the generator mapping
 // already assigned (user request 2026-11-03: "set cvbs on ch1 and fm rf
-// on ch2 on default opening"). Raw is never user-selectable.
+// on ch2 on default opening"). Record/playback panels NEVER get these
+// stock trigger configs (user request 2026-11-03: "remove the stock
+// triggers on config from record/playback that was applied over from test
+// signal mode"). Raw is never user-selectable.
 static void waveform_apply_channel_signal_default(waveform_panel_state_t *state,
-                                                  int channel) {
+                                                  gui_app_t *app, int channel) {
     if (!state || state->signal_type != WAVE_SIGNAL_RAW) return;
+    if (!waveform_test_mode_active(app)) return;
     waveform_apply_signal_defaults(state,
                                    (channel == 1) ? WAVE_SIGNAL_FM_RF
                                                   : WAVE_SIGNAL_CVBS);
+}
+
+// Leaving Test Signal mode: drop the generator's stock signal/trigger
+// config that was applied over from test mode. Record/playback panels run
+// with the STOCK trigger (off, rising edge, level 0) and the plain CH A /
+// CH B mapping. A signal type the USER picked from the dropdown is never
+// touched (the pick survives mode switches as before).
+static void waveform_clear_generator_signal(waveform_panel_state_t *state) {
+    if (!state || state->signal_type == WAVE_SIGNAL_RAW) return;
+    if (state->signal_user_picked) return;
+    waveform_state_lock(state);
+    state->signal_type = WAVE_SIGNAL_RAW;
+    state->trigger_enabled = false;
+    state->trigger_mode = TRIGGER_MODE_RISING;
+    state->trigger_level = 0;
+    state->config_dirty = true;
+    waveform_state_unlock(state);
 }
 
 static void waveform_apply_signal_defaults(waveform_panel_state_t *state,
@@ -1007,8 +1054,13 @@ static size_t waveform_resample_to_buffer(waveform_panel_state_t *state,
                                            waveform_sample_t *dest,
                                            const int16_t *buf, size_t num_samples,
                                            size_t start_idx, float decimation,
-                                           size_t target_width) {
-    const float scale = 1.0f / 2048.0f;
+                                           size_t target_width,
+                                           float norm_scale) {
+    // Normalize by THIS source's display-container full scale (caller
+    // derives it from the per-channel full-scale state; NOT always 2048 -
+    // 8-bit/12-bit/16-bit-shift4 playback is 2048, direct-domain 16-bit is
+    // 4096, DdD is 512).
+    const float scale = (norm_scale > 0.0f) ? norm_scale : (1.0f / 2048.0f);
 
     // Clamp target width to buffer size
     if (target_width > DISPLAY_BUFFER_SIZE) target_width = DISPLAY_BUFFER_SIZE;
@@ -1137,6 +1189,11 @@ static bool waveform_process_display(waveform_panel_state_t *state,
         display_width = DISPLAY_BUFFER_SIZE;
     }
 
+    // Normalization for THIS source's container (not all sources are
+    // 12-bit: 8-bit/12-bit/16-bit-shift4 playback is 2048, direct-domain
+    // 16-bit is 4096, DdD is 512).
+    float norm_scale = 1.0f / (float)(cfg->full_scale ? cfg->full_scale : 2048);
+
     // Get decimation factor from zoom_scale
     float decimation = cfg->zoom_scale;
     if (decimation < ZOOM_SCALE_MIN) decimation = ZOOM_SCALE_MIN;
@@ -1149,7 +1206,8 @@ static bool waveform_process_display(waveform_panel_state_t *state,
     if (!cfg->trigger_enabled) {
         *out_trigger_display_pos = -1;
         *out_available = waveform_resample_to_buffer(
-            state, out_samples, buf, num_samples, 0, decimation, display_width);
+            state, out_samples, buf, num_samples, 0, decimation, display_width,
+            norm_scale);
         return true;
     }
 
@@ -1158,7 +1216,8 @@ static bool waveform_process_display(waveform_panel_state_t *state,
     if (display_window >= (float)num_samples * 0.9f) {
         *out_trigger_display_pos = -1;
         *out_available = waveform_resample_to_buffer(
-            state, out_samples, buf, num_samples, 0, decimation, display_width);
+            state, out_samples, buf, num_samples, 0, decimation, display_width,
+            norm_scale);
         return true;
     }
 
@@ -1175,7 +1234,8 @@ static bool waveform_process_display(waveform_panel_state_t *state,
     if (min_trig_pos >= max_trig_pos) {
         *out_trigger_display_pos = -1;
         *out_available = waveform_resample_to_buffer(
-            state, out_samples, buf, num_samples, 0, decimation, display_width);
+            state, out_samples, buf, num_samples, 0, decimation, display_width,
+            norm_scale);
         return true;
     }
 
@@ -1192,7 +1252,8 @@ static bool waveform_process_display(waveform_panel_state_t *state,
     size_t start_pos = (size_t)((float)trig_pos - pre_trigger_raw_samples);
     *out_trigger_display_pos = (int)trigger_display_pos;
     *out_available = waveform_resample_to_buffer(
-        state, out_samples, buf, num_samples, start_pos, decimation, display_width);
+        state, out_samples, buf, num_samples, start_pos, decimation, display_width,
+        norm_scale);
     return true;
 }
 
@@ -1248,6 +1309,31 @@ static void waveform_vtable_process(void *state_ptr, const int16_t *samples,
         }
         state->display_samples_available = new_available;
         state->trigger_display_pos = new_trigger_display_pos;
+
+        // Cheap gated diagnostics (MISRC_DEBUG, ~2 s per panel): the EXACT
+        // normalized display values driving the trace - what the resampler
+        // produced against this panel's full scale. Automated verification
+        // of playback levels without eyeballs (dev note 2026-11-03; the
+        // common path is a counter compare, the scan only runs on the log
+        // tick - the old WFTRACE pattern).
+        if (misrc_debug_enabled() && new_available > 0) {
+            state->diag_disp_count++;
+            if ((state->diag_disp_count % 560) == 0) {
+                size_t n = new_available < 4096 ? new_available : 4096;
+                float mn = 1e9f, mx = -1e9f;
+                double sum = 0.0;
+                for (size_t i = 0; i < n; i++) {
+                    float v = new_samples[i].value;
+                    if (v < mn) mn = v;
+                    if (v > mx) mx = v;
+                    sum += v;
+                }
+                fprintf(stderr,
+                        "[WFDISP] panel=%p n=%zu vrange=[%.3f,%.3f] vmean=%.3f\n",
+                        (void *)state, new_available, mn, mx,
+                        (float)(sum / (double)n));
+            }
+        }
     }
     // The current config has been applied to this frame: a pending
     // zoom/trigger change no longer needs a paused re-process.
@@ -1295,8 +1381,12 @@ static void *waveform_create(void) {
     state->trigger_dropdown_open = false;
     state->scale_dropdown_open = false;
     state->scale_mode = 0;  // Basic (matches the settings default)
+    // Display-container full scale mirror (synced from app each render;
+    // 2048 = stock 12-bit container until a source says otherwise)
+    state->display_full_scale = 2048;
     state->signal_type = WAVE_SIGNAL_RAW;
     state->signal_dropdown_open = false;
+    state->signal_user_picked = false;
     state->dragging = false;
     atomic_flag_clear(&state->data_lock);
 
@@ -1733,6 +1823,11 @@ static bool waveform_handle_control_click(waveform_panel_state_t *state, struct 
             if (CheckCollisionPointRec(click, opt_rect)) {
                 waveform_apply_signal_defaults(state,
                                                WAVE_SIGNAL_OPTION_VALUE(i));
+                // A user pick survives mode switches; only the
+                // generator-applied default is cleared outside test mode.
+                waveform_state_lock(state);
+                state->signal_user_picked = true;
+                waveform_state_unlock(state);
                 state->signal_dropdown_open = false;
                 return true;
             }
@@ -1863,7 +1958,7 @@ static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, in
     if (!state_ptr || !app) return false;
     waveform_panel_state_t *state = (waveform_panel_state_t *)state_ptr;
     waveform_apply_channel_trigger_source_default(state, channel);
-    waveform_apply_channel_signal_default(state, channel);
+    waveform_apply_channel_signal_default(state, app, channel);
 
     // Click outside the panel resets double-click tracking.
     if (!CheckCollisionPointRec(click, bounds)) {
@@ -1972,7 +2067,9 @@ static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, in
         if (level_norm < -1.0f) level_norm = -1.0f;
 
         waveform_state_lock(state);
-        state->trigger_level = (int16_t)(level_norm * 2047.0f);
+        // Level in THIS channel's raw container domain (full-scale aware)
+        state->trigger_level = (int16_t)(level_norm *
+            (float)(state->display_full_scale ? state->display_full_scale - 1 : 2047));
         state->config_dirty = true;
         waveform_state_unlock(state);
 
@@ -2005,7 +2102,9 @@ static void waveform_panel_update_drag(waveform_panel_state_t *state, gui_app_t 
         if (level_norm < -1.0f) level_norm = -1.0f;
         waveform_state_lock(state);
 
-        state->trigger_level = (int16_t)(level_norm * 2047.0f);
+        // Level in THIS channel's raw container domain (full-scale aware)
+        state->trigger_level = (int16_t)(level_norm *
+            (float)(state->display_full_scale ? state->display_full_scale - 1 : 2047));
         state->config_dirty = true;
         waveform_state_unlock(state);
     } else {
@@ -2061,11 +2160,33 @@ static void waveform_render(void *state_ptr, gui_app_t *app, int channel,
     waveform_panel_state_t *state = (waveform_panel_state_t *)state_ptr;
     if (!state->initialized) return;
     waveform_apply_channel_trigger_source_default(state, channel);
-    waveform_apply_channel_signal_default(state, channel);
+    // Generator mapping applies only while Test Signal mode is active;
+    // outside it, any generator-applied stock config is cleared back to the
+    // stock trigger (record/playback never inherit test-mode triggers).
+    if (waveform_test_mode_active(app)) {
+        waveform_apply_channel_signal_default(state, app, channel);
+    } else {
+        waveform_clear_generator_signal(state);
+    }
 
     // Sync the global amplitude scale mode into the per-panel mirror so the
     // overlay dropdown (which has no app pointer) can read + display it.
     state->scale_mode = app->settings.waveform_scale_mode;
+
+    // Sync THIS channel's display-container full scale. Playback decode
+    // normalizes EVERY input convention (8-bit <<4, 12-bit as-is, 16-bit
+    // recorder >>4, direct-domain <=2047 raw, 13-bit >>1, full-range >>4)
+    // into the 12-bit container, so playback is always 2048 - the SAME
+    // reference as live capture (user rule 2026-11-03: "8/12/16-bit in/out
+    // should match"). Capture backends keep their own container scale via
+    // the autostop helper (e.g. DdD 512).
+    {
+        uint32_t fs = gui_app_level_autostop_full_scale(app);
+        if (fs < 1) fs = 2048;
+        waveform_state_lock(state);
+        state->display_full_scale = fs;
+        waveform_state_unlock(state);
+    }
 
     // Middle-button double-click: reset the waveform view to the stock
     // position (default zoom, trigger level centered, phosphor cleared).
@@ -2347,6 +2468,7 @@ size_t gui_waveform_server_display_points(const int16_t *src,const int16_t *a,
         .trigger_level=(int16_t)cfg->trigger_level,
         .trigger_mode=(trigger_mode_t)cfg->trigger_mode,
         .trigger_source=(trigger_source_t)cfg->trigger_source,
+        .full_scale=2048,
     };
     waveform_sample_t temp[GUI_RD_WIDTH];size_t n=0;int tr=-1;
     gui_waveform_set_trigger_source_buffers(a,b,count);

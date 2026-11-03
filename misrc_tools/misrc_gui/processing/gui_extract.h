@@ -37,6 +37,13 @@ void gui_extract_prepare_stream(gui_app_t *app);
 #include "gui_rf_preview_worker.h"
 int gui_extract_start_tagged(gui_app_t *app);
 bool gui_extract_stamp_playback(const gui_rf_block_info_t info[2], const size_t counts[2]);
+// Independent mixed-rate playback: each channel writes its OWN RF FIFO
+// (BUF_CAPTURE_RF_A/B) and publishes a stamp into that channel's sideband
+// ring before the FIFO write is committed. Positions/rates are that
+// channel's own file clock (no shared axis).
+bool gui_extract_stamp_playback_channel(int channel,
+                                        const gui_rf_block_info_t *info,
+                                        size_t count);
 
 // Stop the extraction thread (call before capture stops)
 void gui_extract_stop(void);

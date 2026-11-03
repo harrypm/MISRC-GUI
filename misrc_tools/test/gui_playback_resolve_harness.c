@@ -272,9 +272,16 @@ static int32_t pattern_recorder_x16(uint32_t i)
 }
 static int32_t pattern_direct_domain(uint32_t i)
 {
-    /* Direct-domain storage (the tape file convention): 12-bit-domain values
-     * written as-is - peaks at +-2190 and mostly NOT multiples of 16. */
+    /* Externally RESAMPLED container-domain capture (the Tape_03 class):
+     * mostly NOT multiples of 16 (the resample broke the grid), peaks
+     * overshooting the capture's rails (resampler ripple). */
     return (int32_t)((int)((i * 7u) % 4381u) - 2190);
+}
+static int32_t pattern_direct_le2047(uint32_t i)
+{
+    /* Container-domain values stored raw, within the rails: peaks at
+     * +-1450, mostly NOT multiples of 16. */
+    return (int32_t)((int)((i * 11u) % 2901u) - 1450);
 }
 static int32_t pattern_full_range(uint32_t i)
 {
@@ -1017,19 +1024,30 @@ static void test_conv16_conventions(void)
                    "recorder sample >> 4 restored");
     }
 
-    /* (b) Direct-domain 16-bit (the measured tape file convention): values
-     * pass through unchanged - the blanket >> 4 would crush these to 1/16. */
+    /* (b) Externally RESAMPLED container-domain 16-bit (the Tape_03 class,
+     * +-2190 resampler ripple): pass through at container scale with the
+     * overshoot clamped to the container rails - the same clamp the
+     * recorder's own resample path applies when writing. */
     ctx.conv16_state[0] = PLAYBACK_CONV16_PENDING;  /* fresh file state */
     conv16_frame(&ctx, pattern_direct_domain, 4096, PLAYBACK_CONV16_PASS,
-                 "direct-domain frame accepted");
+                 "resampled container-domain frame accepted");
     for (uint32_t i = 0; i < 4096; i += 997) {
-        expect_i64(ctx.decode_buf_a[i], (long long)pattern_direct_domain(i),
-                   "direct-domain sample passed through unchanged");
+        int32_t v = pattern_direct_domain(i);
+        if (v > 2047) v = 2047;
+        if (v < -2048) v = -2048;
+        expect_i64(ctx.decode_buf_a[i], (long long)v,
+                   "resampled sample raw with rail clamp");
     }
-    /* Values beyond the 12-bit packing domain clamp downstream, in the raw
-     * encoder (2047 - sample packing) - not by the conversion. */
-    expect_u64(encode_raw_sample(2190, 0), encode_raw_sample(2047, 0),
-               "packing clamps a direct-domain 2190 to the 2047 grid");
+
+    /* (b2) Container-domain 16-bit WITHIN the rails (peaks +-1450): pass
+     * through unchanged - already at the live container scale (in = out). */
+    ctx.conv16_state[0] = PLAYBACK_CONV16_PENDING;
+    conv16_frame(&ctx, pattern_direct_le2047, 4096, PLAYBACK_CONV16_PASS,
+                 "in-rails container-domain frame accepted");
+    for (uint32_t i = 0; i < 4096; i += 997) {
+        expect_i64(ctx.decode_buf_a[i], (long long)pattern_direct_le2047(i),
+                   "in-rails sample passed through unchanged");
+    }
 
     /* (c) Full-range generic 16-bit: >> 4 as an explicit display downscale. */
     ctx.conv16_state[0] = PLAYBACK_CONV16_PENDING;
@@ -1049,8 +1067,11 @@ static void test_conv16_conventions(void)
     conv16_frame(&ctx, pattern_direct_domain, 4096, PLAYBACK_CONV16_PASS,
                  "first non-silent frame decides");
     for (uint32_t i = 0; i < 4096; i += 997) {
-        expect_i64(ctx.decode_buf_a[i], (long long)pattern_direct_domain(i),
-                   "post-lead samples passed through");
+        int32_t v = pattern_direct_domain(i);
+        if (v > 2047) v = 2047;
+        if (v < -2048) v = -2048;
+        expect_i64(ctx.decode_buf_a[i], (long long)v,
+                   "post-lead samples raw with rail clamp");
     }
 
     /* 8-bit frames: << 4 restores the recorder container AND is the correct
@@ -1205,11 +1226,14 @@ static void test_raw_read_seek(const char *temp_dir)
     if (f) fclose(f);
     raw_harness_channel(path, PLAYBACK_INPUT_S16, N, 0, 437, expected);
 
-    /* .16s (the reversed extension) with direct-domain data: pass through. */
+    /* .16s (the reversed extension) with resampled container-domain data:
+     * raw with the container-rail clamp. */
     test_case = "raw_read_16s_direct";
     snprintf(path, sizeof(path), "%s/misrc_pb_%u_direct_20msps.16s", temp_dir, pid);
     for (uint64_t i = 0; i < N; i++) {
         int32_t v = pattern_direct_domain((uint32_t)i);  /* peak 2190, non-grid */
+        if (v > 2047) v = 2047;
+        if (v < -2048) v = -2048;
         bytes[2 * i] = (uint8_t)((uint16_t)(int16_t)v & 0xFF);
         bytes[2 * i + 1] = (uint8_t)(((uint16_t)(int16_t)v >> 8) & 0xFF);
         expected[i] = (int16_t)v;
@@ -1258,11 +1282,14 @@ static void test_raw_read_seek(const char *temp_dir)
         raw_harness_channel(path, PLAYBACK_INPUT_LDS, lds_n, 5, 5, expected);
     }
 
-    /* WAV 16-bit direct-domain: pass through; WAV 24-bit: top 12 bits. */
+    /* WAV 16-bit resampled container-domain: raw with the rail clamp;
+     * WAV 24-bit: top 12 bits. */
     test_case = "raw_read_wav16";
     snprintf(path, sizeof(path), "%s/misrc_pb_%u_wav16_20msps.wav", temp_dir, pid);
     for (uint64_t i = 0; i < N; i++) {
         int32_t v = pattern_direct_domain((uint32_t)i);
+        if (v > 2047) v = 2047;
+        if (v < -2048) v = -2048;
         bytes[2 * i] = (uint8_t)((uint16_t)(int16_t)v & 0xFF);
         bytes[2 * i + 1] = (uint8_t)(((uint16_t)(int16_t)v >> 8) & 0xFF);
         expected[i] = (int16_t)v;

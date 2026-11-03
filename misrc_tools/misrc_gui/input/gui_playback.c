@@ -20,6 +20,7 @@
 #include "../../common/buffer_manager.h"
 #include "../../common/file_utils.h"
 #include "../../common/threading.h"
+#include "../../common/misrc_debug.h"  // gated conv16 decision logging
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -158,6 +159,13 @@ typedef struct playback_ctx {
     atomic_int state;              // playback_state_t
     atomic_int speed;              // playback_speed_t
     atomic_bool loop_enabled;
+    // Per-channel loop (effective only in independent mixed-rate mode with
+    // Link: Separate); Synced mode uses loop_enabled for both channels.
+    atomic_bool channel_loop[2];
+    // Gated diagnostics (MISRC_DEBUG): one-shot on the first conv16
+    // decision, plus a line on every later PROMOTION (quiet-head fix).
+    bool conv16_logged[2];
+    int conv16_prev[2];
     // Seek-while-paused backfill: decode the window ENDING at the seek target
     // and push it through the pipeline so the panels show the real timeline at
     // the playhead (DAW-style non-linear scrub), then hold. The spectrogram
@@ -292,9 +300,9 @@ const char* gui_playback_speed_name(playback_speed_t speed) {
 // from the first non-silent block and is sticky for the channel's session.
 #define PLAYBACK_CONV16_PENDING 0
 #define PLAYBACK_CONV16_SHIFT4 1  // recorder 12-bit << 4 restore (or full-range display downscale)
-#define PLAYBACK_CONV16_PASS   2  // direct-domain values: pass through unchanged
+#define PLAYBACK_CONV16_PASS   2  // container-domain values stored raw (incl. externally RESAMPLED captures): clamp overshoot to the container rails
 #define PLAYBACK_CONV16_DECIDE_FLOOR 16  // a block peaking below this is inconclusive (silence)
-#define PLAYBACK_CONV16_DIRECT_MAX 4096 // direct-domain peak ceiling (13-bit domain)
+#define PLAYBACK_CONV16_DIRECT_MAX 4096 // above this a non-grid file is full-range generic 16-bit
 // These constants and the unguarded ctx->conv16_state member are
 // dependency-independent (FLAC frames and raw s16/WAV16 reads share the
 // sticky detector) and gui_playback_release_context() resets the state
@@ -1067,14 +1075,26 @@ static bool gui_playback_parse_frame_header(const uint8_t *w, size_t len,
     return true;
 }
 
-// Decide (or keep) the 16-bit conversion mode from one frame/block of samples.
-// Thresholds, chosen from the measured files:
+// Decide (or keep) the 16-bit conversion mode from one frame/block of
+// samples. EVERY convention normalizes into the 12-bit display container so
+// playback always shows the capture at its live scale (user rule 2026-11-03:
+// "captures should always look like live ... 8/12/16-bit in/out should
+// match"). Thresholds, chosen from the measured files:
 //   - every sample == 0 (mod 16): the recorder's << 4 grid -> >> 4 restore
 //     (RF noise never lands on that grid by chance; a quiet recorder capture
 //     is still all-mod-16, so this decision never depends on level)
-//   - otherwise peak <= 4096: direct-domain storage (the tape file peaks at
-//     +-2190) -> pass through unchanged
-//   - otherwise: full-range generic 16-bit -> >> 4 display-container downscale
+//   - non-grid peak <= 4096: container-domain values stored raw. This is
+//     the RESAMPLED-capture class (user-confirmed 2026-11-03: "it is 8-bit
+//     data" - an 8/12-bit capture externally resampled, e.g. 40->20 msps):
+//     the resample broke the 16-grid (93.75% non-mod-16 on the measured
+//     file) and its filter ripple overshoots the capture's rails (~+9%,
+//     peak +-2216 on +-2032 rails). Pass through at container scale;
+//     apply_conv16 clamps the overshoot to the container rails exactly like
+//     the recorder's own resample path (convert_i16_to_flac_i32: "the soxr
+//     resampler can overshoot the 12-bit range on clipped input ... Clamp
+//     to the signed 12-bit range").
+//   - otherwise (peak > 4096): full-range generic 16-bit -> >> 4 display-
+//     container downscale
 // A block whose peak stays under 16 (digital silence) leaves the decision
 // pending: zero samples convert identically under every convention, so a
 // silent lead can never mislead the detector.
@@ -1094,10 +1114,19 @@ static void gui_playback_decide_conv16(int *state, const int32_t *in, uint32_t s
 }
 
 static int16_t gui_playback_apply_conv16(int state, int32_t v) {
-    // PASS keeps direct-domain values (encode_raw_sample clamps into the raw
-    // 12-bit packing domain downstream); SHIFT4 covers both the recorder
-    // restore and the full-range display downscale in one operation.
-    return state == PLAYBACK_CONV16_PASS ? (int16_t)v : (int16_t)(v >> 4);
+    // PASS: container-domain values, with resampler overshoot clamped back
+    // to the container rails - the same clamp the recorder's resample path
+    // applies when writing (so an externally-resampled capture plays back
+    // exactly as if the recorder had resampled it). SHIFT4 covers both the
+    // recorder restore and the full-range display downscale. Every branch's
+    // output lives in the 12-bit container (in = out at every bit depth),
+    // so nothing downstream needs to know the source convention.
+    if (state == PLAYBACK_CONV16_PASS) {
+        if (v > 2047) v = 2047;
+        if (v < -2048) v = -2048;
+        return (int16_t)v;
+    }
+    return (int16_t)(v >> 4);
 }
 
 // Map a signed sample of `bits` width (<= 12) into the 12-bit container by
@@ -1558,8 +1587,10 @@ static size_t gui_playback_raw_read(playback_ctx_t *ctx, int channel, int16_t *o
                 } else if (width == 2) {
                     // 16-bit signed sources (raw s16 / WAV16) share the FLAC
                     // write-callback convention detector: recorder 12-bit
-                    // << 4 grid (>> 4 restore) vs direct-domain values (pass
-                    // through) vs full-range (>> 4 display downscale).
+                    // << 4 grid (>> 4 restore) vs container-compatible
+                    // direct values (pass through) vs 13-bit domain (>> 1)
+                    // vs full-range (>> 4 display downscale). Every branch
+                    // lands in the 12-bit container.
                     int32_t wide[sizeof(buf) / 2];
                     for (size_t i = 0; i < items; i++) {
                         wide[i] = (int32_t)(int16_t)((uint16_t)buf[2 * i] | ((uint16_t)buf[2 * i + 1] << 8));
@@ -3500,26 +3531,32 @@ static FLAC__StreamDecoderWriteStatus decoder_write_cb_a(
     // amplitude - the waveform-playback accuracy bug - so the convention
     // is detected from the first non-silent frame and is sticky per
     // channel per file (see gui_playback_decide_conv16):
-    //   16-bit FLAC: recorder 12-bit container << 4 -> >> 4 restore; direct-
-    //               domain values -> pass through; full-range generic ->
-    //               >> 4 display downscale
+    //   16-bit FLAC: recorder 12-bit container << 4 -> >> 4 restore;
+    //               container-domain values stored raw (incl. externally
+    //               resampled 8/12-bit captures; overshoot clamped to the
+    //               container rails); full-range generic -> >> 4
     //   12-bit FLAC: 12-bit container as-is (range -2048 to 2047)
     //   8-bit FLAC:  12-bit container >> 4 -> << 4 restore (also the correct
     //               display scaling for generic full-range 8-bit audio)
     if (bps == 16) {
+        // Every convention lands in the 12-bit container via the single
+        // shared converter (recorder >>4 restore, container-domain raw
+        // with rail clamp, full-range >>4 downscale).
         gui_playback_decide_conv16(&ctx->conv16_state[0], in, samples);
-        if (ctx->conv16_state[0] == PLAYBACK_CONV16_PASS) {
-            // Direct-domain values: pass through unchanged (encode_raw_sample
-            // clamps into the raw 12-bit packing domain downstream).
-            for (uint32_t i = 0; i < samples; i++) {
-                out[i] = (int16_t)in[i];
+        if (ctx->conv16_state[0] != ctx->conv16_prev[0]) {
+            if (misrc_debug_enabled() &&
+                (ctx->conv16_state[0] != PLAYBACK_CONV16_PENDING ||
+                 !ctx->conv16_logged[0])) {
+                fprintf(stderr, "[PLAYBACK] conv16 CH A -> %s\n",
+                        ctx->conv16_state[0] == PLAYBACK_CONV16_SHIFT4 ? "SHIFT4 (>>4)"
+                        : ctx->conv16_state[0] == PLAYBACK_CONV16_PASS ? "PASS (raw, rail-clamped)"
+                        : "PENDING");
             }
-        } else {
-            // Recorder << 4 restore, or a full-range generic file scaled
-            // down into the 12-bit display container: both >> 4.
-            for (uint32_t i = 0; i < samples; i++) {
-                out[i] = (int16_t)(in[i] >> 4);
-            }
+            ctx->conv16_prev[0] = ctx->conv16_state[0];
+            ctx->conv16_logged[0] = true;
+        }
+        for (uint32_t i = 0; i < samples; i++) {
+            out[i] = gui_playback_apply_conv16(ctx->conv16_state[0], in[i]);
         }
     } else if (bps == 12) {
         // 12-bit FLAC: already in 12-bit range, just cast
@@ -3580,19 +3617,25 @@ static FLAC__StreamDecoderWriteStatus decoder_write_cb_b(
         debug_count_b++;
     }
 
-    // Same convention detection as Channel A (see the write-callback note
-    // there): restore the 12-bit container for recorder files, pass direct-
-    // domain 16-bit values through, downscale full-range generic 16-bit.
+    // Same convention handling as Channel A (see the write-callback note
+    // there): every 16-bit convention lands in the 12-bit container via the
+    // single shared converter.
     if (bps == 16) {
         gui_playback_decide_conv16(&ctx->conv16_state[1], in, samples);
-        if (ctx->conv16_state[1] == PLAYBACK_CONV16_PASS) {
-            for (uint32_t i = 0; i < samples; i++) {
-                out[i] = (int16_t)in[i];
+        if (ctx->conv16_state[1] != ctx->conv16_prev[1]) {
+            if (misrc_debug_enabled() &&
+                (ctx->conv16_state[1] != PLAYBACK_CONV16_PENDING ||
+                 !ctx->conv16_logged[1])) {
+                fprintf(stderr, "[PLAYBACK] conv16 CH B -> %s\n",
+                        ctx->conv16_state[1] == PLAYBACK_CONV16_SHIFT4 ? "SHIFT4 (>>4)"
+                        : ctx->conv16_state[1] == PLAYBACK_CONV16_PASS ? "PASS (raw, rail-clamped)"
+                        : "PENDING");
             }
-        } else {
-            for (uint32_t i = 0; i < samples; i++) {
-                out[i] = (int16_t)(in[i] >> 4);
-            }
+            ctx->conv16_prev[1] = ctx->conv16_state[1];
+            ctx->conv16_logged[1] = true;
+        }
+        for (uint32_t i = 0; i < samples; i++) {
+            out[i] = gui_playback_apply_conv16(ctx->conv16_state[1], in[i]);
         }
     } else if (bps == 12) {
         // 12-bit FLAC: already in 12-bit range, just cast
@@ -4644,6 +4687,16 @@ static int playback_thread_func(void *ctx_ptr) {
     if (runtime_rate_hz == 0) runtime_rate_hz = PLAYBACK_SAMPLE_RATE * 1000u;
     atomic_store(&app->sample_rate, runtime_rate_hz);
 
+    // Independent mixed-rate mode: each file feeds its own RF FIFO at its
+    // own true rate (see gui_playback_commit). The batch axis is the FASTER
+    // file's clock (the pacing clock); the slower channel consumes a
+    // proportional sample count per batch via the remainder accumulators.
+    const bool independent = atomic_load(&app->playback_independent_mode);
+    const uint64_t max_rate_hz = runtime_rate_hz;
+    uint64_t rate_hz[2] = {(uint64_t)llround(ctx->channel_rate_hz[0]),
+                           (uint64_t)llround(ctx->channel_rate_hz[1])};
+    uint64_t consume_rem[2] = {0, 0};
+
     uint64_t batch_count = 0;
     uint64_t epochs[2] = {atomic_load(&app->rf_stream_epoch), atomic_load(&app->rf_stream_epoch)};
     const uint32_t raw_silence = encode_raw_sample(0, 0);
@@ -4792,9 +4845,20 @@ static int playback_thread_func(void *ctx_ptr) {
 
         // A paused scrub emits only its target channel. Leave the other
         // decoder, cursor and buffered samples untouched, including at EOF.
+        // Independent mode adds a per-channel pause (Separate link mode or
+        // that channel's EOF): the paused channel emits nothing while the
+        // other keeps rolling.
         bool paused_output = atomic_load(&ctx->state) == PLAYBACK_STATE_PAUSED;
-        bool channel_a_active = ctx->file_a && (!paused_output || ctx->backfill_active_a);
-        bool channel_b_active = ctx->file_b && (!paused_output || ctx->backfill_active_b);
+        bool ch_pause_a = independent &&
+            atomic_load(&app->playback_channel_paused[0]);
+        bool ch_pause_b = independent &&
+            atomic_load(&app->playback_channel_paused[1]);
+        bool channel_a_active = ctx->file_a &&
+                                (!paused_output || ctx->backfill_active_a) &&
+                                !ch_pause_a;
+        bool channel_b_active = ctx->file_b &&
+                                (!paused_output || ctx->backfill_active_b) &&
+                                !ch_pause_b;
         if (!channel_a_active && !channel_b_active) {
             deadline_us = 0;
             atomic_store(&app->last_callback_time_ms, get_time_ms());
@@ -4873,7 +4937,29 @@ static int playback_thread_func(void *ctx_ptr) {
             deadline_us = 0;
             continue;
         }
-        if ((eof_a || eof_b) && !atomic_load(&ctx->loop_enabled)) {
+        // Per-channel effective loop: independent mode honours each
+        // channel's own loop flag; every other mode uses the shared one.
+        bool loop_a = independent ? atomic_load(&ctx->channel_loop[0])
+                                  : atomic_load(&ctx->loop_enabled);
+        bool loop_b = independent ? atomic_load(&ctx->channel_loop[1])
+                                  : atomic_load(&ctx->loop_enabled);
+        if ((eof_a && !loop_a) || (eof_b && !loop_b)) {
+            if (independent) {
+                // Independent mode: a tape that ends pauses ONLY its own
+                // channel (the other file keeps rolling). Seek/replay stays
+                // available via the channel's transport.
+                if (eof_a) {
+                    ctx->backfill_active_a = false;
+                    atomic_store(&app->playback_channel_paused[0], true);
+                    fprintf(stderr, "[PLAYBACK] CH A end of file (independent pause)\n");
+                }
+                if (eof_b) {
+                    ctx->backfill_active_b = false;
+                    atomic_store(&app->playback_channel_paused[1], true);
+                    fprintf(stderr, "[PLAYBACK] CH B end of file (independent pause)\n");
+                }
+                continue;
+            }
             atomic_store(&ctx->state, PLAYBACK_STATE_PAUSED);
             continue; // Seek remains available; no samples cross the EOF boundary.
         }
@@ -4931,6 +5017,97 @@ static int playback_thread_func(void *ctx_ptr) {
 
         if (samples_to_output == 0) {
             thrd_sleep_ms(1);
+            continue;
+        }
+
+        //--------------------------------------------------------------------
+        // INDEPENDENT mixed-rate batch: per-channel FIFOs, no pairing.
+        //--------------------------------------------------------------------
+        if (independent) {
+            const int ch_active[2] = {channel_a_active, channel_b_active};
+            const size_t avail[2] = {avail_a, avail_b};
+            for (int ch = 0; ch < 2; ++ch) {
+                if (!ch_active[ch]) continue;
+                // Samples this channel owes on this max-axis batch:
+                // batch_ticks * rate_ch / max_rate, fraction carried over.
+                uint64_t num = (uint64_t)RAW_BUFFER_SAMPLES * rate_hz[ch] + consume_rem[ch];
+                uint64_t n_ch = num / max_rate_hz;
+                consume_rem[ch] = num % max_rate_hz;
+                size_t out = (size_t)n_ch;
+                if (out > RAW_BUFFER_SAMPLES) out = RAW_BUFFER_SAMPLES;
+                if (out > avail[ch]) out = avail[ch];
+                if (out == 0) continue;
+
+                int16_t *ch_buf = ch ? buf_b : buf_a;
+                if (ch) {
+                    memcpy(ch_buf, ctx->decode_buf_b + ctx->decode_pos_b, out * sizeof(int16_t));
+                    ctx->decode_pos_b += out;
+                } else {
+                    memcpy(ch_buf, ctx->decode_buf_a + ctx->decode_pos_a, out * sizeof(int16_t));
+                    ctx->decode_pos_a += out;
+                }
+
+                size_t bytes = out * sizeof(int16_t);
+                buffer_id_t rf_id = ch ? BUF_CAPTURE_RF_B : BUF_CAPTURE_RF_A;
+                void *raw = bufmgr_write_begin(&app->buffers, rf_id, bytes, NULL);
+                if (raw) {
+                    memcpy(raw, ch_buf, bytes);
+                    uint64_t pos = ch ? atomic_load(&ctx->current_sample_b)
+                                      : atomic_load(&ctx->current_sample_a);
+                    gui_rf_block_info_t info = {
+                        .sample_rate_hz = (uint32_t)rate_hz[ch],
+                        .start_sample = pos,
+                        .epoch = epochs[ch],
+                    };
+                    if (gui_extract_stamp_playback_channel(ch, &info, out)) {
+                        bufmgr_write_end(&app->buffers, rf_id, bytes);
+                    } else {
+                        fprintf(stderr, "[PLAYBACK] RF stamp queue full; CH %c block discarded\n",
+                                ch ? 'B' : 'A');
+                    }
+                } else {
+                    fprintf(stderr, "[PLAYBACK] Warning: CH %c RF FIFO full, block dropped\n",
+                            ch ? 'B' : 'A');
+                }
+
+                if (ch) {
+                    atomic_store(&ctx->current_sample_b,
+                                 atomic_load(&ctx->current_sample_b) + out);
+                } else {
+                    atomic_store(&ctx->current_sample_a,
+                                 atomic_load(&ctx->current_sample_a) + out);
+                }
+            }
+            if (channel_a_active) {
+                atomic_store(&ctx->current_sample, atomic_load(&ctx->current_sample_a));
+            } else if (channel_b_active) {
+                atomic_store(&ctx->current_sample, atomic_load(&ctx->current_sample_b));
+            }
+            atomic_store(&app->last_callback_time_ms, get_time_ms());
+
+#if LIBFLAC_ENABLED == 1
+            // Position-synced monitor audio (unchanged: follows the playhead)
+            gui_playback_audio_feed(ctx);
+#endif
+
+            batch_count++;
+
+            // Pacing: the batch axis is RAW_BUFFER_SAMPLES ticks of the
+            // faster file's clock (the realtime rate).
+            playback_speed_t speed = atomic_load(&ctx->speed);
+            bool backfilling = atomic_load(&ctx->state) == PLAYBACK_STATE_PAUSED &&
+                               (ctx->backfill_active_a || ctx->backfill_active_b);
+            if (speed == PLAYBACK_SPEED_MAX || backfilling) deadline_us = 0;
+            else {
+                float multiplier = speed_multipliers[speed];
+                if (multiplier > 0) {
+                    uint64_t now = gui_playback_clock_us();
+                    if (!deadline_us || clock_speed != speed || deadline_us+100000.0 < now) deadline_us = (double)now;
+                    deadline_us += (double)RAW_BUFFER_SAMPLES*1000000.0/(double)max_rate_hz/multiplier;
+                    gui_playback_wait_clock(ctx,(uint64_t)deadline_us,pace_timer);
+                }
+            }
+            clock_speed = speed;
             continue;
         }
 
@@ -5711,8 +5888,37 @@ static int gui_playback_commit(gui_app_t *app, playback_ctx_t *prepared) {
     atomic_store(&app->sample_rate, playback_rate_hz);
     atomic_store(&app->rf_source_rate_hz[0], s_playback->file_a ? (uint32_t)llround(rate_a_hz) : 0);
     atomic_store(&app->rf_source_rate_hz[1], s_playback->file_b ? (uint32_t)llround(rate_b_hz) : 0);
+    // Display-container full scale per channel. The paired pipeline crushes
+    // every convention into the 12-bit container (2048), but the INDEPENDENT
+    // mixed-rate pipeline carries native-domain samples: a file detected as
+    // DIRECT-DOMAIN 16-bit (conv16 PASS, peak ceiling 4096) must display
+    // against a 4096 full scale or it falsely rails. The producer raises the
+    // value to 4096 once the sticky conv16 detector resolves PASS; every
+    // other convention (12-bit as-is, 8-bit <<4, 16-bit >>4, raw readers)
+    // lands in the 12-bit container.
+    atomic_store(&app->rf_display_full_scale[0], 2048);
+    atomic_store(&app->rf_display_full_scale[1], 2048);
+    // Independent mixed-rate mode (user request 2026-11-03: "Player should
+    // run files independently"): both files with RESOLVED, DIFFERENT rates
+    // run as per-channel FIFOs at their own true clocks, so the RF Preview
+    // decoders run on BOTH channels (the old gate starved them with
+    // "Mixed-rate pair: independent input reader required"). Same-rate sets
+    // and single-file loads keep the paired pipeline; an unresolved rate (0)
+    // keeps the conservative unsupported gate.
+    bool mixed_rate = s_playback->file_a && s_playback->file_b &&
+                      rate_a_hz > 0.0 && rate_b_hz > 0.0 &&
+                      llround(rate_a_hz) != llround(rate_b_hz);
+    atomic_store(&app->playback_independent_mode, mixed_rate);
+    atomic_store(&app->playback_channel_paused[0], false);
+    atomic_store(&app->playback_channel_paused[1], false);
+    atomic_store(&app->playback_link_separate, false);
+    if (mixed_rate) {
+        fprintf(stderr, "[PLAYBACK] Independent mixed-rate mode: A=%.0fHz B=%.0fHz "
+                "(per-channel FIFOs, per-channel preview)\n", rate_a_hz, rate_b_hz);
+    }
     atomic_store(&app->rf_preview_input_supported,
-                  !s_playback->file_a || !s_playback->file_b || llround(rate_a_hz) == llround(rate_b_hz));
+                  !s_playback->file_a || !s_playback->file_b ||
+                  llround(rate_a_hz) == llround(rate_b_hz) || mixed_rate);
     atomic_store(&app->last_callback_time_ms, get_time_ms());
     app->capture_backend_upstream = false;
     app->capture_has_channel_b = (s_playback->file_b != NULL);
@@ -5748,6 +5954,8 @@ static int gui_playback_commit(gui_app_t *app, playback_ctx_t *prepared) {
     atomic_store(&s_playback->state, PLAYBACK_STATE_PLAYING);
     atomic_store(&s_playback->speed, PLAYBACK_SPEED_1X);
     atomic_store(&s_playback->loop_enabled, true);  // Loop by default
+    atomic_store(&s_playback->channel_loop[0], true);
+    atomic_store(&s_playback->channel_loop[1], true);
     atomic_store(&s_playback->seek_requested_a, false);
     atomic_store(&s_playback->seek_requested_b, false);
     atomic_store(&s_playback->seek_target_a, 0);
@@ -5937,6 +6145,13 @@ void gui_playback_stop(gui_app_t *app) {
     gui_extract_stop();
 
     gui_playback_retire_context();
+
+    // Independent mixed-rate mode is a per-session pipeline shape; make sure
+    // no later session (capture or same-rate playback) inherits it.
+    atomic_store(&app->playback_independent_mode, false);
+    atomic_store(&app->playback_channel_paused[0], false);
+    atomic_store(&app->playback_channel_paused[1], false);
+    atomic_store(&app->playback_link_separate, false);
 
     // All old producer/extraction posts have stopped before clearing flags.
     atomic_store(&app->dropout_stop_requested, false);
@@ -6204,6 +6419,72 @@ void gui_playback_set_loop(gui_app_t *app, bool loop) {
 bool gui_playback_get_loop(gui_app_t *app) {
     (void)app;
     return atomic_load(&s_playback->loop_enabled);
+}
+
+//-----------------------------------------------------------------------------
+// Per-channel transport + link mode (player)
+//-----------------------------------------------------------------------------
+// Link: Synced (default) keeps ONE shared transport for both files (legacy
+// behaviour); Separate gives each file its own play/pause + loop. True
+// per-channel pipelines exist only in independent mixed-rate mode; in every
+// other session shape the per-channel controls drive the shared transport
+// (and the shared loop flag), so the buttons always do something coherent.
+
+void gui_playback_set_link_separate(gui_app_t *app, bool separate) {
+    if (!app) return;
+    bool current = atomic_load(&app->playback_link_separate);
+    if (current == separate) return;
+    atomic_store(&app->playback_link_separate, separate);
+    // Switching modes clears per-channel holds so both files start even.
+    atomic_store(&app->playback_channel_paused[0], false);
+    atomic_store(&app->playback_channel_paused[1], false);
+    fprintf(stderr, "[PLAYBACK] Link mode: %s\n", separate ? "SEPARATE" : "SYNCED");
+}
+
+bool gui_playback_get_link_separate(gui_app_t *app) {
+    return app ? atomic_load(&app->playback_link_separate) : false;
+}
+
+void gui_playback_toggle_pause_channel(gui_app_t *app, int channel) {
+    if (!app || channel < 0 || channel > 1) return;
+    if (!atomic_load(&app->playback_link_separate)) {
+        gui_playback_toggle_pause(app);
+        return;
+    }
+    bool was_paused = atomic_load(&app->playback_channel_paused[channel]);
+    atomic_store(&app->playback_channel_paused[channel], !was_paused);
+    if (was_paused &&
+        atomic_load(&s_playback->state) == PLAYBACK_STATE_PAUSED) {
+        // Resuming a channel also lifts a shared (master) pause, otherwise
+        // the per-channel resume would appear to do nothing.
+        atomic_store(&s_playback->state, PLAYBACK_STATE_PLAYING);
+    }
+}
+
+bool gui_playback_is_channel_paused(gui_app_t *app, int channel) {
+    if (!app || channel < 0 || channel > 1) return true;
+    if (gui_playback_get_state(app) != PLAYBACK_STATE_PLAYING) return true;
+    if (!atomic_load(&app->playback_link_separate)) return false;
+    return atomic_load(&app->playback_channel_paused[channel]);
+}
+
+void gui_playback_set_channel_loop(gui_app_t *app, int channel, bool loop) {
+    if (!app || channel < 0 || channel > 1) return;
+    if (!atomic_load(&app->playback_link_separate) ||
+        !atomic_load(&app->playback_independent_mode)) {
+        gui_playback_set_loop(app, loop);
+        return;
+    }
+    atomic_store(&s_playback->channel_loop[channel], loop);
+}
+
+bool gui_playback_get_channel_loop(gui_app_t *app, int channel) {
+    if (!app || channel < 0 || channel > 1) return false;
+    if (!atomic_load(&app->playback_link_separate) ||
+        !atomic_load(&app->playback_independent_mode)) {
+        return gui_playback_get_loop(app);
+    }
+    return atomic_load(&s_playback->channel_loop[channel]);
 }
 
 //-----------------------------------------------------------------------------

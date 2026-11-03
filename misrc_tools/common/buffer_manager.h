@@ -30,6 +30,15 @@ typedef enum {
     BUF_RECORD_A,          /* Extraction -> File writer A (extracted samples) */
     BUF_RECORD_B,          /* Extraction -> File writer B (extracted samples) */
     BUF_DISPLAY,           /* Extraction -> Display thread (for CVBS/oscilloscope) */
+    /* Per-channel RF/display FIFOs: used ONLY by the player's independent
+     * mixed-rate mode (both files loaded, different rates). Each file feeds
+     * its own FIFO at its own true rate so per-channel preview decoders and
+     * panels see honest, time-correct streams. Capture devices and same-rate
+     * playback keep the paired BUF_CAPTURE_RF / BUF_DISPLAY paths. */
+    BUF_CAPTURE_RF_A,      /* Playback CH A -> Extraction (raw RF, A only) */
+    BUF_CAPTURE_RF_B,      /* Playback CH B -> Extraction (raw RF, B only) */
+    BUF_DISPLAY_A,         /* Extraction -> Display thread (CH A) */
+    BUF_DISPLAY_B,         /* Extraction -> Display thread (CH B) */
     BUF_COUNT              /* Must be last */
 } buffer_id_t;
 
@@ -40,6 +49,11 @@ typedef enum {
 #define BUFMGR_SIZE_CAPTURE_AUDIO ((size_t)256 * 1024 * 1024)            /* 256MB */
 #define BUFMGR_SIZE_RECORD        ((size_t)8 * 1024 * 1024 * 1024ULL)    /* 8GB */
 #define BUFMGR_SIZE_DISPLAY       ((size_t)256 * 1024 * 1024)            /* 256MB */
+/* Independent playback per-channel FIFOs: quarter of the paired RF size
+ * each (a player session rarely buffers more than a few hundred ms), and
+ * lazy-init so non-playback sessions never allocate them. */
+#define BUFMGR_SIZE_PLAYBACK_RF   ((size_t)256 * 1024 * 1024)            /* 256MB */
+#define BUFMGR_SIZE_PLAYBACK_DISPLAY ((size_t)64 * 1024 * 1024)          /* 64MB */
 
 /*
  * Per-buffer configuration
