@@ -1216,3 +1216,12 @@ endif
 
 cxadc_samples_test = executable('cxadc_samples_test', 'test/cxadc_samples_test.c', c_args: cflags)
 test('cxadc_samples', cxadc_samples_test)
+
+
+# Monitor & Remote-only audio level metadata: exercise the production JSON
+# parser with current, legacy, incomplete and invalid status snapshots.
+if host_system != 'android'
+  monitor_audio_levels_test = executable('gui_monitor_audio_levels_test',
+    'test/gui_monitor_audio_levels_test.c', c_args: cflags)
+  test('gui_monitor_audio_levels', monitor_audio_levels_test)
+endif

@@ -6,6 +6,7 @@
 #include "gui_monitor_video_wire.h"
 #include "gui_monitor_video_client.h"
 #include "gui_monitor_session_state.h"
+#include "gui_monitor_audio_levels.h"
 #include "gui_remote_display.h"
 #include "gui_remote_fs.h"
 #include "gui_monitor_settings.h"
@@ -770,6 +771,14 @@ bool gui_monitor_server_handle_request(uintptr_t socket_handle,
         unsigned rb=mon_record_buffer_pct(app,BUF_RECORD_B);
         unsigned rf=mon_capture_buffer_pct(app,BUF_CAPTURE_RF);
         unsigned aud=mon_capture_buffer_pct(app,BUF_CAPTURE_AUDIO);
+        /* Only remote Monitor status uses these peaks. No audio samples leave
+         * the server; idle status explicitly sends zero rather than stale data. */
+        const unsigned audio_peaks[4]={
+            state ? (unsigned)atomic_load(&app->audio_peak[0]) : 0u,
+            state ? (unsigned)atomic_load(&app->audio_peak[1]) : 0u,
+            state ? (unsigned)atomic_load(&app->audio_peak[2]) : 0u,
+            state ? (unsigned)atomic_load(&app->audio_peak[3]) : 0u
+        };
         /* Avoid statvfs / Windows drive I/O on every ~100ms status poll.
          * The server socket worker is single-threaded; cache for 2 seconds. */
         static uint64_t free_checked_us=0,free_cached_bytes=0;
@@ -792,7 +801,7 @@ bool gui_monitor_server_handle_request(uintptr_t socket_handle,
             "{\"protocol\":\"MISRC-M/2\",\"state\":%u,\"sample_rate\":%u,\"frames\":%u,\"errors\":%u,\"missed\":%u,"
             "\"record_elapsed_ms\":%" PRIu64 ",\"raw_a\":%" PRIu64 ",\"raw_b\":%" PRIu64 ","
             "\"compressed_a\":%" PRIu64 ",\"compressed_b\":%" PRIu64 ",\"samples_a\":%" PRIu64 ","
-            "\"rec_a_pct\":%u,\"rec_b_pct\":%u,\"rf_pct\":%u,\"aud_pct\":%u,\"rec_a_waits\":%u,\"rec_b_waits\":%u,"
+            "\"rec_a_pct\":%u,\"rec_b_pct\":%u,\"rf_pct\":%u,\"aud_pct\":%u,\"audio_peak_ch1\":%u,\"audio_peak_ch2\":%u,\"audio_peak_ch3\":%u,\"audio_peak_ch4\":%u,\"rec_a_waits\":%u,\"rec_b_waits\":%u,"
             "\"rec_a_drops\":%u,\"rec_b_drops\":%u,"
             "\"local_queue_bytes\":%" PRIu64 ",\"local_queue_capacity\":%" PRIu64 ","
             "\"capture_a\":%u,\"capture_b\":%u,\"use_flac\":%u,\"local_save\":%u,"
@@ -805,6 +814,7 @@ bool gui_monitor_server_handle_request(uintptr_t socket_handle,
             elapsed_ms,(uint64_t)atomic_load(&app->recording_raw_a),(uint64_t)atomic_load(&app->recording_raw_b),
             (uint64_t)atomic_load(&app->recording_compressed_a),(uint64_t)atomic_load(&app->recording_compressed_b),
             (uint64_t)atomic_load(&app->samples_a),ra,rb,rf,aud,
+            audio_peaks[0],audio_peaks[1],audio_peaks[2],audio_peaks[3],
             (unsigned)atomic_load(&app->buffers.stats[BUF_RECORD_A].write_waits),
             (unsigned)atomic_load(&app->buffers.stats[BUF_RECORD_B].write_waits),
             (unsigned)atomic_load(&app->buffers.stats[BUF_RECORD_A].write_drops),
@@ -1078,6 +1088,14 @@ static int mon_client_thread(void *ctx){
             p=strstr(response,"\"missed\":");
             if(p)missed=(unsigned)strtoul(p+9,NULL,10);
             if(state<0||state>2)state=0;
+            /* An older server lacks these optional keys. In that case, or
+             * while idle, show zero instead of a stale local audio reading. */
+            uint32_t remote_audio_peaks[4];
+            bool audio_levels_valid=gui_monitor_audio_levels_parse_status(response,remote_audio_peaks);
+            if(!audio_levels_valid || state==0)
+                memset(remote_audio_peaks,0,sizeof(remote_audio_peaks));
+            for(int ch=0;ch<4;ch++)
+                atomic_store(&g_client.app->audio_peak[ch],remote_audio_peaks[ch]);
             atomic_store(&g_client.peer_state,state);
             atomic_store(&g_client.peer_rate,rate);
             atomic_store(&g_client.peer_frames,frames);
@@ -1196,6 +1214,9 @@ static int mon_client_thread(void *ctx){
             if(status_rc==0)
                 error_reason=strstr(response,"\"protocol\":\"MISRC-M/1\"") ? 2 : 3;
             bool first=gui_monitor_session_status_failed(&session);
+            /* Keep the monitor connection for recovery, but clear live meters
+             * immediately if status polling fails or the peer is incompatible. */
+            for(int ch=0;ch<4;ch++)atomic_store(&g_client.app->audio_peak[ch],0);
             atomic_store(&g_client.status_dropouts,session.status_errors);
             atomic_store(&g_client.last_error,error_reason);
             if(first || session.consecutive_status_errors==10 ||
@@ -1233,6 +1254,7 @@ int gui_monitor_client_start(gui_app_t *app,const char *host,uint16_t port){
      * restored over a fresh M-Client session that just snapshotted it. */
     atomic_store(&g_monitor_restore_pending,false);
     g_client.app=app;g_client.port=port;
+    for(int ch=0;ch<4;ch++)atomic_store(&app->audio_peak[ch],0);
     mon_cfg_disconnect();
     cfg_lock();
     g_cfg_client.local_count=app->device_count;
@@ -1275,6 +1297,7 @@ void gui_monitor_client_stop(void){
     gui_monitor_video_client_stop();
     thrd_join(g_client.thread,NULL);
     if(g_client.app){
+        for(int ch=0;ch<4;ch++)atomic_store(&g_client.app->audio_peak[ch],0);
         /* Neither Pi settings nor its remote device indices may leak into
          * Harry's existing Local / full-RF Client modes. The settings/devices
          * restores are STAGED for the main thread (this may be the net
