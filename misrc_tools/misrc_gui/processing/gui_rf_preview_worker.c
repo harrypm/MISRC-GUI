@@ -70,6 +70,8 @@ struct gui_rf_preview_worker {
     bool audio_have_cpu_baseline;
     uint64_t video_work_wall_us,video_accounted_cpu_us,audio_work_wall_us,audio_accounted_cpu_us;
     rf_mutex_t frame_mutex;
+    void (*monitor_frame_sink)(void *, const uint8_t *, unsigned, unsigned, uint64_t);
+    void *monitor_frame_sink_context;
     atomic_bool stop;
     atomic_bool flush_requested;
     atomic_bool producer_gap;
@@ -449,7 +451,11 @@ static void rf_frame_callback(void *context, const uint8_t *rgba, int width,
     w->stats.generation = ++w->generation;
     w->stats.decode_ms = elapsed_ms;
     w->stats.latency_ms = latency_ms;
+    /* Never hold frame_mutex while copying into a monitor's latest-frame box. */
+    void (*sink)(void *, const uint8_t *, unsigned, unsigned, uint64_t) = w->monitor_frame_sink;
+    void *sink_context = w->monitor_frame_sink_context;
     rf_mutex_unlock(&w->frame_mutex);
+    if(sink) sink(sink_context,rgba,(unsigned)width,(unsigned)height,now);
     w->work_since_frame_us = 0;
     w->work_segment_us = rf_now_us(w);
 }
@@ -1153,6 +1159,16 @@ bool gui_rf_preview_worker_submit(gui_rf_preview_worker_t *w, const int16_t *sam
 #endif
     atomic_flag_clear_explicit(&w->producer_busy, memory_order_release);
     return true;
+}
+
+void gui_rf_preview_worker_set_monitor_frame_sink(gui_rf_preview_worker_t *w,
+    void (*callback)(void *, const uint8_t *, unsigned, unsigned, uint64_t),
+    void *context) {
+    if (!w) return;
+    rf_mutex_lock(&w->frame_mutex);
+    w->monitor_frame_sink = callback;
+    w->monitor_frame_sink_context = context;
+    rf_mutex_unlock(&w->frame_mutex);
 }
 
 bool gui_rf_preview_worker_take_frame(gui_rf_preview_worker_t *w, uint8_t *rgba,

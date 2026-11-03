@@ -1,0 +1,1 @@
+option('modern_monitor_codecs', type: 'feature', value: 'auto', description: 'FFmpeg AV1/VP9/HEVC Monitor Video; enabled fails if missing')

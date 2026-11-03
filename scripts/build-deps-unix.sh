@@ -47,15 +47,11 @@ require_tools() {
 }
 require_tools cmake pkg-config cc git
 
-# System deps hsdaoh/meson rely on (libuvc is hard-required by hsdaoh's CMake).
-for m in fftw3f flac libusb-1.0 soxr libuvc libzstd; do
-  pkg-config --exists "$m" || fail "Missing pkg-config module '$m'. Install the system dev package (apt: libuvc-dev libfftw3-dev libflac-dev libsoxr-dev libusb-1.0-0-dev libzstd-dev; brew: fftw flac libusb libuvc libsoxr zstd)."
-done
-# meson.build hard-requires libFLAC >= 1.5.0 for multithreaded encode.
-flac_ver="$(pkg-config --modversion flac)"
-if ! printf '%s\n1.5.0\n' "$flac_ver" | sort -V | head -1 | grep -qx '1.5.0'; then
-  fail "libFLAC $flac_ver < 1.5.0. On Ubuntu 22.04 use the prebuilt cache flow (see .github/workflows/build.yml flac-${FLAC_VERSION:-1.5.0}-linux) or `brew upgrade flac` on macOS."
-fi
+# Prefer vendored .pc files (especially FLAC 1.5.0 on Ubuntu 22.04) when
+# validating libraries. Check BEFORE invoking CMake or reusing the stamp.
+export PKG_CONFIG="${PKG_CONFIG:-pkg-config}"
+export PKG_CONFIG_PATH="$DEPS_PREFIX/lib/pkgconfig:$DEPS_PREFIX/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
+bash "$SCRIPT_DIR/check-build-deps.sh" --all
 
 # --- Stamp: rebuild only when inputs change ---------------------------------
 stamp_file="$DEPS_PREFIX/.build-stamp"
@@ -69,7 +65,7 @@ compute_stamp() {
     fi
     find "$HSDAOH_SOURCE_DIR" -type f \( -name '*.c' -o -name '*.h' -o -name 'CMakeLists.txt' -o -name '*.in' \) \
       -exec sha256sum {} + 2>/dev/null | sort
-    for m in fftw3f flac libusb-1.0 soxr libuvc libzstd; do
+    for m in fftw3f flac libusb-1.0 soxr libuvc libzstd openh264; do
       printf '%s=%s\n' "$m" "$(pkg-config --modversion "$m" 2>/dev/null || echo missing)"
     done
   } | sha256sum | awk '{print $1}'
@@ -131,8 +127,7 @@ cmake --install "$REPO_ROOT/.deps/raylib/build"
 
 # --- sanity -----------------------------------------------------------------
 export PKG_CONFIG_PATH="$DEPS_PREFIX/lib/pkgconfig:$DEPS_PREFIX/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
-pkg-config --exists hsdaoh || fail "hsdaoh.pc not resolvable after build"
-pkg-config --exists fftw3f || fail "fftw3f not found"
+bash "$SCRIPT_DIR/check-build-deps.sh" --gui
 log "hsdaoh: $(pkg-config --modversion hsdaoh)"
 log "raylib: $(pkg-config --modversion raylib) (built vendored with internal GLFW)"
 log "fftw3f: $(pkg-config --modversion fftw3f)"

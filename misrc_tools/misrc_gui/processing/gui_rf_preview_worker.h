@@ -103,6 +103,13 @@ bool gui_rf_preview_worker_submit(gui_rf_preview_worker_t *worker,
                                   const gui_rf_block_info_t *info);
 /* Copies the newest complete interlaced frame, if generation has changed.
  * Destination capacity is bytes, at least MAX_WIDTH*MAX_HEIGHT*4. */
+/* Optional borrowed RGBA32 frame sink. The callback is invoked on the RF
+ * preview worker after a decoded frame; it must be fast and nonblocking.
+ * Set context lifetime must cover worker callbacks; stop/join before freeing. */
+void gui_rf_preview_worker_set_monitor_frame_sink(gui_rf_preview_worker_t *worker,
+    void (*callback)(void *, const uint8_t *, unsigned, unsigned, uint64_t),
+    void *context);
+
 bool gui_rf_preview_worker_take_frame(gui_rf_preview_worker_t *worker,
                                       uint8_t *rgba, size_t capacity,
                                       uint64_t *generation, int *width,

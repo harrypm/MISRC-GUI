@@ -9,6 +9,7 @@
 #include "gui_panel.h"
 #include "panel_interface.h"
 #include "../core/gui_app.h"
+#include "../net/gui_monitor_video_client.h"
 #include "gui_oscilloscope.h"
 #include "gui_fft.h"
 #include "gui_spectrogram.h"
@@ -104,6 +105,10 @@ static void render_single_panel(gui_app_t *app, int channel,
      * phosphor accumulation, grid, trigger lines, zoom and overlays.
      * Only reduced Zstd/float32 display data comes across the network. */
     if(app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT) {
+        if(type == PANEL_VIEW_CVBS) {
+            gui_monitor_video_client_draw((unsigned)channel,bounds);
+            return;
+        }
         if(type != PANEL_VIEW_WAVEFORM && type != PANEL_VIEW_FFT) {
             DrawRectangleRec(bounds,COLOR_PANEL_BG);
             /* gui_text_draw = the app's Inter font; raw raylib DrawText would
