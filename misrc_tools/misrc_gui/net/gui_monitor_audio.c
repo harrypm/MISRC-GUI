@@ -87,7 +87,7 @@ void gui_monitor_audio_server_tap(gui_app_t *app, const void *data, size_t bytes
         !atomic_load(&g_ma_capture.subscribers)) return;
     size_t frames=bytes / MA_RAW_FRAME_BYTES;
     if (!frames || !ma_trylock(&g_ma_capture.guard)) return;
-    device_type_t type=DEVICE_TYPE_UNKNOWN;
+    device_type_t type=DEVICE_TYPE_HSDAOH;
     if (app->selected_device>=0 && app->selected_device<app->device_count)
         type=app->devices[app->selected_device].type;
     unsigned mode=(type==DEVICE_TYPE_CXADC) ? 1u :
@@ -401,7 +401,10 @@ static int ma_client_thread(void *unused)
         if(sock==MA_BAD){thrd_sleep_ms(350);continue;}
         int error=0;
         OpusDecoder *decoder=opus_decoder_create(MA_OPUS_RATE,1,&error);
-        if(!decoder || error!=OPUS_OK){MA_CLOSE(sock);thrd_sleep_ms(350);continue;}
+        if(!decoder || error!=OPUS_OK){
+            if(decoder)opus_decoder_destroy(decoder);
+            MA_CLOSE(sock);thrd_sleep_ms(350);continue;
+        }
         ma_pcm_clear();
         bool have_sequence=false;
         uint32_t last_sequence=0;
