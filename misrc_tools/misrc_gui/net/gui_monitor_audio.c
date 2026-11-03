@@ -8,7 +8,7 @@
 #include "gui_monitor_transport.h"
 #include "gui_net.h"
 #include "../../common/threading.h"
-#include <opus/opus.h>
+#include <opus.h>
 #include <soxr.h>
 #include <stdatomic.h>
 #include <stdio.h>
