@@ -41,6 +41,11 @@ FLAC_TARBALL="flac-${FLAC_VERSION}.tar.xz"
 FLAC_URL="https://github.com/xiph/flac/releases/download/${FLAC_VERSION}/${FLAC_TARBALL}"
 FLAC_SHA256="f2c1c76592a82ffff8413ba3c4a1299b6c7ab06c734dee03fd88630485c2b920"
 
+OPUS_VERSION=1.5.2
+OPUS_TARBALL="opus-${OPUS_VERSION}.tar.gz"
+OPUS_URL="https://downloads.xiph.org/releases/opus/${OPUS_TARBALL}"
+OPUS_SHA256="65c1d2f78b9f2fb20082c38cbe47c951ad5839345876e46941612ee87f9a7ce1"
+
 ZSTD_VERSION=1.5.7
 ZSTD_TARBALL="zstd-${ZSTD_VERSION}.tar.gz"
 ZSTD_URL="https://github.com/facebook/zstd/releases/download/v${ZSTD_VERSION}/${ZSTD_TARBALL}"
@@ -130,6 +135,26 @@ else
   cmake --install "$DEPS_SRC_DIR/flac-build"
 fi
 record "libFLAC" "${FLAC_VERSION} (sha256 ${FLAC_SHA256})"
+
+# ---------------- Opus 1.5.2 (static low-latency Monitor audio) ----------------
+log "=== Opus ${OPUS_VERSION} (Android static libopus) ==="
+if [[ "$(pc_version opus)" == "${OPUS_VERSION}" ]]; then
+  log "skip (opus.pc already ${OPUS_VERSION})"
+else
+  download "$OPUS_URL" "$DEPS_SRC_DIR/$OPUS_TARBALL" "$OPUS_SHA256"
+  rm -rf "$DEPS_SRC_DIR/opus-src" "$DEPS_SRC_DIR/opus-build"
+  mkdir -p "$DEPS_SRC_DIR/opus-src"
+  tar -xf "$DEPS_SRC_DIR/$OPUS_TARBALL" -C "$DEPS_SRC_DIR/opus-src" --strip-components=1
+  cmake_x -S "$DEPS_SRC_DIR/opus-src" -B "$DEPS_SRC_DIR/opus-build" \
+    -DCMAKE_INSTALL_LIBDIR=lib \
+    -DOPUS_BUILD_SHARED_LIBRARY=OFF \
+    -DOPUS_BUILD_PROGRAMS=OFF -DOPUS_BUILD_TESTING=OFF \
+    -DOPUS_DISABLE_INTRINSICS=ON
+  cmake --build "$DEPS_SRC_DIR/opus-build" --parallel "$JOBS"
+  cmake --install "$DEPS_SRC_DIR/opus-build"
+fi
+[[ "$(pc_version opus)" == "${OPUS_VERSION}" ]] || fail "Android static Opus not found in cross pkg-config"
+record "Opus" "${OPUS_VERSION} (sha256 ${OPUS_SHA256})"
 
 # ---------------- Zstandard 1.5.7 (static libzstd) ----------------
 # Required by the MISRC-M/2 monitor preview; the Android cross pkg-config
@@ -481,7 +506,7 @@ fi
 
 # ---------------- summary ----------------
 log "=== installed .pc versions ==="
-for pc in flac libzstd fftw3f soxr libusb-1.0 libuvc hsdaoh libhsdaoh raylib; do
+for pc in flac opus libzstd fftw3f soxr libusb-1.0 libuvc hsdaoh libhsdaoh raylib; do
   v="$(pc_version "$pc")"
   printf '  %-14s %s\n' "$pc" "${v:-(missing)}"
 done
