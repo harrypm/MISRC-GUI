@@ -162,6 +162,19 @@ static size_t ma_read_capture(ma_reader_t *r, uint8_t *output,
     ma_unlock(&g_ma_capture.guard);
     return frames;
 }
+static bool ma_socket_peer_closed(uintptr_t fd)
+{
+    ma_sock_t sock=(ma_sock_t)fd;
+    fd_set rset;
+    FD_ZERO(&rset);
+    FD_SET(sock,&rset);
+    struct timeval timeout={0,0};
+    int ready=select((int)sock+1,&rset,NULL,NULL,&timeout);
+    if(ready<=0 || !FD_ISSET(sock,&rset))return false;
+    char probe;
+    int n=recv(sock,&probe,1,MSG_PEEK);
+    return n==0; /* A new request is never expected on this connection. */
+}
 static int32_t ma_read_s24(const uint8_t *frame, unsigned ch)
 {
     const uint8_t *p=frame+ch*3u;
@@ -213,6 +226,7 @@ bool gui_monitor_audio_server_stream(uintptr_t fd, gui_app_t *app, unsigned pair
         uint32_t rate=0;unsigned mode=0;bool discontinuity=false;
         size_t frames=ma_read_capture(&reader,raw,&rate,&mode,&discontinuity);
         if(discontinuity || rate!=current_rate) {
+            if(sequence)++sequence; /* tell decoder to reset after a gap */
             have=0;
             (void)opus_encoder_ctl(encoder,OPUS_RESET_STATE);
             if(resampler){soxr_delete(resampler);resampler=NULL;}
@@ -226,7 +240,11 @@ bool gui_monitor_audio_server_stream(uintptr_t fd, gui_app_t *app, unsigned pair
                                   &soxr_error,&io,&quality,NULL);
             if(soxr_error || !resampler){ok=false;break;}
         }
-        if(!frames || !resampler) {thrd_sleep_ms(5);continue;}
+        if(!frames || !resampler) {
+            if(ma_socket_peer_closed(fd))break;
+            thrd_sleep_ms(5);
+            continue;
+        }
         for(size_t i=0;i<frames;i++)
             mixed[i]=ma_mono_sample(raw+i*MA_RAW_FRAME_BYTES,pair,mode);
         size_t in_at=0;
@@ -368,8 +386,13 @@ static ma_sock_t ma_connect_audio(const char *host,uint16_t port,unsigned pair)
     int n=snprintf(request,sizeof(request),
         "GET /monitor/audio?pair=%u HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n",
         pair,host);
-    if(n<=0 || n>=(int)sizeof(request) ||
-       send(sock,request,n,0)!=n){MA_CLOSE(sock);return MA_BAD;}
+    if(n<=0 || n>=(int)sizeof(request)){MA_CLOSE(sock);return MA_BAD;}
+    size_t sent=0;
+    while(sent<(size_t)n){
+        int k=send(sock,request+sent,n-(int)sent,0);
+        if(k<=0){MA_CLOSE(sock);return MA_BAD;}
+        sent+=(size_t)k;
+    }
     char header[512]={0};
     size_t count=0;
     while(count<sizeof(header)-1) {
