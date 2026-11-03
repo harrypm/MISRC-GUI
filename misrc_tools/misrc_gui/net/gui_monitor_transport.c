@@ -330,9 +330,16 @@ static bool mon_parse_browse(char *body,gui_remote_fs_result_t *r){
     r->page=0;return true;
 }
 
+static bool mon_local_audio_setting(const char *key){
+    /* Only the listener controls its headphones. Preserve these fields in
+     * local profile snapshots but exclude them from the server protocol. */
+    return !strcmp(key,"audio_monitor_playback") ||
+           !strcmp(key,"audio_monitor_ch34");
+}
 static bool mon_cfg_pack(const gui_settings_t *s,char *dst,size_t cap){
     size_t used=0;dst[0]=0;
     for(size_t i=0;i<gui_monitor_settings_count();i++){
+        if(mon_local_audio_setting(gui_monitor_settings_key(i)))continue;
         char val[MON_SETTINGS_VALUE_CAP],encoded[MON_SETTINGS_VALUE_CAP*3+1];
         if(!gui_monitor_settings_get(s,i,val,sizeof(val))||!mon_url_encode(val,encoded,sizeof(encoded)))return false;
         int n=snprintf(dst+used,cap-used,"%s=%s\n",gui_monitor_settings_key(i),encoded);
@@ -407,6 +414,7 @@ void gui_monitor_client_sync_main(gui_app_t *app){
             if(eq){*eq++=0;char decoded[MON_SETTINGS_VALUE_CAP];
                 if(mon_url_decode(eq,strlen(eq),decoded,sizeof(decoded))){
                     for(size_t i=0;i<gui_monitor_settings_count();i++)if(!strcmp(line,gui_monitor_settings_key(i))){
+                        if(mon_local_audio_setting(line))break;
                         /* First sync adopts server state. Later server edits are
                          * mirrored only if client has no unsent local edit. */
                         char local[MON_SETTINGS_VALUE_CAP]={0};
@@ -427,6 +435,7 @@ void gui_monitor_client_sync_main(gui_app_t *app){
     /* One update per tick; queued in a single slot, never overwritten.
      * A failed network command is retried by the worker, not lost. */
     for(size_t i=0;i<gui_monitor_settings_count();i++){
+        if(mon_local_audio_setting(gui_monitor_settings_key(i)))continue;
         char value[MON_SETTINGS_VALUE_CAP];
         if(!gui_monitor_settings_get(&app->settings,i,value,sizeof(value)))continue;
         if(strcmp(value,g_cfg_client.last[i])==0)continue;
@@ -682,6 +691,7 @@ bool gui_monitor_server_handle_request(uintptr_t socket_handle,
         /* Strictly whitelist names and typed values before even staging. */
         gui_settings_t probe={0};
         bool valid=query&&mon_query_named(query,"key",key,sizeof(key))&&
+                   !mon_local_audio_setting(key)&&
                    mon_query_named(query,"value",value,sizeof(value))&&
                    gui_monitor_settings_set(&probe,key,value);
         if(!valid||app->is_recording){mon_answer(fd,409,"text/plain","setting invalid or recording active\n");return false;}
