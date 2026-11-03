@@ -54,6 +54,7 @@ static void (*s_frame_cb)(void *ctx) = NULL;
 static void *s_frame_ctx = NULL;
 static bool s_in_modal_loop = false;
 static unsigned s_modal_frames = 0;
+static bool s_maximize_requested = false;
 
 static LRESULT CALLBACK gui_win32_modal_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
@@ -64,6 +65,17 @@ static LRESULT CALLBACK gui_win32_modal_proc(HWND hwnd, UINT msg, WPARAM wp, LPA
                 s_in_modal_loop = true;
                 s_modal_frames = 0;
                 SetTimer(hwnd, GUI_WIN32_MODAL_TIMER_ID, GUI_WIN32_MODAL_TIMER_MS, NULL);
+                break;
+
+            case WM_SIZE:
+                // Aero Snap maximize (drag-to-top, possibly with Win11 snap
+                // layouts): request the clean-fullscreen conversion. The
+                // main loop consumes this AFTER the event poll; toggling
+                // fullscreen from inside the wndproc (mid message dispatch)
+                // would re-enter GLFW's window code.
+                if (wp == SIZE_MAXIMIZED) {
+                    s_maximize_requested = true;
+                }
                 break;
 
             case WM_TIMER:
@@ -112,10 +124,18 @@ void gui_win32_modal_set_frame(void (*frame)(void *ctx), void *ctx)
     s_frame_ctx = ctx;
 }
 
+bool gui_win32_modal_take_maximize_request(void)
+{
+    bool was = s_maximize_requested;
+    s_maximize_requested = false;
+    return was;
+}
+
 void gui_win32_modal_shutdown(void)
 {
     if (s_hwnd) {
         s_in_modal_loop = false;
+        s_maximize_requested = false;
         s_frame_cb = NULL;
         s_frame_ctx = NULL;
         KillTimer(s_hwnd, GUI_WIN32_MODAL_TIMER_ID);

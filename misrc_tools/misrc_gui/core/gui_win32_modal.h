@@ -28,6 +28,14 @@ void gui_win32_modal_set_frame(void (*frame)(void *ctx), void *ctx);
 // CloseWindow().
 void gui_win32_modal_shutdown(void);
 
+// Take (consume) a pending Aero Snap maximize request: true when the
+// window was maximized via a Windows snap gesture (drag-to-top) since the
+// last call. The main loop consumes this to convert the snap into the
+// clean borderless fullscreen (a quick throw at the monitor top can land
+// in a half/snapped state with glitched chrome instead - user report
+// 2026-11-03).
+bool gui_win32_modal_take_maximize_request(void);
+
 #else
 // Other platforms have no modal move/size loop (X11/Cocoa keep the app loop
 // running during live resize): the call sites compile to no-ops, and
@@ -39,6 +47,7 @@ static inline void gui_win32_modal_set_frame(void (*frame)(void *ctx), void *ctx
     (void)ctx;
 }
 static inline void gui_win32_modal_shutdown(void) {}
+static inline bool gui_win32_modal_take_maximize_request(void) { return false; }
 
 #endif
 

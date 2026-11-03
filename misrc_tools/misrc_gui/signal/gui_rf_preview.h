@@ -42,7 +42,10 @@ static inline double rf_display_level(double y01) {
  * Result: 0 IRE blanking renders as a ~57/255 dark grey band; NTSC sync
  * tips (-40 IRE) sit ~4 IRE above the background black and stay faintly
  * visible, while PAL's deeper tip clamps at the floor - the
- * CRT/production-panel VBI contrast of tbc-tools' hybrid mode. */
+ * CRT/production-panel VBI contrast of tbc-tools' hybrid mode.
+ * Full-frame DISPLAY ASPECT now lives in gui_rf_preview_geometry.h
+ * (gui_rf_preview_full_frame_aspect), shared with the CVBS full-frame
+ * view so the two decoders' Full modes render identical geometry. */
 #define RF_HYBRID_BLACK_IRE_PAL  (-38.7543)
 #define RF_HYBRID_SPAN_IRE_PAL   (174.147)
 #define RF_HYBRID_BLACK_IRE_NTSC (-44.1843)

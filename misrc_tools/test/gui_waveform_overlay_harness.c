@@ -202,6 +202,23 @@ void gui_video_follow_generator_system(gui_app_t *app, int system)
     test_follow_calls++;
 }
 
+/* Stub: the generator row (waveform_render) and the Gen box click handler
+ * (waveform_panel_handle_click) read the system/tape-format names and
+ * clamps from gui_testgen.c; the harness doesn't link the generator. */
+int gui_testgen_clamp_system(int system)
+{
+    return (system < 0 || system >= 4) ? 0 : system;
+}
+int gui_testgen_clamp_format(int format)
+{
+    return (format < 0 || format >= 5) ? 0 : format;
+}
+const char *gui_testgen_format_name(int format)
+{
+    static const char *names[5] = { "VHS", "S-VHS", "Betamax", "Video8", "Hi8" };
+    return names[gui_testgen_clamp_format(format)];
+}
+
 /* Stub: the production overlay scales text measurements to logical units via
  * gui_ui_get_scale_factor(); the harness doesn't link gui_ui_scale.c,
  * so return 1.0 (no scaling in the test). */

@@ -939,9 +939,10 @@ int main(int argc, char **argv) {
     app.settings.ui_scale_percent = GUI_UI_SCALE_DEFAULT_PERCENT;
 #endif
     gui_ui_set_scale_percent(app.settings.ui_scale_percent);
-    // Push the persisted CVBS System selection (0=PAL/1=NTSC/2=SECAM) into
-    // the video panel decoders: every created panel starts in the user's
-    // last-selected system instead of hardcoded PAL.
+    // Push the persisted CVBS System selection (0=PAL/1=NTSC/2=SECAM/
+    // 3=MESECAM) into the video panel decoders: every created panel starts
+    // in the user's last-selected system instead of hardcoded PAL
+    // (MESECAM: composite decoders start in SECAM, RF preview in MESECAM).
     gui_cvbs_set_default_system(app.settings.video_system);
 
     // Capture limit should not persist across relaunches.
@@ -1212,6 +1213,12 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[WIN32] modal move/size render driver unavailable\n");
     }
 
+    // Fullscreen toggle bookkeeping: suppresses the Windows snap-maximize
+    // conversion for a short window after a manual toggle so leaving
+    // fullscreen (whose restore can re-fire WM_SIZE/SIZE_MAXIMIZED) does
+    // not immediately bounce back in.
+    double last_fullscreen_toggle_s = -10.0;
+
     // Main loop
     while (!WindowShouldClose() && !atomic_load(&do_exit)) {
         bool was_capturing = app.is_capturing;
@@ -1377,6 +1384,27 @@ int main(int argc, char **argv) {
                     "constraints (slow CPU, single-core, limited I/O).\n\n"
                     "You can raise it with the + button in Settings.");
             }
+        }
+
+        // Fullscreen toggle: F11 (cross-platform) and Alt+Enter (fallback
+        // where F11 is reserved by the system, e.g. macOS Show Desktop).
+        // Windows throw-at-top Aero Snap also converts to this same clean
+        // borderless fullscreen (a quick throw can otherwise land in a
+        // half/snapped state with glitched chrome - user report 2026-11-03).
+        if (IsKeyPressed(KEY_F11) ||
+            (IsKeyPressed(KEY_ENTER) &&
+             (IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT)))) {
+            ToggleFullscreen();
+            last_fullscreen_toggle_s = GetTime();
+            gui_app_set_status(&app, IsWindowFullscreen()
+                ? "Fullscreen (F11 / Alt+Enter to exit)"
+                : "Windowed");
+        }
+        if (gui_win32_modal_take_maximize_request() &&
+            !IsWindowFullscreen() &&
+            GetTime() - last_fullscreen_toggle_s > 1.0) {
+            ToggleFullscreen();
+            last_fullscreen_toggle_s = GetTime();
         }
 
         // Handle keyboard shortcuts

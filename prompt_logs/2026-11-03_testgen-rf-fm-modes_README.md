@@ -228,10 +228,211 @@ future picture area is delineated). CVBS composite panel still uses
 Validation: build clean; gui_testgen_rf / gui_cvbs_baseband /
 gui_waveform_overlay all OK.
 
+### Round 5 — full-frame framing alignment (2026-11-03 05:07)
+
+User: "make the framing more aligned with each other on the full-frame
+modes for the decoders".
+
+Root cause: the CVBS composite decoder's Frame: Full view fitted its full
+frame (1135x625 PAL / 910x525 NTSC at 4fsc) into a FIXED 4:3 rect, while
+the RF preview's Full mode fits the same physical span (full line period
+x full field) at the aspect-correct ~1.510 PAL / ~1.456 NTSC — so the
+two decoders' full-frame pictures had mismatched geometry (CVBS squeezed
+~12% horizontally).
+
+Fix:
+- New shared helper `gui_rf_preview_full_frame_aspect(height)` in
+  `gui_rf_preview_geometry.h` (the header both decoders already share for
+  geometry): (LINE_US / active window) * (active width / full height),
+  keyed by 625/626 -> PAL, 525/526 -> NTSC.
+- `gui_rf_preview_display_aspect` refactored to delegate to it (identical
+  values; the existing gui_rf_preview_geometry test passes unchanged).
+- `gui_cvbs_render_frame_impl`: Full view now fits with the shared
+  full-frame aspect; Active view keeps 4:3 (picture crop).
+
+Validation: `meson compile misrc_gui` clean; `gui_rf_preview_geometry` +
+`gui_cvbs_baseband` + `gui_testgen_rf` all OK. Fresh exe 05:09.
+
+### Committed
+
+- `67b5935` "Test Gen: fix FM RF modes, tape-RF CH2, waveform signal
+  sub-selector" pushed to harrypm/MISRC-GUI main (rounds 1-4 + restore
+  point `restore_points/2026-11-03_testgen-rf-fm-modes-good.zip`).
+
+### Round 6 — remove Raw, default CH1=CVBS / CH2=FM RF (2026-11-03 05:18)
+
+User: "remove raw mode form signal gen set cvbs on ch1 and set fm rf on
+ch2 on defulat opneing".
+
+Fix (gui_oscilloscope.c):
+- The Signal dropdown now lists only CVBS / FM RF / Audio. WAVE_SIGNAL_RAW
+  stays as the internal pre-default state of a freshly created panel but
+  is not selectable (WAVE_SIGNAL_OPTION_COUNT / WAVE_SIGNAL_OPTION_VALUE
+  mapping for the 3-option popup and click handling).
+- New `waveform_apply_channel_signal_default(state, channel)` (same
+  once-only pattern as the trigger-source channel default): CH1 -> CVBS,
+  CH2 -> FM RF with the matching trigger defaults, applied at the panel's
+  first render/click — so the waveform monitors open with the generator
+  mapping already assigned. `gui_waveform_apply_generator_defaults`
+  (sim-start hook) remains as belt-and-braces for never-rendered panels.
+
+Validation: build clean; gui_waveform_overlay / gui_testgen_rf /
+gui_cvbs_baseband all OK. Fresh exe 05:21.
+
+### Round 7 — UX batch (2026-11-03 05:39)
+
+User requests + implementation:
+
+1. **Middle-button double-click resets the waveform view**
+   (gui_oscilloscope.c): 350 ms / 6 px double-click tracker (same
+   thresholds as chrome-hide), polled per frame in waveform_render with a
+   bounds hit test (the left-click dispatch never sees the middle button).
+   Reset = ZOOM_SCALE_DEFAULT zoom, trigger level 0, trigger position -1,
+   phosphor cleared; trigger mode/enabled left as-is.
+2. **Fullscreen**: F11 (cross-platform) and Alt+Enter (fallback where F11 is
+   system-reserved, e.g. macOS) toggle raylib ToggleFullscreen in the main
+   loop. Windows throw-at-top Aero Snap: the win32 modal subclass now flags
+   WM_SIZE/SIZE_MAXIMIZED (gui_win32_modal_take_maximize_request); the main
+   loop converts it into the same clean borderless fullscreen (with a 1 s
+   suppression window after manual toggles so the fullscreen-exit restore
+   cannot bounce straight back in).
+3. **CVBS decoder right/top padding vs RF preview**: NOT yet diagnosed —
+   both decoders now share the full-frame aspect; the residual padding is
+   inside the CVBS decoded texture. Needs a screenshot/next round to
+   identify the exact blank region (decode fills the full frame_width per
+   line; suspected field-boundary row phase).
+4. **Stats -> OSD** on the RF preview decoder: the selector button now
+   reads "OSD: All/Basic/Off" (options unchanged), matching the CVBS
+   decoder's OSD naming.
+5. **MESECAM restructure**: the RF preview System cycle is now
+   PAL -> NTSC -> SECAM -> MESECAM (4 states); the dedicated MESECAM
+   toggle button is removed. gui_vhs_fm_set_format accepts 0-3;
+   gui_vhs_fm_get_profile keys off selected_system==3 -> MESECAM_VHS,
+   ==2 -> native SECAM_VHS (the 2"-quad / 1"-Type-C domain). The tape
+   family cycle button became a real "Format:" dropdown listing
+   VHS / Betamax (open popup owns clicks; Betamax presets unchanged).
+   gui_vhs_fm_set_mesecam kept as legacy API, now mapping onto the system
+   value.
+
+Validation: build clean (05:48); gui_waveform_overlay, gui_rf_preview_
+geometry, gui_testgen_rf, gui_cvbs_baseband, gui_rf_secam all OK.
+
+### Round 8 — RF Preview Format dropdown + generator Fmt + MESECAM (2026-11-03 05:56)
+
+User reports:
+1. "dropdown is broken (not overlaying) for format selection for RF
+   Preview" — the Format options were drawn inline at their button's row;
+   immediate-mode drawing let the LATER System/Preset/Frame/Budget/OSD
+   rows paint over them. Fixed: the options are now drawn at the very END
+   of `render_vhs_decoder_overlay`.
+2. "format selection is missing from waveform generation mode" — new Fmt
+   button on the gen row: [Signal] [Fmt] [Gen]. The tape format is
+   persisted in settings.gen_tape_format and hot-swapped by the simulated
+   capture thread on the next batch (same regenerate pattern as the system).
+3. "MESECAM mode adding also needed" — GUI_TESTGEN_MESECAM (RF-only: the
+   composite channel generates SECAM, the RF channel mixes the studio
+   SECAM chroma down through the PAL converter LO 5060571.875 Hz to the
+   MESECAM rests 654321.875 / 810571.875 Hz). gui_testgen_rf_frame now
+   takes the tape format and a per-(family, format) parameter table
+   (blank/sync/hz-ire/color-under carrier/track rotation) from the
+   tape-decode-rs profiles; SECAM/MESECAM force VHS. Gen box cycles
+   PAL->NTSC->SECAM->MESECAM; the follow maps MESECAM composite to SECAM
+   on the composite side and MESECAM_VHS on the RF side.
+4. "mirror like cvbs does the RF Preview system change with signal
+   change, as there is now a new bug added when wrong decoder is selected
+   to the system it blanks instead of trying to decode it" — the VHS FM
+   render gate `status->v_locked || paused` hid the picture until lock,
+   so a wrong decoder showed nothing. Fixed: the decoded frame now draws
+   whenever one exists (wrong-decoder attempts are visible; the reason
+   line communicates the lock state).
+
+Validation: build clean (06:06); gui_testgen_rf (now including the
+MESECAM->MESECAM_VHS decode + bar hues), gui_cvbs_baseband,
+gui_waveform_overlay all OK (harness stubbed the new testgen helpers).
+
+## Round 9 — format selection removed from CVBS mode; format cycle decoupled from CH1/CH2
+
+User request: "Remove format selection from cvbs mode decouple that cycle
+from Ch1/2".
+
+Changes:
+
+1. `gui_oscilloscope.c` — the generator row's `Fmt` button now renders on
+   FM RF signal panels ONLY. A tape format parameterizes the RF
+   modulation, so it has no meaning in a CVBS or Audio signal context;
+   the button follows the panel's Signal pick rather than the CH1/CH2
+   channel mapping. The default CVBS panel (CH1) shows just
+   `[Signal][Gen]`; the FM RF panel keeps `[Signal][Fmt][Gen]`. The click
+   rect is zeroed when hidden, so the handler (already width-gated) stays
+   inert.
+2. `gui_simulated.c` — per-channel stream positions (`cvbs_stream_pos`,
+   `rf_stream_pos`) replace the single shared `stream_pos`. A system
+   change still regenerates both frame pairs and resets both positions;
+   a FORMAT-only change now regenerates just the RF pair and restarts
+   only the RF stream, so CH1's composite signal keeps flowing without a
+   discontinuity (no decoder glitch on the CVBS panel when the format
+   cycles). Log line distinguishes the two paths
+   ("CH1 CVBS + CH2 RF" vs "CH2 RF only, CH1 CVBS continuous").
+
+Validation: build clean; gui_testgen_rf, gui_cvbs_baseband,
+gui_waveform_overlay all OK (the overlay harness exercises
+waveform_render_overlay only, so the gen-row gating has no harness
+coverage — needs GUI click-through).
+
+## Round 10 — MESECAM generator follow fixed (stale 0-2 guards)
+
+User report: "MESECAM auto cycle when I switch to that FM mode it should
+change to it on the fm decoder" — the Gen box cycling PAL -> NTSC ->
+SECAM -> MESECAM never flipped the RF Preview at the MESECAM step.
+
+Root cause: `gui_video_follow_generator_system`'s entry guard was still
+`system > 2` (a round-4 relic; the MESECAM-aware body from round 8 never
+ran for system 3). Two more 0-2 guards blocked the same value space:
+`gui_cvbs_set_default_system` (startup push of the persisted pick) and
+the RF plugin init hardcoding `gui_vhs_fm_set_format(..., 0)` (new RF
+panels always started PAL).
+
+Changes (all `gui_cvbs.c` + doc comments in `gui_cvbs.h` / `misrc_gui.c`):
+
+1. Follow guard now accepts 0-3: MESECAM flips the RF Preview to the
+   MESECAM_VHS profile (worker rebinding via gui_video_update_rf_routes)
+   while the composite/tape side maps 3 -> 2 (SECAM).
+2. `gui_cvbs_set_default_system` accepts 0-3, so a persisted MESECAM pick
+   survives relaunch.
+3. `video_panel_init_decoder_common` maps 3 -> 2 for the composite/tape
+   decoders (selected_system/selected_tape_format/set_format).
+4. `video_vhs_fm_plugin_init` starts new RF preview panels in the
+   generator's default system instead of hardcoded PAL.
+
+Validation: build clean; gui_testgen_rf, gui_cvbs_baseband,
+gui_waveform_overlay all OK. Follow behavior needs GUI click-through
+(overlay harness stubs the follow function).
+
+## Round 11 — MESECAM removed from the CVBS-mode Gen cycle
+
+User request: "Remove MESECAM from CVBS mode" — the Gen system button
+offered PAL -> NTSC -> SECAM -> MESECAM on EVERY waveform panel, but
+MESECAM is RF-only (a MESECAM generator's composite output is plain
+SECAM), so the step is meaningless in a CVBS/Audio signal context.
+
+Changes:
+
+1. `gui_oscilloscope.c` Gen button follows the panel's Signal pick (same
+   rule as the round-9 Fmt gating): FM RF panels cycle the full
+   PAL -> NTSC -> SECAM -> MESECAM; CVBS/Audio panels cycle
+   PAL -> NTSC -> SECAM only. A MESECAM generator state (set from an FM RF
+   panel) displays as its composite equivalent, "Gen: SECAM", on
+   CVBS/Audio panels and cycles on from there (SECAM -> PAL).
+2. `gui_waveform_overlay_harness.c`: stub `gui_testgen_clamp_system`
+   (next to the clamp_format stub) — the new click-handler call survived
+   LTO stripping and broke the harness link.
+
+Validation: build clean; gui_testgen_rf, gui_cvbs_baseband,
+gui_waveform_overlay all OK.
+
 ### Not yet done
 
-- User GUI click-through re-confirmation (bezel contrast, gen row, RF
-  follow).
-- Commit + restore-point zip only after user confirms it is working.
+- User GUI click-through re-confirmation (rounds 5-11; then commit).
+- CVBS right/top padding diagnosis (needs screenshot).
 - The stale-repo edits in `C:\Users\Harry\misrc_gui_dev` are uncommitted
   and NOT part of this work — decide whether to revert them there.

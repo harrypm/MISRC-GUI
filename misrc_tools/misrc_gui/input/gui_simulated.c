@@ -10,10 +10,15 @@
  *              chroma FM, matching the RF preview decoder profiles so the
  *              VHS FM panel decodes it live.
  *
- * Both channels follow app->settings.video_system (0=PAL, 1=NTSC, 2=SECAM);
- * a change detected in the capture loop regenerates the frames and restarts
- * the stream. TWO frames per system are pre-generated and streamed
- * alternately: SECAM's D'r/D'b line cadence and ident type alternate every
+ * Both channels follow app->settings.video_system (0=PAL, 1=NTSC,
+ * 2=SECAM, 3=MESECAM); a change detected in the capture loop regenerates
+ * the frames and restarts the stream. The tape format
+ * (app->settings.gen_tape_format) parameterizes the RF modulation ONLY:
+ * a format change regenerates and restarts the RF stream while CH1's
+ * composite stream keeps flowing continuously - the format cycle is
+ * decoupled from the CVBS channel (user request 2026-11-03). TWO frames
+ * per system are pre-generated and streamed alternately: SECAM's D'r/D'b
+ * line cadence and ident type alternate every
  * frame (a single repeated frame would hold one cadence and break field
  * identification).
  */
@@ -76,14 +81,21 @@ static int simulated_capture_thread(void *ctx) {
     }
 
     /* Pre-generated frames. cvbs_frame and rf_frame each hold TWO frames
-     * (indices 0 and 1) streamed alternately; both have the same sample
-     * count, so one position counter drives both channels. */
+     * (indices 0 and 1) streamed alternately; both pairs have the same
+     * sample count. */
     int sim_system = -1;   /* force first generation */
+    int sim_format = -1;   /* force first generation */
     int16_t *cvbs_frame = NULL;
     int16_t *rf_frame = NULL;
     size_t frame_samples = 0;      /* samples in ONE frame */
     size_t stream_samples = 0;     /* total across both frames */
-    uint64_t stream_pos = 0;       /* streaming position within the pair */
+    /* Per-channel streaming positions. Both frame pairs have the same
+     * length, but the positions are kept independent so a tape-FORMAT
+     * change (RF-only) restarts just the RF stream - CH1's composite
+     * signal keeps flowing without a discontinuity. A system change
+     * regenerates both pairs and resets both positions together. */
+    uint64_t cvbs_stream_pos = 0;  /* composite position within its pair */
+    uint64_t rf_stream_pos = 0;    /* RF position within its pair */
 
     fprintf(stderr, "[SIM] Simulated capture thread started at %d MSPS (writing to BUF_CAPTURE_RF)\n", SIM_SAMPLE_RATE / 1000000);
     fprintf(stderr, "[SIM] Channel A: hacktv-accurate CVBS (video_system setting)\n");
@@ -95,12 +107,11 @@ static int simulated_capture_thread(void *ctx) {
     uint64_t batch_count = 0;
 
     while (atomic_load(&app->sim_running)) {
-        /* System (PAL/NTSC/SECAM) follows the app's video_system setting;
-         * detect a change and regenerate both channels' frames. */
-        int want_system = app->settings.video_system;
-        if (want_system < 0 || want_system >= GUI_TESTGEN_SYSTEM_COUNT) {
-            want_system = GUI_TESTGEN_PAL;
-        }
+        /* System (PAL/NTSC/SECAM/MESECAM) and tape format follow the app's
+         * settings. A system change regenerates BOTH channels; a format
+         * change regenerates the RF frames only (see the branches below). */
+        int want_system = gui_testgen_clamp_system(app->settings.video_system);
+        int want_format = gui_testgen_clamp_format(app->settings.gen_tape_format);
         /* Channel mapping: the extraction thread swaps raw A/B for MISRC-mode
          * captures (the display's CH1 is fed from raw slot B), and this
          * device emulates the MISRC capture chain. Write the generator
@@ -115,7 +126,11 @@ static int simulated_capture_thread(void *ctx) {
         }
 
         if (want_system != sim_system) {
+            /* System change (or first batch): BOTH channels' signals
+             * change - composite scan geometry and RF modulation alike -
+             * so regenerate both pairs and restart both streams in step. */
             sim_system = want_system;
+            sim_format = want_format;
             size_t need = gui_testgen_frame_samples(
                 (gui_testgen_system_t)sim_system, SIM_SAMPLE_RATE);
             if (need > 0) {
@@ -135,15 +150,19 @@ static int simulated_capture_thread(void *ctx) {
                         (gui_testgen_system_t)sim_system, cvbs_frame + need,
                         need, SIM_SAMPLE_RATE, 1);
                     gui_testgen_rf_frame(
-                        (gui_testgen_system_t)sim_system, rf_frame, need,
+                        (gui_testgen_system_t)sim_system,
+                        (gui_testgen_format_t)sim_format, rf_frame, need,
                         SIM_SAMPLE_RATE, 0);
                     gui_testgen_rf_frame(
-                        (gui_testgen_system_t)sim_system, rf_frame + need,
+                        (gui_testgen_system_t)sim_system,
+                        (gui_testgen_format_t)sim_format, rf_frame + need,
                         need, SIM_SAMPLE_RATE, 1);
-                    stream_pos = 0;
-                    fprintf(stderr, "[SIM] Regenerated %s frames "
+                    cvbs_stream_pos = 0;
+                    rf_stream_pos = 0;
+                    fprintf(stderr, "[SIM] Regenerated %s %s frames "
                             "(2x %zu samples at %u MSPS): CH1 CVBS + CH2 RF\n",
                             gui_testgen_system_name((gui_testgen_system_t)sim_system),
+                            gui_testgen_format_name((gui_testgen_format_t)sim_format),
                             need, SIM_SAMPLE_RATE / 1000000);
                 } else {
                     free(grown_cvbs);
@@ -155,6 +174,30 @@ static int simulated_capture_thread(void *ctx) {
                         stream_samples = 0;
                     }
                 }
+            }
+        } else if (want_format != sim_format) {
+            /* Format-only change: the tape format parameterizes the RF
+             * modulation ONLY. Regenerate just the RF frame pair and
+             * restart its stream; CH1's composite pair is untouched (same
+             * system, same content) and keeps streaming continuously -
+             * the format cycle never disturbs the CVBS channel. */
+            sim_format = want_format;
+            if (frame_samples > 0 && rf_frame) {
+                gui_testgen_rf_frame(
+                    (gui_testgen_system_t)sim_system,
+                    (gui_testgen_format_t)sim_format, rf_frame,
+                    frame_samples, SIM_SAMPLE_RATE, 0);
+                gui_testgen_rf_frame(
+                    (gui_testgen_system_t)sim_system,
+                    (gui_testgen_format_t)sim_format, rf_frame + frame_samples,
+                    frame_samples, SIM_SAMPLE_RATE, 1);
+                rf_stream_pos = 0;
+                fprintf(stderr, "[SIM] Regenerated %s %s RF frames "
+                        "(2x %zu samples at %u MSPS): CH2 RF only, "
+                        "CH1 CVBS continuous\n",
+                        gui_testgen_system_name((gui_testgen_system_t)sim_system),
+                        gui_testgen_format_name((gui_testgen_format_t)sim_format),
+                        frame_samples, SIM_SAMPLE_RATE / 1000000);
             }
         }
 
@@ -172,9 +215,10 @@ static int simulated_capture_thread(void *ctx) {
              * keeps the ~0.72-0.87 generator amplitude inside the 12-bit
              * domain with headroom. */
             if (stream_samples > 0) {
-                size_t at = (size_t)(stream_pos % (uint64_t)stream_samples);
-                int16_t cvbs_s = (int16_t)(((double)cvbs_frame[at] / 32767.0) * 2170.0);
-                int16_t rf_s = (int16_t)(((double)rf_frame[at] / 32767.0) * 1024.0);
+                size_t at_cvbs = (size_t)(cvbs_stream_pos % (uint64_t)stream_samples);
+                size_t at_rf = (size_t)(rf_stream_pos % (uint64_t)stream_samples);
+                int16_t cvbs_s = (int16_t)(((double)cvbs_frame[at_cvbs] / 32767.0) * 2170.0);
+                int16_t rf_s = (int16_t)(((double)rf_frame[at_rf] / 32767.0) * 1024.0);
                 if (swap_ab) {
                     buf_a[i] = rf_s;   /* raw A -> display CH2 (tape RF) */
                     buf_b[i] = cvbs_s; /* raw B -> display CH1 (CVBS) */
@@ -182,7 +226,8 @@ static int simulated_capture_thread(void *ctx) {
                     buf_a[i] = cvbs_s;
                     buf_b[i] = rf_s;
                 }
-                stream_pos++;
+                cvbs_stream_pos++;
+                rf_stream_pos++;
             } else {
                 buf_a[i] = 0;
                 buf_b[i] = 0;

@@ -531,17 +531,19 @@ void gui_cvbs_render_frame(cvbs_decoder_t *decoder,
 // Uses cvbs_format_select_t from gui_app.h (CVBS_SELECT_PAL/CVBS_SELECT_NTSC)
 void gui_cvbs_set_format(cvbs_decoder_t *decoder, int format_select);
 
-// Startup default for the System selector (0=PAL, 1=NTSC, 2=SECAM), pushed
-// once from the persisted app settings after gui_settings_load; every
-// CVBS panel decoder is created in this system. The System dropdown's
-// click handler persists the user's pick back into the settings.
+// Startup default for the System selector (0=PAL, 1=NTSC, 2=SECAM,
+// 3=MESECAM), pushed once from the persisted app settings after
+// gui_settings_load; every panel decoder is created in this system
+// (MESECAM is RF-only: composite decoders start in SECAM, the RF preview
+// starts in the MESECAM profile). The System dropdown's click handler
+// persists the user's pick back into the settings.
 void gui_cvbs_set_default_system(int system_select);
 
 // Switch every Video panel's decoder previews (CVBS, Tape Decode, VHS FM
-// RF) to the Test Gen system (0=PAL, 1=NTSC, 2=SECAM). Called by the Gen
-// box on the waveform panel after it changes settings.video_system.
-// Manual panel selections keep working between generator changes; the
-// next Gen change flips the panels again.
+// RF) to the Test Gen system (0=PAL, 1=NTSC, 2=SECAM, 3=MESECAM).
+// Called by the Gen box on the waveform panel after it changes
+// settings.video_system. Manual panel selections keep working between
+// generator changes; the next Gen change flips the panels again.
 void gui_video_follow_generator_system(gui_app_t *app, int system);
 
 //-----------------------------------------------------------------------------

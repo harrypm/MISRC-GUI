@@ -79,8 +79,18 @@ static void check_bar_hues(const frames_t *f, int row0, int row1) {
         }
 }
 
+static void run_system_fmt(gui_testgen_system_t system,
+                          gui_testgen_format_t format,
+                          gui_rf_profile_t profile, int row0, int row1);
+
 static void run_system(gui_testgen_system_t system, gui_rf_profile_t profile,
                        int row0, int row1) {
+    run_system_fmt(system, GUI_TESTGEN_FORMAT_VHS, profile, row0, row1);
+}
+
+static void run_system_fmt(gui_testgen_system_t system,
+                          gui_testgen_format_t format,
+                          gui_rf_profile_t profile, int row0, int row1) {
     const size_t frame_samples =
         gui_testgen_frame_samples(system, TEST_RATE);
     assert(frame_samples > 0);
@@ -93,7 +103,7 @@ static void run_system(gui_testgen_system_t system, gui_rf_profile_t profile,
     assert(block && rf && frames.rgba);
 
     for (uint32_t idx = 0; idx < TEST_FRAMES; ++idx) {
-        size_t got = gui_testgen_rf_frame(system,
+        size_t got = gui_testgen_rf_frame(system, format,
                                           block + (size_t)idx * frame_samples,
                                           frame_samples, TEST_RATE, idx);
         assert(got == frame_samples);
@@ -115,8 +125,9 @@ static void run_system(gui_testgen_system_t system, gui_rf_profile_t profile,
         position += count;
     }
 
-    printf("%s: %d woven frames (%dx%d), H%d V%d C%d, %s\n",
-           gui_testgen_system_name(system), frames.frames,
+    printf("%s/%s: %d woven frames (%dx%d), H%d V%d C%d, %s\n",
+           gui_testgen_system_name(system), gui_testgen_format_name(format),
+           frames.frames,
            frames.width, frames.height, frames.status.h_locked,
            frames.status.v_locked, frames.status.color_locked,
            frames.status.reason);
@@ -136,11 +147,12 @@ static void run_system(gui_testgen_system_t system, gui_rf_profile_t profile,
 }
 
 int main(void) {
-    assert(gui_testgen_rf_frame(GUI_TESTGEN_SYSTEM_COUNT, NULL, 0,
-                                TEST_RATE, 0) == 0);
+    assert(gui_testgen_rf_frame(GUI_TESTGEN_SYSTEM_COUNT, GUI_TESTGEN_FORMAT_VHS,
+                                NULL, 0, TEST_RATE, 0) == 0);
     run_system(GUI_TESTGEN_PAL, GUI_RF_PROFILE_PAL_VHS, 200, 300);
     run_system(GUI_TESTGEN_NTSC, GUI_RF_PROFILE_NTSC_VHS, 150, 230);
     run_system(GUI_TESTGEN_SECAM, GUI_RF_PROFILE_SECAM_VHS, 200, 300);
-    printf("Test Gen RF: PAL/NTSC/SECAM decode with correct bar hues\n");
+    run_system(GUI_TESTGEN_MESECAM, GUI_RF_PROFILE_MESECAM_VHS, 200, 300);
+    printf("Test Gen RF: PAL/NTSC/SECAM/MESECAM decode with correct bar hues\n");
     return 0;
 }

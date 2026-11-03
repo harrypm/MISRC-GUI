@@ -9,6 +9,7 @@
 #include "../output/gui_audio.h"
 #include "gui_trigger.h"
 #include "gui_vhs_fm.h"
+#include "gui_rf_preview_geometry.h"  // shared full-frame display aspect
 #include "../processing/gui_rf_preview_pressure.h"
 #include "../visualization/gui_text.h"
 #include "../ui/gui_ui.h"
@@ -4369,8 +4370,19 @@ static void gui_cvbs_render_frame_impl(cvbs_decoder_t *decoder,
     // Upload to GPU
     UpdateTexture(decoder->frame_texture, decoder->frame_image.data);
 
-    // Calculate aspect-correct rectangle (4:3 aspect ratio for CVBS)
-    float aspect = 4.0f / 3.0f;
+    // Calculate the aspect-correct rectangle. Active mode (the picture crop)
+    // is 4:3. Full mode draws the entire frame (full line period x full
+    // field height) and uses the SAME shared full-frame display aspect as
+    // the RF preview's Full mode (gui_rf_preview_full_frame_aspect), so
+    // the two decoders' full-frame pictures align with each other — the
+    // previous fixed 4:3 squeezed the full frame horizontally (~1.51 PAL
+    // / ~1.456 NTSC real aspect stretched to 1.333).
+    float aspect;
+    if (decoder->frame_view_mode == CVBS_FRAME_VIEW_FULL) {
+        aspect = (float)gui_rf_preview_full_frame_aspect(field_h);
+    } else {
+        aspect = 4.0f / 3.0f;
+    }
     float display_aspect = width / height;
 
     float draw_w, draw_h;
@@ -5019,17 +5031,20 @@ static inline cvbs_decoder_t *video_panel_active_decoder(video_panel_state_t *pa
     return video_panel_decoder(panel, panel->active_plugin);
 }
 
-// Persisted default system (0=PAL, 1=NTSC, 2=SECAM): misrc_gui pushes the
-// loaded app setting here once at startup (gui_cvbs_set_default_system)
-// and every panel decoder is created in it. The System dropdown's click
-// handler writes the user's pick back to app->settings.video_system so
-// the exit-time settings save persists it across launches (user request,
+// Persisted default system (0=PAL, 1=NTSC, 2=SECAM, 3=MESECAM):
+// misrc_gui pushes the loaded app setting here once at startup
+// (gui_cvbs_set_default_system) and every panel decoder is created in
+// it. MESECAM is RF-only: the composite/tape decoders map it to SECAM at
+// creation time (video_panel_init_decoder_common) while the RF preview
+// keeps 3 = the MESECAM profile. The System dropdown's click handler
+// writes the user's pick back to app->settings.video_system so the
+// exit-time settings save persists it across launches (user request,
 // real-GUI 2026-10-20: "the system config should be persistent based off
 // what the user sets not just PAL always").
 static int s_cvbs_default_system = 0;
 
 void gui_cvbs_set_default_system(int system_select) {
-    if (system_select >= 0 && system_select <= 2) {
+    if (system_select >= 0 && system_select <= 3) {
         s_cvbs_default_system = system_select;
     }
 }
@@ -5052,13 +5067,15 @@ static bool video_panel_init_decoder_common(cvbs_decoder_t *decoder,
 
     // Start in the USER'S persisted system pick, not hardcoded PAL (the
     // tape plugin's apply_runtime_args overrides its own decoder right
-    // after this, so this only governs the CVBS-mode decoders).
-    decoder->overlay.selected_system = s_cvbs_default_system;
-    decoder->overlay.selected_tape_format = 0;  // 0=PAL, 1=NTSC, 2=SECAM
+    // after this, so this only governs the CVBS-mode decoders). MESECAM
+    // (3) is RF-only: the composite/tape side starts in SECAM (2).
+    int composite_default = (s_cvbs_default_system == 3) ? 2 : s_cvbs_default_system;
+    decoder->overlay.selected_system = composite_default;
+    decoder->overlay.selected_tape_format = composite_default;  // 0=PAL, 1=NTSC, 2=SECAM
     decoder->overlay.system_dropdown_open = false;
     decoder->overlay.tape_dropdown_open = false;
     decoder->overlay.tape_format_dropdown_open = false;
-    gui_cvbs_set_format(decoder, s_cvbs_default_system);
+    gui_cvbs_set_format(decoder, composite_default);
     cvbs_trace_mode_watch(decoder, trace_source);
     return true;
 }
@@ -5071,7 +5088,11 @@ static bool video_cvbs_plugin_init(video_cvbs_plugin_t *plugin) {
 static bool video_vhs_fm_plugin_init(video_vhs_fm_plugin_t *plugin) {
     if (!plugin) return false;
     if (!gui_vhs_fm_init(&plugin->decoder)) return false;
-    gui_vhs_fm_set_format(&plugin->decoder, 0);
+    // Start in the generator's default system (0=PAL..3=MESECAM; Betamax
+    // stays NTSC via set_format) instead of hardcoded PAL, so a panel
+    // created after a Gen change - or at startup with a persisted
+    // MESECAM pick - matches the live follow state.
+    gui_vhs_fm_set_format(&plugin->decoder, s_cvbs_default_system);
     plugin->decoder.overlay.is_visible = false;
     plugin->decoder.overlay.dropdown_open = false;
     return true;
@@ -5676,7 +5697,7 @@ static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *ap
     if (panel->chrome.controls_hidden) return;
 
     decoder->overlay.tape_rect = decoder->overlay.beta_preset_rect = (Rectangle){0};
-    decoder->overlay.mesecam_rect = (Rectangle){0};
+    for (int i = 0; i < 2; ++i) decoder->overlay.tape_opts_rect[i] = (Rectangle){0};
     for (int i = 0; i < 3; ++i) decoder->overlay.stats_opts_rect[i] = (Rectangle){0};
     if (bounds.width <= 0 || bounds.height <= 0) {
         decoder->overlay.is_visible = false;
@@ -5700,16 +5721,47 @@ static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *ap
     gui_text_draw(label, text_x, text_y, FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
     float control_y = btn_y + btn_h + 6;
     // One compact control per row, ordered from recording format to options.
-    const char *tape_label = decoder->overlay.selected_tape == 1 ? "Tape: Betamax" : "Tape: VHS";
-    float tape_w = (float)gui_text_measure(tape_label, FONT_SIZE_DROPDOWN_OPT) + 16;
+    // Tape family is a real dropdown ("Format:") listing VHS / Betamax - the
+    // cycle button was easy to overshoot (user request 2026-11-03).
+    const char *tape_label = decoder->overlay.selected_tape == 1 ? "Format: Betamax" : "Format: VHS";
+    float tape_w = (float)gui_text_measure(tape_label, FONT_SIZE_DROPDOWN_OPT) + 24;
     float tape_y = control_y;
     decoder->overlay.tape_rect = (Rectangle){x_right - tape_w, tape_y, tape_w, btn_h};
-    DrawRectangleRounded(decoder->overlay.tape_rect, 0.15f, 4, COLOR_BUTTON_HOVER);
+    Color tape_bg = decoder->overlay.tape_dropdown_open ? COLOR_BUTTON_HOVER : COLOR_BUTTON;
+    DrawRectangleRounded(decoder->overlay.tape_rect, 0.15f, 4, tape_bg);
     gui_text_draw(tape_label, decoder->overlay.tape_rect.x + 8,
                   tape_y + (btn_h - FONT_SIZE_DROPDOWN_OPT) * 0.5f,
                   FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+    // Dropdown arrow
+    {
+        float arrow_size = 5.0f;
+        float arrow_x = decoder->overlay.tape_rect.x + tape_w - 14.0f;
+        float arrow_cy = tape_y + btn_h * 0.5f;
+        if (decoder->overlay.tape_dropdown_open) {
+            Vector2 top = { arrow_x + arrow_size/2, arrow_cy - arrow_size/2 };
+            Vector2 left = { arrow_x, arrow_cy + arrow_size/2 };
+            Vector2 right = { arrow_x + arrow_size, arrow_cy + arrow_size/2 };
+            DrawTriangle(top, left, right, COLOR_TEXT);
+        } else {
+            Vector2 bottom = { arrow_x + arrow_size/2, arrow_cy + arrow_size/2 };
+            Vector2 left = { arrow_x, arrow_cy - arrow_size/2 };
+            Vector2 right = { arrow_x + arrow_size, arrow_cy - arrow_size/2 };
+            DrawTriangle(bottom, right, left, COLOR_TEXT);
+        }
+    }
+    // NOTE: the Format dropdown OPTIONS are drawn at the very END of this
+    // function (after every other control). Immediate-mode drawing means
+    // anything drawn later paints over them - rendering the popup inline
+    // here let the System/Preset/Frame/Budget/OSD rows below overwrite
+    // the options (user report 2026-11-03: "dropdown is broken (not
+    // overlaying)").
     control_y += btn_h + 6;
+    // TV system cycles PAL -> NTSC -> SECAM -> MESECAM. MESECAM is a
+    // first-class system (VHS SECAM tapes are MESECAM color-under);
+    // native SECAM covers 2" quad / 1" Type-C sources. The old dedicated
+    // MESECAM toggle was removed (user request 2026-11-03).
     const char *format_label = decoder->overlay.selected_tape ? "NTSC (fixed)"
+        : decoder->overlay.selected_system == 3 ? "System: MESECAM"
         : decoder->overlay.selected_system == 2 ? "System: SECAM"
         : decoder->overlay.selected_system == 1 ? "System: NTSC" : "System: PAL";
     float fmt_w = (float)gui_text_measure(format_label, FONT_SIZE_DROPDOWN_OPT) + 16;
@@ -5719,18 +5771,6 @@ static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *ap
     gui_text_draw(format_label, decoder->overlay.format_rect.x + 8, text_y,
                    FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
     control_y += btn_h + 6;
-    if (!decoder->overlay.selected_tape && decoder->overlay.selected_system == 2) {
-        const char *mesecam_label = decoder->overlay.secam_mesecam ? "MESECAM: On" : "MESECAM: Off";
-        float mesecam_w = (float)gui_text_measure(mesecam_label, FONT_SIZE_DROPDOWN_OPT) + 16;
-        decoder->overlay.mesecam_rect =
-            (Rectangle){x_right - mesecam_w, control_y, mesecam_w, btn_h};
-        DrawRectangleRounded(decoder->overlay.mesecam_rect, 0.15f, 4,
-                             decoder->overlay.secam_mesecam ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON);
-        gui_text_draw(mesecam_label, decoder->overlay.mesecam_rect.x + 8,
-                      control_y + (btn_h - FONT_SIZE_DROPDOWN_OPT) * 0.5f,
-                      FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
-        control_y += btn_h + 6;
-    }
     if (decoder->overlay.selected_tape) {
         char preset_label[40];
         snprintf(preset_label, sizeof(preset_label), "Preset: %s", gui_vhs_fm_get_beta_preset_name(decoder));
@@ -5768,13 +5808,15 @@ static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *ap
     gui_text_draw(budget_label,decoder->overlay.budget_rect.x+8,control_y+(btn_h-FONT_SIZE_DROPDOWN_OPT)*.5f,
                   FONT_SIZE_DROPDOWN_OPT,COLOR_TEXT);
     control_y += btn_h + 6;
-    // Stats view selector (All / Basic / Off) — a real dropdown so the stats
-    // readout is user-selectable. Its popup follows the final control row.
+    // OSD view selector (All / Basic / Off) — a real dropdown so the OSD
+    // readout is user-selectable. Renamed from "Stats:" to match the CVBS
+    // decoder's OSD naming (user request 2026-11-03). Its popup follows
+    // the final control row.
     static const char *stats_names[3] = { "All", "Basic", "Off" };
     int stats_view = decoder->overlay.stats_view;
     if (stats_view < 0 || stats_view > 2) stats_view = 0;
     char stats_label[40];
-    snprintf(stats_label, sizeof(stats_label), "Stats: %s", stats_names[stats_view]);
+    snprintf(stats_label, sizeof(stats_label), "OSD: %s", stats_names[stats_view]);
     float stats_w = (float)gui_text_measure(stats_label, FONT_SIZE_DROPDOWN_OPT) + 16;
     if (stats_w < 96.0f) stats_w = 96.0f;
     decoder->overlay.stats_btn_rect =
@@ -5810,6 +5852,31 @@ static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *ap
             const char *opt_lbl = stats_names[i];
             float ow = (float)gui_text_measure(opt_lbl, FONT_SIZE_DROPDOWN_OPT);
             gui_text_draw(opt_lbl,
+                          opt.x + (opt.width - ow) * 0.5f,
+                          opt.y + (opt_h - FONT_SIZE_DROPDOWN_OPT) * 0.5f,
+                          FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+        }
+    }
+
+    // Format (tape family) dropdown options - drawn LAST so no later
+    // control can overdraw the popup (see the note at the Format button).
+    // VHS / Betamax, clamped inside the panel like the stats popup.
+    if (decoder->overlay.tape_dropdown_open) {
+        const float opt_h = 20.0f;
+        const char *tape_opts[2] = { "VHS", "Betamax" };
+        float menu_y = decoder->overlay.tape_rect.y + btn_h;
+        if (menu_y + 2 * opt_h > bounds.y + bounds.height - 8)
+            menu_y = decoder->overlay.tape_rect.y - 2 * opt_h;
+        for (int i = 0; i < 2; i++) {
+            Rectangle opt = { decoder->overlay.tape_rect.x,
+                             menu_y + (float)i * opt_h,
+                             decoder->overlay.tape_rect.width, opt_h };
+            decoder->overlay.tape_opts_rect[i] = opt;
+            bool selected = (decoder->overlay.selected_tape == i);
+            bool hover = CheckCollisionPointRec(gui_ui_get_mouse_position(), opt);
+            DrawRectangleRec(opt, gui_dropdown_option_color(selected, hover));
+            float ow = (float)gui_text_measure(tape_opts[i], FONT_SIZE_DROPDOWN_OPT);
+            gui_text_draw(tape_opts[i],
                           opt.x + (opt.width - ow) * 0.5f,
                           opt.y + (opt_h - FONT_SIZE_DROPDOWN_OPT) * 0.5f,
                           FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
@@ -5903,22 +5970,33 @@ static bool cvbs_vtable_handle_click(void *state, gui_app_t *app, int channel,
             return true;
         }
 
+        // Format (tape family) dropdown: the open popup owns clicks,
+        // including when it opens above the button (stats pattern).
+        if (chrome_visible && vhs->overlay.tape_dropdown_open) {
+            panel->chrome.last_click_ms = 0;
+            for (int i = 0; i < 2; i++) {
+                if (CheckCollisionPointRec(mouse_pos, vhs->overlay.tape_opts_rect[i])) {
+                    if (i != vhs->overlay.selected_tape) {
+                        vhs->overlay.selected_tape = i;
+                        if (i) gui_vhs_fm_set_format(vhs, 1);
+                    }
+                    vhs->overlay.tape_dropdown_open = false;
+                    return true;
+                }
+            }
+            // Click outside the options closes the dropdown.
+            vhs->overlay.tape_dropdown_open = false;
+            return true;
+        }
         if (chrome_visible && CheckCollisionPointRec(mouse_pos,vhs->overlay.tape_rect)) {
             panel->chrome.last_click_ms=0;
-            vhs->overlay.selected_tape=(vhs->overlay.selected_tape+1)%2;
-            if (vhs->overlay.selected_tape) gui_vhs_fm_set_format(vhs,1);
+            vhs->overlay.tape_dropdown_open = !vhs->overlay.tape_dropdown_open;
             return true;
         }
         if (chrome_visible && vhs->overlay.selected_tape &&
             CheckCollisionPointRec(mouse_pos,vhs->overlay.beta_preset_rect)) {
             panel->chrome.last_click_ms=0;
             gui_vhs_fm_set_beta_preset(vhs, (vhs->overlay.beta_preset + 1) % GUI_BETA_PRESET_COUNT);
-            return true;
-        }
-        if (chrome_visible && !vhs->overlay.selected_tape && vhs->overlay.selected_system == 2 &&
-            CheckCollisionPointRec(mouse_pos,vhs->overlay.mesecam_rect)) {
-            panel->chrome.last_click_ms=0;
-            gui_vhs_fm_set_mesecam(vhs, !vhs->overlay.secam_mesecam);
             return true;
         }
         if (chrome_visible && CheckCollisionPointRec(mouse_pos,vhs->overlay.budget_rect)) {
@@ -5929,7 +6007,9 @@ static bool cvbs_vtable_handle_click(void *state, gui_app_t *app, int channel,
         }
         if (chrome_visible && CheckCollisionPointRec(mouse_pos, vhs->overlay.format_rect)) {
             panel->chrome.last_click_ms = 0;
-            gui_vhs_fm_set_format(vhs, (vhs->overlay.selected_system + 1) % 3);
+            // PAL -> NTSC -> SECAM -> MESECAM (MESECAM is a first-class TV
+            // system for VHS RF; native SECAM covers quad/Type-C sources).
+            gui_vhs_fm_set_format(vhs, (vhs->overlay.selected_system + 1) % 4);
             return true;
         }
         if (chrome_visible && CheckCollisionPointRec(mouse_pos, vhs->overlay.stats_btn_rect)) {
@@ -6218,16 +6298,21 @@ static const panel_vtable_t s_cvbs_vtable = {
 //-----------------------------------------------------------------------------
 
 // Switch EVERY Video panel's decoder previews to the Test Gen system
-// (0=PAL, 1=NTSC, 2=SECAM): the CVBS composite decoder, the Tape Decode
-// plugin (same value space) and the VHS FM RF preview profile (with worker
-// rebinding). Called from the Gen box on the waveform panel (UI thread)
-// after it updates settings.video_system. The user can override any panel
-// manually at any time (the panel selectors keep working); the NEXT Gen
-// change flips the panels again — "switch to the generator mode when the
-// signal changes, allow user override once flipped". Also makes newly
-// created panels start in the generator's system.
+// (0=PAL, 1=NTSC, 2=SECAM, 3=MESECAM): the CVBS composite decoder, the
+// Tape Decode plugin (same value space; MESECAM maps to SECAM there) and
+// the VHS FM RF preview profile (with worker rebinding; MESECAM takes the
+// MESECAM_VHS profile). Called from the Gen box on the waveform panel
+// (UI thread) after it updates settings.video_system. The user can
+// override any panel manually at any time (the panel selectors keep
+// working); the NEXT Gen change flips the panels again — "switch to the
+// generator mode when the signal changes, allow user override once
+// flipped". Also makes newly created panels start in the generator's
+// system.
 void gui_video_follow_generator_system(gui_app_t *app, int system) {
-    if (!app || system < 0 || system > 2) return;
+    // 0..3 (3=MESECAM, RF-only: composite decodes SECAM). The old <= 2
+    // guard silently dropped the MESECAM Gen step so the FM decoder never
+    // followed it (user report 2026-11-03).
+    if (!app || system < 0 || system > 3) return;
 
     bool any = false;
     while (atomic_flag_test_and_set(&app->panel_config_lock)) {
@@ -6244,18 +6329,20 @@ void gui_video_follow_generator_system(gui_app_t *app, int system) {
             if (view != PANEL_VIEW_CVBS || !state) continue;
             video_panel_state_t *panel = (video_panel_state_t *)state;
 
-            /* CVBS composite decoder: mirror the System dropdown action. */
-            panel->cvbs.decoder.overlay.selected_system = system;
-            gui_cvbs_set_format(&panel->cvbs.decoder, system);
+            /* CVBS composite decoder: mirror the System dropdown action.
+             * MESECAM (3) is RF-only - the composite side decodes SECAM. */
+            int composite_system = (system == 3) ? 2 : system;
+            panel->cvbs.decoder.overlay.selected_system = composite_system;
+            gui_cvbs_set_format(&panel->cvbs.decoder, composite_system);
 
             /* Tape Decode plugin: same value space + runtime args. */
-            panel->tape_decode.decoder.overlay.selected_system = system;
-            panel->tape_decode.decoder.overlay.selected_tape_format = system;
+            panel->tape_decode.decoder.overlay.selected_system = composite_system;
+            panel->tape_decode.decoder.overlay.selected_tape_format = composite_system;
             video_tape_apply_runtime_args(&panel->tape_decode,
                                           "generator_follow");
 
-            /* VHS FM RF preview: follows the system while the tape family
-             * allows it (Betamax stays NTSC by design). */
+            /* VHS FM RF preview: follows the system (3 = MESECAM profile)
+             * while the tape family allows it (Betamax stays NTSC). */
             int profile_before = (int)gui_vhs_fm_get_profile(&panel->vhs_fm.decoder);
             gui_vhs_fm_set_format(&panel->vhs_fm.decoder, system);
             int profile_after = (int)gui_vhs_fm_get_profile(&panel->vhs_fm.decoder);

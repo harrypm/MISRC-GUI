@@ -619,6 +619,9 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     // loads (0=PAL, 1=NTSC, 2=SECAM - the CVBS System selector's space).
     settings->video_system = 0;
 
+    // Test Gen default tape format: VHS (0=VHS..4=Hi8).
+    settings->gen_tape_format = 0;
+
     // Server/Client networking defaults (cxadc_vhs_server-style). Stock mode
     // is Local (no networking). Default port 8080 mirrors the reference server.
     settings->net_mode = 0;                     // 0=Local, 1=unified Server, 2=Client, 3=old Server ID, 4=M-Client
@@ -794,6 +797,7 @@ void gui_settings_save(const gui_settings_t *settings) {
     fprintf(f, "  \"demod_volume\": %.3f,\n", settings->demod_volume);
     fprintf(f, "  \"demod_output_pair\": %d,\n", settings->demod_output_pair);
     fprintf(f, "  \"video_system\": %d,\n", settings->video_system);
+    fprintf(f, "  \"gen_tape_format\": %d,\n", settings->gen_tape_format);
     // Server/Client networking (cxadc_vhs_server-style peer mode).
     fprintf(f, "  \"net_mode\": %d,\n", settings->net_mode);
     fprintf(f, "  \"net_server_port\": %u,\n", (unsigned)settings->net_server_port);
@@ -1526,10 +1530,16 @@ void gui_settings_load(gui_settings_t *settings) {
         settings->demod_output_pair = atoi(value);
     }
     // Video panel: the CVBS System selector's persisted pick; an invalid
-    // saved value keeps the PAL default.
+    // saved value keeps the PAL default. (The generator Gen box may store
+    // 3 = MESECAM here - RF-only, composite maps it to SECAM.)
     if ((value = find_value(content, "video_system")) != NULL) {
         int sys = atoi(value);
-        if (sys >= 0 && sys <= 2) settings->video_system = sys;
+        if (sys >= 0 && sys <= 3) settings->video_system = sys;
+    }
+    // Test Gen tape format family; an invalid saved value keeps VHS.
+    if ((value = find_value(content, "gen_tape_format")) != NULL) {
+        int fmt = atoi(value);
+        if (fmt >= 0 && fmt <= 4) settings->gen_tape_format = fmt;
     }
 
     // Server/Client networking (cxadc_vhs_server-style peer mode).

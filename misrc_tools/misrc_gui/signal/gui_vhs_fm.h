@@ -31,15 +31,19 @@ typedef struct vhs_fm_decoder {
     vhs_fm_format_t format;
     struct {
         Rectangle button_rect, format_rect, budget_rect, tape_rect, beta_preset_rect;
-        Rectangle mesecam_rect;
+        Rectangle tape_opts_rect[2];   // Format dropdown options: VHS / Betamax
         Rectangle stats_btn_rect, stats_opts_rect[3];
         Rectangle frame_rect;
         bool is_visible, dropdown_open, stats_dropdown_open;
-        int selected_system;         // VHS RF: 0 = PAL, 1 = NTSC, 2 = SECAM
+        bool tape_dropdown_open;      // Format (tape family) dropdown open
+        // TV system: 0 = PAL, 1 = NTSC, 2 = native SECAM, 3 = MESECAM.
+        // MESECAM is a first-class system here (VHS SECAM tapes are
+        // heterodyne MESECAM); native SECAM stays for quad/1" sources.
+        int selected_system;
         int selected_tape;            // 0 = VHS, 1 = Betamax (NTSC only)
-        bool secam_mesecam;           // SECAM VHS heterodyne recording; off selects native SECAM
+        bool secam_mesecam;           // Legacy flag kept for API compat; the profile now keys off selected_system == 3
         gui_beta_preset_t beta_preset; // Betamax / Betamax Hi-Fi / SuperBeta / ED Beta
-        int stats_view;               // 0 = All, 1 = Basic, 2 = Off
+        int stats_view;               // 0 = All, 1 = Basic, 2 = Off (OSD view)
         int frame_mode;               // 0 = Active, 1 = Full (VBI + burst view)
     } overlay;
     // controls_hidden + the double-click tracker live on video_panel_state_t

@@ -62,16 +62,23 @@ void gui_vhs_fm_reset(vhs_fm_decoder_t *decoder) {
 }
 void gui_vhs_fm_set_format(vhs_fm_decoder_t *decoder, int format_select) {
     if (!decoder) return;
-    int system = format_select >= 0 && format_select <= 2 ? format_select : 0;
+    // 0 = PAL, 1 = NTSC, 2 = native SECAM, 3 = MESECAM (a first-class TV
+    // system for VHS RF: VHS "SECAM" tapes are MESECAM color-under; native
+    // SECAM FM is the 2" quad / 1" Type-C domain).
+    int system = format_select >= 0 && format_select <= 3 ? format_select : 0;
     decoder->overlay.selected_system = decoder->overlay.selected_tape ? 1 : system;
     decoder->format = gui_vhs_fm_get_format(decoder);
     // The UI route update rebinds this subscriber; other subscribers keep their system.
 }
 void gui_vhs_fm_set_mesecam(vhs_fm_decoder_t *decoder, bool enabled) {
     if (!decoder) return;
+    // Legacy API kept for callers that predate the 4-system selector:
+    // maps onto the system value that now drives the profile.
     decoder->overlay.secam_mesecam = enabled;
+    if (decoder->overlay.selected_system == 2 || decoder->overlay.selected_system == 3) {
+        decoder->overlay.selected_system = enabled ? 3 : 2;
+    }
     decoder->format = gui_vhs_fm_get_format(decoder);
-    // Only SECAM VHS uses this option; keep the remembered value on other systems.
 }
 void gui_vhs_fm_set_beta_preset(vhs_fm_decoder_t *decoder, int preset) {
     if (!decoder) return;
@@ -95,8 +102,13 @@ gui_rf_profile_t gui_vhs_fm_get_profile(const vhs_fm_decoder_t *decoder) {
         return decoder->overlay.beta_preset == GUI_BETA_PRESET_BETAMAX_HIFI
             ? GUI_RF_PROFILE_NTSC_BETAMAX_HIFI : GUI_RF_PROFILE_NTSC_BETAMAX;
     }
+    // TV system: 3 = MESECAM (VHS SECAM tapes), 2 = native SECAM FM
+    // (2" quad / 1" Type-C domain) - the dedicated MESECAM toggle was
+    // removed; the system selector owns the distinction (user 2026-11-03).
+    if (decoder && decoder->overlay.selected_system == 3)
+        return GUI_RF_PROFILE_MESECAM_VHS;
     if (decoder && decoder->overlay.selected_system == 2)
-        return decoder->overlay.secam_mesecam ? GUI_RF_PROFILE_MESECAM_VHS : GUI_RF_PROFILE_SECAM_VHS;
+        return GUI_RF_PROFILE_SECAM_VHS;
     return decoder && decoder->overlay.selected_system == 1 ? GUI_RF_PROFILE_NTSC_VHS : GUI_RF_PROFILE_PAL_VHS;
 }
 void gui_vhs_fm_set_frame_mode(vhs_fm_decoder_t *decoder, int mode_select) {
@@ -187,7 +199,12 @@ void gui_vhs_fm_render_frame(vhs_fm_decoder_t *decoder, float x, float y,
     }
 
     // Display both original fields, in their original alternating rows.
-    if (decoder->texture_valid && supported && (status->v_locked || decoder->stats.paused)) {
+    // Draw whenever a decoded frame EXISTS - including while sync is being
+    // acquired or when the decoder system does not match the signal: hiding
+    // the picture until lock would blank the wrong-decoder decode attempt,
+    // which is a useful visualization (user report 2026-11-03). The reason
+    // line below communicates the lock state.
+    if (decoder->texture_valid && supported) {
         if (decoder->generation != decoder->displayed_generation) {
             decoder->displayed_generation = decoder->generation;
             decoder->displayed_frames++;

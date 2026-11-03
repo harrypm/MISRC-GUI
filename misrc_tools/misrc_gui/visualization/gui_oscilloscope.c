@@ -10,6 +10,7 @@
 #include "gui_phosphor_rt.h"
 #include "gui_fft.h"
 #include "../signal/gui_trigger.h"
+#include "../signal/gui_testgen.h"  // Gen row: format names/clamps
 #include "../ui/gui_popup.h"
 #include "gui_text.h"
 #include "../ui/gui_ui.h"
@@ -56,17 +57,26 @@ static const char *s_render_mode_labels[] = {
     [WAVEFORM_MODE_PHOSPHOR] = "Phosphor",
 };
 
-// Per-panel signal type, assigned through the Signal overlay dropdown.
-// Drives the channel label (e.g. "CH1 CVBS", "CH2 FM RF") and the trigger
-// defaults for that panel. Matches the Test Gen channel mapping (CH1 =
-// composite CVBS, CH2 = tape RF) but stays useful for any source.
+// Per-panel signal type, assigned through the Signal dropdown on the
+// generator row. Drives the channel label (e.g. "CH1 CVBS", "CH2 FM RF")
+// and the trigger defaults for that panel. Matches the Test Gen channel
+// mapping: CH1 = composite CVBS, CH2 = tape RF.
+// WAVE_SIGNAL_RAW is only the internal pre-default state of a freshly
+// created panel (replaced by the channel default at first render/click);
+// it is NOT selectable in the dropdown (user request 2026-11-03).
 typedef enum {
-    WAVE_SIGNAL_RAW = 0,   // Plain channel view (default, label "CH A"/"CH B")
+    WAVE_SIGNAL_RAW = 0,   // Pre-default internal state (never user-selected)
     WAVE_SIGNAL_CVBS,      // Composite video (CVBS H-sync trigger default)
     WAVE_SIGNAL_FM_RF,     // Tape FM RF (rising-edge trigger default)
     WAVE_SIGNAL_AUDIO,     // Audio-band signal (rising-edge trigger default)
     WAVE_SIGNAL_COUNT
 } waveform_signal_type_t;
+
+// Number of SELECTABLE signal options (everything except RAW).
+#define WAVE_SIGNAL_OPTION_COUNT (WAVE_SIGNAL_COUNT - 1)
+// Map a displayed option index (0..WAVE_SIGNAL_OPTION_COUNT-1) to its
+// signal type value: the dropdown lists CVBS / FM RF / Audio.
+#define WAVE_SIGNAL_OPTION_VALUE(i) ((waveform_signal_type_t)((i) + 1))
 
 static const char *s_signal_labels[WAVE_SIGNAL_COUNT] = {
     [WAVE_SIGNAL_RAW] = "Raw",
@@ -142,13 +152,29 @@ typedef struct {
     gui_chrome_hide_t chrome_hide;
 
     // Simulated-device system selector button (visible only when the
-    // Simulated device is selected; cycles PAL -> NTSC -> SECAM).
+    // Simulated device is selected; cycles PAL -> NTSC -> SECAM, plus the
+    // MESECAM step on FM RF signal panels - MESECAM is RF-only, so CVBS /
+    // Audio panels never offer or display it).
     Rectangle sim_sys_btn_rect;
+
+    // Generator tape-format selector button (test mode only, FM RF signal
+    // panels only — a tape format parameterizes the RF modulation, so it
+    // has no meaning in a CVBS/Audio context and the button is absent
+    // there; cycles VHS -> S-VHS -> Betamax -> Video8 -> Hi8). Zeroed
+    // (inert) whenever it is not rendered.
+    Rectangle sim_fmt_btn_rect;
 
     panel_menu_item_t menu_items[TRIGGER_MODE_COUNT];
 
     // Drag state for trigger level
     bool dragging;
+
+    // Middle-button double-click tracker (350 ms / 6 px, same thresholds as
+    // the chrome-hide double-click): two middle clicks on the panel reset
+    // the waveform to the stock position (default zoom + centered trigger
+    // level). User request 2026-11-03.
+    uint64_t mm_last_click_ms;
+    float mm_last_click_x, mm_last_click_y;
 
     // Config-changed flag (guarded by data_lock): set when zoom / trigger
     // settings change (scroll, dropdowns, level drag). Cleared when the
@@ -724,10 +750,22 @@ static void waveform_channel_label(char *buf, size_t len, int channel,
     }
 }
 
-// Apply the trigger defaults for a signal type selection. Raw leaves the
-// current trigger configuration untouched. Trigger fields are shared with
-// the display thread, so the change is made under the panel data lock with
-// config_dirty set (live re-render while playback is paused).
+static void waveform_apply_signal_defaults(waveform_panel_state_t *state,
+                                           waveform_signal_type_t type);
+
+// Channel default signal type: CH1 = composite CVBS, CH2 = tape FM RF
+// (the Test Gen channel mapping). Applied once, at the panel's first
+// render/click, so the waveform monitors open with the generator mapping
+// already assigned (user request 2026-11-03: "set cvbs on ch1 and fm rf
+// on ch2 on default opening"). Raw is never user-selectable.
+static void waveform_apply_channel_signal_default(waveform_panel_state_t *state,
+                                                  int channel) {
+    if (!state || state->signal_type != WAVE_SIGNAL_RAW) return;
+    waveform_apply_signal_defaults(state,
+                                   (channel == 1) ? WAVE_SIGNAL_FM_RF
+                                                  : WAVE_SIGNAL_CVBS);
+}
+
 static void waveform_apply_signal_defaults(waveform_panel_state_t *state,
                                            waveform_signal_type_t type) {
     if (!state) return;
@@ -1670,7 +1708,7 @@ static bool waveform_handle_control_click(waveform_panel_state_t *state, struct 
     Rectangle scale_menu = state->scale_opts_rect[0];
     scale_menu.height = 5 * 20;
     Rectangle signal_menu = state->signal_opts_rect[0];
-    signal_menu.height = WAVE_SIGNAL_COUNT * 20;
+    signal_menu.height = WAVE_SIGNAL_OPTION_COUNT * 20;
     bool click_on_menu =
         (state->render_mode_dropdown_open && CheckCollisionPointRec(click, render_menu)) ||
         (state->trigger_dropdown_open && CheckCollisionPointRec(click, trigger_menu)) ||
@@ -1689,10 +1727,12 @@ static bool waveform_handle_control_click(waveform_panel_state_t *state, struct 
     }
 
     if (state->signal_dropdown_open) {
-        for (int i = 0; i < WAVE_SIGNAL_COUNT; i++) {
+        // Options list CVBS / FM RF / Audio (Raw is not selectable)
+        for (int i = 0; i < WAVE_SIGNAL_OPTION_COUNT; i++) {
             Rectangle opt_rect = state->signal_opts_rect[i];
             if (CheckCollisionPointRec(click, opt_rect)) {
-                waveform_apply_signal_defaults(state, (waveform_signal_type_t)i);
+                waveform_apply_signal_defaults(state,
+                                               WAVE_SIGNAL_OPTION_VALUE(i));
                 state->signal_dropdown_open = false;
                 return true;
             }
@@ -1823,6 +1863,7 @@ static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, in
     if (!state_ptr || !app) return false;
     waveform_panel_state_t *state = (waveform_panel_state_t *)state_ptr;
     waveform_apply_channel_trigger_source_default(state, channel);
+    waveform_apply_channel_signal_default(state, channel);
 
     // Click outside the panel resets double-click tracking.
     if (!CheckCollisionPointRec(click, bounds)) {
@@ -1831,20 +1872,51 @@ static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, in
     }
 
     // Simulated-device system selector button (rendered by waveform_render,
-    // test mode only): cycles PAL -> NTSC -> SECAM; the simulated capture
-    // thread detects the settings.video_system change on its next batch and
-    // regenerates both channels. Video panels still following the generator
-    // switch their decoder previews to the new system (user selections on a
-    // panel stop that panel from following).
+    // test mode only): cycles PAL -> NTSC -> SECAM, plus MESECAM on FM RF
+    // signal panels. MESECAM is an RF-only system (VHS SECAM tapes are
+    // MESECAM color-under; the composite side of a MESECAM generator is
+    // plain SECAM), so CVBS/Audio panels cycle the 3 composite systems and
+    // a MESECAM generator state displays as its composite equivalent,
+    // SECAM, cycling on from there (user request 2026-11-03: "remove
+    // MESECAM from CVBS mode"). The simulated capture thread detects the
+    // settings.video_system change on its next batch and regenerates both
+    // channels. Every Video panel's decoder previews switch to the new
+    // system (manual picks keep working between generator changes; the
+    // next Gen change flips them again).
     if (state->sim_sys_btn_rect.width > 0 &&
         CheckCollisionPointRec(click, state->sim_sys_btn_rect)) {
-        int next = (app->settings.video_system + 1) % 3;
+        int cur = gui_testgen_clamp_system(app->settings.video_system);
+        int span = (state->signal_type == WAVE_SIGNAL_FM_RF) ? 4 : 3;
+        int base = (span == 3 && cur == 3) ? 2 : cur;
+        int next = (base + 1) % span;
         app->settings.video_system = next;
         gui_settings_save(&app->settings);
         gui_video_follow_generator_system(app, next);
         gui_app_set_status(app, next == 0 ? "Test Gen: PAL" :
                                  next == 1 ? "Test Gen: NTSC" :
-                                            "Test Gen: SECAM");
+                                 next == 2 ? "Test Gen: SECAM" :
+                                            "Test Gen: MESECAM");
+        return true;
+    }
+
+    // Generator tape-format selector button (test mode only, FM RF signal
+    // panels — the render path zeroes the rect in every other context, so
+    // the width gate doubles as the visibility gate): cycles
+    // VHS -> S-VHS -> Betamax -> Video8 -> Hi8; the simulated capture
+    // thread detects the settings.gen_tape_format change on its next batch
+    // and regenerates ONLY the RF modulation parameters (CH1's composite
+    // stream keeps flowing untouched).
+    if (state->sim_fmt_btn_rect.width > 0 &&
+        CheckCollisionPointRec(click, state->sim_fmt_btn_rect)) {
+        int next_fmt = (gui_testgen_clamp_format(app->settings.gen_tape_format) + 1)
+                       % GUI_TESTGEN_FORMAT_COUNT;
+        app->settings.gen_tape_format = next_fmt;
+        gui_settings_save(&app->settings);
+        gui_app_set_status(app, next_fmt == 0 ? "Test Gen Format: VHS" :
+                                 next_fmt == 1 ? "Test Gen Format: S-VHS" :
+                                 next_fmt == 2 ? "Test Gen Format: Betamax" :
+                                 next_fmt == 3 ? "Test Gen Format: Video8" :
+                                                "Test Gen Format: Hi8");
         return true;
     }
 
@@ -1989,10 +2061,42 @@ static void waveform_render(void *state_ptr, gui_app_t *app, int channel,
     waveform_panel_state_t *state = (waveform_panel_state_t *)state_ptr;
     if (!state->initialized) return;
     waveform_apply_channel_trigger_source_default(state, channel);
+    waveform_apply_channel_signal_default(state, channel);
 
     // Sync the global amplitude scale mode into the per-panel mirror so the
     // overlay dropdown (which has no app pointer) can read + display it.
     state->scale_mode = app->settings.waveform_scale_mode;
+
+    // Middle-button double-click: reset the waveform view to the stock
+    // position (default zoom, trigger level centered, phosphor cleared).
+    // The left-click dispatch never sees the middle button, so this is
+    // polled here per frame with a bounds hit test.
+    if (IsMouseButtonPressed(MOUSE_MIDDLE_BUTTON) && !gui_popup_is_open()) {
+        Vector2 mouse = gui_ui_get_mouse_position();
+        if (CheckCollisionPointRec(mouse, bounds)) {
+            uint64_t now_ms = get_time_ms();
+            bool double_click =
+                state->mm_last_click_ms != 0 &&
+                now_ms >= state->mm_last_click_ms &&
+                now_ms - state->mm_last_click_ms <= 350 &&
+                fabsf(mouse.x - state->mm_last_click_x) <= 6.0f &&
+                fabsf(mouse.y - state->mm_last_click_y) <= 6.0f;
+            state->mm_last_click_ms = double_click ? 0 : now_ms;
+            state->mm_last_click_x = mouse.x;
+            state->mm_last_click_y = mouse.y;
+            if (double_click) {
+                waveform_state_lock(state);
+                state->zoom_scale = ZOOM_SCALE_DEFAULT;
+                state->trigger_level = 0;
+                state->trigger_display_pos = -1;
+                state->config_dirty = true;
+                waveform_state_unlock(state);
+                if (state->phosphor) {
+                    phosphor_rt_clear(state->phosphor);
+                }
+            }
+        }
+    }
 
     // Update drag state for trigger level (continuous while mouse is held)
     waveform_panel_update_drag(state, app, bounds);
@@ -2030,13 +2134,20 @@ static void waveform_render(void *state_ptr, gui_app_t *app, int channel,
     // Generator option row: rendered AFTER the waveform so the phosphor
     // texture and grid drawing cannot cover it, one row BELOW the
     // Scale/Mode/Trig group, right-aligned at the same margin:
-    //     [Signal: Raw/CVBS/FM RF/Audio]  [Gen: PAL/NTSC/SECAM]
+    //     [Signal: Raw/CVBS/FM RF/Audio] [Fmt: VHS] [Gen: PAL/NTSC/SECAM/MESECAM]
     // TEST MODE ONLY (Simulated device active, not recording, no playback
     // session — see waveform_test_mode_active): the generator options never
     // appear on real capture devices or FLAC playback. The Gen button
     // cycles the system (the simulated capture thread regenerates both
-    // channels; following Video panels switch decoders). The Signal button
-    // assigns this channel's signal type (label + trigger defaults).
+    // channels; every Video panel's decoders follow) — the MESECAM step is
+    // FM RF signal panels only, matching the composite reality that a
+    // MESECAM generator's CVBS output is plain SECAM. The Fmt button
+    // cycles the tape format driving the RF parameters — it renders on FM
+    // RF signal panels ONLY: a tape format does not apply to a composite
+    // or audio signal, and the button follows the panel's Signal pick
+    // rather than the CH1/CH2 channel mapping, so the default CVBS panel
+    // shows just [Signal][Gen] (user request 2026-11-03). The Signal
+    // button assigns this channel's signal type (label + trigger defaults).
     {
         if (waveform_test_mode_active(app) &&
             !gui_chrome_hide_hidden(&state->chrome_hide)) {
@@ -2044,10 +2155,12 @@ static void waveform_render(void *state_ptr, gui_app_t *app, int channel,
             const float row_y = bounds.y + 8.0f + btn_h + 6.0f;
             const float x_right = bounds.x + bounds.width - 8.0f;
 
-            // Gen system button (rightmost on the row)
-            const char *sys_labels[] = {"PAL", "NTSC", "SECAM"};
-            int sys = app->settings.video_system;
-            if (sys < 0 || sys > 2) sys = 0;
+            // Gen system button (rightmost on the row). MESECAM is RF-only:
+            // display the composite-equivalent system (SECAM) on non-FM-RF
+            // panels so MESECAM never appears in a CVBS/Audio context.
+            const char *sys_labels[] = {"PAL", "NTSC", "SECAM", "MESECAM"};
+            int sys = gui_testgen_clamp_system(app->settings.video_system);
+            if (sys == 3 && state->signal_type != WAVE_SIGNAL_FM_RF) sys = 2;
             char gen_label[24];
             snprintf(gen_label, sizeof(gen_label), "Gen: %s", sys_labels[sys]);
             float gen_w = (float)gui_text_measure(gen_label, FONT_SIZE_DROPDOWN_OPT) + 16.0f;
@@ -2059,37 +2172,66 @@ static void waveform_render(void *state_ptr, gui_app_t *app, int channel,
                           row_y + (btn_h - FONT_SIZE_DROPDOWN_OPT) * 0.5f,
                           FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
 
-            // Signal type dropdown (to the left of the Gen button)
+            // Tape-format selector (between Signal and Gen) — FM RF signal
+            // panels only: a tape format parameterizes the RF modulation,
+            // so CVBS/Audio panels skip the button entirely (rect zeroed,
+            // keeping its click handler inert) and Signal anchors directly
+            // next to Gen.
+            bool show_fmt = (state->signal_type == WAVE_SIGNAL_FM_RF);
+            float fmt_x = gen_x;
+            if (show_fmt) {
+                int fmt = gui_testgen_clamp_format(app->settings.gen_tape_format);
+                char fmt_label[32];
+                snprintf(fmt_label, sizeof(fmt_label), "Fmt: %s",
+                         gui_testgen_format_name((gui_testgen_format_t)fmt));
+                float fmt_w = (float)gui_text_measure(fmt_label, FONT_SIZE_DROPDOWN_OPT) + 16.0f;
+                if (fmt_w < 96.0f) fmt_w = 96.0f;
+                fmt_x = gen_x - 8.0f - fmt_w;
+                if (fmt_x < bounds.x + 8.0f) fmt_x = bounds.x + 8.0f;
+                state->sim_fmt_btn_rect = (Rectangle){fmt_x, row_y, fmt_w, btn_h};
+                DrawRectangleRounded(state->sim_fmt_btn_rect, 0.15f, 4, COLOR_BUTTON_ACTIVE);
+                gui_text_draw(fmt_label, fmt_x + 8.0f,
+                              row_y + (btn_h - FONT_SIZE_DROPDOWN_OPT) * 0.5f,
+                              FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+            } else {
+                state->sim_fmt_btn_rect = (Rectangle){0};
+            }
+
+            // Signal type dropdown (leftmost on the row)
             char signal_label[40];
             snprintf(signal_label, sizeof(signal_label), "Signal: %s",
                      s_signal_labels[state->signal_type]);
             float sig_w = (float)gui_text_measure(signal_label, FONT_SIZE_DROPDOWN_OPT) + 28.0f;
             if (sig_w < 110.0f) sig_w = 110.0f;
-            float sig_x = gen_x - 8.0f - sig_w;
+            float sig_x = fmt_x - 8.0f - sig_w;
             if (sig_x < bounds.x + 8.0f) sig_x = bounds.x + 8.0f;
             state->signal_btn_rect = (Rectangle){sig_x, row_y, sig_w, btn_h};
             draw_dropdown_button(state->signal_btn_rect, signal_label,
                                  state->signal_dropdown_open);
 
-            // Signal dropdown options (below the button, clamped in-bounds)
+            // Signal dropdown options (below the button, clamped in-bounds).
+            // Lists CVBS / FM RF / Audio — Raw is not selectable.
             if (state->signal_dropdown_open) {
                 const float opt_h = 20.0f;
                 float opt_y = fmaxf(bounds.y,
                     fminf(row_y + btn_h,
-                          bounds.y + bounds.height - opt_h * WAVE_SIGNAL_COUNT - 4.0f));
+                          bounds.y + bounds.height -
+                              opt_h * WAVE_SIGNAL_OPTION_COUNT - 4.0f));
                 DrawRectangleRounded(
-                    (Rectangle){sig_x, opt_y, sig_w, opt_h * WAVE_SIGNAL_COUNT},
+                    (Rectangle){sig_x, opt_y, sig_w,
+                                opt_h * WAVE_SIGNAL_OPTION_COUNT},
                     0.1f, 4, COLOR_PANEL_BG);
                 Vector2 mouse = gui_ui_get_mouse_position();
-                for (int i = 0; i < WAVE_SIGNAL_COUNT; i++) {
+                for (int i = 0; i < WAVE_SIGNAL_OPTION_COUNT; i++) {
+                    waveform_signal_type_t value = WAVE_SIGNAL_OPTION_VALUE(i);
                     Rectangle opt_rect = {sig_x, opt_y + i * opt_h, sig_w, opt_h};
                     state->signal_opts_rect[i] = opt_rect;
-                    bool is_selected = (state->signal_type == (waveform_signal_type_t)i);
+                    bool is_selected = (state->signal_type == value);
                     bool hover = CheckCollisionPointRec(mouse, opt_rect);
                     DrawRectangleRec(opt_rect, gui_dropdown_option_color(is_selected, hover));
-                    int opt_w = gui_text_measure(s_signal_labels[i],
+                    int opt_w = gui_text_measure(s_signal_labels[value],
                                                  FONT_SIZE_DROPDOWN_OPT);
-                    gui_text_draw(s_signal_labels[i],
+                    gui_text_draw(s_signal_labels[value],
                                   sig_x + sig_w / 2.0f - opt_w / 2.0f,
                                   opt_y + i * opt_h +
                                       (opt_h - FONT_SIZE_DROPDOWN_OPT) / 2.0f,
@@ -2098,6 +2240,7 @@ static void waveform_render(void *state_ptr, gui_app_t *app, int channel,
             }
         } else {
             state->sim_sys_btn_rect = (Rectangle){0};
+            state->sim_fmt_btn_rect = (Rectangle){0};
             state->signal_btn_rect = (Rectangle){0};
             // No stale open popup once the generator row is hidden.
             state->signal_dropdown_open = false;

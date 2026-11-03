@@ -295,10 +295,22 @@ static void ht_rgb_to_yuv(const ht_config_t *c, double r, double g, double b,
 
 /* --- Public API ----------------------------------------------------------- */
 
+int gui_testgen_clamp_system(int system) {
+    if (system < 0 || system >= GUI_TESTGEN_SYSTEM_COUNT) return GUI_TESTGEN_PAL;
+    return system;
+}
+
+int gui_testgen_clamp_format(int format) {
+    if (format < 0 || format >= GUI_TESTGEN_FORMAT_COUNT) return GUI_TESTGEN_FORMAT_VHS;
+    return format;
+}
+
 size_t gui_testgen_frame_samples(gui_testgen_system_t system, uint32_t sample_rate) {
     if ((int)system < 0 || (int)system >= GUI_TESTGEN_SYSTEM_COUNT || sample_rate == 0) {
         return 0;
     }
+    /* MESECAM shares the SECAM (625-line) composite geometry. */
+    if (system == GUI_TESTGEN_MESECAM) system = GUI_TESTGEN_SECAM;
     const ht_config_t *c = &HT_CONF[system];
     /* Line period: PAL 64us, NTSC 63.5555us */
     double line_us = (c->lines == 525) ? 1001.0 / 15.75 : 64.0;
@@ -312,8 +324,16 @@ const char *gui_testgen_system_name(gui_testgen_system_t system) {
         case GUI_TESTGEN_PAL: return "PAL";
         case GUI_TESTGEN_NTSC: return "NTSC";
         case GUI_TESTGEN_SECAM: return "SECAM";
+        case GUI_TESTGEN_MESECAM: return "MESECAM";
         default: return "PAL";
     }
+}
+
+const char *gui_testgen_format_name(int format) {
+    static const char *names[GUI_TESTGEN_FORMAT_COUNT] = {
+        "VHS", "S-VHS", "Betamax", "Video8", "Hi8"
+    };
+    return names[gui_testgen_clamp_format(format)];
 }
 
 /* Per-slot pulse kind. The EQ/broad trains pulse at every slot across the
@@ -429,6 +449,9 @@ size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
                          uint32_t sample_rate, uint32_t frame_index) {
     if ((int)system < 0 || (int)system >= GUI_TESTGEN_SYSTEM_COUNT) return 0;
     if (!out || sample_rate == 0) return 0;
+    /* MESECAM composite = SECAM video (the source signal of a MESECAM VHS
+     * recording); only the RF channel differs (MESECAM color-under). */
+    if (system == GUI_TESTGEN_MESECAM) system = GUI_TESTGEN_SECAM;
     const ht_config_t *c = &HT_CONF[system];
     size_t need = gui_testgen_frame_samples(system, sample_rate);
     if (cap < need) return 0;
@@ -926,10 +949,21 @@ size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
  * AC-coupling bump) are deliberately NOT applied here: they model the
  * composite capture card, not the tape RF chain, and the RF decoder
  * calibrates its display levels from the FM deviation itself. */
-size_t gui_testgen_rf_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
+size_t gui_testgen_rf_frame(gui_testgen_system_t system, gui_testgen_format_t format,
+                            int16_t *out, size_t cap,
                              uint32_t sample_rate, uint32_t frame_index) {
     if ((int)system < 0 || (int)system >= GUI_TESTGEN_SYSTEM_COUNT) return 0;
     if (!out || sample_rate == 0) return 0;
+
+    /* MESECAM: SECAM (625-line) geometry + studio chroma, but the color-under
+     * lands at the MESECAM mixed-down frequencies (see the chroma branch). */
+    const bool mesecam = (system == GUI_TESTGEN_MESECAM);
+    if (mesecam) system = GUI_TESTGEN_SECAM;
+    format = (gui_testgen_format_t)gui_testgen_clamp_format(format);
+    /* SECAM/MESECAM are VHS-family only (the decoder profiles define no
+     * SECAM Beta/8mm variants); force VHS for those systems. */
+    if (system == GUI_TESTGEN_SECAM) format = GUI_TESTGEN_FORMAT_VHS;
+
     const ht_config_t *c = &HT_CONF[system];
     size_t need = gui_testgen_frame_samples(system, sample_rate);
     if (cap < need) return 0;
@@ -940,14 +974,43 @@ size_t gui_testgen_rf_frame(gui_testgen_system_t system, int16_t *out, size_t ca
     const bool pal_family = (c->lines == 625);
     const bool secam = (c->colour_mode == HT_SECAM);
 
-    /* Physical VHS endpoints (rf_profiles / the synthetic RF oracles). */
-    const double blank_hz = pal_family ? 4100000.0 : 3685714.2857142854;
-    const double sync_hz  = pal_family ? 3800000.0 : 3400000.0;
-    const double hz_ire   = pal_family ? 7000.0    : 7142.857142857143;
-    const double carrier  = pal_family ? 626953.0  : 629370.6293706294;
+    /* Per (family, format) physical endpoints from the tape-decode-rs
+     * profiles: ire0/blank (0 IRE), sync tip (-40 IRE), Hz/IRE (white =
+     * blank + 100*hz_ire), color-under carrier, and the per-field chroma
+     * track rotation in quarter-turns per line (field0, field1). The VHS
+     * entries match the previously hardcoded values exactly. */
+    typedef struct {
+        double blank_hz, sync_hz, hz_ire, cc_hz;
+        int rot_a, rot_b;
+    } rf_fmt_params_t;
+    static const rf_fmt_params_t RF_PARAMS[2][GUI_TESTGEN_FORMAT_COUNT] = {
+        /* 625-line family (PAL luma geometry) */
+        {
+            /*                    blank      sync      Hz/IRE   cc           rotA rotB */
+            [GUI_TESTGEN_FORMAT_VHS]     = { 4100000.0, 3820000.0, 7000.0,  626953.0,    0,  -1 },
+            [GUI_TESTGEN_FORMAT_SVHS]    = { 5880000.0, 5432000.0, 11200.0, 626953.0,    0,  -1 },
+            [GUI_TESTGEN_FORMAT_BETAMAX] = { 4220000.0, 3828000.0, 9800.0,  687500.0,    0,   0 },
+            [GUI_TESTGEN_FORMAT_VIDEO8]  = { 4560000.0, 4224000.0, 8400.0,  732421.875,  0,  -1 },
+            [GUI_TESTGEN_FORMAT_HI8]     = { 6300000.0, 5740000.0, 14000.0, 732421.875,  0,  -1 },
+        },
+        /* 525-line family (NTSC) */
+        {
+            [GUI_TESTGEN_FORMAT_VHS]     = { 3685714.2857142854, 3400000.0, 7142.857142857143, 629370.63,  -1,  1 },
+            [GUI_TESTGEN_FORMAT_SVHS]    = { 5857142.857142857,   5400000.0, 11428.57142857143,  629370.63,  -1,  1 },
+            [GUI_TESTGEN_FORMAT_BETAMAX] = { 3942857.1428571427,  3600000.0, 8571.42857142857,   688374.13,   2,  0 },
+            [GUI_TESTGEN_FORMAT_VIDEO8]  = { 4542857.142857143,   4200000.0, 8571.42857142857,   743444.06,   0,  2 },
+            [GUI_TESTGEN_FORMAT_HI8]     = { 6271428.571428571,   5700000.0, 14285.71428571429,  743444.06,   0,  2 },
+        },
+    };
+    const rf_fmt_params_t *rfp = &RF_PARAMS[pal_family ? 0 : 1][format];
+
+    const double blank_hz = rfp->blank_hz;
+    const double sync_hz  = rfp->sync_hz;
+    const double hz_ire   = rfp->hz_ire;
+    const double carrier  = rfp->cc_hz;
     const double fm_amp = 0.72;
     const double cu_amp = 0.20;   /* PAL/NTSC color-under amplitude */
-    const double se_amp = 0.15;   /* native SECAM chroma FM amplitude */
+    const double se_amp = 0.15;   /* SECAM/MESECAM chroma FM amplitude */
 
     /* Record pre-emphasis: the inverse of the decoder's de-emphasis shelf
      * (first-order bilinear, zero/pole swapped). PAL/SECAM 100/400 ns,
@@ -1038,9 +1101,12 @@ size_t gui_testgen_rf_frame(gui_testgen_system_t system, int16_t *out, size_t ca
             dr = parity_basis != frame_flip;
         }
         const int vswitch = (pal_family && hidx > 0 && (hidx & 1)) ? -1 : 1;
-        const double track_rot = (hidx < 0) ? 0.0
-            : (pal_family ? (field ? -M_PI / 2.0 : 0.0)
-                         : (field ?  M_PI / 2.0 : -M_PI / 2.0));
+        /* Track rotation from the format table: quarter-turns per line,
+         * per field (PAL VHS 0/-1, NTSC VHS -1/+1, NTSC Betamax 180/0,
+         * NTSC Video8/Hi8 0/+180, PAL Betamax none). */
+        const int rot_units = (hidx < 0) ? 0
+            : (field ? rfp->rot_b : rfp->rot_a);
+        const double track_rot = (double)rot_units * (M_PI / 2.0);
 
         for (size_t n = ss; n < line_end && n < need; n++) {
             const size_t x = n - ss;
@@ -1101,7 +1167,15 @@ size_t gui_testgen_rf_frame(gui_testgen_system_t system, int16_t *out, size_t ca
                 double studio_hz = nominal + deviation * pre_d;
                 if (studio_hz < 3900000.0) studio_hz = 3900000.0;
                 if (studio_hz > 4756250.0) studio_hz = 4756250.0;
-                cc_phase += 2.0 * M_PI * (studio_hz / 4.0) * dt;
+                /* Native SECAM: the studio chroma FM divided by four on tape
+                 * (rests 1.0625 / 1.1015625 MHz). MESECAM: the PAL
+                 * converter's LO (5060571.875 Hz) mixes the SAME studio
+                 * chroma down - f_out = LO - f_in lands D'R at
+                 * 654321.875 Hz and D'B at 810571.875 Hz with the deviation
+                 * inverted, exactly the decoder's MESECAM profile. */
+                double chroma_hz = mesecam ? (5060571.875 - studio_hz)
+                                           : (studio_hz / 4.0);
+                cc_phase += 2.0 * M_PI * chroma_hz * dt;
                 if (cc_phase > 2.0 * M_PI) cc_phase = fmod(cc_phase, 2.0 * M_PI);
                 /* Carrier envelope: ident + picture lines, 5.6 us through
                  * the active area (the porch carries the rest frequency,

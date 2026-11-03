@@ -368,8 +368,14 @@ typedef struct {
     // (0=PAL, 1=NTSC, 2=SECAM - gui_cvbs_set_format's value space).
     // Applied to every CVBS panel decoder at create; the System dropdown
     // writes the user's selection back here (saved with the normal
-    // exit-time settings save).
+    // exit-time settings save). The generator Gen box writes 0-3 here
+    // (3 = MESECAM, RF-only; composite maps it to SECAM).
     int     video_system;
+
+    // Test Gen tape format family (0=VHS, 1=S-VHS, 2=Betamax, 3=Video8,
+    // 4=Hi8 - gui_testgen_format_t). Drives the Channel B RF modulation
+    // parameters; persisted so the generator reopens in the last pick.
+    int     gen_tape_format;
 
     // Playback settings
     char playback_file_a[FILE_PATH_MAX];   // FLAC file for channel A playback
