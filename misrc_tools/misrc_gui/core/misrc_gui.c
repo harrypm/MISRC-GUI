@@ -126,11 +126,18 @@ static void print_usage(const char *program_name) {
             "--debug-view enables verbose runtime logs.\n"
             "--config <path> loads settings from <path> instead of the default\n"
             "           location (useful for automated GUI testing).\n"
-            "--select-device <sel> pick the capture device at launch: a device-list\n"
-            "           index, or a case-insensitive name substring (first match,\n"
-            "           e.g. \"CXADC\"). Exits 1 if nothing matches. Needed for\n"
-            "           automated runs because startup otherwise prefers\n"
-            "           hsdaoh > MISRC Clockgen > CXADC.\n"
+            "--select-device <sel> pick the capture device at launch: a\n"
+            "           device-list index, or a case-insensitive name substring\n"
+            "           (first match). Exits 1 if nothing matches. Needed for\n"
+            "           automated runs: startup otherwise prefers hsdaoh > MISRC\n"
+            "           Clockgen > CXADC.\n"
+            "--gen-system <system> preload the Test Gen system: pal|ntsc|secam|\n"
+            "           mesecam (or 0-3). Mirrors the waveform Gen button; the\n"
+            "           decoders follow at startup (MESECAM: composite decodes\n"
+            "           SECAM, RF preview starts MESECAM).\n"
+            "--gen-format <format> preload the Test Gen tape format: vhs|svhs|\n"
+            "           betamax|video8|hi8 (or 0-4). Mirrors the Fmt button on\n"
+            "           FM RF waveform panels (the RF modulation family).\n"
             "--auto-capture starts capture unattended ~1 s after launch (Local mode;\n"
             "           no --config required).\n"
             "--auto-record <seconds> runs a full unattended record cycle: start\n"
@@ -583,6 +590,47 @@ static void gui_enable_debug_console(void) {
 }
 #endif
 
+// --gen-system / --gen-format value parsing (hard rule
+// dev/gui_automation_flags_rules.md: every user-interactable GUI element
+// carries an automation trigger). Accepts names (case-insensitive) or the
+// raw numeric value; -1 = unknown, so main() can fail fast with the exact
+// accepted list.
+static int gui_parse_gen_system(const char *text)
+{
+    char lower[16];
+    size_t n = 0;
+    if (!text || !text[0]) return -1;
+    for (; text[n] && n < sizeof(lower) - 1; n++) {
+        lower[n] = (char)tolower((unsigned char)text[n]);
+    }
+    lower[n] = '\0';
+    if (strcmp(lower, "pal") == 0     || strcmp(lower, "0") == 0) return 0;
+    if (strcmp(lower, "ntsc") == 0    || strcmp(lower, "1") == 0) return 1;
+    if (strcmp(lower, "secam") == 0   || strcmp(lower, "2") == 0) return 2;
+    if (strcmp(lower, "mesecam") == 0 || strcmp(lower, "3") == 0) return 3;
+    return -1;
+}
+
+static int gui_parse_gen_format(const char *text)
+{
+    char lower[16];
+    size_t n = 0;
+    if (!text || !text[0]) return -1;
+    for (; text[n] && n < sizeof(lower) - 1; n++) {
+        lower[n] = (char)tolower((unsigned char)text[n]);
+    }
+    lower[n] = '\0';
+    if (strcmp(lower, "vhs") == 0     || strcmp(lower, "0") == 0) return 0;
+    if (strcmp(lower, "svhs") == 0    || strcmp(lower, "s-vhs") == 0 ||
+        strcmp(lower, "1") == 0) return 1;
+    if (strcmp(lower, "betamax") == 0 || strcmp(lower, "beta") == 0 ||
+        strcmp(lower, "2") == 0) return 2;
+    if (strcmp(lower, "video8") == 0  || strcmp(lower, "8mm") == 0 ||
+        strcmp(lower, "3") == 0) return 3;
+    if (strcmp(lower, "hi8") == 0     || strcmp(lower, "4") == 0) return 4;
+    return -1;
+}
+
 // Shared Clay layout build (the main loop + the Windows modal frames).
 // Extracted so the modal-loop render driver renders the SAME layout the
 // main loop renders, from one source of truth.
@@ -726,6 +774,8 @@ int main(int argc, char **argv) {
     bool has_capture_arg = false;
     const char *config_path = NULL;  /* --config <path> override */
     const char *select_device_arg = NULL;  /* --select-device <index-or-name> */
+    const char *gen_system_arg = NULL;    /* --gen-system <pal|ntsc|secam|mesecam|0-3> */
+    const char *gen_format_arg = NULL;    /* --gen-format <vhs|svhs|betamax|video8|hi8|0-4> */
     bool auto_capture = false;             /* --auto-capture */
     bool auto_record_given = false;        /* --auto-record <seconds> seen */
     int auto_record_seconds = 0;           /* --auto-record seconds */
@@ -783,6 +833,29 @@ int main(int argc, char **argv) {
             // automated runs. Consumes the next arg.
             if (i + 1 < argc) {
                 select_device_arg = argv[++i];
+            }
+            continue;
+        }
+        if (strcmp(a, "--gen-system") == 0) {
+            // --gen-system <pal|ntsc|secam|mesecam|0-3>: preload the Test Gen
+            // system (hard rule dev/gui_automation_flags_rules.md). Consumes
+            // the next arg; validated after the settings load, fail fast.
+            if (i + 1 < argc) {
+                gen_system_arg = argv[++i];
+            } else {
+                fprintf(stderr, "--gen-system requires a <pal|ntsc|secam|mesecam|0-3> value\n");
+                return 1;
+            }
+            continue;
+        }
+        if (strcmp(a, "--gen-format") == 0) {
+            // --gen-format <vhs|svhs|betamax|video8|hi8|0-4>: preload the
+            // Test Gen tape format (RF modulation family). Same pattern.
+            if (i + 1 < argc) {
+                gen_format_arg = argv[++i];
+            } else {
+                fprintf(stderr, "--gen-format requires a <vhs|svhs|betamax|video8|hi8|0-4> value\n");
+                return 1;
             }
             continue;
         }
@@ -939,6 +1012,41 @@ int main(int argc, char **argv) {
     app.settings.ui_scale_percent = GUI_UI_SCALE_DEFAULT_PERCENT;
 #endif
     gui_ui_set_scale_percent(app.settings.ui_scale_percent);
+    // --gen-system / --gen-format launch overrides (hard rule
+    // dev/gui_automation_flags_rules.md: every GUI element carries an
+    // automation trigger). Applied AFTER the settings load so a flag beats
+    // both the defaults and any --config values; the startup push below and
+    // the simulated capture thread both read the final values. Note: a
+    // session that saves settings persists the overridden values.
+    if (gen_system_arg) {
+        int gen_sys = gui_parse_gen_system(gen_system_arg);
+        if (gen_sys < 0) {
+            fprintf(stderr,
+                    "--gen-system: unknown system '%s' (pal|ntsc|secam|mesecam or 0-3)\n",
+                    gen_system_arg);
+            return 1;
+        }
+        app.settings.video_system = gen_sys;
+        fprintf(stderr, "[AUTO] --gen-system: %s\n",
+                gen_sys == 3 ? "MESECAM" :
+                gen_sys == 2 ? "SECAM" :
+                gen_sys == 1 ? "NTSC" : "PAL");
+    }
+    if (gen_format_arg) {
+        int gen_fmt = gui_parse_gen_format(gen_format_arg);
+        if (gen_fmt < 0) {
+            fprintf(stderr,
+                    "--gen-format: unknown format '%s' (vhs|svhs|betamax|video8|hi8 or 0-4)\n",
+                    gen_format_arg);
+            return 1;
+        }
+        app.settings.gen_tape_format = gen_fmt;
+        fprintf(stderr, "[AUTO] --gen-format: %s\n",
+                gen_fmt == 4 ? "Hi8" :
+                gen_fmt == 3 ? "Video8" :
+                gen_fmt == 2 ? "Betamax" :
+                gen_fmt == 1 ? "S-VHS" : "VHS");
+    }
     // Push the persisted CVBS System selection (0=PAL/1=NTSC/2=SECAM/
     // 3=MESECAM) into the video panel decoders: every created panel starts
     // in the user's last-selected system instead of hardcoded PAL
@@ -1213,11 +1321,13 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[WIN32] modal move/size render driver unavailable\n");
     }
 
-    // Fullscreen toggle bookkeeping: suppresses the Windows snap-maximize
-    // conversion for a short window after a manual toggle so leaving
-    // fullscreen (whose restore can re-fire WM_SIZE/SIZE_MAXIMIZED) does
-    // not immediately bounce back in.
-    double last_fullscreen_toggle_s = -10.0;
+    // Snap-maximize verification: the system can apply a Win11 snap layout
+    // slightly AFTER the drag release, overwriting the MaximizeWindow() that
+    // answered a throw. The main loop re-checks shortly after and re-applies
+    // the maximize if the window ended up un-maximized (a half/quarter snap)
+    // instead. Two retries at 250 ms spacing.
+    int snap_maximize_retries = 0;
+    double snap_maximize_verify_s = 0.0;
 
     // Main loop
     while (!WindowShouldClose() && !atomic_load(&do_exit)) {
@@ -1388,23 +1498,66 @@ int main(int argc, char **argv) {
 
         // Fullscreen toggle: F11 (cross-platform) and Alt+Enter (fallback
         // where F11 is reserved by the system, e.g. macOS Show Desktop).
-        // Windows throw-at-top Aero Snap also converts to this same clean
-        // borderless fullscreen (a quick throw can otherwise land in a
-        // half/snapped state with glitched chrome - user report 2026-11-03).
+        // BORDERLESS windowed fullscreen: ToggleFullscreen() switches the
+        // monitor's video mode to the WINDOW's size - a non-native resolution
+        // the GPU driver then rescales, which glitched the user's driver at
+        // the system level (user report 2026-11-03). ToggleBorderlessWindowed()
+        // keeps the desktop's native video mode and simply makes the window
+        // undecorated at monitor size - a true borderless fullscreen with no
+        // display mode change. Window DRAG gestures never enter this path:
+        // throw-at-top maximizes normally and hold-at-top halves (the snap
+        // intents consumed below).
         if (IsKeyPressed(KEY_F11) ||
             (IsKeyPressed(KEY_ENTER) &&
              (IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT)))) {
-            ToggleFullscreen();
-            last_fullscreen_toggle_s = GetTime();
-            gui_app_set_status(&app, IsWindowFullscreen()
+            ToggleBorderlessWindowed();
+            gui_app_set_status(&app, IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE)
                 ? "Fullscreen (F11 / Alt+Enter to exit)"
                 : "Windowed");
         }
-        if (gui_win32_modal_take_maximize_request() &&
-            !IsWindowFullscreen() &&
-            GetTime() - last_fullscreen_toggle_s > 1.0) {
-            ToggleFullscreen();
-            last_fullscreen_toggle_s = GetTime();
+        // Windows drag-to-top snap intents, classified in the win32 modal
+        // subclass by how long the drag dwelled at the monitor's top edge
+        // (user request 2026-11-03):
+        //   QUICK THROW at the top edge -> MaximizeWindow(): a normal
+        //     maximized window - NOT borderless - which also overrides any
+        //     Win11 snap-layout arrangement a fast gesture landed in (the
+        //     round-7 "goes half mode" symptom).
+        //   HOLD at the top edge (>= 400 ms) -> the window snaps to the
+        //     TOP HALF of the monitor's work area.
+        // F11 / Alt+Enter above remains the borderless fullscreen toggle.
+        // No-op requests on non-Windows platforms.
+        {
+            // Diagnostics in the STATUS BAR (always visible): the console
+            // attach behind --debug-view did not surface output in the
+            // user's terminal (2026-11-03), so every drag release also
+            // reports its classification inputs + verdict here.
+            char drag_summary[96];
+            if (gui_win32_modal_take_drag_summary(drag_summary,
+                                                   sizeof(drag_summary))) {
+                gui_app_set_status(&app, drag_summary);
+            }
+        }
+        if (gui_win32_modal_take_maximize_request()) {
+            MaximizeWindow();
+            snap_maximize_retries = 2;
+            snap_maximize_verify_s = GetTime() + 0.25;
+        }
+        if (gui_win32_modal_take_top_half_request()) {
+            gui_win32_modal_apply_top_half();
+        }
+        if (snap_maximize_retries > 0 && GetTime() >= snap_maximize_verify_s) {
+            snap_maximize_retries--;
+            snap_maximize_verify_s = GetTime() + 0.25;
+            if (!IsWindowMaximized() &&
+                !IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE)) {
+                fprintf(stderr,
+                        "[WIN32] snap: maximize lost to a late system snap - "
+                        "re-applying (%d retries left)\n",
+                        snap_maximize_retries);
+                MaximizeWindow();
+            } else {
+                snap_maximize_retries = 0;
+            }
         }
 
         // Handle keyboard shortcuts

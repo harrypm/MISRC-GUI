@@ -430,9 +430,192 @@ Changes:
 Validation: build clean; gui_testgen_rf, gui_cvbs_baseband,
 gui_waveform_overlay all OK.
 
+### Committed (rounds 5-11)
+
+- `f5fc496` "Test Gen: MESECAM + tape-format UX, fullscreen, signal-mode
+  gating (rounds 5-11)" pushed to harrypm/MISRC-GUI main (18 files;
+  restore point `restore_points/2026-11-03_testgen-rf-ux-rounds5-11-good.zip`).
+  User confirmed rounds 5-11 in the GUI before committing.
+
+## Round 12 — borderless fullscreen + UI-scale fixes for the new controls
+
+User report: "The F11 mode has introduced a graphical bug instead of doing
+a normal borderless full-screen when enabled/cyceled this tripped up my
+driver on a system level, I beleve this is a scaling bug... Also the
+scaling modes, the new GUI elements for the signal genarators does not
+scale properly.."
+
+Root causes + fixes:
+
+1. `ToggleFullscreen()` (raylib) switches the MONITOR'S VIDEO MODE to the
+   window's size — a non-native resolution the GPU driver rescales (the
+   system-level driver glitch). Replaced with `ToggleBorderlessWindowed()`
+   (misrc_gui.c, both the F11/Alt+Enter path and the Windows snap-maximize
+   conversion): keeps the desktop's native video mode, makes the window
+   undecorated at monitor size — a true borderless fullscreen with no mode
+   change. State checks now use `IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE)`
+   (raylib 4.5+; the MSYS2 toolchain has 5.x).
+2. The generator row (Signal/Fmt/Gen) and the RF Preview overlay measured
+   button widths with raw `gui_text_measure` values (physical pixels) used
+   directly as LOGICAL layout units — the row-1 overlay group's documented
+   contract (commit 8b19ddf) converts them via `1/gui_ui_get_scale_factor()`.
+   At zoom < 100% the labels overflowed the too-narrow buttons; at zoom >
+   100% the buttons bloated ~scale× too wide. Both `waveform_render`'s gen
+   row (gui_oscilloscope.c) and `render_vhs_decoder_overlay` (gui_cvbs.c:
+   Decoder/Format/System/Preset/Frame/Budget/OSD buttons + both popups)
+   now convert measurements AND fixed pixel floors to logical units.
+
+Validation: build clean; gui_testgen_rf, gui_cvbs_baseband,
+gui_waveform_overlay all OK (the cvbs test LTO-strips the render path, so
+the new scale call adds no link dependency). Needs GUI click-through:
+F11/Alt+Enter/snap at native resolution, and the gen row + RF Preview
+controls at several UI zoom levels (Ctrl+wheel / Ctrl+0 / Ctrl+/-).
+
+NOTE: the older composite CVBS overlay (render_cvbs_system_overlay) still
+uses raw physical mixing throughout — same latent zoom issue, not touched
+this round (pre-existing code, not reported). Convert it the same way if
+the user sees it mis-scaling.
+
+## Round 13 — drag gestures: throw-at-top = maximize, hold-at-top = top half
+
+User request: "I want throw up to be full-screen window not borderless,
+f11 while windowed to be borderless and hold at top to be half size and
+throw at top to be full screen".
+
+Three distinct behaviors now (misrc_gui.c + gui_win32_modal.c/h):
+
+1. **F11 / Alt+Enter while windowed** -> borderless fullscreen (round 12's
+   ToggleBorderlessWindowed kept; toggling again returns to windowed).
+2. **Quick THROW at the top edge** -> MaximizeWindow(): a normal maximized
+   window (title bar/taskbar intact, NOT borderless). This also overrides
+   any Win11 snap-layout arrangement the fast gesture landed in - the
+   round-7 "goes half mode" symptom.
+3. **HOLD at the top edge (>= 400 ms)** -> the window snaps to the TOP HALF
+   of the current monitor's work area (taskbar excluded).
+
+Mechanics: the win32 modal subclass now tracks the drag (WM_SYSCOMMAND
+SC_MOVE gates it to caption moves only - resizes/buttons unaffected),
+polls the cursor vs the monitor top edge (4 px zone) on WM_MOUSEMOVE + the
+15 ms modal timer, and classifies the release at WM_EXITSIZEMOVE by edge
+dwell time. The old WM_SIZE/SIZE_MAXIMIZED -> borderless conversion and
+its 1 s suppression bookkeeping are REMOVED. Requests are queued in the
+wndproc and consumed in the main loop (MaximizeWindow via raylib;
+top-half via SW_RESTORE-if-maximized + SetWindowPos to the work-area top
+half - GLFW's wndproc stays chained and observes the resulting
+notifications). Leaving the edge zone resets the dwell, so hovering the
+Win11 snap-layouts flyout never counts as a hold. Non-Windows platforms
+stub everything to no-ops (drag gestures there are native anyway).
+
+User follow-up: "throws somtimes trigger half blank mode still" — the
+dwell-only classifier misread real throws: a flick that lingered at the
+edge >= 400 ms before release landed as a HOLD (top half), and a fast
+flick's last WM_MOUSEMOVE could lag the true release position out of the
+4 px edge zone (no request queued, so the native Win11 half/quarter snap
+stood). Fix (same session):
+
+- Release VELOCITY now decides: the classifier keeps a trailing cursor
+  sample history (WM_MOUSEMOVE + the 15 ms modal timer) and measures the
+  speed over the last ~100 ms at release. Releasing while the cursor is
+  still moving fast (>= 0.5 px/ms) is a THROW -> maximize, no matter how
+  long it dwelled at the edge first; a HOLD now requires the cursor
+  parked in the zone >= 400 ms AND a slow release.
+- The release position is queried FRESH (GetCursorPos inside
+  WM_EXITSIZEMOVE) instead of trusting the last mouse sample.
+- An edge touch within the last 150 ms also counts as a top gesture (the
+  cursor can release slightly below the edge or cross into a monitor
+  above on multi-monitor setups).
+
+Second user follow-up: "still happens". Rather than guess a third
+time, the classifier is now instrumented AND made race-proof:
+
+- **Diagnostic line per drag release** (stderr, visible with
+  --debug-view): `[WIN32] snap: syscmd=0x... zone=? recent=?
+  dwell=..ms speed=..px/ms -> maximize|top-half|ignore` plus consumption
+  lines (`throw -> maximize`, `hold -> top half`, `maximize lost to a
+  late system snap - re-applying`). A still-failing throw is now
+  diagnosable from the log alone.
+- **De-gated the WM_SYSCOMMAND dependency**: if no WM_SYSCOMMAND precedes
+  WM_ENTERSIZEMOVE (a missing SC_MOVE would have silently disabled the
+  whole classifier - consistent with throws still landing half), the
+  drag defaults to a MOVE. Resizes still see SC_SIZE first and keep their
+  precise gate.
+- **Late-snap retry**: after a throw's MaximizeWindow(), the main loop
+  re-checks at +250 ms (2 retries) and re-maximizes if the system applied
+  a half/quarter layout AFTER our call (IsWindowMaximized check).
+- Recent-edge-touch window widened 150 -> 300 ms.
+
+Validation: build clean; gui_testgen_rf, gui_cvbs_baseband,
+gui_waveform_overlay all OK. If a throw STILL half-snaps, run with
+`misrc_gui --debug-view`, reproduce, and read the `[WIN32] snap:` lines:
+  - `-> ignore` on a real throw = classifier missed the gesture (raise
+    GUI_WIN32_SNAP_RECENT_MS / widen the zone).
+  - `-> top-half` on a real throw = speed threshold too low (raise
+    GUI_WIN32_SNAP_THROW_PX_MS).
+  - `-> maximize` yet still half = the retry log tells whether a late
+    system snap overrode it.
+
+Third follow-up: "debug view did nothing?" — the user's terminal showed no
+output from `--debug-view` (the GUI exe's console attach does not surface
+stderr in every terminal). The classifier summary is now ALSO shown in the
+IN-APP STATUS BAR after every drag release (`Snap: zone=? recent=?
+dwell=..ms speed=.. -> verdict`), via
+`gui_win32_modal_take_drag_summary()` — no console needed. The user just
+throws the window and reads the bottom bar.
+
 ### Not yet done
 
-- User GUI click-through re-confirmation (rounds 5-11; then commit).
+- PARKED (user, 2026-11-03, "note this issue for now"): throws at the top
+  edge SOMETIMES still land in half mode despite the velocity classifier,
+  the SYSCOMMAND de-gate and the late-snap retry. Next step: read the
+  in-app STATUS BAR diagnostic after a bad throw (Snap: zone/recent/dwell/
+  speed -> verdict) and tune the matching threshold. Rounds 12-13 stay
+  uncommitted until the user re-confirms or lifts the park.
+- User GUI click-through re-confirmation of rounds 12-13 (then commit).
 - CVBS right/top padding diagnosis (needs screenshot).
 - The stale-repo edits in `C:\Users\Harry\misrc_gui_dev` are uncommitted
   and NOT part of this work — decide whether to revert them there.
+
+## Round 14 — --gen-system / --gen-format flags + the GUI-automation hard rule
+
+User request: "add flags and make it a hard project dev rule all GUI
+elements must have a GUI autoload trigger flag for automated testing.."
+
+Changes:
+
+1. **CLI flags** (misrc_gui.c): `--gen-system <pal|ntsc|secam|mesecam|0-3>`
+   and `--gen-format <vhs|svhs|betamax|video8|hi8|0-4>` (also s-vhs/beta/
+   8mm aliases; case-insensitive; numeric accepted). Parsed in the first-pass
+   arg loop (GUI flags - never route to the capture CLI), applied AFTER the
+   settings load and BEFORE the startup default-system push, so flag >
+   --config > default. Fail fast: unknown value prints the accepted list
+   and exits 1 (verified: exit 1 + message). Valid runs log `[AUTO]`
+   lines (verified: `--gen-system mesecam --gen-format betamax` prints
+   both and launches). Usage text updated. Note: a session that saves
+   settings persists the overridden values.
+2. **Hard rule doc** `dev/gui_automation_flags_rules.md` (+ dev/README.md
+   index): every user-interactable GUI element ships with a CLI flag
+   and/or --config key in the SAME change; fail fast; [AUTO] logging;
+   observable effect; flag > config > default; panel-local runtime state
+   exempt until it gains a persisted key. Includes the inventory of
+   current triggers and the known-gaps backlog (panel view/split,
+   Signal/Mode/Scale/Trig dropdowns, decoder-mode cycle, fullscreen flag,
+   M-Client remote table lacks the gen keys).
+
+Validation: build clean; gui_testgen_rf, gui_cvbs_baseband,
+gui_waveform_overlay all OK; --help lists both flags; invalid-value and
+valid-launch paths verified with Start-Process + redirected streams (the
+GUI-subsystem exe's exit code does not read back through pwsh's `&` —
+use Start-Process for scripted checks).
+
+### Test Gen autoload/config state (user question 2026-11-03)
+
+"did new CLI args get added for the autoload config for test gen modes
+etc?" - NO new CLI args. What exists:
+- `--config <file>` autoloads `video_system` (0-3, incl. MESECAM) and
+  `gen_tape_format` (0-4); the round-10 startup push honors them
+  (composite decoders map MESECAM->SECAM, RF preview starts MESECAM).
+- Both keys persist in the default settings file on changes/exit.
+- Unattended gen launch: `misrc_gui --config <json> --select-device sim
+  --auto-capture` (the device is named "[Simulated] Test Signal").
+- Not exposed: dedicated CLI flags (--gen-system/--gen-format) and the
+  M-Client remote settings table. Offered to add flags on request.

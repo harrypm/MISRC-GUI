@@ -2151,6 +2151,14 @@ static void waveform_render(void *state_ptr, gui_app_t *app, int channel,
     {
         if (waveform_test_mode_active(app) &&
             !gui_chrome_hide_hidden(&state->chrome_hide)) {
+            // Text measurements return physical pixels; the panel bounds
+            // and every hit rect on this row are LOGICAL units (the row-1
+            // overlay group's contract - see waveform_render_overlay).
+            // Convert the measurements and the fixed pixel floors to
+            // logical so the generator row scales correctly at every UI
+            // zoom level (user report 2026-11-03: the buttons did not
+            // scale with the UI zoom).
+            const float to_logical_w = 1.0f / gui_ui_get_scale_factor();
             const float btn_h = 18.0f;
             const float row_y = bounds.y + 8.0f + btn_h + 6.0f;
             const float x_right = bounds.x + bounds.width - 8.0f;
@@ -2163,8 +2171,8 @@ static void waveform_render(void *state_ptr, gui_app_t *app, int channel,
             if (sys == 3 && state->signal_type != WAVE_SIGNAL_FM_RF) sys = 2;
             char gen_label[24];
             snprintf(gen_label, sizeof(gen_label), "Gen: %s", sys_labels[sys]);
-            float gen_w = (float)gui_text_measure(gen_label, FONT_SIZE_DROPDOWN_OPT) + 16.0f;
-            if (gen_w < 90.0f) gen_w = 90.0f;
+            float gen_w = (float)gui_text_measure(gen_label, FONT_SIZE_DROPDOWN_OPT) * to_logical_w + 16.0f;
+            if (gen_w < 90.0f * to_logical_w) gen_w = 90.0f * to_logical_w;
             float gen_x = x_right - gen_w;
             state->sim_sys_btn_rect = (Rectangle){gen_x, row_y, gen_w, btn_h};
             DrawRectangleRounded(state->sim_sys_btn_rect, 0.15f, 4, COLOR_BUTTON_ACTIVE);
@@ -2184,8 +2192,8 @@ static void waveform_render(void *state_ptr, gui_app_t *app, int channel,
                 char fmt_label[32];
                 snprintf(fmt_label, sizeof(fmt_label), "Fmt: %s",
                          gui_testgen_format_name((gui_testgen_format_t)fmt));
-                float fmt_w = (float)gui_text_measure(fmt_label, FONT_SIZE_DROPDOWN_OPT) + 16.0f;
-                if (fmt_w < 96.0f) fmt_w = 96.0f;
+                float fmt_w = (float)gui_text_measure(fmt_label, FONT_SIZE_DROPDOWN_OPT) * to_logical_w + 16.0f;
+                if (fmt_w < 96.0f * to_logical_w) fmt_w = 96.0f * to_logical_w;
                 fmt_x = gen_x - 8.0f - fmt_w;
                 if (fmt_x < bounds.x + 8.0f) fmt_x = bounds.x + 8.0f;
                 state->sim_fmt_btn_rect = (Rectangle){fmt_x, row_y, fmt_w, btn_h};
@@ -2201,8 +2209,8 @@ static void waveform_render(void *state_ptr, gui_app_t *app, int channel,
             char signal_label[40];
             snprintf(signal_label, sizeof(signal_label), "Signal: %s",
                      s_signal_labels[state->signal_type]);
-            float sig_w = (float)gui_text_measure(signal_label, FONT_SIZE_DROPDOWN_OPT) + 28.0f;
-            if (sig_w < 110.0f) sig_w = 110.0f;
+            float sig_w = (float)gui_text_measure(signal_label, FONT_SIZE_DROPDOWN_OPT) * to_logical_w + 28.0f;
+            if (sig_w < 110.0f * to_logical_w) sig_w = 110.0f * to_logical_w;
             float sig_x = fmt_x - 8.0f - sig_w;
             if (sig_x < bounds.x + 8.0f) sig_x = bounds.x + 8.0f;
             state->signal_btn_rect = (Rectangle){sig_x, row_y, sig_w, btn_h};
@@ -2229,8 +2237,8 @@ static void waveform_render(void *state_ptr, gui_app_t *app, int channel,
                     bool is_selected = (state->signal_type == value);
                     bool hover = CheckCollisionPointRec(mouse, opt_rect);
                     DrawRectangleRec(opt_rect, gui_dropdown_option_color(is_selected, hover));
-                    int opt_w = gui_text_measure(s_signal_labels[value],
-                                                 FONT_SIZE_DROPDOWN_OPT);
+                    int opt_w = (int)(gui_text_measure(s_signal_labels[value],
+                                                 FONT_SIZE_DROPDOWN_OPT) * to_logical_w);
                     gui_text_draw(s_signal_labels[value],
                                   sig_x + sig_w / 2.0f - opt_w / 2.0f,
                                   opt_y + i * opt_h +

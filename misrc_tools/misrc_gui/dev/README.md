@@ -32,6 +32,8 @@ Use lowercase with underscores:
 | `prompt_appimage_taskbar_desktop_icon_readme.md` | AppImage Desktop-icon cleanup + stable WM_CLASS / taskbar identity prompt log |
 | `prompt_cxadc_direct_native_raw_stream_readme.md` | CXADC direct native RAW stream (byte-exact `.u8`/`.u16`, converted `.s8`/`.s16`) prompt log |
 | `cxadc_win_lockstep_notes.md` | CXADC-Win (Windows driver) lock-step dev notes |
+| `gui_automation_flags_rules.md` | HARD rule: every GUI element carries a CLI flag / config key for automated testing (inventory + gaps) |
+| `gui_output_verification_rules.md` | HARD rule: headless verification must read what the GUI displays (render-path conversion contracts) |
 
 ### When starting a new prompt
 

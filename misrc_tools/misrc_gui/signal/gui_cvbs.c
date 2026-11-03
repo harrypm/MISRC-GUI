@@ -5704,11 +5704,19 @@ static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *ap
         return;
     }
 
+    // Text measurements return physical pixels; the panel bounds and every
+    // hit rect below are LOGICAL units (the UI render-scale transform
+    // scales rects while the font keeps its fixed physical size - the same
+    // contract as the waveform overlay group). Convert the measurements and
+    // the fixed pixel floors to logical so this overlay scales correctly at
+    // every UI zoom level (user report 2026-11-03: the new signal-generator
+    // controls did not scale with the UI zoom).
+    const float to_logical_w = 1.0f / gui_ui_get_scale_factor();
     const float btn_h = 18.0f;
     const char *label = "Decoder: RF Preview";
-    float text_w = (float)gui_text_measure(label, FONT_SIZE_DROPDOWN_OPT);
+    float text_w = (float)gui_text_measure(label, FONT_SIZE_DROPDOWN_OPT) * to_logical_w;
     float btn_w = text_w + 16.0f;
-    if (btn_w < 128.0f) btn_w = 128.0f;
+    if (btn_w < 128.0f * to_logical_w) btn_w = 128.0f * to_logical_w;
 
     float x_right = bounds.x + bounds.width - 8.0f;
     float btn_x = x_right - btn_w;
@@ -5724,7 +5732,7 @@ static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *ap
     // Tape family is a real dropdown ("Format:") listing VHS / Betamax - the
     // cycle button was easy to overshoot (user request 2026-11-03).
     const char *tape_label = decoder->overlay.selected_tape == 1 ? "Format: Betamax" : "Format: VHS";
-    float tape_w = (float)gui_text_measure(tape_label, FONT_SIZE_DROPDOWN_OPT) + 24;
+    float tape_w = (float)gui_text_measure(tape_label, FONT_SIZE_DROPDOWN_OPT) * to_logical_w + 24;
     float tape_y = control_y;
     decoder->overlay.tape_rect = (Rectangle){x_right - tape_w, tape_y, tape_w, btn_h};
     Color tape_bg = decoder->overlay.tape_dropdown_open ? COLOR_BUTTON_HOVER : COLOR_BUTTON;
@@ -5764,7 +5772,7 @@ static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *ap
         : decoder->overlay.selected_system == 3 ? "System: MESECAM"
         : decoder->overlay.selected_system == 2 ? "System: SECAM"
         : decoder->overlay.selected_system == 1 ? "System: NTSC" : "System: PAL";
-    float fmt_w = (float)gui_text_measure(format_label, FONT_SIZE_DROPDOWN_OPT) + 16;
+    float fmt_w = (float)gui_text_measure(format_label, FONT_SIZE_DROPDOWN_OPT) * to_logical_w + 16;
     decoder->overlay.format_rect = (Rectangle){x_right - fmt_w, control_y, fmt_w, btn_h};
     DrawRectangleRounded(decoder->overlay.format_rect, 0.15f, 4, COLOR_BUTTON_HOVER);
     text_y = control_y + (btn_h - FONT_SIZE_DROPDOWN_OPT) * 0.5f;
@@ -5774,7 +5782,7 @@ static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *ap
     if (decoder->overlay.selected_tape) {
         char preset_label[40];
         snprintf(preset_label, sizeof(preset_label), "Preset: %s", gui_vhs_fm_get_beta_preset_name(decoder));
-        float preset_w = (float)gui_text_measure(preset_label, FONT_SIZE_DROPDOWN_OPT) + 16;
+        float preset_w = (float)gui_text_measure(preset_label, FONT_SIZE_DROPDOWN_OPT) * to_logical_w + 16;
         decoder->overlay.beta_preset_rect =
             (Rectangle){x_right - preset_w, control_y, preset_w, btn_h};
         DrawRectangleRounded(decoder->overlay.beta_preset_rect, 0.15f, 4, COLOR_BUTTON_HOVER);
@@ -5787,14 +5795,14 @@ static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *ap
     // decode window to the whole line so VBI + sync tip + colour burst render
     // with decoded chroma instead of only the active picture area.
     const char *frame_label = decoder->overlay.frame_mode == 1 ? "Frame: Full" : "Frame: Active";
-    float frame_w = (float)gui_text_measure(frame_label, FONT_SIZE_DROPDOWN_OPT) + 24;
-    if (frame_w < 118.0f) frame_w = 118.0f;
+    float frame_w = (float)gui_text_measure(frame_label, FONT_SIZE_DROPDOWN_OPT) * to_logical_w + 24;
+    if (frame_w < 118.0f * to_logical_w) frame_w = 118.0f * to_logical_w;
     decoder->overlay.frame_rect =
         (Rectangle){x_right - frame_w, control_y, frame_w, btn_h};
     DrawRectangleRounded(decoder->overlay.frame_rect, 0.15f, 4, COLOR_BUTTON_HOVER);
     {
         text_y = control_y + (btn_h - FONT_SIZE_DROPDOWN_OPT) * 0.5f;
-        float fw = (float)gui_text_measure(frame_label, FONT_SIZE_DROPDOWN_OPT);
+        float fw = (float)gui_text_measure(frame_label, FONT_SIZE_DROPDOWN_OPT) * to_logical_w;
         gui_text_draw(frame_label,
                       decoder->overlay.frame_rect.x + (frame_w - fw) * 0.5f,
                       text_y, FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
@@ -5802,7 +5810,7 @@ static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *ap
     control_y += btn_h + 6;
     int budget=vhs_budget_clamp(app->settings.rf_preview_budget_percent);
     char budget_label[40]; snprintf(budget_label,sizeof(budget_label),"Budget: %.2f core (shared)",budget/100.0);
-    float budget_w=(float)gui_text_measure(budget_label,FONT_SIZE_DROPDOWN_OPT)+16;
+    float budget_w=(float)gui_text_measure(budget_label,FONT_SIZE_DROPDOWN_OPT)*to_logical_w+16;
     decoder->overlay.budget_rect=(Rectangle){x_right-budget_w,control_y,budget_w,btn_h};
     DrawRectangleRounded(decoder->overlay.budget_rect,0.15f,4,COLOR_BUTTON_HOVER);
     gui_text_draw(budget_label,decoder->overlay.budget_rect.x+8,control_y+(btn_h-FONT_SIZE_DROPDOWN_OPT)*.5f,
@@ -5817,8 +5825,8 @@ static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *ap
     if (stats_view < 0 || stats_view > 2) stats_view = 0;
     char stats_label[40];
     snprintf(stats_label, sizeof(stats_label), "OSD: %s", stats_names[stats_view]);
-    float stats_w = (float)gui_text_measure(stats_label, FONT_SIZE_DROPDOWN_OPT) + 16;
-    if (stats_w < 96.0f) stats_w = 96.0f;
+    float stats_w = (float)gui_text_measure(stats_label, FONT_SIZE_DROPDOWN_OPT) * to_logical_w + 16;
+    if (stats_w < 96.0f * to_logical_w) stats_w = 96.0f * to_logical_w;
     decoder->overlay.stats_btn_rect =
         (Rectangle){x_right - stats_w, control_y, stats_w, btn_h};
     Color stats_bg = decoder->overlay.stats_dropdown_open ? COLOR_BUTTON_HOVER : COLOR_BUTTON;
@@ -5827,7 +5835,7 @@ static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *ap
     // is already indicated by the button highlight (stats_bg) above.
     {
         text_y = control_y + (btn_h - FONT_SIZE_DROPDOWN_OPT) * 0.5f;
-        float sw = (float)gui_text_measure(stats_label, FONT_SIZE_DROPDOWN_OPT);
+        float sw = (float)gui_text_measure(stats_label, FONT_SIZE_DROPDOWN_OPT) * to_logical_w;
         gui_text_draw(stats_label,
                       decoder->overlay.stats_btn_rect.x + (stats_w - sw) * 0.5f,
                       text_y, FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
@@ -5850,7 +5858,7 @@ static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *ap
             bool hover = CheckCollisionPointRec(gui_ui_get_mouse_position(), opt);
             DrawRectangleRec(opt, gui_dropdown_option_color(selected, hover));
             const char *opt_lbl = stats_names[i];
-            float ow = (float)gui_text_measure(opt_lbl, FONT_SIZE_DROPDOWN_OPT);
+            float ow = (float)gui_text_measure(opt_lbl, FONT_SIZE_DROPDOWN_OPT) * to_logical_w;
             gui_text_draw(opt_lbl,
                           opt.x + (opt.width - ow) * 0.5f,
                           opt.y + (opt_h - FONT_SIZE_DROPDOWN_OPT) * 0.5f,
@@ -5875,7 +5883,7 @@ static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *ap
             bool selected = (decoder->overlay.selected_tape == i);
             bool hover = CheckCollisionPointRec(gui_ui_get_mouse_position(), opt);
             DrawRectangleRec(opt, gui_dropdown_option_color(selected, hover));
-            float ow = (float)gui_text_measure(tape_opts[i], FONT_SIZE_DROPDOWN_OPT);
+            float ow = (float)gui_text_measure(tape_opts[i], FONT_SIZE_DROPDOWN_OPT) * to_logical_w;
             gui_text_draw(tape_opts[i],
                           opt.x + (opt.width - ow) * 0.5f,
                           opt.y + (opt_h - FONT_SIZE_DROPDOWN_OPT) * 0.5f,
