@@ -6,6 +6,7 @@
 #include "gui_net.h"
 #include "gui_net_queue_limits.h"
 #include "gui_monitor_transport.h"
+#include "gui_monitor_audio.h"
 #include "gui_monitor_local_save.h"
 #include "../input/gui_playback.h"
 #include "../core/gui_app.h"
@@ -2275,10 +2276,13 @@ void gui_net_tap_rf(gui_app_t *app, const void *data, size_t bytes) {
 }
 
 void gui_net_tap_audio(gui_app_t *app, const void *data, size_t bytes) {
-    (void)app;
     if (s_server && s_server->audio.initialized) {
         net_fanout_push(&s_server->audio, data, bytes);
     }
+    /* Lightweight tap is exclusive to MISRC-M/2 subscribers; never encode
+     * or wait inside the capture callback or the legacy /baseband fanout. */
+    if(gui_monitor_server_active())
+        gui_monitor_audio_server_tap(app,data,bytes);
 }
 
 void gui_net_poll_commands(gui_app_t *app) {
