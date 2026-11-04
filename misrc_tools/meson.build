@@ -491,6 +491,7 @@ if raylib_dep.found()
     # Server/Client networking (cxadc_vhs_server-style peer mode)
     'misrc_gui/net/gui_net.c',
     'misrc_gui/net/gui_monitor_transport.c',
+    'misrc_gui/net/gui_monitor_audio.c',
     'misrc_gui/net/gui_monitor_settings.c',
     'misrc_gui/net/gui_monitor_local_save.c',
     'misrc_gui/net/monitor_local_save_proxy.c',
@@ -551,6 +552,15 @@ if raylib_dep.found()
   zstd_dep = dependency('libzstd', required: true, static: windows_static_deps)
   gui_deps = deps + [ raylib_dep, fftw3f_dep ]
   gui_deps += [ zstd_dep ]
+  # Monitor & Remote Audio Mon streams 48 kHz / 10 ms Opus mono.
+  # Do not silently ship a client with a clickable but nonworking Audio Mon.
+  if not soxr_dep.found()
+    error('Monitor Opus audio requires libsoxr resampling (install libsoxr-dev).')
+  endif
+  opus_dep = dependency('opus', required: true,
+                        static: windows_static_deps or host_system == 'android')
+  gui_deps += [opus_dep]
+  message('MISRC Monitor & Remote Opus Audio Mon enabled')
   # OpenH264 is mandatory for the Monitor Client's video feature. Do not
   # silently produce an apparently successful GUI without H.264 support.
   openh264_dep = dependency('openh264', required: false, static: windows_static_deps or host_system == 'android')
@@ -1216,3 +1226,17 @@ endif
 
 cxadc_samples_test = executable('cxadc_samples_test', 'test/cxadc_samples_test.c', c_args: cflags)
 test('cxadc_samples', cxadc_samples_test)
+
+
+# Monitor Opus frame header: exact byte layout / length validation (no dependencies).
+monitor_audio_wire_test = executable('gui_monitor_audio_wire_test',
+  'test/gui_monitor_audio_wire_test.c', c_args: cflags)
+test('gui_monitor_audio_wire', monitor_audio_wire_test)
+
+# Monitor & Remote-only audio level metadata: exercise the production JSON
+# parser with current, legacy, incomplete and invalid status snapshots.
+if host_system != 'android'
+  monitor_audio_levels_test = executable('gui_monitor_audio_levels_test',
+    'test/gui_monitor_audio_levels_test.c', c_args: cflags)
+  test('gui_monitor_audio_levels', monitor_audio_levels_test)
+endif

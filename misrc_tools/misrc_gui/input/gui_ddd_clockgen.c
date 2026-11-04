@@ -15,6 +15,7 @@
 #include "gui_ddd_clockgen.h"
 
 #include "../core/gui_app.h"
+#include "../net/gui_monitor_audio.h"
 #include "../../common/buffer_manager.h"
 #include "../../common/threading.h"
 
@@ -398,6 +399,7 @@ static int ddd_cg_audio_capture_thread(void *ctx_ptr)
 
         bufmgr_write_end(&app->buffers, BUF_CAPTURE_AUDIO, output_bytes);
         bufmgr_signal_data(&app->buffers, BUF_CAPTURE_AUDIO);
+        gui_monitor_audio_server_tap(app,out,output_bytes);
         atomic_store(&app->audio_sample_rate, ctx->sample_rate_hz);
         atomic_store(&app->last_callback_time_ms, get_time_ms());
     }

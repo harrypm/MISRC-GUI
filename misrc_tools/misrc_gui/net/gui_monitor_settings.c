@@ -23,6 +23,8 @@ static const desc_t fields[]={
     {"enable_audio_2ch_34",offsetof(gui_settings_t,enable_audio_2ch_34),sizeof(((gui_settings_t*)0)->enable_audio_2ch_34),'B',0,1},
     {"misrc_mode",offsetof(gui_settings_t,misrc_mode),sizeof(((gui_settings_t*)0)->misrc_mode),'B',0,1},
     {"misrc_v15_v25_ab_swap",offsetof(gui_settings_t,misrc_v15_v25_ab_swap),sizeof(((gui_settings_t*)0)->misrc_v15_v25_ab_swap),'B',0,1},
+    /* Audio Mon remains in local-profile snapshots, but is explicitly
+     * excluded from Monitor network synchronization in the transport. */
     {"audio_monitor_playback",offsetof(gui_settings_t,audio_monitor_playback),sizeof(((gui_settings_t*)0)->audio_monitor_playback),'B',0,1},
     {"audio_monitor_ch34",offsetof(gui_settings_t,audio_monitor_ch34),sizeof(((gui_settings_t*)0)->audio_monitor_ch34),'B',0,1},
     {"level_autostop_enabled",offsetof(gui_settings_t,level_autostop_enabled),sizeof(((gui_settings_t*)0)->level_autostop_enabled),'B',0,1},

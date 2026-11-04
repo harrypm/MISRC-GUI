@@ -5,6 +5,7 @@
 #include "../processing/gui_extract.h"
 #include "../processing/gui_display_thread.h"
 #include "../output/gui_audio.h"
+#include "../net/gui_monitor_audio.h"
 #include "../output/gui_record.h"
 #include "../signal/gui_headswitch_lock.h"
 #include "../../common/buffer_manager.h"
@@ -2235,6 +2236,7 @@ static int cxadc_audio_capture_thread(void *ctx_ptr)
                     gui_headswitch_lock_ingest_s24le_interleaved(out, output_bytes, ctx->audio_sample_rate_hz);
                     bufmgr_write_end(&app->buffers, BUF_CAPTURE_AUDIO, output_bytes);
                     bufmgr_signal_data(&app->buffers, BUF_CAPTURE_AUDIO);
+                    gui_monitor_audio_server_tap(app,out,output_bytes);
                     atomic_store(&app->audio_sample_rate, ctx->audio_sample_rate_hz);
                     atomic_store(&app->last_callback_time_ms, get_time_ms());
                 } else {
@@ -2335,6 +2337,7 @@ cxadc_wasapi_done:
 
         bufmgr_write_end(&app->buffers, BUF_CAPTURE_AUDIO, output_bytes);
         bufmgr_signal_data(&app->buffers, BUF_CAPTURE_AUDIO);
+        gui_monitor_audio_server_tap(app,out,output_bytes);
         atomic_store(&app->audio_sample_rate, ctx->audio_sample_rate_hz);
         atomic_store(&app->last_callback_time_ms, get_time_ms());
     }

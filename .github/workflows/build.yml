@@ -186,6 +186,7 @@ jobs:
             libuvc-dev \
             libsoxr-dev \
             libopenh264-dev \
+            libopus-dev \
             libx11-dev \
             libxcursor-dev \
             libxi-dev \
@@ -581,6 +582,7 @@ jobs:
             mingw-w64-ucrt-x86_64-libusb
             mingw-w64-ucrt-x86_64-libsoxr
             mingw-w64-ucrt-x86_64-openh264
+            mingw-w64-ucrt-x86_64-opus
             mingw-w64-ucrt-x86_64-meson
             mingw-w64-ucrt-x86_64-nasm
             mingw-w64-ucrt-x86_64-ninja
@@ -605,6 +607,7 @@ jobs:
             mingw-w64-ucrt-x86_64-libusb
             mingw-w64-ucrt-x86_64-libsoxr
             mingw-w64-ucrt-x86_64-openh264
+            mingw-w64-ucrt-x86_64-opus
             mingw-w64-ucrt-x86_64-meson
             mingw-w64-ucrt-x86_64-nasm
             mingw-w64-ucrt-x86_64-ninja
@@ -811,6 +814,7 @@ jobs:
             mingw-w64-clang-aarch64-libusb
             mingw-w64-clang-aarch64-libsoxr
             mingw-w64-clang-aarch64-openh264
+            mingw-w64-clang-aarch64-opus
             mingw-w64-clang-aarch64-llvm-openmp
             mingw-w64-clang-aarch64-meson
             mingw-w64-clang-aarch64-ninja
@@ -836,6 +840,7 @@ jobs:
             mingw-w64-clang-aarch64-libusb
             mingw-w64-clang-aarch64-libsoxr
             mingw-w64-clang-aarch64-openh264
+            mingw-w64-clang-aarch64-opus
             mingw-w64-clang-aarch64-llvm-openmp
             mingw-w64-clang-aarch64-meson
             mingw-w64-clang-aarch64-ninja
@@ -1044,7 +1049,7 @@ jobs:
             /usr/local/Homebrew/Library/Taps/hashicorp/homebrew-tap; do
             rm -rf "$tap_dir"
           done
-          for formula in cmake fftw flac libusb libuvc meson nasm ninja pkgconf libsoxr; do
+          for formula in cmake fftw flac libusb libuvc meson nasm ninja pkgconf libsoxr opus; do
             if ! brew list --versions "$formula" >/dev/null 2>&1; then
               brew install "$formula"
             fi

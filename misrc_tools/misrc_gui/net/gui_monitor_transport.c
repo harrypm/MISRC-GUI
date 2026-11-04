@@ -6,6 +6,8 @@
 #include "gui_monitor_video_wire.h"
 #include "gui_monitor_video_client.h"
 #include "gui_monitor_session_state.h"
+#include "gui_monitor_audio_levels.h"
+#include "gui_monitor_audio.h"
 #include "gui_remote_display.h"
 #include "gui_remote_fs.h"
 #include "gui_monitor_settings.h"
@@ -328,9 +330,16 @@ static bool mon_parse_browse(char *body,gui_remote_fs_result_t *r){
     r->page=0;return true;
 }
 
+static bool mon_local_audio_setting(const char *key){
+    /* Only the listener controls its headphones. Preserve these fields in
+     * local profile snapshots but exclude them from the server protocol. */
+    return !strcmp(key,"audio_monitor_playback") ||
+           !strcmp(key,"audio_monitor_ch34");
+}
 static bool mon_cfg_pack(const gui_settings_t *s,char *dst,size_t cap){
     size_t used=0;dst[0]=0;
     for(size_t i=0;i<gui_monitor_settings_count();i++){
+        if(mon_local_audio_setting(gui_monitor_settings_key(i)))continue;
         char val[MON_SETTINGS_VALUE_CAP],encoded[MON_SETTINGS_VALUE_CAP*3+1];
         if(!gui_monitor_settings_get(s,i,val,sizeof(val))||!mon_url_encode(val,encoded,sizeof(encoded)))return false;
         int n=snprintf(dst+used,cap-used,"%s=%s\n",gui_monitor_settings_key(i),encoded);
@@ -405,6 +414,7 @@ void gui_monitor_client_sync_main(gui_app_t *app){
             if(eq){*eq++=0;char decoded[MON_SETTINGS_VALUE_CAP];
                 if(mon_url_decode(eq,strlen(eq),decoded,sizeof(decoded))){
                     for(size_t i=0;i<gui_monitor_settings_count();i++)if(!strcmp(line,gui_monitor_settings_key(i))){
+                        if(mon_local_audio_setting(line))break;
                         /* First sync adopts server state. Later server edits are
                          * mirrored only if client has no unsent local edit. */
                         char local[MON_SETTINGS_VALUE_CAP]={0};
@@ -425,6 +435,7 @@ void gui_monitor_client_sync_main(gui_app_t *app){
     /* One update per tick; queued in a single slot, never overwritten.
      * A failed network command is retried by the worker, not lost. */
     for(size_t i=0;i<gui_monitor_settings_count();i++){
+        if(mon_local_audio_setting(gui_monitor_settings_key(i)))continue;
         char value[MON_SETTINGS_VALUE_CAP];
         if(!gui_monitor_settings_get(&app->settings,i,value,sizeof(value)))continue;
         if(strcmp(value,g_cfg_client.last[i])==0)continue;
@@ -565,6 +576,9 @@ static int mon_send(mon_sock_t s, const char *data, size_t n) {
     }
     return 0;
 }
+static int mon_audio_send(uintptr_t sock, const char *bytes, size_t size) {
+    return mon_send((mon_sock_t)sock,bytes,size);
+}
 static void mon_answer(mon_sock_t s, int code, const char *type, const char *body) {
     char hdr[320];
     size_t n=strlen(body);
@@ -677,6 +691,7 @@ bool gui_monitor_server_handle_request(uintptr_t socket_handle,
         /* Strictly whitelist names and typed values before even staging. */
         gui_settings_t probe={0};
         bool valid=query&&mon_query_named(query,"key",key,sizeof(key))&&
+                   !mon_local_audio_setting(key)&&
                    mon_query_named(query,"value",value,sizeof(value))&&
                    gui_monitor_settings_set(&probe,key,value);
         if(!valid||app->is_recording){mon_answer(fd,409,"text/plain","setting invalid or recording active\n");return false;}
@@ -711,6 +726,20 @@ bool gui_monitor_server_handle_request(uintptr_t socket_handle,
             atomic_store(&app->clip_count_b_neg,0);
         }
         mon_answer(fd,200,"text/plain","clip counters cleared\n");return false;
+    }
+    if(strcmp(path,"/monitor/audio")==0){
+        int pair=mon_arg(query,"pair",-1);
+        if(pair!=0 && pair!=1){
+            mon_answer(fd,400,"text/plain","invalid audio channel pair\n");return false;
+        }
+        if(!app->is_capturing){
+            mon_answer(fd,409,"text/plain","server capture not active\n");return false;
+        }
+        /* Own this request worker until the low-latency Opus stream ends.
+         * The shared listener still serves other /monitor requests. */
+        mon_timeouts(fd,1000);
+        (void)gui_monitor_audio_server_stream((uintptr_t)fd,app,(unsigned)pair,mon_audio_send);
+        return false;
     }
     if(strcmp(path,"/monitor/video/osd")==0){
         int channel=mon_arg(query,"channel",-1),detail=mon_arg(query,"detail",2);
@@ -770,6 +799,14 @@ bool gui_monitor_server_handle_request(uintptr_t socket_handle,
         unsigned rb=mon_record_buffer_pct(app,BUF_RECORD_B);
         unsigned rf=mon_capture_buffer_pct(app,BUF_CAPTURE_RF);
         unsigned aud=mon_capture_buffer_pct(app,BUF_CAPTURE_AUDIO);
+        /* Only remote Monitor status uses these peaks. No audio samples leave
+         * the server; idle status explicitly sends zero rather than stale data. */
+        const unsigned audio_peaks[4]={
+            state ? (unsigned)atomic_load(&app->audio_peak[0]) : 0u,
+            state ? (unsigned)atomic_load(&app->audio_peak[1]) : 0u,
+            state ? (unsigned)atomic_load(&app->audio_peak[2]) : 0u,
+            state ? (unsigned)atomic_load(&app->audio_peak[3]) : 0u
+        };
         /* Avoid statvfs / Windows drive I/O on every ~100ms status poll.
          * The server socket worker is single-threaded; cache for 2 seconds. */
         static uint64_t free_checked_us=0,free_cached_bytes=0;
@@ -792,7 +829,7 @@ bool gui_monitor_server_handle_request(uintptr_t socket_handle,
             "{\"protocol\":\"MISRC-M/2\",\"state\":%u,\"sample_rate\":%u,\"frames\":%u,\"errors\":%u,\"missed\":%u,"
             "\"record_elapsed_ms\":%" PRIu64 ",\"raw_a\":%" PRIu64 ",\"raw_b\":%" PRIu64 ","
             "\"compressed_a\":%" PRIu64 ",\"compressed_b\":%" PRIu64 ",\"samples_a\":%" PRIu64 ","
-            "\"rec_a_pct\":%u,\"rec_b_pct\":%u,\"rf_pct\":%u,\"aud_pct\":%u,\"rec_a_waits\":%u,\"rec_b_waits\":%u,"
+            "\"rec_a_pct\":%u,\"rec_b_pct\":%u,\"rf_pct\":%u,\"aud_pct\":%u,\"audio_peak_ch1\":%u,\"audio_peak_ch2\":%u,\"audio_peak_ch3\":%u,\"audio_peak_ch4\":%u,\"rec_a_waits\":%u,\"rec_b_waits\":%u,"
             "\"rec_a_drops\":%u,\"rec_b_drops\":%u,"
             "\"local_queue_bytes\":%" PRIu64 ",\"local_queue_capacity\":%" PRIu64 ","
             "\"capture_a\":%u,\"capture_b\":%u,\"use_flac\":%u,\"local_save\":%u,"
@@ -805,6 +842,7 @@ bool gui_monitor_server_handle_request(uintptr_t socket_handle,
             elapsed_ms,(uint64_t)atomic_load(&app->recording_raw_a),(uint64_t)atomic_load(&app->recording_raw_b),
             (uint64_t)atomic_load(&app->recording_compressed_a),(uint64_t)atomic_load(&app->recording_compressed_b),
             (uint64_t)atomic_load(&app->samples_a),ra,rb,rf,aud,
+            audio_peaks[0],audio_peaks[1],audio_peaks[2],audio_peaks[3],
             (unsigned)atomic_load(&app->buffers.stats[BUF_RECORD_A].write_waits),
             (unsigned)atomic_load(&app->buffers.stats[BUF_RECORD_B].write_waits),
             (unsigned)atomic_load(&app->buffers.stats[BUF_RECORD_A].write_drops),
@@ -854,6 +892,7 @@ int gui_monitor_server_start(gui_app_t *app,uint16_t port) {
     g_record_result.detail[0]=0;
     mon_record_unlock();
     gui_monitor_local_save_server_init();
+    gui_monitor_audio_server_reset();
     memset(&g_cfg_server,0,sizeof(g_cfg_server));
     mon_cfg_snapshot(app);
     g_server.app=app;g_server.port=port;
@@ -870,6 +909,7 @@ void gui_monitor_server_stop(void){
     if(!atomic_load(&g_server.active))return;
     atomic_store(&g_server.active,false);
     gui_monitor_video_server_stop();
+    gui_monitor_audio_server_reset();
     gui_monitor_local_save_server_shutdown();
     g_server.app=NULL;g_server.port=0;
 }
@@ -1078,6 +1118,14 @@ static int mon_client_thread(void *ctx){
             p=strstr(response,"\"missed\":");
             if(p)missed=(unsigned)strtoul(p+9,NULL,10);
             if(state<0||state>2)state=0;
+            /* An older server lacks these optional keys. In that case, or
+             * while idle, show zero instead of a stale local audio reading. */
+            uint32_t remote_audio_peaks[4];
+            bool audio_levels_valid=gui_monitor_audio_levels_parse_status(response,remote_audio_peaks);
+            if(!audio_levels_valid || state==0)
+                memset(remote_audio_peaks,0,sizeof(remote_audio_peaks));
+            for(int ch=0;ch<4;ch++)
+                atomic_store(&g_client.app->audio_peak[ch],remote_audio_peaks[ch]);
             atomic_store(&g_client.peer_state,state);
             atomic_store(&g_client.peer_rate,rate);
             atomic_store(&g_client.peer_frames,frames);
@@ -1196,6 +1244,9 @@ static int mon_client_thread(void *ctx){
             if(status_rc==0)
                 error_reason=strstr(response,"\"protocol\":\"MISRC-M/1\"") ? 2 : 3;
             bool first=gui_monitor_session_status_failed(&session);
+            /* Keep the monitor connection for recovery, but clear live meters
+             * immediately if status polling fails or the peer is incompatible. */
+            for(int ch=0;ch<4;ch++)atomic_store(&g_client.app->audio_peak[ch],0);
             atomic_store(&g_client.status_dropouts,session.status_errors);
             atomic_store(&g_client.last_error,error_reason);
             if(first || session.consecutive_status_errors==10 ||
@@ -1233,6 +1284,7 @@ int gui_monitor_client_start(gui_app_t *app,const char *host,uint16_t port){
      * restored over a fresh M-Client session that just snapshotted it. */
     atomic_store(&g_monitor_restore_pending,false);
     g_client.app=app;g_client.port=port;
+    for(int ch=0;ch<4;ch++)atomic_store(&app->audio_peak[ch],0);
     mon_cfg_disconnect();
     cfg_lock();
     g_cfg_client.local_count=app->device_count;
@@ -1266,15 +1318,19 @@ int gui_monitor_client_start(gui_app_t *app,const char *host,uint16_t port){
     atomic_store(&g_client.running,true);
     if(gui_monitor_video_client_start(host,port)!=0)
         fprintf(stderr,"[M-VIDEO] OpenH264 client unavailable; waveform/FFT unaffected\n");
+    if(gui_monitor_audio_client_start(app,host,port)!=0)
+        fprintf(stderr,"[M-AUDIO] Failed to start Monitor Opus audio receiver\n");
     fprintf(stderr,"[M-CLIENT] Connecting to monitor %s:%u (Zstd-1 original waveform/FFT + status/control)\n",host,(unsigned)port);
     return 0;
 }
 void gui_monitor_client_stop(void){
     if(!atomic_load(&g_client.running))return;
     atomic_store(&g_client.stopping,true);
+    gui_monitor_audio_client_stop();
     gui_monitor_video_client_stop();
     thrd_join(g_client.thread,NULL);
     if(g_client.app){
+        for(int ch=0;ch<4;ch++)atomic_store(&g_client.app->audio_peak[ch],0);
         /* Neither Pi settings nor its remote device indices may leak into
          * Harry's existing Local / full-RF Client modes. The settings/devices
          * restores are STAGED for the main thread (this may be the net

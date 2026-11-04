@@ -35,6 +35,16 @@ Monitor & Remote insists on a **`MISRC-M/2`** handshake and never receives raw R
 - Monitor & Remote receives the Server device catalogue; pseudo-devices such as
   Simulated and Playback legitimately use `index=-1`.
 
+- **Monitor Audio Mon:** `GET /monitor/audio?pair=0|1` sends a separate
+  low-bandwidth HTTP stream of 48 kHz mono Opus, encoded in 10 ms frames
+  (about 80 kbit/s) from the server's existing captured CH1/2 or CH3/4
+  baseband audio. Frames use a bounded 12-byte `MAO1` header + Opus payload,
+  not Ogg and not the legacy `/baseband` endpoint. The stream exists only
+  while the remote Audio Mon is enabled, and stops on disconnect/idle.
+  Monitor-only audio controls are **client-local**; they do not change the
+  server's local Audio Mon settings. Local, Server and legacy Client playback
+  pipelines are unchanged.
+
 **Preview is not a raw-RF transport.** Encoded recordings are transferred only
 when Monitor & Remote Local Save is explicitly enabled.
 

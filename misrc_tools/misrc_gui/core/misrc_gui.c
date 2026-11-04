@@ -45,6 +45,7 @@
 #include "../output/gui_record.h"
 #include "../output/gui_audio.h"
 #include "../net/gui_net.h"
+#include "../net/gui_monitor_audio.h"
 #include "../../common/threading.h"
 #include "../../common/utf8_argv.h"
 #include "version.h"
@@ -1928,6 +1929,9 @@ int main(int argc, char **argv) {
         // Update VU meters
         gui_app_update_vu_meters(&app, dt);
 
+        // Monitor & Remote Opus audio is a separate client-owned output.
+        // Release it before the legacy Local/Client audio pump starts.
+        gui_monitor_audio_client_update(&app);
         // Pump audio playback monitoring (system output)
         gui_audio_update_playback(&app);
 
@@ -1990,6 +1994,8 @@ int main(int argc, char **argv) {
 
     // Save settings before cleanup
     gui_settings_save(&app.settings);
+    // Raylib output must be destroyed on the GUI thread before net cleanup.
+    gui_monitor_audio_client_update(NULL);
     
     gui_app_cleanup(&app);
     free(clay_memory);

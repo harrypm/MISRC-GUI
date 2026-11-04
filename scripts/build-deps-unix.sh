@@ -65,7 +65,7 @@ compute_stamp() {
     fi
     find "$HSDAOH_SOURCE_DIR" -type f \( -name '*.c' -o -name '*.h' -o -name 'CMakeLists.txt' -o -name '*.in' \) \
       -exec sha256sum {} + 2>/dev/null | sort
-    for m in fftw3f flac libusb-1.0 soxr libuvc libzstd openh264; do
+    for m in fftw3f flac libusb-1.0 soxr libuvc libzstd openh264 opus; do
       printf '%s=%s\n' "$m" "$(pkg-config --modversion "$m" 2>/dev/null || echo missing)"
     done
   } | sha256sum | awk '{print $1}'
