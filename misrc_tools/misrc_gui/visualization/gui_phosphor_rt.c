@@ -530,9 +530,9 @@ const float PHOSPHOR_CHANNEL_COLOR_B[3] = { 220.0f/255.0f, 200.0f/255.0f, 80.0f/
 // Waveform Drawing Helpers
 //-----------------------------------------------------------------------------
 
-void phosphor_rt_draw_waveform(phosphor_rt_t *prt,
-                               const waveform_sample_t *samples, size_t sample_count,
-                               float amplitude_scale) {
+void phosphor_rt_draw_waveform_xstep(phosphor_rt_t *prt,
+                                     const waveform_sample_t *samples, size_t sample_count,
+                                     float amplitude_scale, float x_step) {
     if (!prt || !prt->valid || !samples || sample_count < 2) return;
 
     int buf_height = prt->logical_height;
@@ -544,14 +544,23 @@ void phosphor_rt_draw_waveform(phosphor_rt_t *prt,
     // Get draw color for hit intensity
     Color waveColor = phosphor_rt_get_draw_color(prt);
 
-    // Draw waveform as connected line segments
-    for (size_t i = 0; i < sample_count - 1; i++) {
-        float y0 = center_y - samples[i].value * scale * buf_height;
-        float y1 = center_y - samples[i + 1].value * scale * buf_height;
+    // Draw waveform as connected line segments. Point i sits at
+    // x = i * x_step so a point count different from the panel width
+    // stretches across the full panel (Res selector).
+    float prev_x = 0.0f;
+    float prev_y = center_y - samples[0].value * scale * buf_height;
+    for (size_t i = 1; i < sample_count; i++) {
+        float y = center_y - samples[i].value * scale * buf_height;
+        float x_pos = (float)i * x_step;
 
-        float x0 = (float)i;
-        float x1 = (float)(i + 1);
-
-        DrawLineEx((Vector2){x0, y0}, (Vector2){x1, y1}, 1.0f, waveColor);
+        DrawLineEx((Vector2){prev_x, prev_y}, (Vector2){x_pos, y}, 1.0f, waveColor);
+        prev_x = x_pos;
+        prev_y = y;
     }
+}
+
+void phosphor_rt_draw_waveform(phosphor_rt_t *prt,
+                               const waveform_sample_t *samples, size_t sample_count,
+                               float amplitude_scale) {
+    phosphor_rt_draw_waveform_xstep(prt, samples, sample_count, amplitude_scale, 1.0f);
 }

@@ -4845,14 +4845,14 @@ static int playback_thread_func(void *ctx_ptr) {
 
         // A paused scrub emits only its target channel. Leave the other
         // decoder, cursor and buffered samples untouched, including at EOF.
-        // Independent mode adds a per-channel pause (Separate link mode or
-        // that channel's EOF): the paused channel emits nothing while the
-        // other keeps rolling.
+        // Per-channel pause (DAW per-track transport, user request
+        // 2026-11-03: "fix the player by adding the per channel play/pause
+        // and loop function"): the paused channel emits nothing (zeros in
+        // the paired packing, no FIFO writes in independent mode) while the
+        // other keeps rolling. Works in BOTH link modes.
         bool paused_output = atomic_load(&ctx->state) == PLAYBACK_STATE_PAUSED;
-        bool ch_pause_a = independent &&
-            atomic_load(&app->playback_channel_paused[0]);
-        bool ch_pause_b = independent &&
-            atomic_load(&app->playback_channel_paused[1]);
+        bool ch_pause_a = atomic_load(&app->playback_channel_paused[0]);
+        bool ch_pause_b = atomic_load(&app->playback_channel_paused[1]);
         bool channel_a_active = ctx->file_a &&
                                 (!paused_output || ctx->backfill_active_a) &&
                                 !ch_pause_a;
@@ -4937,31 +4937,26 @@ static int playback_thread_func(void *ctx_ptr) {
             deadline_us = 0;
             continue;
         }
-        // Per-channel effective loop: independent mode honours each
-        // channel's own loop flag; every other mode uses the shared one.
-        bool loop_a = independent ? atomic_load(&ctx->channel_loop[0])
-                                  : atomic_load(&ctx->loop_enabled);
-        bool loop_b = independent ? atomic_load(&ctx->channel_loop[1])
-                                  : atomic_load(&ctx->loop_enabled);
+        // Per-channel loop: each channel honours its own loop flag in BOTH
+        // link modes (Synced sets both flags together, so the shared
+        // loop_enabled stays in sync; Separate drives them individually).
+        bool loop_a = atomic_load(&ctx->channel_loop[0]);
+        bool loop_b = atomic_load(&ctx->channel_loop[1]);
         if ((eof_a && !loop_a) || (eof_b && !loop_b)) {
-            if (independent) {
-                // Independent mode: a tape that ends pauses ONLY its own
-                // channel (the other file keeps rolling). Seek/replay stays
-                // available via the channel's transport.
-                if (eof_a) {
-                    ctx->backfill_active_a = false;
-                    atomic_store(&app->playback_channel_paused[0], true);
-                    fprintf(stderr, "[PLAYBACK] CH A end of file (independent pause)\n");
-                }
-                if (eof_b) {
-                    ctx->backfill_active_b = false;
-                    atomic_store(&app->playback_channel_paused[1], true);
-                    fprintf(stderr, "[PLAYBACK] CH B end of file (independent pause)\n");
-                }
-                continue;
+            // A tape that ends pauses ONLY its own channel (DAW per-track
+            // transport, both link modes); the other file keeps rolling.
+            // Seek/replay stays available via the channel's buttons.
+            if (eof_a) {
+                ctx->backfill_active_a = false;
+                atomic_store(&app->playback_channel_paused[0], true);
+                fprintf(stderr, "[PLAYBACK] CH A end of file (channel pause)\n");
             }
-            atomic_store(&ctx->state, PLAYBACK_STATE_PAUSED);
-            continue; // Seek remains available; no samples cross the EOF boundary.
+            if (eof_b) {
+                ctx->backfill_active_b = false;
+                atomic_store(&app->playback_channel_paused[1], true);
+                fprintf(stderr, "[PLAYBACK] CH B end of file (channel pause)\n");
+            }
+            continue;
         }
         // Loop channel A independently
         if (eof_a) {
@@ -6447,31 +6442,43 @@ bool gui_playback_get_link_separate(gui_app_t *app) {
 
 void gui_playback_toggle_pause_channel(gui_app_t *app, int channel) {
     if (!app || channel < 0 || channel > 1) return;
-    if (!atomic_load(&app->playback_link_separate)) {
-        gui_playback_toggle_pause(app);
+    // Master (shared) pause first: clicking a track's Play while the whole
+    // transport is paused resumes the transport (DAW behavior) instead of
+    // toggling an invisible per-channel flag.
+    if (atomic_load(&s_playback->state) == PLAYBACK_STATE_PAUSED) {
+        atomic_store(&s_playback->state, PLAYBACK_STATE_PLAYING);
+        atomic_store(&app->playback_channel_paused[0], false);
+        atomic_store(&app->playback_channel_paused[1], false);
         return;
     }
+    if (!atomic_load(&app->playback_link_separate)) {
+        // Synced link: the channels act as a group - pause both if either
+        // is playing, resume both when both are paused.
+        bool any_playing = !atomic_load(&app->playback_channel_paused[0]) ||
+                           !atomic_load(&app->playback_channel_paused[1]);
+        atomic_store(&app->playback_channel_paused[0], any_playing);
+        atomic_store(&app->playback_channel_paused[1], any_playing);
+        return;
+    }
+    // Separate link: toggle only this channel.
     bool was_paused = atomic_load(&app->playback_channel_paused[channel]);
     atomic_store(&app->playback_channel_paused[channel], !was_paused);
-    if (was_paused &&
-        atomic_load(&s_playback->state) == PLAYBACK_STATE_PAUSED) {
-        // Resuming a channel also lifts a shared (master) pause, otherwise
-        // the per-channel resume would appear to do nothing.
-        atomic_store(&s_playback->state, PLAYBACK_STATE_PLAYING);
-    }
 }
 
 bool gui_playback_is_channel_paused(gui_app_t *app, int channel) {
     if (!app || channel < 0 || channel > 1) return true;
+    // A master pause pauses every track; otherwise the channel's own flag.
     if (gui_playback_get_state(app) != PLAYBACK_STATE_PLAYING) return true;
-    if (!atomic_load(&app->playback_link_separate)) return false;
     return atomic_load(&app->playback_channel_paused[channel]);
 }
 
 void gui_playback_set_channel_loop(gui_app_t *app, int channel, bool loop) {
     if (!app || channel < 0 || channel > 1) return;
-    if (!atomic_load(&app->playback_link_separate) ||
-        !atomic_load(&app->playback_independent_mode)) {
+    if (!atomic_load(&app->playback_link_separate)) {
+        // Synced link: loop is a group setting - drive both channel flags
+        // (and the shared loop_enabled mirror) together.
+        atomic_store(&s_playback->channel_loop[0], loop);
+        atomic_store(&s_playback->channel_loop[1], loop);
         gui_playback_set_loop(app, loop);
         return;
     }
@@ -6480,10 +6487,8 @@ void gui_playback_set_channel_loop(gui_app_t *app, int channel, bool loop) {
 
 bool gui_playback_get_channel_loop(gui_app_t *app, int channel) {
     if (!app || channel < 0 || channel > 1) return false;
-    if (!atomic_load(&app->playback_link_separate) ||
-        !atomic_load(&app->playback_independent_mode)) {
-        return gui_playback_get_loop(app);
-    }
+    // Per-channel flags are authoritative in both link modes (Synced keeps
+    // them equal by setting them together).
     return atomic_load(&s_playback->channel_loop[channel]);
 }
 

@@ -4031,12 +4031,6 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                     }
 
                     // Channel A playback file
-                    {
-                        bool pb_live = app->is_capturing && gui_playback_is_running(app);
-                        bool pb_has_file = app->settings.playback_file_a[0] != '\0';
-                        bool pb_active = pb_live && pb_has_file;
-                        bool pb_paused = pb_active && gui_playback_is_channel_paused(app, 0);
-                        bool pb_loop = pb_has_file && gui_playback_get_channel_loop(app, 0);
                     CLAY(CLAY_ID("PlaybackFileARow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 6 } }) {
                         CLAY(CLAY_ID("PlaybackFileBrowseA"), { .layout = { .sizing = { CLAY_SIZING_FIXED(70), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
                             CLAY_TEXT(CLAY_STRING("Ch A..."), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
@@ -4050,25 +4044,11 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                         CLAY(CLAY_ID("PlaybackFileClearA"), { .layout = { .sizing = { CLAY_SIZING_FIXED(28), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
                             CLAY_TEXT(CLAY_STRING("X"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
                         }
-                        // Per-file transport (next to the file input, user
-                        // request 2026-11-03). Synced link: these mirror the
-                        // shared transport; Separate: this file only.
-                        CLAY(CLAY_IDI("PlaybackPauseBtn", 0), { .layout = { .sizing = { CLAY_SIZING_FIXED(52), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(!pb_active ? ui_disabled_color(COLOR_BUTTON) : (pb_paused ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON)), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                            CLAY_TEXT(pb_paused ? CLAY_STRING("Play") : CLAY_STRING("Pause"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(pb_active ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT)) }));
-                        }
-                        CLAY(CLAY_IDI("PlaybackLoopBtn", 0), { .layout = { .sizing = { CLAY_SIZING_FIXED(52), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(!pb_active ? ui_disabled_color(COLOR_BUTTON) : (pb_loop ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON)), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                            CLAY_TEXT(CLAY_STRING("Loop"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(pb_active ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT)) }));
-                        }
-                    }
+                        // Per-file Play/Pause + Loop moved to the right end of
+                        // each playback timeline row (user request 2026-11-03).
                     }
 
                     // Channel B playback file
-                    {
-                        bool pb_live = app->is_capturing && gui_playback_is_running(app);
-                        bool pb_has_file = app->settings.playback_file_b[0] != '\0';
-                        bool pb_active = pb_live && pb_has_file;
-                        bool pb_paused = pb_active && gui_playback_is_channel_paused(app, 1);
-                        bool pb_loop = pb_has_file && gui_playback_get_channel_loop(app, 1);
                     CLAY(CLAY_ID("PlaybackFileBRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 6 } }) {
                         CLAY(CLAY_ID("PlaybackFileBrowseB"), { .layout = { .sizing = { CLAY_SIZING_FIXED(70), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
                             CLAY_TEXT(CLAY_STRING("Ch B..."), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
@@ -4081,13 +4061,6 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                         CLAY(CLAY_ID("PlaybackFileClearB"), { .layout = { .sizing = { CLAY_SIZING_FIXED(28), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
                             CLAY_TEXT(CLAY_STRING("X"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
                         }
-                        CLAY(CLAY_IDI("PlaybackPauseBtn", 1), { .layout = { .sizing = { CLAY_SIZING_FIXED(52), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(!pb_active ? ui_disabled_color(COLOR_BUTTON) : (pb_paused ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON)), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                            CLAY_TEXT(pb_paused ? CLAY_STRING("Play") : CLAY_STRING("Pause"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(pb_active ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT)) }));
-                        }
-                        CLAY(CLAY_IDI("PlaybackLoopBtn", 1), { .layout = { .sizing = { CLAY_SIZING_FIXED(52), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(!pb_active ? ui_disabled_color(COLOR_BUTTON) : (pb_loop ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON)), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                            CLAY_TEXT(CLAY_STRING("Loop"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(pb_active ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT)) }));
-                        }
-                    }
                     }
 
                     // Playback audio (drag-and-drop monitor source; loads with
@@ -7058,6 +7031,72 @@ static void render_channel_stats(gui_app_t *app, int channel,
     }
 }
 
+// Per-channel transport icon buttons (Play/Pause + Loop) beside the scrub
+// slider on each playback timeline row (user request 2026-11-03: icons, not
+// text labels).
+#define PLAYBACK_TRANSPORT_BTN_W 28
+#define PLAYBACK_TRANSPORT_BTN_H 20
+#define PLAYBACK_TRANSPORT_ICON_SIZE 12
+
+// Per-channel transport icon group for one playback timeline row: Play/Pause
+// + Loop as compact icon buttons (font-free custom Clay elements, matching
+// the toolbar's loop icon). Reuses the PlaybackPauseBtn/PlaybackLoopBtn Clay
+// IDs the old settings-panel text buttons used, so the existing click
+// handlers keep working unchanged. Non-stacked rows call this from inside
+// the timeline (directly after the scrub track); stacked narrow rows call it
+// as a row-level group at the right end (see render_playback_timeline_row).
+static void render_playback_transport_buttons(int channel_index, bool pb_active,
+                                               bool pb_paused, bool pb_loop) {
+    static CustomLayoutElement s_pause_icon[2];
+    static CustomLayoutElement s_loop_icon[2];
+    // Toolbar RecordButton convention: the Play glyph shows when paused or
+    // not running; the Pause glyph only while actually playing.
+    bool playing = pb_active && !pb_paused;
+    s_pause_icon[channel_index].type = playing
+        ? CUSTOM_LAYOUT_ELEMENT_TYPE_PAUSE_ICON
+        : CUSTOM_LAYOUT_ELEMENT_TYPE_PLAY_ICON;
+    s_loop_icon[channel_index].type = CUSTOM_LAYOUT_ELEMENT_TYPE_LOOP_ICON;
+    Color pause_bg = !pb_active ? ui_disabled_color(COLOR_BUTTON)
+        : (pb_paused ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON);
+    Color loop_bg = !pb_active ? ui_disabled_color(COLOR_BUTTON)
+        : (pb_loop ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON);
+    CLAY(CLAY_IDI("PlaybackTransportBtns", channel_index), {
+        .layout = {
+            .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) },
+            .layoutDirection = CLAY_LEFT_TO_RIGHT,
+            .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
+            .childGap = 4
+        }
+    }) {
+        CLAY(CLAY_IDI("PlaybackPauseBtn", channel_index), {
+            .layout = {
+                .sizing = { CLAY_SIZING_FIXED(PLAYBACK_TRANSPORT_BTN_W), CLAY_SIZING_FIXED(PLAYBACK_TRANSPORT_BTN_H) },
+                .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
+            },
+            .backgroundColor = to_clay_color(pause_bg),
+            .cornerRadius = CLAY_CORNER_RADIUS(4)
+        }) {
+            CLAY(CLAY_IDI("PlaybackPauseIcon", channel_index), {
+                .layout = { .sizing = { CLAY_SIZING_FIXED(PLAYBACK_TRANSPORT_ICON_SIZE), CLAY_SIZING_FIXED(PLAYBACK_TRANSPORT_ICON_SIZE) } },
+                .custom = { .customData = &s_pause_icon[channel_index] }
+            }) {}
+        }
+        CLAY(CLAY_IDI("PlaybackLoopBtn", channel_index), {
+            .layout = {
+                .sizing = { CLAY_SIZING_FIXED(PLAYBACK_TRANSPORT_BTN_W), CLAY_SIZING_FIXED(PLAYBACK_TRANSPORT_BTN_H) },
+                .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
+            },
+            .backgroundColor = to_clay_color(loop_bg),
+            .cornerRadius = CLAY_CORNER_RADIUS(4)
+        }) {
+            CLAY(CLAY_IDI("PlaybackLoopIcon", channel_index), {
+                .layout = { .sizing = { CLAY_SIZING_FIXED(PLAYBACK_TRANSPORT_ICON_SIZE), CLAY_SIZING_FIXED(PLAYBACK_TRANSPORT_ICON_SIZE) } },
+                .custom = { .customData = &s_loop_icon[channel_index] }
+            }) {}
+        }
+    }
+}
+
 typedef struct {
     int left_padding, right_padding, label_width, track_width;
     int readout_width;      // "8-bit 20.0 MSPS" slot; 0 = no horizontal room
@@ -7082,6 +7121,14 @@ static gui_playback_timeline_layout_t gui_ui_playback_timeline_layout(gui_app_t 
     int label_min = screen_width < 900 ? 120 : 150;
     if (label_width < label_min) label_width = label_min;
     int available = screen_width - spacing.horizontal_gap * 4 - left_padding - right_padding;
+    // Transport icon group (beside the scrub slider) takes a fixed two-button
+    // group plus one extra gap — the timeline's 8px internal gap on normal
+    // rows, or the row gap on stacked narrow rows. Budget it so the scrub
+    // track and info tiers adapt instead of overflowing.
+    {
+        int transport_gap = spacing.horizontal_gap > 8 ? spacing.horizontal_gap : 8;
+        available -= PLAYBACK_TRANSPORT_BTN_W * 2 + 4 + transport_gap;
+    }
     if (available < 1) available = 1;
     int track_width = screen_width < 900 ? 180 : (screen_width < 1150 ? 240 : 300);
     bool stacked = available - label_width - 8 < 64;
@@ -7210,6 +7257,11 @@ static void render_playback_timeline_row(gui_app_t *app, int channel_index, char
     Color timeline_track_color = seekable ? (Color){45, 45, 52, 255} : (Color){33, 33, 38, 255};
     Color timeline_fill_color = seekable ? (provisional ? COLOR_METER_YELLOW : COLOR_SYNC_GREEN) : COLOR_TEXT_DIM;
     Color readout_color = loaded ? COLOR_TEXT_DIM : ui_disabled_color(COLOR_TEXT_DIM);
+    // Per-channel transport icon state (icons beside the scrub slider).
+    bool pb_live = app->is_capturing && gui_playback_is_running(app);
+    bool pb_active = pb_live && loaded;
+    bool pb_paused = pb_active && gui_playback_is_channel_paused(app, channel_index);
+    bool pb_loop = loaded && gui_playback_get_channel_loop(app, channel_index);
     bool show_length_status = loaded && (provisional || verification_failed);
     char *index_text = playback_index_display[channel_index == 1 ? 1 : 0];
     if (show_length_status) {
@@ -7295,6 +7347,13 @@ static void render_playback_timeline_row(gui_app_t *app, int channel_index, char
                 }
             }
 
+            // Transport icons directly next to the scrub slider (user request
+            // 2026-11-03). Stacked narrow rows render them at the row's right
+            // end instead — the vertical timeline would overflow the row.
+            if (!layout->stacked) {
+                render_playback_transport_buttons(channel_index, pb_active, pb_paused, pb_loop);
+            }
+
             // Right-side file info line: [basename][bit-depth + rate][RAW/FLAC]
             // — flows after the scrub track horizontally / its own line stacked.
             if (layout->name_width > 0 || layout->readout_width > 0 || layout->fileinfo_width > 0) {
@@ -7349,6 +7408,13 @@ static void render_playback_timeline_row(gui_app_t *app, int channel_index, char
                     }
                 }
             }
+        }
+
+        // Stacked (very narrow) rows: the timeline flows vertically, so the
+        // transport icons render here at the row's right end instead of
+        // inside it (normal rows put them next to the scrub slider).
+        if (layout->stacked) {
+            render_playback_transport_buttons(channel_index, pb_active, pb_paused, pb_loop);
         }
 
         CLAY(CLAY_IDI("PlaybackTimelineRightPad", channel_index), {
@@ -10619,6 +10685,42 @@ void gui_handle_interactions(gui_app_t *app) {
             }
         }
 
+        // Per-channel transport buttons (Play/Pause + Loop) live at the right
+        // end of the playback timeline rows (moved out of the settings panel,
+        // user request 2026-11-03). Synced link: they drive the shared
+        // transport; Separate: the one channel only. Runs outside the
+        // settings-panel gate because the buttons render in the channel area.
+        for (int pb_ch = 0; pb_ch < 2; pb_ch++) {
+            if (Clay_PointerOver(CLAY_IDI("PlaybackPauseBtn", pb_ch))) {
+                if (app->is_capturing && gui_playback_is_running(app) &&
+                    (pb_ch == 0 ? app->settings.playback_file_a[0]
+                                : app->settings.playback_file_b[0])) {
+                    bool was_paused = gui_playback_is_channel_paused(app, pb_ch);
+                    gui_playback_toggle_pause_channel(app, pb_ch);
+                    gui_app_set_status(app, was_paused
+                        ? (pb_ch ? "CH B resumed" : "CH A resumed")
+                        : (pb_ch ? "CH B paused" : "CH A paused"));
+                } else {
+                    gui_app_set_status(app, "Playback is not running");
+                }
+                gui_ui_set_click_consumed();
+            }
+            if (Clay_PointerOver(CLAY_IDI("PlaybackLoopBtn", pb_ch))) {
+                if (app->is_capturing && gui_playback_is_running(app) &&
+                    (pb_ch == 0 ? app->settings.playback_file_a[0]
+                                : app->settings.playback_file_b[0])) {
+                    bool now_on = !gui_playback_get_channel_loop(app, pb_ch);
+                    gui_playback_set_channel_loop(app, pb_ch, now_on);
+                    gui_app_set_status(app, now_on
+                        ? (pb_ch ? "CH B loop ON" : "CH A loop ON")
+                        : (pb_ch ? "CH B loop OFF" : "CH A loop OFF"));
+                } else {
+                    gui_app_set_status(app, "Playback is not running");
+                }
+                gui_ui_set_click_consumed();
+            }
+        }
+
         // Settings panel interactions
         if (app->settings_panel_open) {
             bool settings_cxadc_has_channel_b = false;
@@ -11182,36 +11284,6 @@ void gui_handle_interactions(gui_app_t *app) {
                 gui_app_set_status(app, sep ? "Player link: Separate (per-file transport)"
                                             : "Player link: Synced (shared transport)");
                 gui_ui_set_click_consumed();
-            }
-            for (int pb_ch = 0; pb_ch < 2; pb_ch++) {
-                if (Clay_PointerOver(CLAY_IDI("PlaybackPauseBtn", pb_ch))) {
-                    if (app->is_capturing && gui_playback_is_running(app) &&
-                        (pb_ch == 0 ? app->settings.playback_file_a[0]
-                                    : app->settings.playback_file_b[0])) {
-                        bool was_paused = gui_playback_is_channel_paused(app, pb_ch);
-                        gui_playback_toggle_pause_channel(app, pb_ch);
-                        gui_app_set_status(app, was_paused
-                            ? (pb_ch ? "CH B resumed" : "CH A resumed")
-                            : (pb_ch ? "CH B paused" : "CH A paused"));
-                    } else {
-                        gui_app_set_status(app, "Playback is not running");
-                    }
-                    gui_ui_set_click_consumed();
-                }
-                if (Clay_PointerOver(CLAY_IDI("PlaybackLoopBtn", pb_ch))) {
-                    if (app->is_capturing && gui_playback_is_running(app) &&
-                        (pb_ch == 0 ? app->settings.playback_file_a[0]
-                                    : app->settings.playback_file_b[0])) {
-                        bool now_on = !gui_playback_get_channel_loop(app, pb_ch);
-                        gui_playback_set_channel_loop(app, pb_ch, now_on);
-                        gui_app_set_status(app, now_on
-                            ? (pb_ch ? "CH B loop ON" : "CH A loop ON")
-                            : (pb_ch ? "CH B loop OFF" : "CH A loop OFF"));
-                    } else {
-                        gui_app_set_status(app, "Playback is not running");
-                    }
-                    gui_ui_set_click_consumed();
-                }
             }
         }
 

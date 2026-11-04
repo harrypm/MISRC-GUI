@@ -87,6 +87,116 @@ static const char *s_signal_labels[WAVE_SIGNAL_COUNT] = {
 };
 
 //-----------------------------------------------------------------------------
+// Waveform render-resolution presets (playback device only). Res selects
+// how many waveform points are drawn across the panel width; Range
+// selects which preset group the Res dropdown lists (coarse vs fine
+// sampling densities). This is the FIRST implementation's model (user
+// confirmed 2026-11-03: "Coarse/Fine mode first implementation" was the
+// working one - selecting MORE points than panel pixels oversamples the
+// window with soxr and the stretch renderer draws them all).
+//-----------------------------------------------------------------------------
+
+typedef enum {
+    WAVEFORM_RES_RANGE_COARSE = 0,
+    WAVEFORM_RES_RANGE_FINE,
+    WAVEFORM_RES_RANGE_COUNT
+} waveform_res_range_t;
+
+typedef enum {
+    WAVEFORM_RES_AUTO = 0,      // One point per pixel (stock behaviour)
+    WAVEFORM_RES_PTS_64,
+    WAVEFORM_RES_PTS_128,
+    WAVEFORM_RES_PTS_256,
+    WAVEFORM_RES_PTS_512,
+    WAVEFORM_RES_PTS_1024,
+    WAVEFORM_RES_PTS_2048,
+    WAVEFORM_RES_PTS_4096,
+    WAVEFORM_RES_PTS_8192,
+    WAVEFORM_RES_PTS_16384,
+    WAVEFORM_RES_PTS_32768,
+    WAVEFORM_RES_COUNT
+} waveform_res_points_t;
+
+// Coarse range: chunky resolutions. Fine range: the full ladder.
+static const waveform_res_points_t s_res_coarse[] = {
+    WAVEFORM_RES_PTS_256,
+    WAVEFORM_RES_PTS_512,
+    WAVEFORM_RES_PTS_1024,
+    WAVEFORM_RES_PTS_2048,
+    WAVEFORM_RES_PTS_4096,
+};
+static const waveform_res_points_t s_res_fine[] = {
+    WAVEFORM_RES_PTS_64,
+    WAVEFORM_RES_PTS_128,
+    WAVEFORM_RES_PTS_256,
+    WAVEFORM_RES_PTS_512,
+    WAVEFORM_RES_PTS_1024,
+    WAVEFORM_RES_PTS_2048,
+    WAVEFORM_RES_PTS_4096,
+    WAVEFORM_RES_PTS_8192,
+    WAVEFORM_RES_PTS_16384,
+    WAVEFORM_RES_PTS_32768,
+};
+
+// Dropdown option array size: the largest preset group.
+#define WAVEFORM_RES_OPTION_COUNT (sizeof(s_res_fine) / sizeof(s_res_fine[0]))
+
+static const char *s_res_range_labels[WAVEFORM_RES_RANGE_COUNT] = {
+    [WAVEFORM_RES_RANGE_COARSE] = "Coarse",
+    [WAVEFORM_RES_RANGE_FINE] = "Fine",
+};
+
+// Human label for a Res enum value ("Auto", "64", ..., "32768").
+static const char *waveform_res_points_label(int res_points) {
+    switch ((waveform_res_points_t)res_points) {
+        case WAVEFORM_RES_AUTO:  return "Auto";
+        case WAVEFORM_RES_PTS_64:    return "64";
+        case WAVEFORM_RES_PTS_128:   return "128";
+        case WAVEFORM_RES_PTS_256:   return "256";
+        case WAVEFORM_RES_PTS_512:   return "512";
+        case WAVEFORM_RES_PTS_1024:  return "1024";
+        case WAVEFORM_RES_PTS_2048:  return "2048";
+        case WAVEFORM_RES_PTS_4096:  return "4096";
+        case WAVEFORM_RES_PTS_8192:  return "8192";
+        case WAVEFORM_RES_PTS_16384: return "16384";
+        case WAVEFORM_RES_PTS_32768: return "32768";
+        default:                     return "Auto";
+    }
+}
+
+// Enum value -> actual point count (0 = Auto -> caller uses display width).
+static int waveform_res_points_value(int res_points) {
+    switch ((waveform_res_points_t)res_points) {
+        case WAVEFORM_RES_PTS_64:    return 64;
+        case WAVEFORM_RES_PTS_128:   return 128;
+        case WAVEFORM_RES_PTS_256:   return 256;
+        case WAVEFORM_RES_PTS_512:   return 512;
+        case WAVEFORM_RES_PTS_1024:  return 1024;
+        case WAVEFORM_RES_PTS_2048:  return 2048;
+        case WAVEFORM_RES_PTS_4096:  return 4096;
+        case WAVEFORM_RES_PTS_8192:  return 8192;
+        case WAVEFORM_RES_PTS_16384: return 16384;
+        case WAVEFORM_RES_PTS_32768: return 32768;
+        case WAVEFORM_RES_AUTO:
+        default:                     return 0;
+    }
+}
+
+// Clamp a Res value into the active range group (a Fine-only pick like
+// 8192 falls back to the group's largest preset when the group is Coarse).
+static int waveform_res_clamp_to_range(int res_points, int range) {
+    const waveform_res_points_t *group = (range == WAVEFORM_RES_RANGE_FINE)
+        ? s_res_fine : s_res_coarse;
+    size_t n = (range == WAVEFORM_RES_RANGE_FINE)
+        ? sizeof(s_res_fine) / sizeof(s_res_fine[0])
+        : sizeof(s_res_coarse) / sizeof(s_res_coarse[0]);
+    for (size_t i = 0; i < n; i++) {
+        if ((int)group[i] == res_points) return res_points;
+    }
+    return (int)group[n - 1];
+}
+
+//-----------------------------------------------------------------------------
 // Waveform Panel State (per-panel trigger, resampling, and display)
 //-----------------------------------------------------------------------------
 
@@ -145,6 +255,24 @@ typedef struct {
     // NOT all sources are 12-bit; consumers must not hardcode 2048 (user
     // report 2026-11-03: "not all samples will be 12-bit").
     uint32_t display_full_scale;
+
+    // Render-resolution selector (playback device only): Res = a DECIMATION
+    // scale (0 = None -> full resolution, one point per pixel, the stock
+    // behaviour); Range = which preset group the Res dropdown lists.
+    int res_range;              // waveform_res_range_t value
+    int res_points;             // waveform_res_points_t value (0 = Auto)
+    Rectangle range_btn_rect;
+    Rectangle range_opts_rect[WAVEFORM_RES_RANGE_COUNT];
+    bool range_dropdown_open;
+    Rectangle res_btn_rect;
+    // +1 slot: row 0 is Auto and rows 1..N the active group's presets
+    // (WAVEFORM_RES_OPTION_COUNT is the group size only). Sizing this to the
+    // group alone made the render path's res_opts_rect[N] write run 16 bytes
+    // out of bounds onto res_dropdown_open/signal state while the FINE group
+    // was open — the dropdown closed itself every frame and could not be
+    // selected from (user report 2026-11-03).
+    Rectangle res_opts_rect[WAVEFORM_RES_OPTION_COUNT + 1];
+    bool res_dropdown_open;
 
     // Signal type dropdown (leftmost of the right-anchored overlay group).
     // Raw keeps the legacy "CH A"/"CH B" label; CVBS / FM RF / Audio
@@ -223,6 +351,7 @@ typedef struct {
     trigger_source_t trigger_source;
     float zoom_scale;
     uint32_t full_scale;        // Display-container full scale (NOT always 2048)
+    int res_points;             // Render-resolution pick (0 = Auto)
 } waveform_runtime_cfg_t;
 
 typedef struct {
@@ -277,6 +406,7 @@ static waveform_runtime_cfg_t waveform_capture_runtime_cfg(waveform_panel_state_
     cfg.trigger_source = state->trigger_source;
     cfg.zoom_scale = state->zoom_scale;
     cfg.full_scale = state->display_full_scale ? state->display_full_scale : 2048;
+    cfg.res_points = state->res_points;
     waveform_state_unlock(state);
     return cfg;
 }
@@ -746,6 +876,18 @@ static bool waveform_test_mode_active(gui_app_t *app) {
            !atomic_load(&app->playback_running);
 }
 
+// Player-only render-resolution selector visibility: the selected device is
+// the playback device and the panel is not in test-generator mode (the Gen
+// row owns the second overlay row there). User request 2026-11-03.
+static bool waveform_playback_res_visible(gui_app_t *app) {
+    if (!app || app->selected_device < 0 ||
+        app->selected_device >= app->device_count) {
+        return false;
+    }
+    if (waveform_test_mode_active(app)) return false;
+    return app->devices[app->selected_device].type == DEVICE_TYPE_PLAYBACK;
+}
+
 // Channel label shown in the panel grid, derived from the assigned signal
 // type. Raw (or any source outside test mode) keeps the legacy
 // "CH A"/"CH B" names; a typed channel uses the "CH1"/"CH2" numbering
@@ -861,29 +1003,41 @@ static void render_waveform_line_internal(waveform_panel_state_t *state,
     if (new_display_width > DISPLAY_BUFFER_SIZE) new_display_width = DISPLAY_BUFFER_SIZE;
     atomic_store(&state->display_width, new_display_width);
 
+    // Trigger x in POINT domain: the frame holds display_width/factor
+    // points across the panel (Res 1:1 = one point per pixel). Map the
+    // trigger point index to panel pixels for the grid t=0 reference.
+    int points_in_frame = (int)snap.samples_available;
+    int trig_px = snap.trigger_display_pos;
+    if (snap.trigger_enabled && trig_px >= 0 && points_in_frame > 1) {
+        trig_px = (int)((float)trig_px * w / (float)(points_in_frame - 1));
+        if (trig_px >= (int)w) trig_px = (int)w - 1;
+    }
+
     // Draw grid with labels first
     uint32_t sample_rate = atomic_load(&app->sample_rate);
     draw_channel_grid(x, y, w, h, label_buf, color, app->settings.show_grid,
                       snap.zoom_scale, sample_rate,
-                      snap.trigger_enabled, snap.trigger_display_pos, &state->time_div_rect,
+                      snap.trigger_enabled, trig_px, &state->time_div_rect,
                       app->settings.waveform_scale_mode, channel);
 
     // Draw trigger level and position markers
     draw_panel_trigger_markers(x, y, w, h, &snap, app->settings.amplitude_scale, color);
     if (snap.samples_available == 0) return;
 
-    int display_width = (int)w;
-    if (display_width > DISPLAY_BUFFER_SIZE) display_width = DISPLAY_BUFFER_SIZE;
-    int samples_to_draw = (snap.samples_available < (size_t)display_width) ?
-                          (int)snap.samples_available : display_width;
+    // ALL points in the frame are drawn, stretched across the panel width
+    // (Res selector: the point count is the output resolution, not pixels).
+    int samples_to_draw = (int)snap.samples_available;
+    if (samples_to_draw > DISPLAY_BUFFER_SIZE) samples_to_draw = DISPLAY_BUFFER_SIZE;
+    float step_x = (samples_to_draw > 1) ? w / (float)(samples_to_draw - 1) : 0.0f;
 
     float center_y = y + h / 2.0f;
     float scale = (h / 2.0f) * app->settings.amplitude_scale;
 
     // Draw waveform as connected line
     float prev_py = center_y;
+    float prev_px_x = x;
     for (int px = 0; px < samples_to_draw; px++) {
-        float px_x = x + px;
+        float px_x = x + (float)px * step_x;
         float py = center_y - render_samples[px].value * scale;
 
         // Clamp to bounds
@@ -891,8 +1045,9 @@ static void render_waveform_line_internal(waveform_panel_state_t *state,
         if (py > y + h) py = y + h;
 
         if (px > 0) {
-            DrawLineEx((Vector2){px_x - 1, prev_py}, (Vector2){px_x, py}, 1.0f, color);
+            DrawLineEx((Vector2){prev_px_x, prev_py}, (Vector2){px_x, py}, 1.0f, color);
         }
+        prev_px_x = px_x;
         prev_py = py;
     }
 }
@@ -915,11 +1070,19 @@ static void render_waveform_phosphor_internal(waveform_panel_state_t *state,
     if (new_display_width > DISPLAY_BUFFER_SIZE) new_display_width = DISPLAY_BUFFER_SIZE;
     atomic_store(&state->display_width, new_display_width);
 
+    // Trigger x in POINT domain (see render_waveform_line_internal)
+    int points_in_frame = (int)snap.samples_available;
+    int trig_px = snap.trigger_display_pos;
+    if (snap.trigger_enabled && trig_px >= 0 && points_in_frame > 1) {
+        trig_px = (int)((float)trig_px * w / (float)(points_in_frame - 1));
+        if (trig_px >= (int)w) trig_px = (int)w - 1;
+    }
+
     // Draw grid with labels first
     uint32_t sample_rate = atomic_load(&app->sample_rate);
     draw_channel_grid(x, y, w, h, label_buf, color, app->settings.show_grid,
                       snap.zoom_scale, sample_rate,
-                      snap.trigger_enabled, snap.trigger_display_pos, &state->time_div_rect,
+                      snap.trigger_enabled, trig_px, &state->time_div_rect,
                       app->settings.waveform_scale_mode, channel);
 
     // Draw trigger level and position markers
@@ -930,8 +1093,11 @@ static void render_waveform_phosphor_internal(waveform_panel_state_t *state,
     int buf_height = (int)h;
     if (buf_width <= 0 || buf_height <= 0) return;
 
-    int samples_to_draw = (snap.samples_available < (size_t)buf_width) ?
-                          (int)snap.samples_available : buf_width;
+    // ALL points in the frame are drawn, stretched across the panel width
+    // (Res selector: the point count is the output resolution, not pixels).
+    int samples_to_draw = (int)snap.samples_available;
+    if (samples_to_draw > DISPLAY_BUFFER_SIZE) samples_to_draw = DISPLAY_BUFFER_SIZE;
+    float step_x = (samples_to_draw > 1) ? (float)buf_width / (float)(samples_to_draw - 1) : 0.0f;
 
     // Get phosphor state from panel
     phosphor_rt_t *prt = state->phosphor;
@@ -943,7 +1109,8 @@ static void render_waveform_phosphor_internal(waveform_panel_state_t *state,
 
         // Update phosphor
         phosphor_rt_begin_frame(prt);
-        phosphor_rt_draw_waveform(prt, render_samples, samples_to_draw, app->settings.amplitude_scale);
+        phosphor_rt_draw_waveform_xstep(prt, render_samples, samples_to_draw,
+                                        app->settings.amplitude_scale, step_x);
         phosphor_rt_end_frame(prt);
 
         // Render phosphor to screen
@@ -954,22 +1121,25 @@ static void render_waveform_phosphor_internal(waveform_panel_state_t *state,
         }
     }
 
-    // Draw line overlay on phosphor (semi-transparent)
+    // Draw line overlay on phosphor (semi-transparent), stretched across
+    // the panel with the same point-domain step as the phosphor pass
     float center_y = y + h / 2.0f;
     float scale = (h / 2.0f) * app->settings.amplitude_scale;
     float prev_py = center_y;
+    float prev_px_x = x;
     Color waveform_color = {color.r, color.g, color.b, 200};
 
     for (int px = 0; px < samples_to_draw; px++) {
-        float px_x = x + px;
+        float px_x = x + (float)px * step_x;
         float py = center_y - render_samples[px].value * scale;
 
         if (py < y) py = y;
         if (py > y + h) py = y + h;
 
         if (px > 0) {
-            DrawLineEx((Vector2){px_x - 1, prev_py}, (Vector2){px_x, py}, 1.0f, waveform_color);
+            DrawLineEx((Vector2){prev_px_x, prev_py}, (Vector2){px_x, py}, 1.0f, waveform_color);
         }
+        prev_px_x = px_x;
         prev_py = py;
     }
 }
@@ -1078,7 +1248,6 @@ static size_t waveform_resample_to_buffer(waveform_panel_state_t *state,
     // Calculate how many source samples we actually need
     size_t source_samples_needed = (size_t)ceilf((float)display_count * decimation);
     if (source_samples_needed > available) source_samples_needed = available;
-
 
 #if LIBSOXR_ENABLED
     // Bypass soxr for 1:1 ratio
@@ -1194,19 +1363,40 @@ static bool waveform_process_display(waveform_panel_state_t *state,
     // 16-bit is 4096, DdD is 512).
     float norm_scale = 1.0f / (float)(cfg->full_scale ? cfg->full_scale : 2048);
 
-    // Get decimation factor from zoom_scale
+    // Resolved render resolution (FIRST-implementation model, restored
+    // 2026-11-03 per user confirmation): Auto -> one point per pixel; a
+    // fixed Res PINS THE POINT COUNT (clamped to the display buffer)
+    // while the panel coverage stays display_width pixels - selecting
+    // MORE points than pixels OVERSAMPLES the window (more visual
+    // information; the stretch renderer draws every point).
+    size_t point_count = display_width;
+    if (cfg->res_points != WAVEFORM_RES_AUTO) {
+        int fixed = waveform_res_points_value(cfg->res_points);
+        if (fixed > 0) {
+            point_count = (size_t)fixed;
+            if (point_count > DISPLAY_BUFFER_SIZE) point_count = DISPLAY_BUFFER_SIZE;
+        }
+    }
+    if (point_count == 0) point_count = 1;
+
+    // Get decimation factor from zoom_scale. zoom_scale is samples per
+    // PIXEL; the resampler runs in the point domain, so scale by the
+    // points-per-pixel stretch factor (no-op for Auto; a higher preset
+    // count LOWERS the decimation -> more raw samples per frame).
     float decimation = cfg->zoom_scale;
     if (decimation < ZOOM_SCALE_MIN) decimation = ZOOM_SCALE_MIN;
     if (decimation > ZOOM_SCALE_MAX) decimation = ZOOM_SCALE_MAX;
+    decimation *= (float)display_width / (float)point_count;
 
-    // How many raw samples we need for the full display at this zoom
-    float display_window = (float)display_width * decimation;
+    // How many raw samples we need for the full display at this zoom:
+    // points across the panel x raw samples per point.
+    float display_window = (float)point_count * decimation;
 
     // If trigger is disabled, just show the start of the buffer
     if (!cfg->trigger_enabled) {
         *out_trigger_display_pos = -1;
         *out_available = waveform_resample_to_buffer(
-            state, out_samples, buf, num_samples, 0, decimation, display_width,
+            state, out_samples, buf, num_samples, 0, decimation, point_count,
             norm_scale);
         return true;
     }
@@ -1216,13 +1406,14 @@ static bool waveform_process_display(waveform_panel_state_t *state,
     if (display_window >= (float)num_samples * 0.9f) {
         *out_trigger_display_pos = -1;
         *out_available = waveform_resample_to_buffer(
-            state, out_samples, buf, num_samples, 0, decimation, display_width,
+            state, out_samples, buf, num_samples, 0, decimation, point_count,
             norm_scale);
         return true;
     }
 
-    // Trigger point should appear at 10% across the display
-    size_t trigger_display_pos = display_width / 10;
+    // Trigger point should appear at 10% across the display (point
+    // domain: the renderer stretches the points across the panel width)
+    size_t trigger_display_pos = point_count / 10;
     float pre_trigger_raw_samples = (float)trigger_display_pos * decimation;
     float post_trigger_raw_samples = display_window - pre_trigger_raw_samples;
 
@@ -1234,7 +1425,7 @@ static bool waveform_process_display(waveform_panel_state_t *state,
     if (min_trig_pos >= max_trig_pos) {
         *out_trigger_display_pos = -1;
         *out_available = waveform_resample_to_buffer(
-            state, out_samples, buf, num_samples, 0, decimation, display_width,
+            state, out_samples, buf, num_samples, 0, decimation, point_count,
             norm_scale);
         return true;
     }
@@ -1252,7 +1443,7 @@ static bool waveform_process_display(waveform_panel_state_t *state,
     size_t start_pos = (size_t)((float)trig_pos - pre_trigger_raw_samples);
     *out_trigger_display_pos = (int)trigger_display_pos;
     *out_available = waveform_resample_to_buffer(
-        state, out_samples, buf, num_samples, start_pos, decimation, display_width,
+        state, out_samples, buf, num_samples, start_pos, decimation, point_count,
         norm_scale);
     return true;
 }
@@ -1384,6 +1575,15 @@ static void *waveform_create(void) {
     // Display-container full scale mirror (synced from app each render;
     // 2048 = stock 12-bit container until a source says otherwise)
     state->display_full_scale = 2048;
+    // Render-resolution selector defaults (playback-only control): Fine
+    // range group, maximum preset (user request 2026-11-03 - the player
+    // opens with the most visual information). The process path clamps the
+    // preset to DISPLAY_BUFFER_SIZE, so 32768 renders at the engine's
+    // point-count cap.
+    state->res_range = WAVEFORM_RES_RANGE_FINE;
+    state->res_points = WAVEFORM_RES_PTS_32768;
+    state->range_dropdown_open = false;
+    state->res_dropdown_open = false;
     state->signal_type = WAVE_SIGNAL_RAW;
     state->signal_dropdown_open = false;
     state->signal_user_picked = false;
@@ -1799,11 +1999,25 @@ static bool waveform_handle_control_click(waveform_panel_state_t *state, struct 
     scale_menu.height = 5 * 20;
     Rectangle signal_menu = state->signal_opts_rect[0];
     signal_menu.height = WAVE_SIGNAL_OPTION_COUNT * 20;
+    Rectangle res_menu = state->res_opts_rect[0];
+    {
+        // Match the menu the render path actually drew: Auto + the ACTIVE
+        // group's presets. Using the fine-group size while Coarse is active
+        // counted an 80px dead zone below the menu as "on menu".
+        size_t res_group_n = (state->res_range == WAVEFORM_RES_RANGE_FINE)
+            ? sizeof(s_res_fine) / sizeof(s_res_fine[0])
+            : sizeof(s_res_coarse) / sizeof(s_res_coarse[0]);
+        res_menu.height = (float)(res_group_n + 1) * 20.0f;
+    }
+    Rectangle range_menu = state->range_opts_rect[0];
+    range_menu.height = WAVEFORM_RES_RANGE_COUNT * 20;
     bool click_on_menu =
         (state->render_mode_dropdown_open && CheckCollisionPointRec(click, render_menu)) ||
         (state->trigger_dropdown_open && CheckCollisionPointRec(click, trigger_menu)) ||
         (state->scale_dropdown_open && CheckCollisionPointRec(click, scale_menu)) ||
-        (state->signal_dropdown_open && CheckCollisionPointRec(click, signal_menu));
+        (state->signal_dropdown_open && CheckCollisionPointRec(click, signal_menu)) ||
+        (state->res_dropdown_open && CheckCollisionPointRec(click, res_menu)) ||
+        (state->range_dropdown_open && CheckCollisionPointRec(click, range_menu));
 
     //-------------------------------------------------------------------------
     // Signal Type Dropdown (leftmost of the group)
@@ -1813,6 +2027,7 @@ static bool waveform_handle_control_click(waveform_panel_state_t *state, struct 
         state->scale_dropdown_open = false;  // Close other dropdowns
         state->render_mode_dropdown_open = false;
         state->trigger_dropdown_open = false;
+        state->res_dropdown_open = false;
         return true;
     }
 
@@ -1838,6 +2053,83 @@ static bool waveform_handle_control_click(waveform_panel_state_t *state, struct 
     }
 
     //-------------------------------------------------------------------------
+    // Render-Resolution Dropdown (playback device only; the render path
+    // zeroes the button rect for every other source, so this is inert
+    // outside the player)
+    //-------------------------------------------------------------------------
+    if (!click_on_menu && state->res_btn_rect.width > 0 &&
+        CheckCollisionPointRec(click, state->res_btn_rect)) {
+        state->res_dropdown_open = !state->res_dropdown_open;
+        state->scale_dropdown_open = false;
+        state->render_mode_dropdown_open = false;
+        state->trigger_dropdown_open = false;
+        state->signal_dropdown_open = false;
+        return true;
+    }
+
+    if (state->res_dropdown_open) {
+        const waveform_res_points_t *group =
+            (state->res_range == WAVEFORM_RES_RANGE_FINE) ? s_res_fine : s_res_coarse;
+        size_t group_n = (state->res_range == WAVEFORM_RES_RANGE_FINE)
+            ? sizeof(s_res_fine) / sizeof(s_res_fine[0])
+            : sizeof(s_res_coarse) / sizeof(s_res_coarse[0]);
+        // Row 0: Auto (stock one-point-per-pixel)
+        if (CheckCollisionPointRec(click, state->res_opts_rect[0])) {
+            waveform_state_lock(state);
+            state->res_points = WAVEFORM_RES_AUTO;
+            state->config_dirty = true;
+            waveform_state_unlock(state);
+            state->res_dropdown_open = false;
+            return true;
+        }
+        // Rows 1..N: the active group's presets (rects drawn by the
+        // render path; row i+1 holds group[i])
+        for (size_t i = 0; i < group_n; i++) {
+            if (CheckCollisionPointRec(click, state->res_opts_rect[i + 1])) {
+                waveform_state_lock(state);
+                state->res_points = (int)group[i];
+                state->config_dirty = true;
+                waveform_state_unlock(state);
+                state->res_dropdown_open = false;
+                return true;
+            }
+        }
+        // Click outside closes dropdown
+        state->res_dropdown_open = false;
+        return true;
+    }
+
+    if (!click_on_menu && state->range_btn_rect.width > 0 &&
+        CheckCollisionPointRec(click, state->range_btn_rect)) {
+        state->range_dropdown_open = !state->range_dropdown_open;
+        state->res_dropdown_open = false;
+        state->scale_dropdown_open = false;
+        state->render_mode_dropdown_open = false;
+        state->trigger_dropdown_open = false;
+        state->signal_dropdown_open = false;
+        return true;
+    }
+
+    if (state->range_dropdown_open) {
+        for (int i = 0; i < WAVEFORM_RES_RANGE_COUNT; i++) {
+            if (CheckCollisionPointRec(click, state->range_opts_rect[i])) {
+                waveform_state_lock(state);
+                state->res_range = i;
+                // A Fine-only pick falls back to the group's largest
+                // preset so the Res selection stays valid.
+                state->res_points = waveform_res_clamp_to_range(state->res_points, i);
+                state->config_dirty = true;
+                waveform_state_unlock(state);
+                state->range_dropdown_open = false;
+                return true;
+            }
+        }
+        // Click outside closes dropdown
+        state->range_dropdown_open = false;
+        return true;
+    }
+
+    //-------------------------------------------------------------------------
     // Amplitude Scale Dropdown (left side)
     //-------------------------------------------------------------------------
     if (!click_on_menu && CheckCollisionPointRec(click, state->scale_btn_rect)) {
@@ -1845,6 +2137,7 @@ static bool waveform_handle_control_click(waveform_panel_state_t *state, struct 
         state->render_mode_dropdown_open = false;  // Close other dropdowns
         state->trigger_dropdown_open = false;
         state->signal_dropdown_open = false;
+        state->res_dropdown_open = false;
         return true;
     }
 
@@ -1872,6 +2165,7 @@ static bool waveform_handle_control_click(waveform_panel_state_t *state, struct 
         state->trigger_dropdown_open = false;  // Close other dropdown
         state->scale_dropdown_open = false;
         state->signal_dropdown_open = false;
+        state->res_dropdown_open = false;
         return true;
     }
 
@@ -1897,6 +2191,7 @@ static bool waveform_handle_control_click(waveform_panel_state_t *state, struct 
         state->render_mode_dropdown_open = false;  // Close other dropdown
         state->scale_dropdown_open = false;
         state->signal_dropdown_open = false;
+        state->res_dropdown_open = false;
         return true;
     }
 
@@ -2032,6 +2327,7 @@ static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, in
         state->trigger_dropdown_open = false;
         state->scale_dropdown_open = false;
         state->signal_dropdown_open = false;
+        state->res_dropdown_open = false;
         return true;
     }
 
@@ -2222,16 +2518,29 @@ static void waveform_render(void *state_ptr, gui_app_t *app, int channel,
     // Update drag state for trigger level (continuous while mouse is held)
     waveform_panel_update_drag(state, app, bounds);
 
-    // DAW-style pause hold (playback only): while PAUSED no new display
-    // frames arrive, so zoom / trigger-level changes would not render until
-    // resume (config is applied per frame in waveform_vtable_process).
-    // Re-process the LAST display frame — the trigger source buffers still
-    // reference it — whenever the config changed while holding, so zoom,
-    // trigger level and trigger mode keep rendering live while paused.
-    if (app->selected_device >= 0 &&
+    // DAW-style pause hold (playback only): while THIS channel is held no
+    // new display frames arrive, so zoom / trigger-level changes would not
+    // render until resume (config is applied per frame in
+    // waveform_vtable_process). Re-process the LAST display frame — the
+    // trigger source buffers still reference it — whenever the config
+    // changed while holding, so zoom, trigger level and trigger mode keep
+    // rendering live. Per-channel hold gate (user request 2026-11-03): the
+    // per-channel transport pauses a track WITHOUT flipping the master
+    // PLAYBACK_STATE, so the old master-state check left zoom dead on a
+    // per-channel-paused track. Covers master pause and the no-loop
+    // end-of-file hold too; the explicit state check keeps
+    // STARTING/STOPPED sessions on the normal path.
+    playback_state_t pb_state = gui_playback_get_state(app);
+    bool playback_zoom_hold =
+        app->selected_device >= 0 &&
         app->selected_device < app->device_count &&
         app->devices[app->selected_device].type == DEVICE_TYPE_PLAYBACK &&
-        gui_playback_get_state(app) == PLAYBACK_STATE_PAUSED) {
+        gui_playback_is_running(app) &&
+        (pb_state == PLAYBACK_STATE_PAUSED ||
+         pb_state == PLAYBACK_STATE_EOF ||
+         (pb_state == PLAYBACK_STATE_PLAYING &&
+          atomic_load(&app->playback_channel_paused[channel])));
+    if (playback_zoom_hold) {
         bool dirty = false;
         waveform_state_lock(state);
         dirty = state->config_dirty;
@@ -2375,6 +2684,120 @@ static void waveform_render(void *state_ptr, gui_app_t *app, int channel,
             state->signal_dropdown_open = false;
         }
     }
+
+    // Playback render-resolution row: [Res: 1:1|1:2|1:4]. Same second-row
+    // slot as the test-mode Gen row (mutually exclusive). PLAYER ONLY: the
+    // output decimation of the visualised waveform (1:1 = full resolution);
+    // every other source zeroes the rect (click-inert).
+    {
+        if (waveform_playback_res_visible(app) &&
+            !gui_chrome_hide_hidden(&state->chrome_hide)) {
+            const float to_logical_w = 1.0f / gui_ui_get_scale_factor();
+            const float btn_h = 18.0f;
+            const float row_y = bounds.y + 8.0f + btn_h + 6.0f;
+            const float x_right = bounds.x + bounds.width - 8.0f;
+            Vector2 mouse = gui_ui_get_mouse_position();
+
+            // Res button (rightmost on the row)
+            char res_label[24];
+            snprintf(res_label, sizeof(res_label), "Res: %s",
+                     waveform_res_points_label(state->res_points));
+            float res_w = (float)gui_text_measure(res_label, FONT_SIZE_DROPDOWN_OPT) * to_logical_w + 24.0f;
+            if (res_w < 90.0f * to_logical_w) res_w = 90.0f * to_logical_w;
+            float res_x = x_right - res_w;
+            state->res_btn_rect = (Rectangle){res_x, row_y, res_w, btn_h};
+            draw_dropdown_button(state->res_btn_rect, res_label,
+                                 state->res_dropdown_open);
+
+            // Res options: Auto + the active range group's ladder.
+            if (state->res_dropdown_open) {
+                const waveform_res_points_t *group =
+                    (state->res_range == WAVEFORM_RES_RANGE_FINE) ? s_res_fine : s_res_coarse;
+                size_t group_n = (state->res_range == WAVEFORM_RES_RANGE_FINE)
+                    ? sizeof(s_res_fine) / sizeof(s_res_fine[0])
+                    : sizeof(s_res_coarse) / sizeof(s_res_coarse[0]);
+                size_t rows = group_n + 1;  // +1 for Auto
+                const float opt_h = 20.0f;
+                float opt_y = fmaxf(bounds.y,
+                    fminf(row_y + btn_h,
+                          bounds.y + bounds.height - opt_h * (float)rows - 4.0f));
+                DrawRectangleRounded(
+                    (Rectangle){res_x, opt_y, res_w, opt_h * (float)rows},
+                    0.1f, 4, COLOR_PANEL_BG);
+                // Row 0: Auto (stock one-point-per-pixel)
+                Rectangle auto_rect = {res_x, opt_y, res_w, opt_h};
+                state->res_opts_rect[0] = auto_rect;
+                bool auto_sel = (state->res_points == WAVEFORM_RES_AUTO);
+                bool auto_hover = CheckCollisionPointRec(mouse, auto_rect);
+                DrawRectangleRec(auto_rect, gui_dropdown_option_color(auto_sel, auto_hover));
+                int a_w = (int)(gui_text_measure("Auto", FONT_SIZE_DROPDOWN_OPT) * to_logical_w);
+                gui_text_draw("Auto", res_x + res_w / 2.0f - a_w / 2.0f,
+                              opt_y + (opt_h - FONT_SIZE_DROPDOWN_OPT) / 2.0f,
+                              FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+                // Rows 1..N: the group's preset point counts
+                for (size_t i = 0; i < group_n; i++) {
+                    Rectangle opt_rect = {res_x, opt_y + (float)(i + 1) * opt_h, res_w, opt_h};
+                    state->res_opts_rect[i + 1] = opt_rect;
+                    bool is_selected = (state->res_points == (int)group[i]);
+                    bool hover = CheckCollisionPointRec(mouse, opt_rect);
+                    DrawRectangleRec(opt_rect, gui_dropdown_option_color(is_selected, hover));
+                    const char *lab = waveform_res_points_label((int)group[i]);
+                    int o_w = (int)(gui_text_measure(lab, FONT_SIZE_DROPDOWN_OPT) * to_logical_w);
+                    gui_text_draw(lab, res_x + res_w / 2.0f - o_w / 2.0f,
+                                  opt_y + (float)(i + 1) * opt_h +
+                                      (opt_h - FONT_SIZE_DROPDOWN_OPT) / 2.0f,
+                                  FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+                }
+            }
+
+            // Range button (left of Res): selects the Res preset group
+            const char *range_label_buf = s_res_range_labels[
+                (state->res_range >= 0 && state->res_range < WAVEFORM_RES_RANGE_COUNT)
+                    ? state->res_range : 0];
+            char range_label[32];
+            snprintf(range_label, sizeof(range_label), "Range: %s", range_label_buf);
+            float range_w = (float)gui_text_measure(range_label, FONT_SIZE_DROPDOWN_OPT) * to_logical_w + 24.0f;
+            if (range_w < 110.0f * to_logical_w) range_w = 110.0f * to_logical_w;
+            float range_x = res_x - 8.0f - range_w;
+            if (range_x < bounds.x + 8.0f) range_x = bounds.x + 8.0f;
+            state->range_btn_rect = (Rectangle){range_x, row_y, range_w, btn_h};
+            draw_dropdown_button(state->range_btn_rect, range_label,
+                                 state->range_dropdown_open);
+
+            // Range options: Coarse / Fine
+            if (state->range_dropdown_open) {
+                const float opt_h = 20.0f;
+                float opt_y = fmaxf(bounds.y,
+                    fminf(row_y + btn_h,
+                          bounds.y + bounds.height - opt_h * WAVEFORM_RES_RANGE_COUNT - 4.0f));
+                DrawRectangleRounded(
+                    (Rectangle){range_x, opt_y, range_w,
+                                opt_h * WAVEFORM_RES_RANGE_COUNT},
+                    0.1f, 4, COLOR_PANEL_BG);
+                for (int i = 0; i < WAVEFORM_RES_RANGE_COUNT; i++) {
+                    Rectangle opt_rect = {range_x, opt_y + i * opt_h, range_w, opt_h};
+                    state->range_opts_rect[i] = opt_rect;
+                    bool is_selected = (state->res_range == i);
+                    bool hover = CheckCollisionPointRec(mouse, opt_rect);
+                    DrawRectangleRec(opt_rect, gui_dropdown_option_color(is_selected, hover));
+                    int o_w = (int)(gui_text_measure(s_res_range_labels[i],
+                                               FONT_SIZE_DROPDOWN_OPT) * to_logical_w);
+                    gui_text_draw(s_res_range_labels[i],
+                                  range_x + range_w / 2.0f - o_w / 2.0f,
+                                  opt_y + i * opt_h +
+                                      (opt_h - FONT_SIZE_DROPDOWN_OPT) / 2.0f,
+                                  FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+                }
+            }
+        } else {
+            // Not playback (or chrome hidden): zero the rects so the
+            // click handler ignores them, and collapse any stale popup.
+            state->res_btn_rect = (Rectangle){0};
+            state->range_btn_rect = (Rectangle){0};
+            state->res_dropdown_open = false;
+            state->range_dropdown_open = false;
+        }
+    }
 }
 
 //-----------------------------------------------------------------------------
@@ -2469,6 +2892,7 @@ size_t gui_waveform_server_display_points(const int16_t *src,const int16_t *a,
         .trigger_mode=(trigger_mode_t)cfg->trigger_mode,
         .trigger_source=(trigger_source_t)cfg->trigger_source,
         .full_scale=2048,
+        .res_points=WAVEFORM_RES_AUTO,
     };
     waveform_sample_t temp[GUI_RD_WIDTH];size_t n=0;int tr=-1;
     gui_waveform_set_trigger_source_buffers(a,b,count);

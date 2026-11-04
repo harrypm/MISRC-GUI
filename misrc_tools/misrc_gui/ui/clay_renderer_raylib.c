@@ -279,7 +279,44 @@ void Clay_Raylib_Render(Clay_RenderCommandArray renderCommands, Font* fonts)
                             cx + cosf(tip_ang - wing_offset) * wing_radius,
                             cy + sinf(tip_ang - wing_offset) * wing_radius
                         };
-                        DrawTriangle(tip, wing_a, wing_b, col);
+                        // Winding matches the dropdown arrows (negative
+                        // screen-space cross); the opposite order can be
+                        // backface-culled, which would drop the arrowhead.
+                        DrawTriangle(tip, wing_b, wing_a, col);
+                        break;
+                    }
+                    case CUSTOM_LAYOUT_ELEMENT_TYPE_PLAY_ICON: {
+                        // Filled right-pointing triangle (transport play).
+                        float cx = boundingBox.x + boundingBox.width * 0.5f;
+                        float cy = boundingBox.y + boundingBox.height * 0.5f;
+                        float s = (boundingBox.width < boundingBox.height ? boundingBox.width : boundingBox.height);
+                        float half_h = s * 0.46f;
+                        float base_w = s * 0.90f;
+                        // Optical centering: nudge right so the triangle's
+                        // visual mass sits centered like the other glyphs.
+                        Vector2 tip = { cx + base_w * 0.54f, cy };
+                        Vector2 top = { cx - base_w * 0.46f, cy - half_h };
+                        Vector2 bot = { cx - base_w * 0.46f, cy + half_h };
+                        // Winding matches the dropdown arrows (negative
+                        // screen-space cross): the opposite order rendered as
+                        // nothing on this pipeline (user report 2026-11-03:
+                        // the play glyph never showed).
+                        DrawTriangle(tip, top, bot, COLOR_TEXT);
+                        break;
+                    }
+                    case CUSTOM_LAYOUT_ELEMENT_TYPE_PAUSE_ICON: {
+                        // Two filled vertical bars (transport pause).
+                        float cx = boundingBox.x + boundingBox.width * 0.5f;
+                        float cy = boundingBox.y + boundingBox.height * 0.5f;
+                        float s = (boundingBox.width < boundingBox.height ? boundingBox.width : boundingBox.height);
+                        float bar_h = s * 0.92f;
+                        float bar_w = s * 0.26f;
+                        float bar_gap = s * 0.24f;
+                        float y0 = cy - bar_h * 0.5f;
+                        DrawRectangle((int)roundf(cx - bar_w - bar_gap * 0.5f), (int)roundf(y0),
+                                      (int)roundf(bar_w), (int)roundf(bar_h), COLOR_TEXT);
+                        DrawRectangle((int)roundf(cx + bar_gap * 0.5f), (int)roundf(y0),
+                                      (int)roundf(bar_w), (int)roundf(bar_h), COLOR_TEXT);
                         break;
                     }
                     case CUSTOM_LAYOUT_ELEMENT_TYPE_VERSION_ICON: {

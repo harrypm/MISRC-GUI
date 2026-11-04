@@ -130,6 +130,14 @@ void phosphor_rt_draw_waveform(phosphor_rt_t *prt,
                                const waveform_sample_t *samples, size_t sample_count,
                                float amplitude_scale);
 
+// Same as phosphor_rt_draw_waveform but with an explicit horizontal step
+// between consecutive points (in logical pixels): point i is drawn at
+// x = i * x_step. Used by the waveform panel's render-resolution selector
+// (a point count below the panel width stretches across the panel).
+void phosphor_rt_draw_waveform_xstep(phosphor_rt_t *prt,
+                                     const waveform_sample_t *samples, size_t sample_count,
+                                     float amplitude_scale, float x_step);
+
 //-----------------------------------------------------------------------------
 // Channel colors for opacity mode (RGB 0-1 range)
 //-----------------------------------------------------------------------------

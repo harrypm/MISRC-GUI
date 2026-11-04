@@ -1,5 +1,67 @@
 # MISRC GUI development notes
 
+## 2026-11-03 Player: per-channel transport icons on the timeline rows + waveform Res (Coarse/Fine point presets) + per-channel hold gates (USER-VERIFIED)
+
+- User request chain (all same-day, same session): "fix the player by
+  adding the per channel play/pause and loop function, and add the full
+  resolution playback mode" -> buttons "on the right side (aligned with
+  file input name and time counters)" -> "icons next to the slider" ->
+  "set the default to fine and 32768 for player mode and allow for zoom on
+  the paused waveform" -> "pause and load for spectrograph is broken".
+- Per-channel transport (gui_playback.c): ungated from Link: Separate.
+  Pause/Play works in BOTH modes (Synced = group pause/resume, Separate =
+  per channel; a paused channel emits nothing while the other keeps
+  rolling; positions freeze). Loop per-channel in both modes (Synced sets
+  both flags + the loop_enabled mirror). EOF without loop pauses ONLY
+  that channel; clicking a channel's Play while the master transport is
+  paused resumes the transport (DAW behavior).
+- Transport UI (gui_ui.c): compact ICON buttons directly beside each
+  playback timeline row's scrub slider (play triangle + loop arrows as
+  font-free custom Clay elements, reusing the PlaybackPauseBtn /
+  PlaybackLoopBtn Clay IDs so the click handlers are unchanged).
+  Settings-panel text buttons removed; the handlers moved outside the
+  settings-panel gate so the buttons work with the panel closed. The Play
+  glyph shows when paused or not running, pause bars only while actually
+  playing (toolbar RecordButton convention). HARD LESSON: filled
+  DrawTriangle glyphs must use the dropdown-arrow winding (negative
+  screen-space cross product) - the opposite winding renders as NOTHING
+  on this pipeline (cost one round-trip: "play icon never showed").
+- Waveform Res selector (gui_oscilloscope.c, playback device only, second
+  overlay row): the RESTORED first-implementation model (user-confirmed
+  working reference) - `Range: Coarse|Fine` selects the preset group,
+  `Res: Auto|64..32768` pins the display POINT COUNT (clamped to
+  DISPLAY_BUFFER_SIZE=4096; presets above 4096 are label-equivalent to
+  4096). More points than panel pixels = OVERSAMPLED stretch render
+  (soxr resample + all points drawn; phosphor via
+  phosphor_rt_draw_waveform_xstep; trigger x in the point domain).
+  Default is now Fine/32768 (player opens at max oversampling).
+- Res dropdown BUG (user report: "it just closes not allowing selection"):
+  res_opts_rect was sized to the preset-group count (10) but holds 11 rows
+  (Auto + 10 Fine presets). While the Fine group's dropdown was open, the
+  render path's res_opts_rect[10] write ran 16 bytes out of bounds onto
+  res_dropdown_open/signal state, so the dropdown closed itself every
+  frame (Coarse never overflowed - 6 rows fit). Fix: array +1 slot and the
+  click-handler menu rect now matches the ACTIVE group's row count (the
+  fine-sized rect also mis-counted an 80px dead zone below a Coarse menu
+  as "on menu").
+- Per-channel HOLD gates (root cause of two user reports): the
+  per-channel transport pauses tracks WITHOUT flipping the master
+  PLAYBACK_STATE, so every master-state gate silently broke.
+  - Waveform (gui_oscilloscope.c): the paused-frame re-process (zoom /
+    trigger changes keep rendering while held) now fires for
+    per-channel-paused tracks, master pause and no-loop EOF; explicit
+    state check keeps STARTING/STOPPED sessions out.
+  - Spectrograph (gui_spectrogram.c): the DAW paused analysis window
+    (async direct-file load of a span around the playhead, wheel adjusts
+    0.1-60 s) now engages per channel; before the fix the rolling feed
+    kept scrolling (repeating the last frame 60x/s) and the window never
+    loaded. Palette-reload gate matches.
+- Verified: build clean; targeted suites green (gui_waveform_overlay,
+  gui_spectrogram_playback_lifetime with new playback stubs,
+  gui_playback_resolve). User real-GUI verified across the session:
+  button placement, icons, per-channel pause/loop, Res dropdown
+  selection, default Fine/32768, paused zoom, spectrograph pause/load.
+
 ## 2026-11-03 Waveform: test-gen stock trigger configs no longer leak into record/playback (USER-VERIFIED)
 
 - User request: "remove the stock triggers on config from record/playback
