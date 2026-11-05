@@ -449,7 +449,10 @@ jobs:
           set -eux
           export ANDROID_HOME="$HOME/Android/Sdk"
           mkdir -p "$ANDROID_HOME/cmdline-tools"
-          curl -fL -o /tmp/cmdtools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          # Retry ALL errors incl. transient SSL/connect failures — mirrors the
+          # hardened download() in android/build-deps-android.sh (run 41943704989
+          # died to an unretried curl exit 35).
+          curl -fL --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 30 -o /tmp/cmdtools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
           unzip -q /tmp/cmdtools.zip -d /tmp/android-cmdtools
           mv /tmp/android-cmdtools/cmdline-tools "$ANDROID_HOME/cmdline-tools/latest"
           rm /tmp/cmdtools.zip

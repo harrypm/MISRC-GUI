@@ -43,7 +43,12 @@ FLAC_SHA256="f2c1c76592a82ffff8413ba3c4a1299b6c7ab06c734dee03fd88630485c2b920"
 
 OPUS_VERSION=1.5.2
 OPUS_TARBALL="opus-${OPUS_VERSION}.tar.gz"
-OPUS_URL="https://downloads.xiph.org/releases/opus/${OPUS_TARBALL}"
+# GitHub release asset, byte-identical to downloads.xiph.org (sha256 verified
+# 2026-11-05, both hosts = 65c1d2f7...) but far more reliable from GH runners:
+# run 41943704989 (job 126970743360) died with `curl: (35) error:0A000126:SSL
+# routines::unexpected eof while reading` pulling opus-1.5.2.tar.gz from
+# downloads.xiph.org. Mirrors the FLAC source choice above (github.com/xiph).
+OPUS_URL="https://github.com/xiph/opus/releases/download/v${OPUS_VERSION}/${OPUS_TARBALL}"
 OPUS_SHA256="65c1d2f78b9f2fb20082c38cbe47c951ad5839345876e46941612ee87f9a7ce1"
 
 ZSTD_VERSION=1.5.7
@@ -94,7 +99,13 @@ download() {
     log "cached $(basename "$out")"
   else
     log "downloading $(basename "$out")"
-    curl -fL --retry 3 -o "$out" "$url"
+    # --retry alone does NOT cover SSL connect errors (curl exit 35): curl's
+    # default retry policy treats only timeouts/HTTP 5xx as transient, so the
+    # old `--retry 3` was a no-op for the exit-35 SSL failure that killed run
+    # 41943704989. --retry-all-errors (curl >= 7.71; ubuntu-22.04 runners ship
+    # 7.81) makes every failure retryable; --connect-timeout avoids multi-minute
+    # TCP hangs on stalled mirrors; --retry-delay 2 spaces the 5 attempts.
+    curl -fL --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 30 -o "$out" "$url"
   fi
   if [[ -n "$sha" ]]; then
     local actual
