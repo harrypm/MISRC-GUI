@@ -30,6 +30,7 @@
 #endif
 
 #include <errno.h>
+#include <ctype.h>
 #include <signal.h>
 #include <string.h>
 #include <stdio.h>
@@ -47,6 +48,10 @@
 #warning "No C threads, fallback to pthreads/winthreads"
 #endif
 #include <time.h>
+#ifndef _WIN32
+#include <unistd.h>
+#include <sys/utsname.h>
+#endif
 
 #include "../common/buffer.h"
 #include "../common/threading.h"
@@ -404,42 +409,200 @@ static void cli_capture_logf(const char *level, const char *format, ...) {
     va_end(args);
 }
 
+/* Use the same local time formats as the existing GUI session log. */
+static void cli_capture_format_now(char *dst, size_t len, const char *format) {
+    if (!dst || !len) return;
+    dst[0] = '\0';
+    time_t now = time(NULL);
+    if (now == (time_t)-1) return;
+    struct tm tm_now;
+#ifdef _WIN32
+    if (localtime_s(&tm_now, &now) != 0) return;
+#else
+    if (!localtime_r(&now, &tm_now)) return;
+#endif
+    strftime(dst, len, format, &tm_now);
+}
+
+/* The GUI extracts a YYYY.MM.DD_HH.MM.SS token from output paths. */
+static bool cli_capture_find_timestamp(const char *s, char *dst, size_t len) {
+    if (!s || !dst || len < 20) return false;
+    for (const char *p = s; *p; ++p) {
+        if (strlen(p) < 19) break;
+        bool ok = true;
+        for (int i = 0; i < 19; ++i) {
+            if (i == 4 || i == 7 || i == 13 || i == 16) {
+                if (p[i] != '.') ok = false;
+            } else if (i == 10) {
+                if (p[i] != '_') ok = false;
+            } else if (!isdigit((unsigned char)p[i])) {
+                ok = false;
+            }
+        }
+        if (ok) {
+            memcpy(dst, p, 19);
+            dst[19] = '\0';
+            return true;
+        }
+    }
+    return false;
+}
+
+static void cli_capture_log_system_info(void) {
+    char host[128] = "unknown";
+    char model[256] = "unknown";
+    char os[256] = "unknown";
+    uint32_t cores = 0;
+#ifdef _WIN32
+    const char *hostname = getenv("COMPUTERNAME");
+    if (hostname && *hostname) snprintf(host, sizeof(host), "%s", hostname);
+    const char *cores_str = getenv("NUMBER_OF_PROCESSORS");
+    if (cores_str) {
+        int c = atoi(cores_str);
+        if (c > 0) cores = (uint32_t)c;
+    }
+    snprintf(os, sizeof(os), "Windows");
+    const char *user = getenv("USERNAME");
+#else
+    if (gethostname(host, sizeof(host) - 1) != 0)
+        snprintf(host, sizeof(host), "unknown");
+    host[sizeof(host) - 1] = '\0';
+    struct utsname uts;
+    if (uname(&uts) == 0)
+        snprintf(os, sizeof(os), "%s %s (%s)",
+                 uts.sysname, uts.release, uts.machine);
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    if (n > 0) cores = (uint32_t)n;
+    const char *user = getenv("USER");
+    if (!user || !*user) user = getenv("LOGNAME");
+#ifdef __linux__
+    FILE *cpu = fopen("/proc/cpuinfo", "r");
+    if (cpu) {
+        char line[512];
+        while (fgets(line, sizeof(line), cpu)) {
+            if (strncmp(line, "model name", 10) == 0) {
+                char *colon = strchr(line, ':');
+                if (!colon) break;
+                ++colon;
+                while (*colon == ' ' || *colon == '\t') ++colon;
+                size_t count = strcspn(colon, "\r\n");
+                if (count >= sizeof(model)) count = sizeof(model) - 1;
+                memcpy(model, colon, count);
+                model[count] = '\0';
+                break;
+            }
+        }
+        fclose(cpu);
+    }
+#endif
+#endif
+    cli_capture_logf("INFO", "computer_name: %s", host);
+    cli_capture_logf("INFO", "computer_model_name: %s", model);
+    cli_capture_logf("INFO", "computer_cores: %u", (unsigned)cores);
+    cli_capture_logf("INFO", "user_name: %s",
+                     (user && *user) ? user : "unknown");
+    cli_capture_logf("INFO", "operating_system_VERSION: %s", os);
+}
+
+/* Match GUI log naming: base_YYYY.MM.DD_HH.MM.SS_misrc_capture.log.
+ * The CLI has no separate GUI base-name setting, so derive it from RF name. */
 static void cli_capture_log_open(const char *output_a, const char *output_b) {
     const char *rf_path = NULL;
     if (output_a && strcmp(output_a, "-") != 0) rf_path = output_a;
     else if (output_b && strcmp(output_b, "-") != 0) rf_path = output_b;
-    if (!rf_path) return;  /* Nothing to name for a stdout-only capture. */
+    if (!rf_path) return;
 
-    char log_path[CLI_CAPTURE_LOG_PATH_MAX];
-    size_t length = strlen(rf_path);
-    if (length + sizeof(".log") > sizeof(log_path)) {
-        fprintf(stderr, "WARNING: RF filename is too long for a capture log\n");
+    const char *sep = strrchr(rf_path, '/');
+    const char *bsep = strrchr(rf_path, '\\');
+    if (bsep && (!sep || bsep > sep)) sep = bsep;
+    const char *filename = sep ? sep + 1 : rf_path;
+    if (!*filename) return;
+
+    char base[128];
+    size_t stem = strlen(filename);
+    const char *dot = strrchr(filename, '.');
+    if (dot && dot != filename) stem = (size_t)(dot - filename);
+    /* Existing CLI capture scripts use e.g. 52_p01_MISRC_40_MSPS_RF_.... */
+    const char *misrc = strstr(filename, "_MISRC_");
+    if (misrc && (size_t)(misrc - filename) < stem)
+        stem = (size_t)(misrc - filename);
+    if (stem == 0) stem = strlen(filename);
+    if (stem >= sizeof(base)) stem = sizeof(base) - 1;
+    memcpy(base, filename, stem);
+    base[stem] = '\0';
+    /* Use the GUI's sanitization rules, including spaces. */
+    for (size_t i = 0; i < stem; ++i) {
+        unsigned char c = (unsigned char)base[i];
+        if (c == ' ' || c == '\t') base[i] = '-';
+        else if (!isalnum(c) && c != '.' && c != '_' && c != '-' && c < 0x80)
+            base[i] = '-';
+    }
+    while (stem && base[stem - 1] == '-') base[--stem] = '\0';
+    if (!stem) snprintf(base, sizeof(base), "capture");
+
+    char date_tag[32] = "";
+    if (!cli_capture_find_timestamp(filename, date_tag, sizeof(date_tag)))
+        cli_capture_format_now(date_tag, sizeof(date_tag), "%Y.%m.%d_%H.%M.%S");
+    if (!*date_tag) snprintf(date_tag, sizeof(date_tag), "session");
+
+    char dir[CLI_CAPTURE_LOG_PATH_MAX];
+    size_t dir_len = sep ? (size_t)(sep - rf_path) : 0;
+    if (dir_len >= sizeof(dir)) {
+        fprintf(stderr, "WARNING: capture log path too long\n");
         return;
     }
-    memcpy(log_path, rf_path, length + 1);
+    if (dir_len) {
+        memcpy(dir, rf_path, dir_len);
+        dir[dir_len] = '\0';
+    } else snprintf(dir, sizeof(dir), ".");
+    if (dir_len == 0) dir_len = strlen(dir);
 
-    const char *sep = strrchr(log_path, '/');
-    const char *backslash = strrchr(log_path, '\\');
-    if (backslash && (!sep || backslash > sep)) sep = backslash;
-    char *extension = strrchr(log_path, '.');
-    if (extension && (!sep || extension > sep) &&
-        strcmp(extension, ".flac") == 0) {
-        strcpy(extension, ".log");
-    } else {
-        strcat(log_path, ".log");
+    char log_path[CLI_CAPTURE_LOG_PATH_MAX];
+    int n = snprintf(log_path, sizeof(log_path), "%s/%s_%s_misrc_capture.log",
+                     dir, base, date_tag);
+    if (n < 0 || (size_t)n >= sizeof(log_path)) {
+        fprintf(stderr, "WARNING: capture log filename too long\n");
+        return;
     }
 
-    /* Append rather than overwrite a log when the user reuses a filename. */
-    FILE *file = file_open_utf8(log_path, "a");
-    if (!file) {
+    /* GUI opens a new log per session, rather than appending old sessions. */
+    FILE *fp = file_open_utf8(log_path, "w");
+    if (!fp) {
         fprintf(stderr, "WARNING: Cannot open CLI capture log: %s\n", log_path);
         return;
     }
     cli_capture_log_lock();
-    s_cli_capture_log = file;
+    s_cli_capture_log = fp;
     cli_capture_log_unlock();
-    cli_capture_logf("INFO", "--- MISRC CLI capture session started ---");
+
+    cli_capture_logf("INFO", "MISRC capture log started");
+    cli_capture_log_system_info();
+    cli_capture_logf("INFO", "misrc_tools_version: %s", MIRSC_TOOLS_VERSION);
+    char iso[32] = "";
+    cli_capture_format_now(iso, sizeof(iso), "%Y-%m-%dT%H:%M:%S");
+    cli_capture_logf("INFO", "datetime_start: %s", *iso ? iso : "unknown");
     cli_capture_logf("INFO", "capture_log_path: %s", log_path);
+    cli_capture_logf("INFO", "capture_base_name: %s", base);
+    cli_capture_logf("INFO", "output_path: %s", dir);
+}
+
+
+static void cli_capture_format_size(uint64_t size, char *dst, size_t len) {
+    if (!dst || len == 0) return;
+    if (size >= 1073741824ULL)
+        snprintf(dst, len, "%.3f GB (%" PRIu64 " bytes)",
+                 (double)size / 1073741824.0, size);
+    else
+        snprintf(dst, len, "%.2f MB (%" PRIu64 " bytes)",
+                 (double)size / 1048576.0, size);
+}
+
+static void cli_capture_format_hms(double seconds, char *dst, size_t len) {
+    if (!dst || len == 0) return;
+    if (seconds < 0.0) seconds = 0.0;
+    uint64_t t = (uint64_t)seconds;
+    snprintf(dst, len, "%02" PRIu64 ".%02" PRIu64 ".%02" PRIu64,
+             t / 3600ULL, (t / 60ULL) % 60ULL, t % 60ULL);
 }
 
 static void cli_capture_log_close(void) {
@@ -1123,6 +1286,7 @@ int main(int argc, char **argv)
 
 	//clipping state
 	size_t clip[2] = {0, 0};
+	uint64_t clip_total[2] = {0, 0};
 
 	//peak level
 	uint16_t peak_level[2] = {0, 0};
@@ -1356,30 +1520,44 @@ int main(int argc, char **argv)
 	}
 
 
-    // Open the CLI session log before starting any RF writer or capture thread.
-    // The path is derived from the output RF FLAC filename.
+    // CLI only: GUI-compatible session log, without touching the GUI code.
+    const time_t cli_started_at = time(NULL);
     cli_capture_log_open(output_names[0], output_names[1]);
-    cli_capture_logf("INFO", "misrc_tools_version: %s", MIRSC_TOOLS_VERSION);
-    cli_capture_logf("INFO", "capture_device: %s",
-                     sc_dev_name ? sc_dev_name : "selected device index");
-    cli_capture_logf("INFO", "capture_device_index: %d", dev_index);
-    cli_capture_logf("INFO", "RF output channels: A=%s B=%s",
-                     output_names[0] ? "on" : "off", output_names[1] ? "on" : "off");
-    if (output_names[0]) cli_capture_logf("INFO", "RF_FILE_PATH_A: %s", output_names[0]);
-    if (output_names[1]) cli_capture_logf("INFO", "RF_FILE_PATH_B: %s", output_names[1]);
-    cli_capture_logf("INFO", "RF sample width: %s; pad_12bit=%s",
-                     out_size == 4 ? "FLAC" : "RAW", pad ? "on" : "off");
+    bool cli_flac_mode = false;
+    uint32_t rf_bits[2] = {16, 16};
 #if LIBFLAC_ENABLED == 1
-    if (output_thread_func == (thrd_start_t)flac_file_writer) {
-        cli_capture_logf("INFO", "FLAC settings: level=%d threads=%u verify=%s 12bit=%s",
-                         flac_level, flac_threads, flac_verify ? "on" : "off",
-                         flac_12bit ? "yes" : "no");
-    }
+    cli_flac_mode = (output_thread_func == (thrd_start_t)flac_file_writer);
+    if (cli_flac_mode) rf_bits[0] = rf_bits[1] = flac_12bit ? 12 : 16;
 #endif
 #if LIBSOXR_ENABLED == 1
-    cli_capture_logf("INFO", "RF resampling: A=%.1f kHz B=%.1f kHz",
-                     resample_rate[0], resample_rate[1]);
+    if (reduce_8bit[0]) rf_bits[0] = 8;
+    if (reduce_8bit[1]) rf_bits[1] = 8;
 #endif
+    cli_capture_logf("INFO", "capture_device_type: %s",
+                     sc_dev_name ? "simple_capture" : "hsdaoh");
+    if (sc_dev_name)
+        cli_capture_logf("INFO", "capture_device_name: %s", sc_dev_name);
+    cli_capture_logf("INFO", "capture_format: %s", cli_flac_mode ? "FLAC" : "RAW converted");
+    cli_capture_logf("INFO", "Capture channels: A=%s B=%s",
+                     output_names[0] ? "on" : "off", output_names[1] ? "on" : "off");
+#if LIBSOXR_ENABLED == 1
+    cli_capture_logf("INFO", "RF settings: bitsA=%u bitsB=%u resampleA=%s(%.1f kHz) resampleB=%s(%.1f kHz)",
+                     rf_bits[0], rf_bits[1],
+                     resample_rate[0] != 0.0 ? "on" : "off", resample_rate[0],
+                     resample_rate[1] != 0.0 ? "on" : "off", resample_rate[1]);
+#else
+    cli_capture_logf("INFO", "RF settings: bitsA=%u bitsB=%u resampleA=off(0.0 kHz) resampleB=off(0.0 kHz)",
+                     rf_bits[0], rf_bits[1]);
+#endif
+    cli_capture_logf("INFO", "Capture limits: capture_limit_seconds=%" PRIu64 " record_limit_seconds=0 (record_timer_disarmed)",
+                     total_samples_before_exit / 40000000ULL);
+#if LIBFLAC_ENABLED == 1
+    if (cli_flac_mode)
+        cli_capture_logf("INFO", "FLAC settings: level=%d verify=%s threads=%u",
+                         flac_level, flac_verify ? "on" : "off", flac_threads);
+#endif
+    if (output_names[0]) cli_capture_logf("INFO", "FILE_PATH_A: %s", output_names[0]);
+    if (output_names[1]) cli_capture_logf("INFO", "FILE_PATH_B: %s", output_names[1]);
     cli_capture_logf("INFO", "Audio outputs: 4ch=%s 2ch12=%s 2ch34=%s",
                      output_name_4ch_audio ? "on" : "off",
                      output_names_2ch_audio[0] ? "on" : "off",
@@ -1394,8 +1572,6 @@ int main(int argc, char **argv)
         if (output_names_1ch_audio[i])
             cli_capture_logf("INFO", "AUDIO_1CH_%d_FILE_PATH: %s",
                              i + 1, output_names_1ch_audio[i]);
-    cli_capture_logf("INFO", "Capture limit (RF samples): %" PRIu64,
-                     total_samples_before_exit);
 
 #ifndef _WIN32
 	sigact.sa_handler = sighandler;
@@ -1508,6 +1684,7 @@ int main(int argc, char **argv)
 			exit(1);
 		}
 		fprintf(stderr, "Opened %s device %s.\n", sc_get_impl_name(), sc_dev_name);
+		cli_capture_logf("INFO", "capture_device_name: %s", sc_dev_name);
 	}
 	else {
 		proc_set_priority(PROC_PRIORITY_ABOVE);
@@ -1527,8 +1704,10 @@ int main(int argc, char **argv)
 		r = hsdaoh_get_usb_strings(hs_dev, dev_manufact, dev_product, dev_serial);
 		if (r < 0)
 			fprintf(stderr, "Failed to identify hsdaoh device #%d.\n", dev_index);
-		else
+		else {
 			fprintf(stderr, "Opened device #%d: %s %s, serial: %s\n", dev_index, dev_manufact, dev_product, dev_serial);
+			cli_capture_logf("INFO", "capture_device_name: %s %s (serial: %s)", dev_manufact, dev_product, dev_serial);
+		}
 
 		fprintf(stderr, "Reading samples...\n");
 		r = MISRC_HSDAOH_START_STREAM(hs_dev, hsdaoh_callback, &cap_ctx);
@@ -1566,6 +1745,8 @@ int main(int argc, char **argv)
 		if(clip[0] > 0 && !suppress_a_clipping)
 		{
 			fprintf(stderr,"ADC A : %zu samples clipped\n",clip[0]);
+			cli_capture_logf("WARN", "ADC A: %zu samples clipped", clip[0]);
+			clip_total[0] += clip[0];
 			clip[0] = 0;
 			new_line = 1;
 		}
@@ -1573,6 +1754,8 @@ int main(int argc, char **argv)
 		if(clip[1] > 0 && !suppress_b_clipping)
 		{
 			fprintf(stderr,"ADC B : %zu samples clipped\n",clip[1]);
+			cli_capture_logf("WARN", "ADC B: %zu samples clipped", clip[1]);
+			clip_total[1] += clip[1];
 			clip[1] = 0;
 			new_line = 1;
 		}
@@ -1608,6 +1791,7 @@ int main(int argc, char **argv)
 		fprintf(stderr, "\nUser cancel, exiting...\n");
 	else
 		fprintf(stderr, "\nLibrary error %d, exiting...\n", r);
+	const time_t cli_capture_stopped_at = time(NULL);
 	cli_capture_logf("INFO", "Capture stopped: samples=%" PRIu64 " stop_requested=%s",
 	                 total_samples, do_exit ? "yes" : "no");
 
@@ -1669,16 +1853,66 @@ int main(int argc, char **argv)
 	        (unsigned)atomic_load(&cap_ctx.rb_wait_count),
 	        (unsigned)atomic_load(&cap_ctx.rb_drop_count),
 	        (unsigned)atomic_load(&cap_ctx.rb_audio_drop_count));
-    cli_capture_logf("INFO", "Capture time (RF seconds): %.6f", (double)total_samples / 40000000.0);
-    cli_capture_logf("INFO", "RF clipped samples: A=%zu B=%zu", clip[0], clip[1]);
+    clip_total[0] += clip[0];
+    clip_total[1] += clip[1];
+    const time_t cli_completed_at = time(NULL);
+    double capture_secs = difftime(cli_capture_stopped_at, cli_started_at);
+    double processing_secs = difftime(cli_completed_at, cli_capture_stopped_at);
+    double total_secs = difftime(cli_completed_at, cli_started_at);
+    if (capture_secs < 0.0) capture_secs = 0.0;
+    if (processing_secs < 0.0) processing_secs = 0.0;
+    if (total_secs < 0.0) total_secs = 0.0;
+    char total_hms[32], capture_hms[32], processing_hms[32];
+    cli_capture_format_hms(total_secs, total_hms, sizeof(total_hms));
+    cli_capture_format_hms(capture_secs, capture_hms, sizeof(capture_hms));
+    cli_capture_format_hms(processing_secs, processing_hms, sizeof(processing_hms));
+
+    uint64_t size_a = 0, size_b = 0;
+    bool have_a = output_names[0] && !output_is_stdout[0] &&
+                  file_path_info_utf8(output_names[0], &size_a, NULL);
+    bool have_b = output_names[1] && !output_is_stdout[1] &&
+                  file_path_info_utf8(output_names[1], &size_b, NULL);
+    char compressed_a[64] = "N/A", compressed_b[64] = "N/A";
+    if (have_a) cli_capture_format_size(size_a, compressed_a, sizeof(compressed_a));
+    if (have_b) cli_capture_format_size(size_b, compressed_b, sizeof(compressed_b));
+
+    uint64_t raw_a = output_names[0] ? total_samples * sizeof(int16_t) : 0;
+    uint64_t raw_b = output_names[1] ? total_samples * sizeof(int16_t) : 0;
+    char raw_a_str[64], raw_b_str[64], raw_total_str[64], comp_total_str[64];
+    cli_capture_format_size(raw_a, raw_a_str, sizeof(raw_a_str));
+    cli_capture_format_size(raw_b, raw_b_str, sizeof(raw_b_str));
+    cli_capture_format_size(raw_a + raw_b, raw_total_str, sizeof(raw_total_str));
+    cli_capture_format_size(size_a + size_b, comp_total_str, sizeof(comp_total_str));
+
+    uint32_t waits = (uint32_t)atomic_load(&cap_ctx.rb_wait_count);
+    uint32_t drops = (uint32_t)atomic_load(&cap_ctx.rb_drop_count) +
+                     (uint32_t)atomic_load(&cap_ctx.rb_audio_drop_count);
+    cli_capture_logf("INFO", "Recording stopped: duration=%.2fs (%s) rawA=%s rawB=%s waits=%u drops=%u",
+                     total_secs, total_hms, raw_a_str, raw_b_str, waits, drops);
+    cli_capture_logf("INFO", "Capture time: %.2fs (%s)", capture_secs, capture_hms);
+    cli_capture_logf("INFO", "Processing time: %.2fs (%s)", processing_secs, processing_hms);
+    cli_capture_logf("INFO", "Output data: compressedA=%s compressedB=%s",
+                     compressed_a, compressed_b);
+    if (cli_flac_mode && (have_a || have_b) && (size_a + size_b) > 0) {
+        cli_capture_logf("INFO", "Compression ratio: total_raw=%s total_compressed=%s ratio=%.3fx",
+                         raw_total_str, comp_total_str, (double)(raw_a + raw_b) / (double)(size_a + size_b));
+    } else if (!cli_flac_mode) {
+        cli_capture_logf("INFO", "Compression ratio: N/A (non-compressed recording mode)");
+    } else {
+        cli_capture_logf("INFO", "Compression ratio: N/A (output size unavailable)");
+    }
+    if (drops)
+        cli_capture_logf("WARN", "Backpressure drops detected: %u frame blocks dropped", drops);
+    cli_capture_logf("INFO", "RF clipped samples: A=%" PRIu64 " B=%" PRIu64,
+                     clip_total[0], clip_total[1]);
     cli_capture_logf("INFO", "Backpressure summary: waits=%u rf_drops=%u audio_drops=%u",
-                     (unsigned)atomic_load(&cap_ctx.rb_wait_count),
-                     (unsigned)atomic_load(&cap_ctx.rb_drop_count),
+                     waits, (unsigned)atomic_load(&cap_ctx.rb_drop_count),
                      (unsigned)atomic_load(&cap_ctx.rb_audio_drop_count));
+    char end_iso[32] = "";
+    cli_capture_format_now(end_iso, sizeof(end_iso), "%Y-%m-%dT%H:%M:%S");
+    cli_capture_logf("INFO", "datetime_end: %s", *end_iso ? end_iso : "unknown");
     cli_capture_logf(flac_metadata_errors ? "ERROR" : "INFO",
-                     "CLI recording finished (status=%s)",
-                     flac_metadata_errors ? "FLAC metadata error" : "complete");
-    cli_capture_logf("INFO", "--- MISRC CLI capture session ended ---");
+                     flac_metadata_errors ? "Session incomplete (FLAC metadata error)" : "Session complete");
     cli_capture_log_close();
 	proc_set_priority(PROC_PRIORITY_NORMAL);
 
