@@ -1,6 +1,7 @@
 /* Offline end-to-end RF preview probe. Links the production worker, resampler
  * and decoder, without raylib or capture devices. Input is signed s16le RF. */
 #include "../misrc_gui/processing/gui_rf_preview_worker.h"
+#include "../misrc_gui/signal/gui_vhs_hifi.h"
 #include "../common/threading.h"
 
 #include <errno.h>
@@ -95,15 +96,18 @@ static void receive_audio(void *context,const float *pcm,size_t frames,uint64_t 
 
 int main(int argc, char **argv) {
     bool realtime = false, full_frame = false, budget_supplied = false, no_audio = false;
+    gui_rf_ld_audio_t ld_audio = GUI_RF_LD_AUDIO_ANALOG;
     double seconds_cap = 0.0, budget = 0.0;
     const char *audio_path = NULL;
     if (argc < 5 ||
         (strcmp(argv[3], "pal") != 0 && strcmp(argv[3], "ntsc") != 0 && strcmp(argv[3], "pal-svhs") != 0 && strcmp(argv[3], "ntsc-svhs") != 0 &&
+         strcmp(argv[3], "pal-ld") != 0 && strcmp(argv[3], "ntsc-ld") != 0 &&
          strcmp(argv[3], "secam") != 0 && strcmp(argv[3], "mesecam") != 0 &&
+         strcmp(argv[3], "ntsc-vhs-hifi") != 0 && strcmp(argv[3], "pal-vhs-hifi") != 0 &&
          strcmp(argv[3], "ntsc-beta") != 0 && strcmp(argv[3], "ntsc-beta-hifi") != 0 &&
          strcmp(argv[3], "ntsc-superbeta") != 0 && strcmp(argv[3], "ntsc-superbeta-hifi") != 0 && strcmp(argv[3], "ntsc-ed-beta") != 0)) {
-        fprintf(stderr, "Usage: %s input.s16le sample_rate_hz pal|ntsc|pal-svhs|ntsc-svhs|secam|mesecam|ntsc-beta|ntsc-beta-hifi|ntsc-superbeta|ntsc-superbeta-hifi|ntsc-ed-beta output.ppm"
-                        " [--max|--realtime] [--full] [--no-audio] [output.wav] [seconds_cap] [realtime_budget_cores]\n", argv[0]);
+        fprintf(stderr, "Usage: %s input.s16le sample_rate_hz pal|ntsc|pal-svhs|ntsc-svhs|pal-ld|ntsc-ld|secam|mesecam|ntsc-beta|ntsc-beta-hifi|ntsc-superbeta|ntsc-superbeta-hifi|ntsc-ed-beta|ntsc-vhs-hifi|pal-vhs-hifi output.ppm|-"
+                        " [--max|--realtime] [--full] [--no-audio|--ld-digital|--ld-ac3] [output.wav] [seconds_cap] [realtime_budget_cores]\n", argv[0]);
         return 1;
     }
     /* Retain the upstream --full / seconds-cap form and the Beta probe's
@@ -113,6 +117,8 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--realtime") == 0) realtime = true;
         else if (strcmp(argv[i], "--full") == 0) full_frame = true;
         else if (strcmp(argv[i], "--no-audio") == 0) no_audio = true;
+        else if (strcmp(argv[i], "--ld-digital") == 0) ld_audio = GUI_RF_LD_AUDIO_DIGITAL;
+        else if (strcmp(argv[i], "--ld-ac3") == 0) ld_audio = GUI_RF_LD_AUDIO_AC3;
         else {
             char *option_end = NULL;
             errno = 0;
@@ -141,21 +147,36 @@ int main(int argc, char **argv) {
     char *end = NULL;
     errno = 0;
     unsigned long parsed_rate = strtoul(argv[2], &end, 10);
-    if (errno || end == argv[2] || *end || parsed_rate < 16000000u || parsed_rate > 200000000u) {
-        fprintf(stderr, "RF sample rate must be 16000000..200000000 Hz\n");
+    if (errno || end == argv[2] || *end || parsed_rate > 200000000u) {
+        fprintf(stderr, "Invalid RF sample rate\n");
         return 1;
     }
     uint32_t rate = (uint32_t)parsed_rate;
     gui_rf_profile_t profile = strcmp(argv[3],"pal")==0 ? GUI_RF_PROFILE_PAL_VHS :
         strcmp(argv[3],"pal-svhs")==0 ? GUI_RF_PROFILE_PAL_SVHS :
         strcmp(argv[3],"ntsc-svhs")==0 ? GUI_RF_PROFILE_NTSC_SVHS :
+        strcmp(argv[3],"pal-ld")==0 ? GUI_RF_PROFILE_PAL_LASERDISC :
+        strcmp(argv[3],"ntsc-ld")==0 ? GUI_RF_PROFILE_NTSC_LASERDISC :
         strcmp(argv[3],"secam")==0 ? GUI_RF_PROFILE_SECAM_VHS :
         strcmp(argv[3],"mesecam")==0 ? GUI_RF_PROFILE_MESECAM_VHS :
         strcmp(argv[3],"ntsc-beta")==0 ? GUI_RF_PROFILE_NTSC_BETAMAX :
         strcmp(argv[3],"ntsc-beta-hifi")==0 ? GUI_RF_PROFILE_NTSC_BETAMAX_HIFI :
         strcmp(argv[3],"ntsc-superbeta")==0 ? GUI_RF_PROFILE_NTSC_SUPERBETA :
         strcmp(argv[3],"ntsc-superbeta-hifi")==0 ? GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI :
+        strcmp(argv[3],"ntsc-vhs-hifi")==0 ? GUI_RF_PROFILE_NTSC_VHS_HIFI :
+        strcmp(argv[3],"pal-vhs-hifi")==0 ? GUI_RF_PROFILE_PAL_VHS_HIFI :
         strcmp(argv[3],"ntsc-ed-beta")==0 ? GUI_RF_PROFILE_NTSC_ED_BETA : GUI_RF_PROFILE_NTSC_VHS;
+    bool audio_only = gui_rf_profile_is_audio_only(profile);
+    if (rate < 16000000u && !(audio_only && gui_vhs_hifi_is_native_low_rate(rate))) {
+        fprintf(stderr, "RF sample rate must be at least 16 MSPS, or 8, 8.192 or 10 MSPS for VHS Hi-Fi\n");
+        return 1;
+    }
+    if (audio_only && (no_audio || full_frame)) return 1;
+    if (ld_audio != GUI_RF_LD_AUDIO_ANALOG && (no_audio || !gui_rf_profile_is_laserdisc(profile))) return 1;
+    if (ld_audio == GUI_RF_LD_AUDIO_AC3 && profile != GUI_RF_PROFILE_NTSC_LASERDISC) {
+        fprintf(stderr, "--ld-ac3 requires ntsc-ld\n");
+        return 1;
+    }
     uint64_t max_samples = seconds_cap > 0.0 ? (uint64_t)(seconds_cap * rate) : UINT64_MAX;
     if (budget_supplied && !realtime) return 1;
     if (!budget_supplied) budget = realtime ? 1.0 : 0.0;
@@ -175,11 +196,14 @@ int main(int argc, char **argv) {
     }
     if (full_frame) gui_rf_preview_worker_set_frame_mode(worker, true);
     if (no_audio) gui_rf_preview_worker_set_audio_enabled(worker, false);
+    gui_rf_preview_worker_set_ld_audio(worker, ld_audio);
     audio_probe_t audio={0};
     if(audio_path) {
         audio.file=fopen(audio_path,"wb");
         if(!audio.file) { perror("Open audio output"); gui_rf_preview_worker_destroy(worker); free(bytes); free(samples); free(frame); fclose(input); return 1; }
         wav_header(audio.file,0);
+    }
+    if (audio_path || audio_only || ld_audio == GUI_RF_LD_AUDIO_AC3) {
         gui_rf_preview_worker_set_audio_callback(worker,receive_audio,&audio);
     }
     uint64_t pace_start = file_now_us();
@@ -232,8 +256,8 @@ int main(int argc, char **argv) {
         exit_status = 1;
     }
     uint64_t processing_end = file_now_us();
-    bool saved = width > 0 && height > 0 && save_ppm(argv[4], frame, width, height);
-    if (!saved && !exit_status) exit_status = 2;
+    bool saved = !audio_only && width > 0 && height > 0 && save_ppm(argv[4], frame, width, height);
+    if (!exit_status && (audio_only ? !audio.frames || stats.total_frames != 0 : !saved)) exit_status = 2;
     gui_rf_preview_worker_destroy(worker);
     if(audio.file) { wav_header(audio.file,audio.frames); if(fclose(audio.file)!=0) audio.failed=true; }
     if(audio.failed) exit_status=1;
@@ -247,7 +271,7 @@ int main(int argc, char **argv) {
            "\"processing_wall_ms\":%.3f,\"wall_ms\":%.3f,\"throughput_msps\":%.3f,"
            "\"fps\":%.3f,\"decode_ms\":%.3f,\"latency_ms\":%.3f,"
            "\"h_locked\":%s,\"v_locked\":%s,\"color_locked\":%s,\"reason\":",
-           rate, gui_rf_profile_video_rate_hz(profile), argv[3], realtime ? "realtime" : "max", budget, full_frame ? "full" : "active",
+           rate, audio_only ? 0 : gui_rf_profile_video_rate_hz(profile), argv[3], realtime ? "realtime" : "max", budget, full_frame ? "full" : "active",
            seconds_cap, (unsigned long long)total_samples,
            (double)total_samples / rate, (unsigned long long)submitted,
            (unsigned long long)rejected, (unsigned long long)stats.blocks_dropped,
@@ -263,6 +287,12 @@ int main(int argc, char **argv) {
            (unsigned long long)audio.frames,(unsigned long long)audio.nonzero,audio.peak,
            stats.hifi.locked ? "true" : "false");
     print_json_string(stats.hifi.reason);
+    if (audio_only) printf(",\"audio_rf_rate_hz\":%u", stats.vhs_hifi_rf_rate_hz);
+    if (gui_rf_profile_is_laserdisc(profile))
+        printf(",\"ld_audio\":\"%s\",\"ld_audio_locked\":%s",no_audio ? "off" :
+               ld_audio == GUI_RF_LD_AUDIO_AC3 ? "ac3" :
+               ld_audio == GUI_RF_LD_AUDIO_DIGITAL ? "digital" : "analog",
+               stats.ld_audio_locked ? "true" : "false");
     printf(",\"audio_cpu_ms\":%.3f,\"audio_processing_wall_ms\":%.3f,"
            "\"audio_blocks_dropped\":%llu,\"audio_enabled\":%s,\"audio_active\":%s,\"audio_flushes\":%llu",
            stats.audio_cpu_ms,stats.audio_wall_ms,(unsigned long long)stats.audio_blocks_dropped,

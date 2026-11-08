@@ -52,7 +52,7 @@ static inline double rf_display_level(double y01) {
 #define RF_HYBRID_SPAN_IRE_NTSC  (197.680)
 
 typedef enum { GUI_RF_PAL = 0, GUI_RF_NTSC = 1 } gui_rf_format_t;
-/* Tape modulation profiles are independent of PAL/NTSC field geometry. */
+/* RF modulation profiles are independent of PAL/NTSC field geometry. */
 typedef enum {
     GUI_RF_PROFILE_PAL_VHS = 0,
     GUI_RF_PROFILE_NTSC_VHS,
@@ -65,8 +65,16 @@ typedef enum {
     GUI_RF_PROFILE_NTSC_ED_BETA,
     GUI_RF_PROFILE_PAL_SVHS,
     GUI_RF_PROFILE_NTSC_SVHS,
+    GUI_RF_PROFILE_PAL_LASERDISC,
+    GUI_RF_PROFILE_NTSC_LASERDISC,
+    GUI_RF_PROFILE_NTSC_VHS_HIFI,
+    GUI_RF_PROFILE_PAL_VHS_HIFI,
     GUI_RF_PROFILE_COUNT
 } gui_rf_profile_t;
+
+static inline bool gui_rf_profile_is_audio_only(gui_rf_profile_t profile) {
+    return profile == GUI_RF_PROFILE_NTSC_VHS_HIFI || profile == GUI_RF_PROFILE_PAL_VHS_HIFI;
+}
 typedef struct gui_rf_decoder gui_rf_decoder_t;
 
 typedef struct {

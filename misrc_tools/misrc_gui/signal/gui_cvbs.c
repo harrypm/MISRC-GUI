@@ -6,9 +6,11 @@
  */
 
 #include "gui_cvbs.h"
+#include "../input/gui_playback.h"
 #include "../output/gui_audio.h"
 #include "gui_trigger.h"
 #include "gui_vhs_fm.h"
+#include "gui_vhs_hifi.h"
 #include "gui_rf_preview_geometry.h"  // shared full-frame display aspect
 #include "../processing/gui_rf_preview_pressure.h"
 #include "../visualization/gui_text.h"
@@ -5281,14 +5283,21 @@ static _Atomic(gui_rf_preview_worker_t *) s_rf_routes[2][GUI_RF_PROFILE_COUNT];
 static unsigned s_rf_references[2][GUI_RF_PROFILE_COUNT];
 static vhs_fm_decoder_t *s_rf_bindings[4];
 static gui_rf_preview_worker_t *s_rf_audio_source;
+static bool s_rf_audio_audible;
 static void video_rf_audio(void *context, const float *stereo, size_t frames, uint64_t end_sample) {
-    (void)end_sample; // Audio and video consume the same continuous RF worker.
-    if (stereo && frames) gui_audio_push_hifi(context, stereo, frames);
-    else gui_audio_reset_hifi(context);
+    if (!stereo || !frames) {
+        gui_audio_reset_hifi(context);
+    } else if (gui_rf_preview_worker_audio_is_ld(context)) {
+        gui_audio_push_ld(context, stereo, frames, end_sample,
+                          gui_rf_preview_worker_audio_is_current);
+    } else {
+        gui_audio_push_rf_checked(context, stereo, frames, end_sample,
+                                  gui_rf_preview_worker_audio_is_current);
+    }
 }
 static atomic_uint s_rf_route_readers;
 static atomic_bool s_rf_pressure_paused;
-static bool s_rf_input_supported = true; // Extraction producer owns this.
+static bool s_rf_input_supported = true; // The active RF producer owns this.
 static gui_rf_preview_pressure_t s_rf_pressure;
 static void video_detach_rf(vhs_fm_decoder_t *decoder) {
     if (!decoder || !decoder->worker) return;
@@ -5300,6 +5309,7 @@ static void video_detach_rf(vhs_fm_decoder_t *decoder) {
                 gui_rf_preview_worker_set_audio_enabled(worker,false);
                 gui_audio_set_hifi_source(NULL);
                 s_rf_audio_source = NULL;
+                s_rf_audio_audible = false;
             }
             while (atomic_load(&s_rf_route_readers)) thrd_sleep_ms(1);
             gui_rf_preview_worker_destroy(worker);
@@ -5384,25 +5394,133 @@ void gui_video_update_rf_routes(gui_app_t *app) {
         }
         s_rf_bindings[i]=decoder;
     }
-    // One monitor source: first visible Hi-Fi-capable panel (A before B).
-    gui_rf_preview_worker_t *audio_source = NULL;
-    for (int i=0; i<4; ++i) if (desired[i] && desired[i]->worker &&
-        gui_rf_profile_has_hifi(gui_vhs_fm_get_profile(desired[i]))) {
-        audio_source=desired[i]->worker;
-        break;
+    // Prefer the first playing RF audio panel (A before B). If all candidates
+    // are paused, keep the first selected so monitoring stays on the RF route.
+    const bool file_playback = gui_playback_is_running(app);
+    const bool can_drain_ld = file_playback && !gui_audio_rf_output_unavailable();
+    const bool rtl_input = atomic_load(&app->rf_source_is_rtlsdr);
+    const uint32_t rtl_center_hz = (uint32_t)atomic_load(&app->rf_source_rtlsdr_tuning);
+    const uint32_t rtl_rate_hz = (uint32_t)atomic_load(&app->sample_rate);
+    struct {
+        playback_rf_end_t state;
+        uint64_t token;
+        unsigned panels;
+        bool video_done;
+    } tails[2] = {0};
+    unsigned ld_video_channels = 0;
+    if (file_playback) {
+        for (int i = 0; i < 4; ++i) {
+            if (!desired[i] || !desired[i]->worker) continue;
+            gui_rf_profile_t profile = gui_vhs_fm_get_profile(desired[i]);
+            int channel = i / 2;
+            unsigned bit = 1u << channel;
+            if (!gui_rf_profile_is_laserdisc(profile) ||
+                !gui_rf_preview_worker_rate_supported(profile, atomic_load(&app->rf_source_rate_hz[channel])))
+                continue;
+            tails[channel].panels |= 1u << i;
+            if (!(ld_video_channels & bit)) {
+                tails[channel].state = gui_playback_get_channel_rf_end(app, channel, &tails[channel].token);
+                tails[channel].video_done = true;
+                ld_video_channels |= bit;
+            } else if (desired[i - 1] && desired[i - 1]->worker == desired[i]->worker) {
+                continue; // Two panels can share a worker on the same channel.
+            }
+            if (tails[channel].state == PLAYBACK_RF_END_READY &&
+                !gui_rf_preview_worker_finish_ld_video(desired[i]->worker))
+                tails[channel].video_done = false;
+        }
+        gui_playback_set_ld_video_channels(app, ld_video_channels);
     }
+
+    gui_rf_preview_worker_t *previous_audio = s_rf_audio_source;
+    int audio_panel = -1, audio_tail_channel = -1;
+    bool audio_paused = false, audio_tail_done = false;
+    for (int i=0; i<4; ++i) {
+        if (!desired[i] || !desired[i]->worker) continue;
+        gui_rf_profile_t profile = gui_vhs_fm_get_profile(desired[i]);
+        if (!gui_rf_profile_has_audio(profile)) continue;
+        if (rtl_input && (!gui_rf_profile_is_audio_only(profile) || !rtl_center_hz ||
+            !gui_vhs_hifi_iq_supported(gui_rf_profile_format(profile), rtl_rate_hz, rtl_center_hz))) continue;
+        int channel = i / 2;
+        if (file_playback &&
+            !gui_rf_preview_worker_rate_supported(profile, atomic_load(&app->rf_source_rate_hz[channel]))) continue;
+        bool paused = file_playback && gui_playback_is_channel_paused(app, channel);
+        if (can_drain_ld && s_rf_audio_audible && app->settings.audio_monitor_playback &&
+            desired[i]->worker == previous_audio && gui_rf_profile_is_laserdisc(profile) &&
+            tails[channel].state != PLAYBACK_RF_END_NONE) {
+            audio_tail_channel = channel;
+            audio_tail_done = tails[channel].state == PLAYBACK_RF_END_READY &&
+                gui_rf_preview_worker_finish_ld_audio(previous_audio) &&
+                gui_audio_finish_rf_source(previous_audio);
+            // Finish the already audible tail before a higher-priority panel
+            // can replace its monitor source and invalidate queued PCM.
+            if (!audio_tail_done) {
+                audio_panel = i;
+                audio_paused = false;
+                break;
+            }
+        }
+        if (audio_panel >= 0 && (paused || !audio_paused)) continue;
+        audio_panel = i;
+        audio_paused = paused;
+    }
+
+    gui_rf_preview_worker_t *audio_source = NULL;
+    bool burst_audio = false;
+    bool ld_source = false, track_changed = false;
+    if (audio_panel >= 0) {
+        vhs_fm_decoder_t *selected = desired[audio_panel];
+        audio_source = selected->worker;
+        gui_rf_profile_t profile = gui_vhs_fm_get_profile(selected);
+        if (gui_rf_profile_is_laserdisc(profile)) {
+            ld_source = true;
+            gui_rf_ld_audio_t mode = selected->overlay.ld_audio;
+            if (mode == GUI_RF_LD_AUDIO_AC3 && profile == GUI_RF_PROFILE_PAL_LASERDISC)
+                mode = GUI_RF_LD_AUDIO_ANALOG;
+            track_changed = gui_rf_preview_worker_set_ld_audio(audio_source, mode);
+            burst_audio = mode == GUI_RF_LD_AUDIO_AC3;
+            for (int j=audio_panel+1; j<4; ++j)
+                if (desired[j] && desired[j]->worker==audio_source)
+                    desired[j]->overlay.ld_audio=selected->overlay.ld_audio;
+        }
+    }
+    // A replacement worker or track must not inherit an older tail on the same channel.
+    if (file_playback && (!s_rf_audio_source || audio_source != s_rf_audio_source || track_changed))
+        gui_playback_set_ld_audio_channel(app, -1);
     if (audio_source != s_rf_audio_source) {
         if (s_rf_audio_source) gui_rf_preview_worker_set_audio_enabled(s_rf_audio_source,false);
-        gui_audio_set_hifi_source(audio_source);
         s_rf_audio_source=audio_source;
     }
-    // Decode audio only for the selected, audible live source. Keep the Hi-Fi
-    // video profile when muted; its FM carriers and RF filtering still apply.
-    bool audible=app->is_capturing && app->settings.audio_monitor_playback;
+    bool audible=audio_source && app->is_capturing && app->settings.audio_monitor_playback && !audio_paused;
+    s_rf_audio_audible = audible;
+    if (file_playback)
+        gui_playback_set_ld_audio_channel(app, can_drain_ld && audible && ld_source ? audio_panel / 2 : -1);
+    const bool ld_playback = ld_source && audible && file_playback;
+    const bool ld_sync = ld_playback && gui_playback_get_speed(app) == PLAYBACK_SPEED_1X;
+    gui_audio_rf_mode_t audio_mode = ld_sync ? GUI_AUDIO_RF_LD_TIMED :
+                                     ld_playback ? GUI_AUDIO_RF_LD : GUI_AUDIO_RF_HIFI;
+    gui_audio_set_rf_source(audio_source, burst_audio, audio_mode);
+    if (track_changed) gui_audio_reset_hifi(audio_source);
+    // Decode audio only for the selected, audible source.
     for (int ch=0;ch<2;++ch) for (int profile=0;profile<GUI_RF_PROFILE_COUNT;++profile) {
-        if (!gui_rf_profile_has_hifi((gui_rf_profile_t)profile)) continue;
+        if (!gui_rf_profile_has_audio((gui_rf_profile_t)profile)) continue;
         gui_rf_preview_worker_t *worker=atomic_load(&s_rf_routes[ch][profile]);
-        if (worker) gui_rf_preview_worker_set_audio_enabled(worker,audible && worker==audio_source);
+        if (!worker) continue;
+        bool selected = worker == audio_source;
+        if (gui_rf_profile_is_laserdisc((gui_rf_profile_t)profile))
+            gui_rf_preview_worker_set_ld_sync(worker, ld_sync && selected);
+        gui_rf_preview_worker_set_audio_enabled(worker, audible && selected);
+    }
+    for (int channel = 0; channel < 2; ++channel) {
+        if (tails[channel].state == PLAYBACK_RF_END_READY && tails[channel].video_done &&
+            (audio_tail_channel != channel || audio_tail_done || !audible ||
+             audio_source != previous_audio || track_changed)) {
+            for (int i = channel * 2; i < channel * 2 + 2; ++i) {
+                if (tails[channel].panels & (1u << i))
+                    gui_vhs_fm_latch_ld_tail(desired[i]);
+            }
+            gui_playback_finish_ld_tail(app, channel, tails[channel].token);
+        }
     }
 }
 static unsigned video_buffer_percent(gui_app_t *app, buffer_id_t id) {
@@ -5411,9 +5529,9 @@ static unsigned video_buffer_percent(gui_app_t *app, buffer_id_t id) {
     uint64_t written=atomic_load(&app->buffers.stats[id].bytes_written);
     return gui_rf_preview_pressure_fill_percent(written,read,app->buffers.buffers[id].buffer_size);
 }
-void gui_video_submit_rf(gui_app_t *app, const int16_t *samples_a, const int16_t *samples_b,
-                          size_t count_a, size_t count_b, const gui_rf_block_info_t info[2],
-                          bool input_supported) {
+static void video_submit_rf(gui_app_t *app, const int16_t *samples_a, const int16_t *samples_b,
+                            size_t count_a, size_t count_b, const gui_rf_block_info_t info[2],
+                            bool input_supported, const uint8_t *iq) {
     if (!app || !info) return;
     unsigned raw=video_buffer_percent(app,BUF_CAPTURE_RF), record=0;
     // Keep the drop snapshot independent of recording toggles: re-enabling a
@@ -5440,12 +5558,53 @@ void gui_video_submit_rf(gui_app_t *app, const int16_t *samples_a, const int16_t
         gui_rf_preview_worker_t *worker=atomic_load(&s_rf_routes[ch][sys]);
         if (!worker) continue;
         gui_rf_preview_worker_set_paused(worker,paused);
-        if (support_changed || (info[ch].discontinuity && !counts[ch])) gui_rf_preview_worker_reset(worker);
-        if (input_supported && samples[ch] && counts[ch])
-            gui_rf_preview_worker_submit(worker,samples[ch],counts[ch],&info[ch]);
+        const bool have_input = input_supported && (iq || samples[ch]) && counts[ch];
+        const bool ld_boundary = info[ch].discontinuity &&
+            gui_rf_profile_is_laserdisc((gui_rf_profile_t)sys);
+        if (support_changed || (info[ch].discontinuity && !counts[ch]) ||
+            (ld_boundary && !have_input))
+            gui_rf_preview_worker_reset(worker);
+        if (have_input && iq) {
+            gui_rf_preview_worker_submit_iq(worker, iq, counts[ch], &info[ch],
+                info[ch].discontinuity ? gui_audio_reset_hifi : NULL);
+        } else if (have_input) {
+            gui_rf_preview_worker_submit_with_audio_reset(worker, samples[ch], counts[ch],
+                &info[ch], ld_boundary ? gui_audio_reset_hifi : NULL);
+        } else if (ld_boundary) {
+            gui_audio_reset_hifi(worker);
+        }
     }
     atomic_fetch_sub(&s_rf_route_readers,1);
 }
+void gui_video_submit_rf(gui_app_t *app, const int16_t *samples_a, const int16_t *samples_b,
+                         size_t count_a, size_t count_b, const gui_rf_block_info_t info[2],
+                         bool input_supported) {
+    /* The RTL-SDR producer supplies original I/Q independently of channel mapping. */
+    if (!app || atomic_load(&app->rf_source_is_rtlsdr)) return;
+    video_submit_rf(app, samples_a, samples_b, count_a, count_b, info, input_supported, NULL);
+}
+
+void gui_video_reset_rtlsdr(gui_app_t *app) {
+    if (!app || app->headless_server) return;
+    atomic_fetch_add(&s_rf_route_readers, 1);
+    for (int ch = 0; ch < 2; ++ch) for (int profile = 0; profile < GUI_RF_PROFILE_COUNT; ++profile) {
+        if (!gui_rf_profile_is_audio_only((gui_rf_profile_t)profile)) continue;
+        gui_rf_preview_worker_t *worker = atomic_load(&s_rf_routes[ch][profile]);
+        if (worker) {
+            gui_rf_preview_worker_reset(worker);
+            gui_audio_reset_hifi(worker);
+        }
+    }
+    atomic_fetch_sub(&s_rf_route_readers, 1);
+}
+
+void gui_video_submit_rtlsdr(gui_app_t *app, const uint8_t *iq, size_t count,
+                             const gui_rf_block_info_t *info) {
+    if (!app || app->headless_server || !info || !iq) return;
+    const gui_rf_block_info_t pair[2] = {*info, *info};
+    video_submit_rf(app, NULL, NULL, count, count, pair, true, iq);
+}
+
 static void *cvbs_vtable_create(void) {
     video_panel_state_t *panel = calloc(1, sizeof(video_panel_state_t));
     if (!panel) return NULL;
@@ -5702,6 +5861,13 @@ static void cvbs_vtable_process(void *state, const int16_t *samples, size_t coun
 // Rendering Functions
 //-----------------------------------------------------------------------------
 
+static float rf_overlay_menu_y(Rectangle button, float height, float top, float bottom) {
+    float below = button.y + button.height;
+    if (below + height <= bottom) return below;
+    if (button.y - height >= top) return button.y - height;
+    return bottom - height;
+}
+
 static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *app, Rectangle bounds) {
     if (!panel || !app) return;
     vhs_fm_decoder_t *decoder = &panel->vhs_fm.decoder;
@@ -5711,53 +5877,64 @@ static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *ap
     if (panel->chrome.controls_hidden) return;
 
     decoder->overlay.tape_rect = decoder->overlay.beta_preset_rect = (Rectangle){0};
-    for (int i = 0; i < 2; ++i) decoder->overlay.tape_opts_rect[i] = (Rectangle){0};
+    for (int i = 0; i < GUI_RF_FAMILY_COUNT; ++i) decoder->overlay.tape_opts_rect[i] = (Rectangle){0};
     decoder->overlay.vhs_preset_rect = (Rectangle){0};
+    decoder->overlay.ld_audio_rect = (Rectangle){0};
     for (int i = 0; i < 3; ++i) decoder->overlay.stats_opts_rect[i] = (Rectangle){0};
     if (bounds.width <= 0 || bounds.height <= 0) {
         decoder->overlay.is_visible = false;
         return;
     }
 
-    // Text measurements return physical pixels; the panel bounds and every
-    // hit rect below are LOGICAL units (the UI render-scale transform
-    // scales rects while the font keeps its fixed physical size - the same
-    // contract as the waveform overlay group). Convert the measurements and
-    // the fixed pixel floors to logical so this overlay scales correctly at
-    // every UI zoom level (user report 2026-11-03: the new signal-generator
-    // controls did not scale with the UI zoom).
-    const float to_logical_w = 1.0f / gui_ui_get_scale_factor();
-    const float btn_h = 18.0f;
+    // Text measurements and rectangles use the same logical units.
+    // The panel renderer scales both the glyphs and the controls.
+    bool audio_only = gui_rf_profile_is_audio_only(gui_vhs_fm_get_profile(decoder));
+    const int rows = audio_only ? 6 : 7;
+    const float pad_y = fminf(8.0f, bounds.height / 8.0f);
+    const float pane_top = bounds.y + pad_y;
+    const float pane_bottom = bounds.y + bounds.height - pad_y;
+    const float available = pane_bottom - pane_top;
+    // Keep all controls clickable when the pane is short. Use the normal
+    // button height and text size as long as reducing the gaps is enough.
+    const float btn_h = fminf(18.0f, available / rows);
+    const float row_gap = fminf(6.0f, fmaxf(0.0f, (available - rows * btn_h) / (rows - 1)));
+    const int font_size = (int)fminf(FONT_SIZE_DROPDOWN_OPT, floorf(btn_h - 2.0f));
+    if (font_size < 1) {
+        decoder->overlay.is_visible = false;
+        return;
+    }
     const char *label = "Decoder: RF Preview";
-    float text_w = (float)gui_text_measure(label, FONT_SIZE_DROPDOWN_OPT) * to_logical_w;
+    float text_w = (float)gui_text_measure(label, font_size);
     float btn_w = text_w + 16.0f;
-    if (btn_w < 128.0f * to_logical_w) btn_w = 128.0f * to_logical_w;
+    if (btn_w < 128.0f) btn_w = 128.0f;
 
     float x_right = bounds.x + bounds.width - 8.0f;
     float btn_x = x_right - btn_w;
-    float btn_y = bounds.y + 8.0f;
+    float btn_y = pane_top;
     decoder->overlay.button_rect = (Rectangle){btn_x, btn_y, btn_w, btn_h};
 
     DrawRectangleRounded(decoder->overlay.button_rect, 0.15f, 4, COLOR_BUTTON_HOVER);
     float text_x = btn_x + (btn_w - text_w) * 0.5f;
-    float text_y = btn_y + (btn_h - FONT_SIZE_DROPDOWN_OPT) * 0.5f;
-    gui_text_draw(label, text_x, text_y, FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
-    float control_y = btn_y + btn_h + 6;
+    float text_y = btn_y + (btn_h - font_size) * 0.5f;
+    gui_text_draw(label, text_x, text_y, font_size, COLOR_TEXT);
+    float control_y = btn_y + btn_h + row_gap;
     // One compact control per row, ordered from recording format to options.
-    // Tape family is a real dropdown ("Format:") listing VHS / Betamax - the
-    // cycle button was easy to overshoot (user request 2026-11-03).
-    const char *tape_label = decoder->overlay.selected_tape == 1 ? "Format: Betamax" : "Format: VHS";
-    float tape_w = (float)gui_text_measure(tape_label, FONT_SIZE_DROPDOWN_OPT) * to_logical_w + 24;
+    static const char *const family_names[GUI_RF_FAMILY_COUNT] = { "VHS", "Betamax", "LaserDisc" };
+    gui_rf_family_t family = decoder->overlay.selected_tape;
+    bool beta = family == GUI_RF_FAMILY_BETAMAX;
+    char tape_label[32];
+    snprintf(tape_label, sizeof(tape_label), "Format: %s", family_names[family]);
+    float tape_w = (float)gui_text_measure(tape_label, font_size) + 24;
     float tape_y = control_y;
     decoder->overlay.tape_rect = (Rectangle){x_right - tape_w, tape_y, tape_w, btn_h};
     Color tape_bg = decoder->overlay.tape_dropdown_open ? COLOR_BUTTON_HOVER : COLOR_BUTTON;
     DrawRectangleRounded(decoder->overlay.tape_rect, 0.15f, 4, tape_bg);
     gui_text_draw(tape_label, decoder->overlay.tape_rect.x + 8,
-                  tape_y + (btn_h - FONT_SIZE_DROPDOWN_OPT) * 0.5f,
-                  FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+                  tape_y + (btn_h - font_size) * 0.5f,
+                  font_size, COLOR_TEXT);
     // Dropdown arrow
     {
-        float arrow_size = 5.0f;
+        float arrow_size = fminf(5.0f, btn_h - 2.0f);
         float arrow_x = decoder->overlay.tape_rect.x + tape_w - 14.0f;
         float arrow_cy = tape_y + btn_h * 0.5f;
         if (decoder->overlay.tape_dropdown_open) {
@@ -5775,64 +5952,81 @@ static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *ap
     // NOTE: the Format dropdown OPTIONS are drawn at the very END of this
     // function (after every other control). Immediate-mode drawing means
     // anything drawn later paints over them - rendering the popup inline
-    // here let the System/Preset/Frame/Budget/OSD rows below overwrite
+    // here let the lower control rows overwrite
     // the options (user report 2026-11-03: "dropdown is broken (not
     // overlaying)").
-    control_y += btn_h + 6;
-    // TV system cycles PAL -> NTSC -> SECAM -> MESECAM. MESECAM is a
-    // first-class system (VHS SECAM tapes are MESECAM color-under);
-    // native SECAM covers 2" quad / 1" Type-C sources. The old dedicated
-    // MESECAM toggle was removed (user request 2026-11-03).
-    const char *format_label = decoder->overlay.selected_tape ? "NTSC (fixed)"
-        : decoder->overlay.selected_system == 3 ? "System: MESECAM"
-        : decoder->overlay.selected_system == 2 ? "System: SECAM"
-        : decoder->overlay.selected_system == 1 ? "System: NTSC" : "System: PAL";
-    float fmt_w = (float)gui_text_measure(format_label, FONT_SIZE_DROPDOWN_OPT) * to_logical_w + 16;
-    decoder->overlay.format_rect = (Rectangle){x_right - fmt_w, control_y, fmt_w, btn_h};
-    DrawRectangleRounded(decoder->overlay.format_rect, 0.15f, 4, COLOR_BUTTON_HOVER);
-    text_y = control_y + (btn_h - FONT_SIZE_DROPDOWN_OPT) * 0.5f;
-    gui_text_draw(format_label, decoder->overlay.format_rect.x + 8, text_y,
-                   FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
-    control_y += btn_h + 6;
-    {
+    control_y += btn_h + row_gap;
+    if (family != GUI_RF_FAMILY_LASERDISC) {
         char preset_label[40];
-        snprintf(preset_label, sizeof(preset_label), "Preset: %s", decoder->overlay.selected_tape
+        snprintf(preset_label, sizeof(preset_label), "Preset: %s", beta
             ? gui_vhs_fm_get_beta_preset_name(decoder) : gui_vhs_fm_get_vhs_preset_name(decoder));
-        float preset_w = (float)gui_text_measure(preset_label, FONT_SIZE_DROPDOWN_OPT) * to_logical_w + 16;
-        Rectangle *preset_rect = decoder->overlay.selected_tape
+        float preset_w = (float)gui_text_measure(preset_label, font_size) + 16;
+        Rectangle *preset_rect = beta
             ? &decoder->overlay.beta_preset_rect : &decoder->overlay.vhs_preset_rect;
         *preset_rect = (Rectangle){x_right - preset_w, control_y, preset_w, btn_h};
         DrawRectangleRounded(*preset_rect, 0.15f, 4, COLOR_BUTTON_HOVER);
         gui_text_draw(preset_label, preset_rect->x + 8,
-                      control_y + (btn_h - FONT_SIZE_DROPDOWN_OPT) * 0.5f,
-                      FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
-        control_y += btn_h + 6;
+                      control_y + (btn_h - font_size) * 0.5f,
+                      font_size, COLOR_TEXT);
+        control_y += btn_h + row_gap;
+    }
+    // VHS cycles PAL -> NTSC -> SECAM -> MESECAM. MESECAM is a
+    // first-class system (VHS SECAM tapes are MESECAM color-under);
+    // native SECAM covers 2" quad / 1" Type-C sources. The old dedicated
+    // MESECAM toggle was removed (user request 2026-11-03).
+    int system = decoder->overlay.selected_system;
+    if (audio_only && system != 1) system = 0;
+    const char *format_label = beta ? "NTSC (fixed)"
+        : system == 3 ? "System: MESECAM"
+        : system == 2 ? "System: SECAM"
+        : system == 1 ? "System: NTSC" : "System: PAL";
+    float fmt_w = (float)gui_text_measure(format_label, font_size) + 16;
+    decoder->overlay.format_rect = (Rectangle){x_right - fmt_w, control_y, fmt_w, btn_h};
+    DrawRectangleRounded(decoder->overlay.format_rect, 0.15f, 4, COLOR_BUTTON_HOVER);
+    text_y = control_y + (btn_h - font_size) * 0.5f;
+    gui_text_draw(format_label, decoder->overlay.format_rect.x + 8, text_y,
+                   font_size, COLOR_TEXT);
+    control_y += btn_h + row_gap;
+    if (family == GUI_RF_FAMILY_LASERDISC) {
+        bool other=decoder->worker && s_rf_audio_source && decoder->worker!=s_rf_audio_source;
+        const char *audio_label=other ? "Audio: Other panel" :
+            decoder->overlay.ld_audio==GUI_RF_LD_AUDIO_DIGITAL ? "Audio: Digital PCM" :
+            decoder->overlay.ld_audio==GUI_RF_LD_AUDIO_AC3 &&
+                gui_vhs_fm_get_profile(decoder)==GUI_RF_PROFILE_NTSC_LASERDISC
+                ? "Audio: AC-3 RF" : "Audio: Analog FM";
+        float audio_w=(float)gui_text_measure(audio_label,font_size)+16;
+        Rectangle audio_rect={x_right-audio_w,control_y,audio_w,btn_h};
+        if (!other) decoder->overlay.ld_audio_rect=audio_rect;
+        DrawRectangleRounded(audio_rect,.15f,4,COLOR_BUTTON_HOVER);
+        gui_text_draw(audio_label,audio_rect.x+8,
+                      control_y+(btn_h-font_size)*.5f,font_size,COLOR_TEXT);
+        control_y+=btn_h+row_gap;
     }
     // Frame display mode toggle (Active / Full): Full widens the horizontal
     // decode window to the whole line so VBI + sync tip + colour burst render
     // with decoded chroma instead of only the active picture area.
-    const char *frame_label = decoder->overlay.frame_mode == 1 ? "Frame: Full" : "Frame: Active";
-    float frame_w = (float)gui_text_measure(frame_label, FONT_SIZE_DROPDOWN_OPT) * to_logical_w + 24;
-    if (frame_w < 118.0f * to_logical_w) frame_w = 118.0f * to_logical_w;
-    decoder->overlay.frame_rect =
-        (Rectangle){x_right - frame_w, control_y, frame_w, btn_h};
-    DrawRectangleRounded(decoder->overlay.frame_rect, 0.15f, 4, COLOR_BUTTON_HOVER);
-    {
-        text_y = control_y + (btn_h - FONT_SIZE_DROPDOWN_OPT) * 0.5f;
-        float fw = (float)gui_text_measure(frame_label, FONT_SIZE_DROPDOWN_OPT) * to_logical_w;
+    decoder->overlay.frame_rect = (Rectangle){0};
+    if (!audio_only) {
+        const char *frame_label = decoder->overlay.frame_mode == 1 ? "Frame: Full" : "Frame: Active";
+        float frame_w = (float)gui_text_measure(frame_label, font_size) + 24;
+        if (frame_w < 118.0f) frame_w = 118.0f;
+        decoder->overlay.frame_rect = (Rectangle){x_right - frame_w, control_y, frame_w, btn_h};
+        DrawRectangleRounded(decoder->overlay.frame_rect, 0.15f, 4, COLOR_BUTTON_HOVER);
+        text_y = control_y + (btn_h - font_size) * 0.5f;
+        float fw = (float)gui_text_measure(frame_label, font_size);
         gui_text_draw(frame_label,
                       decoder->overlay.frame_rect.x + (frame_w - fw) * 0.5f,
-                      text_y, FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+                      text_y, font_size, COLOR_TEXT);
+        control_y += btn_h + row_gap;
     }
-    control_y += btn_h + 6;
     int budget=vhs_budget_clamp(app->settings.rf_preview_budget_percent);
     char budget_label[40]; snprintf(budget_label,sizeof(budget_label),"Budget: %.2f core (shared)",budget/100.0);
-    float budget_w=(float)gui_text_measure(budget_label,FONT_SIZE_DROPDOWN_OPT)*to_logical_w+16;
+    float budget_w=(float)gui_text_measure(budget_label,font_size)+16;
     decoder->overlay.budget_rect=(Rectangle){x_right-budget_w,control_y,budget_w,btn_h};
     DrawRectangleRounded(decoder->overlay.budget_rect,0.15f,4,COLOR_BUTTON_HOVER);
-    gui_text_draw(budget_label,decoder->overlay.budget_rect.x+8,control_y+(btn_h-FONT_SIZE_DROPDOWN_OPT)*.5f,
-                  FONT_SIZE_DROPDOWN_OPT,COLOR_TEXT);
-    control_y += btn_h + 6;
+    gui_text_draw(budget_label,decoder->overlay.budget_rect.x+8,control_y+(btn_h-font_size)*.5f,
+                  font_size,COLOR_TEXT);
+    control_y += btn_h + row_gap;
     // OSD view selector (All / Basic / Off) — a real dropdown so the OSD
     // readout is user-selectable. Renamed from "Stats:" to match the CVBS
     // decoder's OSD naming (user request 2026-11-03). Its popup follows
@@ -5842,8 +6036,8 @@ static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *ap
     if (stats_view < 0 || stats_view > 2) stats_view = 0;
     char stats_label[40];
     snprintf(stats_label, sizeof(stats_label), "OSD: %s", stats_names[stats_view]);
-    float stats_w = (float)gui_text_measure(stats_label, FONT_SIZE_DROPDOWN_OPT) * to_logical_w + 16;
-    if (stats_w < 96.0f * to_logical_w) stats_w = 96.0f * to_logical_w;
+    float stats_w = (float)gui_text_measure(stats_label, font_size) + 16;
+    if (stats_w < 96.0f) stats_w = 96.0f;
     decoder->overlay.stats_btn_rect =
         (Rectangle){x_right - stats_w, control_y, stats_w, btn_h};
     Color stats_bg = decoder->overlay.stats_dropdown_open ? COLOR_BUTTON_HOVER : COLOR_BUTTON;
@@ -5851,18 +6045,16 @@ static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *ap
     // No dropdown arrow: it overlapped the centered label; the open state
     // is already indicated by the button highlight (stats_bg) above.
     {
-        text_y = control_y + (btn_h - FONT_SIZE_DROPDOWN_OPT) * 0.5f;
-        float sw = (float)gui_text_measure(stats_label, FONT_SIZE_DROPDOWN_OPT) * to_logical_w;
+        text_y = control_y + (btn_h - font_size) * 0.5f;
+        float sw = (float)gui_text_measure(stats_label, font_size);
         gui_text_draw(stats_label,
                       decoder->overlay.stats_btn_rect.x + (stats_w - sw) * 0.5f,
-                      text_y, FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+                      text_y, font_size, COLOR_TEXT);
     }
     // Keep the popup inside shorter panels; hit-testing gives it priority.
     if (decoder->overlay.stats_dropdown_open) {
-        float opt_h = 20.0f;
-        float menu_y = decoder->overlay.stats_btn_rect.y + btn_h;
-        if (menu_y + 3 * opt_h > bounds.y + bounds.height - 8)
-            menu_y = decoder->overlay.stats_btn_rect.y - 3 * opt_h;
+        const float opt_h = fminf(btn_h + 2.0f, available / 3);
+        float menu_y = rf_overlay_menu_y(decoder->overlay.stats_btn_rect, 3 * opt_h, pane_top, pane_bottom);
         for (int i = 0; i < 3; i++) {
             Rectangle opt = {
                 decoder->overlay.stats_btn_rect.x,
@@ -5875,36 +6067,33 @@ static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *ap
             bool hover = CheckCollisionPointRec(gui_ui_get_mouse_position(), opt);
             DrawRectangleRec(opt, gui_dropdown_option_color(selected, hover));
             const char *opt_lbl = stats_names[i];
-            float ow = (float)gui_text_measure(opt_lbl, FONT_SIZE_DROPDOWN_OPT) * to_logical_w;
+            float ow = (float)gui_text_measure(opt_lbl, font_size);
             gui_text_draw(opt_lbl,
                           opt.x + (opt.width - ow) * 0.5f,
-                          opt.y + (opt_h - FONT_SIZE_DROPDOWN_OPT) * 0.5f,
-                          FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+                          opt.y + (opt_h - font_size) * 0.5f,
+                          font_size, COLOR_TEXT);
         }
     }
 
-    // Format (tape family) dropdown options - drawn LAST so no later
+    // Format dropdown options - drawn LAST so no later
     // control can overdraw the popup (see the note at the Format button).
-    // VHS / Betamax, clamped inside the panel like the stats popup.
     if (decoder->overlay.tape_dropdown_open) {
-        const float opt_h = 20.0f;
-        const char *tape_opts[2] = { "VHS", "Betamax" };
-        float menu_y = decoder->overlay.tape_rect.y + btn_h;
-        if (menu_y + 2 * opt_h > bounds.y + bounds.height - 8)
-            menu_y = decoder->overlay.tape_rect.y - 2 * opt_h;
-        for (int i = 0; i < 2; i++) {
+        const float opt_h = fminf(btn_h + 2.0f, available / GUI_RF_FAMILY_COUNT);
+        float menu_y = rf_overlay_menu_y(decoder->overlay.tape_rect,
+                                        GUI_RF_FAMILY_COUNT * opt_h, pane_top, pane_bottom);
+        for (gui_rf_family_t i = GUI_RF_FAMILY_VHS; i < GUI_RF_FAMILY_COUNT; ++i) {
             Rectangle opt = { decoder->overlay.tape_rect.x,
                              menu_y + (float)i * opt_h,
                              decoder->overlay.tape_rect.width, opt_h };
             decoder->overlay.tape_opts_rect[i] = opt;
-            bool selected = (decoder->overlay.selected_tape == i);
+            bool selected = (family == i);
             bool hover = CheckCollisionPointRec(gui_ui_get_mouse_position(), opt);
             DrawRectangleRec(opt, gui_dropdown_option_color(selected, hover));
-            float ow = (float)gui_text_measure(tape_opts[i], FONT_SIZE_DROPDOWN_OPT) * to_logical_w;
-            gui_text_draw(tape_opts[i],
+            float ow = (float)gui_text_measure(family_names[i], font_size);
+            gui_text_draw(family_names[i],
                           opt.x + (opt.width - ow) * 0.5f,
-                          opt.y + (opt_h - FONT_SIZE_DROPDOWN_OPT) * 0.5f,
-                          FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+                          opt.y + (opt_h - font_size) * 0.5f,
+                          font_size, COLOR_TEXT);
         }
     }
 }
@@ -5987,23 +6176,14 @@ static bool cvbs_vtable_handle_click(void *state, gui_app_t *app, int channel,
             vhs->overlay.stats_dropdown_open = false;
             return true;
         }
-        // Control clicks first (only while the controls are shown) so a
-        // double-click ON a control never toggles the chrome.
-        if (chrome_visible && CheckCollisionPointRec(mouse_pos, vhs->overlay.button_rect)) {
-            panel->chrome.last_click_ms = 0;
-            video_panel_activate_plugin(panel, video_panel_next_plugin(panel->active_plugin));
-            return true;
-        }
-
-        // Format (tape family) dropdown: the open popup owns clicks,
-        // including when it opens above the button (stats pattern).
+        // The open Format popup owns clicks, including when it overlaps controls.
         if (chrome_visible && vhs->overlay.tape_dropdown_open) {
             panel->chrome.last_click_ms = 0;
-            for (int i = 0; i < 2; i++) {
+            for (gui_rf_family_t i = GUI_RF_FAMILY_VHS; i < GUI_RF_FAMILY_COUNT; ++i) {
                 if (CheckCollisionPointRec(mouse_pos, vhs->overlay.tape_opts_rect[i])) {
                     if (i != vhs->overlay.selected_tape) {
                         vhs->overlay.selected_tape = i;
-                        if (i) gui_vhs_fm_set_format(vhs, 1);
+                        gui_vhs_fm_set_format(vhs, vhs->overlay.selected_system);
                     }
                     vhs->overlay.tape_dropdown_open = false;
                     return true;
@@ -6013,21 +6193,51 @@ static bool cvbs_vtable_handle_click(void *state, gui_app_t *app, int channel,
             vhs->overlay.tape_dropdown_open = false;
             return true;
         }
+        // Control clicks first (only while the controls are shown) so a
+        // double-click ON a control never toggles the chrome.
+        if (chrome_visible && CheckCollisionPointRec(mouse_pos, vhs->overlay.button_rect)) {
+            panel->chrome.last_click_ms = 0;
+            video_panel_activate_plugin(panel, video_panel_next_plugin(panel->active_plugin));
+            return true;
+        }
         if (chrome_visible && CheckCollisionPointRec(mouse_pos,vhs->overlay.tape_rect)) {
             panel->chrome.last_click_ms=0;
             vhs->overlay.tape_dropdown_open = !vhs->overlay.tape_dropdown_open;
             return true;
         }
-        if (chrome_visible && vhs->overlay.selected_tape &&
+        if (chrome_visible && vhs->overlay.selected_tape == GUI_RF_FAMILY_BETAMAX &&
             CheckCollisionPointRec(mouse_pos,vhs->overlay.beta_preset_rect)) {
             panel->chrome.last_click_ms=0;
             gui_vhs_fm_set_beta_preset(vhs, (vhs->overlay.beta_preset + 1) % GUI_BETA_PRESET_COUNT);
             return true;
         }
-        if (chrome_visible && !vhs->overlay.selected_tape &&
+        if (chrome_visible && vhs->overlay.selected_tape == GUI_RF_FAMILY_VHS &&
             CheckCollisionPointRec(mouse_pos,vhs->overlay.vhs_preset_rect)) {
             panel->chrome.last_click_ms=0;
             gui_vhs_fm_set_vhs_preset(vhs, (vhs->overlay.vhs_preset + 1) % GUI_VHS_PRESET_COUNT);
+            return true;
+        }
+        if (chrome_visible && vhs->overlay.selected_tape==GUI_RF_FAMILY_LASERDISC &&
+            CheckCollisionPointRec(mouse_pos,vhs->overlay.ld_audio_rect)) {
+            panel->chrome.last_click_ms=0;
+            bool ntsc = gui_vhs_fm_get_profile(vhs) == GUI_RF_PROFILE_NTSC_LASERDISC;
+            switch (vhs->overlay.ld_audio) {
+                case GUI_RF_LD_AUDIO_DIGITAL:
+                    vhs->overlay.ld_audio = ntsc ? GUI_RF_LD_AUDIO_AC3 : GUI_RF_LD_AUDIO_ANALOG;
+                    break;
+                case GUI_RF_LD_AUDIO_AC3:
+                    vhs->overlay.ld_audio = ntsc ? GUI_RF_LD_AUDIO_ANALOG : GUI_RF_LD_AUDIO_DIGITAL;
+                    break;
+                default:
+                    vhs->overlay.ld_audio = GUI_RF_LD_AUDIO_DIGITAL;
+                    break;
+            }
+            if (vhs->worker && vhs->worker==s_rf_audio_source) {
+                for (int i=0; i<4; ++i)
+                    if (s_rf_bindings[i] && s_rf_bindings[i]->worker==vhs->worker)
+                        s_rf_bindings[i]->overlay.ld_audio=vhs->overlay.ld_audio;
+            }
+            gui_video_update_rf_routes(app);
             return true;
         }
         if (chrome_visible && CheckCollisionPointRec(mouse_pos,vhs->overlay.budget_rect)) {
@@ -6038,9 +6248,7 @@ static bool cvbs_vtable_handle_click(void *state, gui_app_t *app, int channel,
         }
         if (chrome_visible && CheckCollisionPointRec(mouse_pos, vhs->overlay.format_rect)) {
             panel->chrome.last_click_ms = 0;
-            // PAL -> NTSC -> SECAM -> MESECAM (MESECAM is a first-class TV
-            // system for VHS RF; native SECAM covers quad/Type-C sources).
-            gui_vhs_fm_set_format(vhs, (vhs->overlay.selected_system + 1) % 4);
+            gui_vhs_fm_cycle_system(vhs);
             return true;
         }
         if (chrome_visible && CheckCollisionPointRec(mouse_pos, vhs->overlay.stats_btn_rect)) {
@@ -6331,7 +6539,7 @@ static const panel_vtable_t s_cvbs_vtable = {
 // Switch EVERY Video panel's decoder previews to the Test Gen system
 // (0=PAL, 1=NTSC, 2=SECAM, 3=MESECAM): the CVBS composite decoder, the
 // Tape Decode plugin (same value space; MESECAM maps to SECAM there) and
-// the VHS FM RF preview profile (with worker rebinding; MESECAM takes the
+// the tape RF preview profile (with worker rebinding; MESECAM takes the
 // MESECAM_VHS profile). Called from the Gen box on the waveform panel
 // (UI thread) after it updates settings.video_system. The user can
 // override any panel manually at any time (the panel selectors keep
@@ -6372,10 +6580,10 @@ void gui_video_follow_generator_system(gui_app_t *app, int system) {
             video_tape_apply_runtime_args(&panel->tape_decode,
                                           "generator_follow");
 
-            /* VHS FM RF preview: follows the system (3 = MESECAM profile)
-             * while the tape family allows it (Betamax stays NTSC). */
+            /* The generator drives tape RF. Keep the selected LaserDisc system. */
             int profile_before = (int)gui_vhs_fm_get_profile(&panel->vhs_fm.decoder);
-            gui_vhs_fm_set_format(&panel->vhs_fm.decoder, system);
+            if (panel->vhs_fm.decoder.overlay.selected_tape != GUI_RF_FAMILY_LASERDISC)
+                gui_vhs_fm_set_format(&panel->vhs_fm.decoder, system);
             int profile_after = (int)gui_vhs_fm_get_profile(&panel->vhs_fm.decoder);
             TraceLog(LOG_INFO,
                      "GEN FOLLOW: ch=%d slot=%d system=%d rf_profile %d -> %d",

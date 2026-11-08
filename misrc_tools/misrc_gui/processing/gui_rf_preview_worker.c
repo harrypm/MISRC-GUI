@@ -2,6 +2,10 @@
  * decoder, the renderer, queue space, or an allocation. Queue slots are owned
  * by a single producer and consumer; only the consumer advances read_index. */
 #include "gui_rf_preview_worker.h"
+#include "../signal/gui_vhs_hifi.h"
+#include "../signal/gui_ld_rf_ac3.h"
+#include "../signal/gui_ld_rf_analog.h"
+#include "../signal/gui_ld_rf_digital.h"
 #include "gui_rf_preview_policy.h"
 #include "../signal/gui_rf_resampler.h"
 #include "../../common/threading.h"
@@ -32,12 +36,18 @@ static void rf_mutex_unlock(rf_mutex_t *m) { pthread_mutex_unlock(m); }
 #define RF_AUDIO_QUEUE_SLOTS 32u
 #define RF_AUDIO_BLOCK_SAMPLES 32768u
 #define RF_AUDIO_MAX_US 100000u
+/* Keep track selection and queue invalidation in the same atomic value. */
+#define RF_AUDIO_GENERATION_STEP 4u
+#define RF_AUDIO_MODE_MASK (RF_AUDIO_GENERATION_STEP - 1u)
 /* Rate provisions (see dev/output_stdio_buffer_and_rf_rate_provisions.md):
  * 2x 40 MSPS dual-channel captures use two per-channel workers (each on the
  * 40 MSPS exact path); single-stream captures up to 200 MSPS are accepted. */
 #define RF_MIN_RATE 16000000u
 #define RF_MAX_RATE 200000000u
 #define RF_FRAME_BYTES ((size_t)GUI_RF_FRAME_MAX_WIDTH * GUI_RF_FRAME_MAX_HEIGHT * 4)
+#define RF_LD_HISTORY_FRAMES 16u
+#define RF_LD_FALLBACK_DELAY (GUI_RF_DECODE_RATE_HZ / 1000u * 240u)
+#define RF_LD_FRAME_TOLERANCE (GUI_RF_DECODE_RATE_HZ / 2000u)
 
 typedef struct {
     gui_rf_block_info_t info;
@@ -46,7 +56,7 @@ typedef struct {
     uint64_t duration_end_us;
     uint64_t control;
     uint64_t pause_control;
-    uint64_t audio_source_generation;
+    uint64_t audio_source_generation, video_source_generation;
     int16_t samples[RF_BLOCK_SAMPLES];
 } rf_input_slot_t;
 
@@ -54,18 +64,29 @@ typedef struct {
     float samples[RF_AUDIO_BLOCK_SAMPLES];
     size_t count;
     uint64_t first_sample, generation, enqueue_us;
+    uint32_t rate, iq_center_hz;
+    gui_rf_profile_t profile;
 } rf_audio_slot_t;
+
+typedef struct {
+    uint64_t generation, end_sample;
+    int width, height;
+} rf_ld_frame_t;
 
 struct gui_rf_preview_worker {
     thrd_t thread, audio_thread;
     atomic_bool audio_ready, audio_enabled, audio_active, audio_budget_waiting, audio_callback_installed;
     atomic_uint_fast64_t audio_generation, applied_audio_generation, audio_source_generation;
+    atomic_uint_fast64_t video_source_generation;
+    atomic_uint_fast64_t audio_finish_requested, audio_finish_rf_flushed, audio_finish_completed;
+    atomic_uint_fast64_t video_finish_requested, video_finish_completed;
     bool producer_audio_seen;
     uint64_t producer_audio_epoch,producer_audio_next;
-    uint32_t producer_audio_rate;
+    uint32_t producer_audio_rate, producer_iq_center;
     atomic_uint_fast64_t audio_read, audio_write, audio_dropped;
     rf_audio_slot_t *audio_queue;
     uint64_t audio_processing_generation;
+    uint32_t audio_processing_rate;
     uint64_t audio_last_cpu_us, audio_last_completion_us;
     bool audio_have_cpu_baseline;
     uint64_t video_work_wall_us,video_accounted_cpu_us,audio_work_wall_us,audio_accounted_cpu_us;
@@ -93,6 +114,12 @@ struct gui_rf_preview_worker {
 
     gui_rf_decoder_t *decoder;
     gui_beta_hifi_decoder_t *hifi;
+    gui_vhs_hifi_decoder_t *vhs_hifi;
+    gui_rf_profile_t vhs_hifi_profile;
+    uint32_t vhs_hifi_rate, vhs_hifi_iq_center;
+    gui_ld_rf_analog_t *ld_analog;
+    gui_ld_rf_digital_t *ld_digital;
+    gui_ld_rf_ac3_t *ld_ac3;
     gui_rf_preview_audio_callback_t audio_callback;
     void *audio_context;
     gui_rf_resampler_t *resampler, *wide_resampler;
@@ -102,7 +129,8 @@ struct gui_rf_preview_worker {
     atomic_uint_fast64_t applied_control;
     uint64_t source_epoch;
     uint64_t expected_source_sample;
-    uint32_t source_rate;
+    uint32_t source_rate, source_iq_center;
+    uint32_t native_audio_rate;
     bool stream_valid;
     uint64_t output_sample;      /* Audio and legacy video: public 20 MSPS axis. */
     uint64_t wide_output_sample; /* Wide-passband video: independent 20 MSPS cursor. */
@@ -110,6 +138,7 @@ struct gui_rf_preview_worker {
     uint64_t narrow_audio_generation;
     uint64_t block_enqueue_us;
     uint64_t block_source_end;
+    uint64_t block_video_source_generation;
     uint64_t work_since_frame_us;
     uint64_t work_segment_us;
     uint64_t generation;
@@ -124,8 +153,14 @@ struct gui_rf_preview_worker {
     uint8_t *frame;
     int frame_width;
     int frame_height;
-    bool frame_valid;
-    uint64_t frame_control;
+    bool frame_valid, frame_is_ld;
+    uint64_t frame_control, frame_source_generation;
+    atomic_bool ld_sync_enabled;
+    uint8_t *ld_frame_pixels;
+    size_t ld_frame_stride;
+    unsigned ld_frame_next, ld_frame_count;
+    uint32_t ld_frame_span;
+    rf_ld_frame_t ld_frames[RF_LD_HISTORY_FRAMES];
     gui_rf_preview_stats_t stats;
 #ifdef _WIN32
     uint64_t timer_frequency;
@@ -333,10 +368,17 @@ static void rf_accumulate_status(gui_rf_preview_worker_t *w,
 
 static void rf_clear_frame(gui_rf_preview_worker_t *w, const char *reason, bool preserve_frame) {
     rf_mutex_lock(&w->frame_mutex);
-    if (!preserve_frame) w->frame_valid = false;
+    if (!preserve_frame) {
+        w->frame_valid = false;
+        w->ld_frame_count = 0;
+        w->stats.frame_end_sample = 0;
+    }
     memset(&w->stats.decode, 0, sizeof(w->stats.decode));
     snprintf(w->stats.decode.reason, sizeof(w->stats.decode.reason), "%s", reason);
     w->stats.source_rate_hz = w->source_rate;
+    w->stats.vhs_hifi_rf_rate_hz = 0;
+    if (gui_rf_profile_is_audio_only(w->profile))
+        w->stats.vhs_hifi_rf_rate_hz = w->resampler ? GUI_RF_DECODE_RATE_HZ : w->native_audio_rate;
     w->stats.resets++;
     w->stats.decode_ms = 0.0;
     w->stats.latency_ms = 0.0;
@@ -344,11 +386,18 @@ static void rf_clear_frame(gui_rf_preview_worker_t *w, const char *reason, bool 
     w->work_since_frame_us = 0;
 }
 
-static void rf_audio_invalidate(gui_rf_preview_worker_t *w) {
-    atomic_fetch_add_explicit(&w->audio_generation,1,memory_order_acq_rel);
+static void rf_audio_wake(gui_rf_preview_worker_t *w) {
 #ifdef _WIN32
     SetEvent(w->audio_event);
+#else
+    (void)w;
 #endif
+}
+
+static void rf_audio_invalidate(gui_rf_preview_worker_t *w) {
+    /* Preserve the LD audio mode when invalidating queued samples. */
+    atomic_fetch_add_explicit(&w->audio_generation,RF_AUDIO_GENERATION_STEP,memory_order_acq_rel);
+    rf_audio_wake(w);
 }
 
 /* Producer/control epochs exclude previously queued RF as well as PCM.
@@ -359,12 +408,19 @@ static void rf_audio_cut_input(gui_rf_preview_worker_t *w) {
     rf_audio_invalidate(w);
 }
 
+/* Only RF boundaries and video controls invalidate the retained pictures. */
+static void rf_cut_input(gui_rf_preview_worker_t *w) {
+    atomic_fetch_add_explicit(&w->video_source_generation, 1, memory_order_acq_rel);
+    rf_audio_cut_input(w);
+}
+
 static void rf_reset_decoder_preserve(gui_rf_preview_worker_t *w, const char *reason,
                                       bool preserve_frame) {
     gui_rf_decode_status_t status;
     gui_rf_decoder_get_status(w->decoder, &status);
     rf_accumulate_status(w, &status);
-    gui_rf_decoder_reset_profile(w->decoder, w->profile);
+    if (!gui_rf_profile_is_audio_only(w->profile))
+        gui_rf_decoder_reset_profile(w->decoder, w->profile);
     rf_audio_invalidate(w);
     memset(&w->last_status, 0, sizeof(w->last_status));
     if (w->resampler) gui_rf_resampler_reset(w->resampler);
@@ -388,31 +444,60 @@ static bool rf_reserve_output(float **buffer, size_t *available, size_t capacity
 }
 static bool rf_wideband_profile(gui_rf_profile_t profile) {
     return profile == GUI_RF_PROFILE_NTSC_ED_BETA ||
-           profile == GUI_RF_PROFILE_PAL_SVHS || profile == GUI_RF_PROFILE_NTSC_SVHS;
+           profile == GUI_RF_PROFILE_PAL_SVHS || profile == GUI_RF_PROFILE_NTSC_SVHS ||
+           gui_rf_profile_is_laserdisc(profile);
 }
+static gui_rf_format_t rf_vhs_hifi_format(gui_rf_profile_t profile) {
+    return profile == GUI_RF_PROFILE_PAL_VHS_HIFI ? GUI_RF_PAL : GUI_RF_NTSC;
+}
+static bool rf_uses_native_audio(gui_rf_profile_t profile, uint32_t rate, uint32_t iq_center) {
+    if (!gui_rf_profile_is_audio_only(profile)) return false;
+    return iq_center ? gui_vhs_hifi_iq_supported(rf_vhs_hifi_format(profile), rate, iq_center)
+                     : gui_vhs_hifi_is_native_low_rate(rate);
+}
+bool gui_rf_preview_worker_rate_supported(gui_rf_profile_t profile, uint32_t rate) {
+    if (rf_uses_native_audio(profile, rate, 0)) return true;
+    if (rate < RF_MIN_RATE || rate > RF_MAX_RATE) return false;
+    if (rf_wideband_profile(profile))
+        return rate >= GUI_RF_DECODE_RATE_HZ &&
+               gui_rf_resampler_output_capacity_ed_beta(rate, 1) != 0;
+    return gui_rf_resampler_output_capacity(rate, 1) != 0;
+}
+
 static const char *rf_rate_error(const gui_rf_preview_worker_t *w) {
-    if (rf_wideband_profile(w->profile) && w->source_rate < GUI_RF_DECODE_RATE_HZ)
+    if (w->source_iq_center) {
+        if (!gui_rf_profile_is_audio_only(w->profile)) return "RTL-SDR I/Q requires the Hi-Fi preset";
+        return "Hi-Fi I/Q: use 1.024/1.200/1.536/2.048/2.400 MSPS and center both carriers";
+    }
+    if (gui_rf_profile_is_audio_only(w->profile) && w->source_rate < RF_MIN_RATE)
+        return "Unsupported Hi-Fi RF rate: use 8, 8.192, 10 or at least 16 MSPS";
+    if (rf_wideband_profile(w->profile) && w->source_rate < GUI_RF_DECODE_RATE_HZ) {
+        if (gui_rf_profile_is_laserdisc(w->profile))
+            return "Unsupported LaserDisc RF rate: requires at least 20 MSPS";
         return w->profile == GUI_RF_PROFILE_NTSC_ED_BETA
             ? "Unsupported EDBeta RF rate: requires at least 20 MSPS"
             : "Unsupported S-VHS RF rate: requires at least 20 MSPS";
+    }
     return "Unsupported RF rate or resampler unavailable";
 }
-static bool rf_configure_rate(gui_rf_preview_worker_t *w, uint32_t rate) {
+static bool rf_configure_rate(gui_rf_preview_worker_t *w, uint32_t rate, uint32_t iq_center) {
     gui_rf_resampler_destroy(w->resampler);
     gui_rf_resampler_destroy(w->wide_resampler);
     w->resampler = w->wide_resampler = NULL;
     w->narrow_stream_valid = false;
     w->source_rate = rate;
+    w->source_iq_center = iq_center;
+    w->native_audio_rate = rf_uses_native_audio(w->profile, rate, iq_center) ? rate : 0;
+    if (w->native_audio_rate) return true;
+    if (iq_center || !gui_rf_preview_worker_rate_supported(w->profile, rate)) return false;
     bool wideband = rf_wideband_profile(w->profile);
-    if (rate < RF_MIN_RATE || rate > RF_MAX_RATE ||
-        (wideband && rate < GUI_RF_DECODE_RATE_HZ)) return false;
     if (!rf_reserve_output(&w->output, &w->output_capacity,
             gui_rf_resampler_output_capacity(rate, RF_BLOCK_SAMPLES))) return false;
     w->resampler = gui_rf_resampler_create(rate);
     if (!w->resampler) return false;
     if (wideband) {
-        /* S-VHS also needs the ED converter's wider RF passband: its white
-         * carrier is 7MHz and the useful upper FM sideband reaches 9MHz. */
+        /* ED Beta, S-VHS and LaserDisc keep RF up to the wider 20 MSPS
+         * preview passband, including LaserDisc's NTSC white carrier. */
         if (!rf_reserve_output(&w->wide_output, &w->wide_output_capacity,
                 gui_rf_resampler_output_capacity_ed_beta(rate, RF_BLOCK_SAMPLES))) goto fail;
         w->wide_resampler = gui_rf_resampler_create_ed_beta(rate);
@@ -424,6 +509,24 @@ fail:
     gui_rf_resampler_destroy(w->wide_resampler);
     w->resampler = w->wide_resampler = NULL;
     return false;
+}
+
+/* frame_mutex held. Keep one copy of each LD picture and grow the stride only
+ * when the output geometry needs it. Allocation failure uses latest-only. */
+static uint8_t *rf_ld_frame_destination(gui_rf_preview_worker_t *w, size_t bytes,
+                                       uint64_t end_sample, int width, int height) {
+    if (bytes > w->ld_frame_stride) {
+        w->ld_frame_count = 0;
+        uint8_t *pixels = realloc(w->ld_frame_pixels, bytes * RF_LD_HISTORY_FRAMES);
+        if (!pixels) return w->frame;
+        w->ld_frame_pixels = pixels;
+        w->ld_frame_stride = bytes;
+    }
+    unsigned next = w->ld_frame_next;
+    w->ld_frames[next] = (rf_ld_frame_t){w->generation, end_sample, width, height};
+    w->ld_frame_next = (next + 1u) % RF_LD_HISTORY_FRAMES;
+    if (w->ld_frame_count < RF_LD_HISTORY_FRAMES) ++w->ld_frame_count;
+    return w->ld_frame_pixels + next * w->ld_frame_stride;
 }
 
 static void rf_frame_callback(void *context, const uint8_t *rgba, int width,
@@ -449,14 +552,36 @@ static void rf_frame_callback(void *context, const uint8_t *rgba, int width,
     double latency_ms = (double)(now - w->block_enqueue_us) / 1000.0 +
                         sample_age * 1000.0 / GUI_RF_DECODE_RATE_HZ;
     rf_mutex_lock(&w->frame_mutex);
-    memcpy(w->frame, rgba, (size_t)width * height * 4);
+    bool laserdisc = gui_rf_profile_is_laserdisc(w->profile);
+    if (laserdisc && w->block_video_source_generation !=
+        atomic_load_explicit(&w->video_source_generation, memory_order_acquire)) {
+        rf_mutex_unlock(&w->frame_mutex);
+        return;
+    }
+    size_t bytes = (size_t)width * height * 4u;
+    ++w->generation;
+    uint8_t *destination = w->frame;
+    if (laserdisc && atomic_load_explicit(&w->ld_sync_enabled, memory_order_relaxed)) {
+        if (w->frame_source_generation != w->block_video_source_generation)
+            w->ld_frame_count = 0;
+        w->ld_frame_span = w->profile == GUI_RF_PROFILE_PAL_LASERDISC
+            ? GUI_RF_DECODE_RATE_HZ / 25u
+            : (uint32_t)((GUI_RF_DECODE_RATE_HZ * UINT64_C(1001) + 29999u) / 30000u);
+        destination = rf_ld_frame_destination(w, bytes, end_sample, width, height);
+    } else {
+        w->ld_frame_count = 0;
+    }
+    memcpy(destination, rgba, bytes);
     w->frame_width = width;
     w->frame_height = height;
     w->frame_control = w->applied_control;
+    w->frame_source_generation = w->block_video_source_generation;
+    w->frame_is_ld = laserdisc;
     w->frame_valid = true;
     w->stats.decode = *status;
     w->stats.source_rate_hz = w->source_rate;
-    w->stats.generation = ++w->generation;
+    w->stats.generation = w->generation;
+    w->stats.frame_end_sample = end_sample;
     w->stats.decode_ms = elapsed_ms;
     w->stats.latency_ms = latency_ms;
     /* Never hold frame_mutex while copying into a monitor's latest-frame box. */
@@ -595,21 +720,80 @@ static void rf_finish_budget(gui_rf_preview_worker_t *w, uint64_t begin_wall) {
     w->last_budget_completion_us = rf_now_us(w);
 }
 
-static bool rf_audio_current(gui_rf_preview_worker_t *w,uint64_t generation) {
+static bool rf_audio_current(const gui_rf_preview_worker_t *w,uint64_t generation) {
     return !atomic_load_explicit(&w->stop,memory_order_acquire) &&
         atomic_load_explicit(&w->audio_enabled,memory_order_acquire) &&
-        gui_rf_profile_has_hifi((gui_rf_profile_t)atomic_load_explicit(&w->requested_profile,memory_order_acquire)) &&
+        gui_rf_profile_has_audio((gui_rf_profile_t)atomic_load_explicit(&w->requested_profile,memory_order_acquire)) &&
         !(atomic_load_explicit(&w->pause_control,memory_order_acquire)&1u) &&
         generation==atomic_load_explicit(&w->audio_generation,memory_order_acquire);
+}
+bool gui_rf_preview_worker_audio_is_current(const void *worker) {
+    const gui_rf_preview_worker_t *w = worker;
+    return w && rf_audio_current(w, w->audio_processing_generation);
+}
+bool gui_rf_preview_worker_audio_is_ld(const void *worker) {
+    const gui_rf_preview_worker_t *w = worker;
+    return w && gui_rf_profile_is_laserdisc((gui_rf_profile_t)
+        atomic_load_explicit(&w->requested_profile, memory_order_acquire));
+}
+static void rf_audio_publish(void *context,const float *stereo,size_t frames,uint64_t end_sample) {
+    gui_rf_preview_worker_t *w=context;
+    if(atomic_load_explicit(&w->audio_callback_installed,memory_order_acquire) &&
+       w->audio_callback && rf_audio_current(w,w->audio_processing_generation))
+        w->audio_callback(w->audio_context,stereo,frames,end_sample);
 }
 static void rf_audio_callback(void *context,const float *stereo,size_t frames,
                               uint64_t end_sample,const gui_beta_hifi_status_t *status) {
     gui_rf_preview_worker_t *w=context;
     if(!rf_audio_current(w,w->audio_processing_generation)) return;
     rf_mutex_lock(&w->frame_mutex);w->stats.hifi=*status;rf_mutex_unlock(&w->frame_mutex);
-    if(atomic_load_explicit(&w->audio_callback_installed,memory_order_acquire) &&
-       w->audio_callback && rf_audio_current(w,w->audio_processing_generation))
-        w->audio_callback(w->audio_context,stereo,frames,end_sample);
+    /* Retain the public 20 MSPS timestamp axis for native-rate Hi-Fi. */
+    if (w->audio_processing_rate != GUI_RF_DECODE_RATE_HZ)
+        end_sample = rf_scale_sample(end_sample, w->audio_processing_rate);
+    rf_audio_publish(w,stereo,frames,end_sample);
+}
+
+static void rf_audio_laserdisc(gui_rf_preview_worker_t *w,const rf_audio_slot_t *slot,
+                               gui_rf_profile_t profile,bool reset) {
+    bool locked=false;
+    gui_rf_ld_audio_t mode = (gui_rf_ld_audio_t)(slot->generation & RF_AUDIO_MODE_MASK);
+    if (mode == GUI_RF_LD_AUDIO_AC3 && profile == GUI_RF_PROFILE_NTSC_LASERDISC) {
+        if (reset) {
+            if (!w->ld_ac3) w->ld_ac3 = gui_ld_rf_ac3_create();
+            else gui_ld_rf_ac3_reset(w->ld_ac3);
+        }
+        if (w->ld_ac3) {
+            gui_ld_rf_ac3_process(w->ld_ac3, slot->samples, slot->count,
+                                  slot->first_sample, rf_audio_publish, w);
+            locked = gui_ld_rf_ac3_locked(w->ld_ac3);
+        }
+    } else if (mode == GUI_RF_LD_AUDIO_DIGITAL) {
+        if (reset) {
+            if (!w->ld_digital) w->ld_digital=gui_ld_rf_digital_create();
+            if (w->ld_digital) gui_ld_rf_digital_reset(w->ld_digital);
+        }
+        if (w->ld_digital) {
+            gui_ld_rf_digital_process(w->ld_digital,slot->samples,slot->count,
+                                      slot->first_sample,rf_audio_publish,w);
+            locked=gui_ld_rf_digital_locked(w->ld_digital);
+        }
+    } else {
+        if (reset) {
+            if (!w->ld_analog) w->ld_analog=gui_ld_rf_analog_create();
+            if (w->ld_analog) gui_ld_rf_analog_reset(w->ld_analog,
+                profile==GUI_RF_PROFILE_NTSC_LASERDISC ? GUI_LD_RF_NTSC : GUI_LD_RF_PAL);
+        }
+        if (w->ld_analog) {
+            gui_ld_rf_analog_process(w->ld_analog,slot->samples,slot->count,
+                                     slot->first_sample,rf_audio_publish,w);
+            locked=gui_ld_rf_analog_locked(w->ld_analog);
+        }
+    }
+    if (rf_audio_current(w,slot->generation)) {
+        rf_mutex_lock(&w->frame_mutex);
+        w->stats.ld_audio_locked=locked;
+        rf_mutex_unlock(&w->frame_mutex);
+    }
 }
 static void rf_audio_wait(gui_rf_preview_worker_t *w,uint64_t wait_us) {
 #ifdef _WIN32
@@ -670,7 +854,7 @@ static int rf_audio_thread(void *context) {
     (void)rf_lower_thread_priority();
     w->audio_have_cpu_baseline=rf_thread_cpu_us(&w->audio_last_cpu_us);
     w->audio_last_completion_us=rf_now_us(w);
-    bool needs_reset=false;
+    bool needs_reset=true;
     while(!atomic_load_explicit(&w->stop,memory_order_acquire)) {
         uint64_t generation=atomic_load_explicit(&w->audio_generation,memory_order_acquire);
         if(generation!=atomic_load_explicit(&w->applied_audio_generation,memory_order_relaxed)) {
@@ -680,7 +864,10 @@ static int rf_audio_thread(void *context) {
             needs_reset=true;
             if(atomic_load_explicit(&w->audio_callback_installed,memory_order_acquire) && w->audio_callback)
                 w->audio_callback(w->audio_context,NULL,0,0);
-            rf_mutex_lock(&w->frame_mutex);memset(&w->stats.hifi,0,sizeof(w->stats.hifi));rf_mutex_unlock(&w->frame_mutex);
+            rf_mutex_lock(&w->frame_mutex);
+            memset(&w->stats.hifi,0,sizeof(w->stats.hifi));
+            w->stats.ld_audio_locked=false;
+            rf_mutex_unlock(&w->frame_mutex);
             atomic_store_explicit(&w->applied_audio_generation,generation,memory_order_release);
             atomic_store(&w->audio_active,false);
 #ifdef _WIN32
@@ -689,7 +876,34 @@ static int rf_audio_thread(void *context) {
         }
         uint64_t read=atomic_load_explicit(&w->audio_read,memory_order_relaxed);
         uint64_t write=atomic_load_explicit(&w->audio_write,memory_order_acquire);
-        if(read==write) {rf_audio_wait(w,10000);continue;}
+        if (read == write) {
+            if (generation == atomic_load_explicit(&w->audio_finish_requested, memory_order_acquire) &&
+                generation != atomic_load_explicit(&w->audio_finish_completed, memory_order_relaxed) &&
+                generation == atomic_load_explicit(&w->audio_finish_rf_flushed, memory_order_acquire)) {
+                // The RF worker publishes its flush after queuing the last samples.
+                if (read != atomic_load_explicit(&w->audio_write, memory_order_acquire)) continue;
+                gui_rf_ld_audio_t mode = (gui_rf_ld_audio_t)(generation & RF_AUDIO_MODE_MASK);
+                if (!needs_reset && ((mode == GUI_RF_LD_AUDIO_DIGITAL && w->ld_digital) ||
+                                     (mode == GUI_RF_LD_AUDIO_AC3 && w->ld_ac3))) {
+                    if (!rf_audio_acquire_budget(w, generation)) continue;
+                    uint64_t begin = rf_now_us(w);
+                    atomic_store_explicit(&w->audio_active, true, memory_order_release);
+                    if (rf_audio_current(w, generation)) {
+                        w->audio_processing_generation = generation;
+                        if (mode == GUI_RF_LD_AUDIO_DIGITAL)
+                            gui_ld_rf_digital_finish(w->ld_digital, rf_audio_publish, w);
+                        else
+                            gui_ld_rf_ac3_finish(w->ld_ac3);
+                    }
+                    rf_audio_finish_budget(w, begin);
+                    atomic_store_explicit(&w->audio_active, false, memory_order_release);
+                }
+                if (rf_audio_current(w, generation))
+                    atomic_store_explicit(&w->audio_finish_completed, generation, memory_order_release);
+            }
+            rf_audio_wait(w, 10000);
+            continue;
+        }
         rf_audio_slot_t *slot=&w->audio_queue[read%RF_AUDIO_QUEUE_SLOTS];
         /* A source/control change may enqueue a current slot after the loop
          * captured its old generation. Refresh before discarding fresh audio. */
@@ -709,8 +923,35 @@ static int rf_audio_thread(void *context) {
         atomic_store_explicit(&w->audio_active,true,memory_order_release);
         if(rf_audio_current(w,generation) && rf_now_us(w)-slot->enqueue_us<=RF_AUDIO_MAX_US) {
             w->audio_processing_generation=generation;
-            if(needs_reset) {gui_beta_hifi_reset(w->hifi);needs_reset=false;}
-            gui_beta_hifi_process(w->hifi,slot->samples,slot->count,slot->first_sample,rf_audio_callback,w);
+            w->audio_processing_rate=slot->rate;
+            if (gui_rf_profile_is_laserdisc(slot->profile)) {
+                rf_audio_laserdisc(w,slot,slot->profile,needs_reset);
+            } else if (gui_rf_profile_is_audio_only(slot->profile)) {
+                if (!w->vhs_hifi || w->vhs_hifi_profile != slot->profile ||
+                    w->vhs_hifi_rate != slot->rate || w->vhs_hifi_iq_center != slot->iq_center_hz) {
+                    gui_vhs_hifi_destroy(w->vhs_hifi);
+                    gui_rf_format_t format = rf_vhs_hifi_format(slot->profile);
+                    w->vhs_hifi = slot->iq_center_hz
+                        ? gui_vhs_hifi_create_iq(format, slot->rate, slot->iq_center_hz)
+                        : gui_vhs_hifi_create(format, slot->rate);
+                    w->vhs_hifi_profile = slot->profile;
+                    w->vhs_hifi_rate = slot->rate;
+                    w->vhs_hifi_iq_center = slot->iq_center_hz;
+                } else if (needs_reset) {
+                    gui_vhs_hifi_reset(w->vhs_hifi);
+                }
+                if (w->vhs_hifi && slot->iq_center_hz)
+                    gui_vhs_hifi_process_iq(w->vhs_hifi, slot->samples,
+                        slot->samples + RF_AUDIO_BLOCK_SAMPLES / 2, slot->count,
+                        slot->first_sample, rf_audio_callback, w);
+                else if (w->vhs_hifi)
+                    gui_vhs_hifi_process(w->vhs_hifi, slot->samples, slot->count,
+                                         slot->first_sample, rf_audio_callback, w);
+            } else {
+                if (needs_reset) gui_beta_hifi_reset(w->hifi);
+                gui_beta_hifi_process(w->hifi,slot->samples,slot->count,slot->first_sample,rf_audio_callback,w);
+            }
+            needs_reset=false;
         }
         rf_audio_finish_budget(w,begin);
         atomic_store_explicit(&w->audio_active,false,memory_order_release);
@@ -733,32 +974,114 @@ static bool rf_audio_start(gui_rf_preview_worker_t *w) {
 fail:
     free(w->audio_queue);w->audio_queue=NULL;gui_beta_hifi_destroy(w->hifi);w->hifi=NULL;return false;
 }
-static void rf_audio_enqueue(gui_rf_preview_worker_t *w,const float *samples,size_t count,uint64_t first,
-                             uint64_t generation,uint64_t source_generation,
-                             uint64_t control,uint64_t pause_control) {
+static void rf_audio_enqueue(gui_rf_preview_worker_t *w, const rf_input_slot_t *input,
+                             size_t count, uint64_t first, uint64_t generation) {
     if(!atomic_load_explicit(&w->audio_ready,memory_order_acquire) ||
        !atomic_load_explicit(&w->audio_enabled,memory_order_acquire)) return;
-    if(!rf_audio_current(w,generation) ||
-       source_generation!=atomic_load_explicit(&w->audio_source_generation,memory_order_acquire) ||
-       atomic_load_explicit(&w->control,memory_order_acquire)!=control ||
-       atomic_load_explicit(&w->pause_control,memory_order_acquire)!=pause_control) return;
+    if(!rf_audio_current(w,generation)) return;
+    if(input && (input->info.preview_only ||
+       input->audio_source_generation!=atomic_load_explicit(&w->audio_source_generation,memory_order_acquire) ||
+       atomic_load_explicit(&w->control,memory_order_acquire)!=input->control ||
+       atomic_load_explicit(&w->pause_control,memory_order_acquire)!=input->pause_control)) return;
     uint64_t write=atomic_load_explicit(&w->audio_write,memory_order_relaxed);
     uint64_t read=atomic_load_explicit(&w->audio_read,memory_order_acquire);
-    size_t blocks=(count+RF_AUDIO_BLOCK_SAMPLES-1)/RF_AUDIO_BLOCK_SAMPLES;
+    /* Reuse the audio slot's storage for separate I and Q float planes. */
+    const uint32_t iq_center = input ? input->info.iq_center_hz : 0;
+    size_t slot_capacity = iq_center ? RF_AUDIO_BLOCK_SAMPLES / 2 : RF_AUDIO_BLOCK_SAMPLES;
+    size_t blocks = (count + slot_capacity - 1) / slot_capacity;
     if(blocks>RF_AUDIO_QUEUE_SLOTS-(write-read)) {
         atomic_fetch_add(&w->audio_dropped,blocks);rf_audio_invalidate(w);return;
     }
     uint64_t now=rf_now_us(w);
-    while(count) {
-        size_t n=count<RF_AUDIO_BLOCK_SAMPLES ? count : RF_AUDIO_BLOCK_SAMPLES;
-        rf_audio_slot_t *slot=&w->audio_queue[write%RF_AUDIO_QUEUE_SLOTS];
-        slot->count=n;slot->first_sample=first;slot->generation=generation;slot->enqueue_us=now;
-        memcpy(slot->samples,samples,n*sizeof(*samples));write++;samples+=n;count-=n;first+=n;
+    for (size_t offset = 0; offset < count;) {
+        size_t n = count - offset;
+        if (n > slot_capacity) n = slot_capacity;
+        rf_audio_slot_t *slot = &w->audio_queue[write++ % RF_AUDIO_QUEUE_SLOTS];
+        slot->count = n;
+        slot->first_sample = first + offset;
+        slot->generation = generation;
+        slot->enqueue_us = now;
+        slot->profile = w->profile;
+        slot->rate = w->native_audio_rate ? w->native_audio_rate : GUI_RF_DECODE_RATE_HZ;
+        slot->iq_center_hz = iq_center;
+        if (slot->iq_center_hz) {
+            const uint8_t *iq = (const uint8_t *)input->samples + 2 * offset;
+            float *q = slot->samples + RF_AUDIO_BLOCK_SAMPLES / 2;
+            for (size_t i = 0; i < n; ++i) {
+                slot->samples[i] = ((int)iq[2 * i] - 128) * (1.0f / 128.0f);
+                q[i] = ((int)iq[2 * i + 1] - 128) * (1.0f / 128.0f);
+            }
+        } else if (input && w->native_audio_rate) {
+            for (size_t i = 0; i < n; ++i)
+                slot->samples[i] = (float)input->samples[offset + i] * (1.0f / 32768.0f);
+        } else {
+            memcpy(slot->samples, w->output + offset, n * sizeof(*slot->samples));
+        }
+        offset += n;
     }
     atomic_store_explicit(&w->audio_write,write,memory_order_release);
 #ifdef _WIN32
     SetEvent(w->audio_event);
 #endif
+}
+
+/* Only the RF worker owns the resampler. The audio thread can finish the
+ * format decoder once it sees this generation and consumes the tail slots. */
+static void rf_finish_ld_input(gui_rf_preview_worker_t *w, uint64_t control,
+                               uint64_t pause_control) {
+    uint64_t audio = atomic_load_explicit(&w->audio_finish_requested, memory_order_acquire);
+    uint64_t video = atomic_load_explicit(&w->video_finish_requested, memory_order_acquire);
+    bool audio_done = audio && audio != atomic_load_explicit(&w->audio_finish_rf_flushed, memory_order_relaxed) &&
+                      rf_audio_current(w, audio);
+    bool video_done = video && video != atomic_load_explicit(&w->video_finish_completed, memory_order_relaxed) &&
+                      video == atomic_load_explicit(&w->video_source_generation, memory_order_acquire);
+    if (!audio_done && !video_done) return;
+
+    bool drain_audio = audio_done && w->stream_valid && w->resampler &&
+                       w->narrow_stream_valid && w->narrow_audio_generation == audio;
+    bool drain_video = video_done && w->stream_valid && w->wide_resampler &&
+                       w->block_video_source_generation == video;
+    if (drain_audio) {
+        uint64_t write = atomic_load_explicit(&w->audio_write, memory_order_relaxed);
+        uint64_t read = atomic_load_explicit(&w->audio_read, memory_order_acquire);
+        if (write - read >= RF_AUDIO_QUEUE_SLOTS) drain_audio = audio_done = false;
+    }
+    if (drain_audio || drain_video) {
+        if (!rf_acquire_budget(w, control, pause_control)) return;
+        uint64_t begin_wall = rf_now_us(w);
+        if (drain_audio) {
+            size_t capacity = w->output_capacity < RF_AUDIO_BLOCK_SAMPLES ? w->output_capacity : RF_AUDIO_BLOCK_SAMPLES;
+            size_t count;
+            if (gui_rf_resampler_finish(w->resampler, w->output, capacity, &count)) {
+                if (count) {
+                    rf_audio_enqueue(w, NULL, count, w->output_sample, audio);
+                    w->output_sample += count;
+                }
+                audio_done = count < capacity;
+            }
+            w->narrow_stream_valid = !audio_done;
+        }
+        if (drain_video) {
+            size_t count;
+            if (gui_rf_resampler_finish(w->wide_resampler, w->wide_output, w->wide_output_capacity, &count)) {
+                if (count) {
+                    w->work_segment_us = rf_now_us(w);
+                    gui_rf_decoder_process(w->decoder, w->wide_output, count,
+                        w->wide_output_sample, rf_frame_callback, w);
+                    w->work_since_frame_us += rf_now_us(w) - w->work_segment_us;
+                    w->wide_output_sample += count;
+                }
+                video_done = count < w->wide_output_capacity;
+            }
+        }
+        rf_finish_budget(w, begin_wall);
+    }
+    if (audio_done && rf_audio_current(w, audio)) {
+        atomic_store_explicit(&w->audio_finish_rf_flushed, audio, memory_order_release);
+        rf_audio_wake(w);
+    }
+    if (video_done)
+        atomic_store_explicit(&w->video_finish_completed, video, memory_order_release);
 }
 
 static int rf_worker_thread(void *context) {
@@ -779,11 +1102,13 @@ static int rf_worker_thread(void *context) {
         if (control != w->applied_control) {
             bool was_wideband = rf_wideband_profile(w->profile);
             w->profile = (gui_rf_profile_t)atomic_load_explicit(&w->requested_profile, memory_order_relaxed);
-            if (gui_rf_profile_has_hifi(w->profile)) (void)rf_audio_start(w);
-            if (w->source_rate && was_wideband != rf_wideband_profile(w->profile))
-                (void)rf_configure_rate(w, w->source_rate);
+            if (gui_rf_profile_has_audio(w->profile)) (void)rf_audio_start(w);
+            if (w->source_rate && (was_wideband != rf_wideband_profile(w->profile) ||
+                (w->native_audio_rate != 0) != rf_uses_native_audio(w->profile, w->source_rate, w->source_iq_center)))
+                (void)rf_configure_rate(w, w->source_rate, w->source_iq_center);
             /* Publish completion only after reset and audio invalidation. */
-            rf_reset_decoder(w, w->source_rate && !w->resampler ? rf_rate_error(w) : "RF preview reset; acquiring");
+            rf_reset_decoder(w, w->source_rate && !w->resampler && !w->native_audio_rate
+                ? rf_rate_error(w) : "RF preview reset; acquiring");
             atomic_store_explicit(&w->applied_control,control,memory_order_release);
         }
         uint64_t pause_control = atomic_load_explicit(&w->pause_control, memory_order_acquire);
@@ -811,6 +1136,7 @@ static int rf_worker_thread(void *context) {
         uint64_t read = atomic_load_explicit(&w->read_index, memory_order_relaxed);
         uint64_t write = atomic_load_explicit(&w->write_index, memory_order_acquire);
         if (read == write) {
+            rf_finish_ld_input(w, control, pause_control);
 #ifdef _WIN32
             /* Sleep(1) can take 15.6 ms in a headless Windows process. An
              * auto-reset event keeps sparse/high-rate batches responsive. */
@@ -850,14 +1176,16 @@ static int rf_worker_thread(void *context) {
                 if (rf_now_us(w) - slot->enqueue_us > RF_QUEUE_MAX_US) rf_discard_queue(w);
                 continue;
             }
-            bool boundary = !w->stream_valid || slot->info.discontinuity ||
+            bool changed_input = slot->info.sample_rate_hz != w->source_rate ||
+                                 slot->info.iq_center_hz != w->source_iq_center;
+            bool boundary = !w->stream_valid || slot->info.discontinuity || changed_input ||
                             slot->info.epoch != w->source_epoch ||
-                            slot->info.sample_rate_hz != w->source_rate ||
                             slot->info.start_sample != w->expected_source_sample;
             if (boundary) {
-                bool changed_rate = slot->info.sample_rate_hz != w->source_rate;
-                if (changed_rate) (void)rf_configure_rate(w, slot->info.sample_rate_hz);
-                rf_reset_decoder(w, w->resampler ? "RF discontinuity; acquiring" : rf_rate_error(w));
+                if (changed_input)
+                    (void)rf_configure_rate(w, slot->info.sample_rate_hz, slot->info.iq_center_hz);
+                rf_reset_decoder(w, w->resampler || w->native_audio_rate
+                    ? "RF discontinuity; acquiring" : rf_rate_error(w));
                 w->source_epoch = slot->info.epoch;
                 w->output_sample = w->source_rate ? rf_scale_sample(slot->info.start_sample, w->source_rate) : 0;
                 w->wide_output_sample = w->source_rate ? rf_scale_sample_rate(slot->info.start_sample,
@@ -865,23 +1193,28 @@ static int rf_worker_thread(void *context) {
                 w->stream_valid = true;
             }
             w->expected_source_sample = slot->info.start_sample + slot->count;
-            if (w->resampler) {
+            if (w->native_audio_rate) {
+                uint64_t generation = atomic_load_explicit(&w->audio_generation, memory_order_acquire);
+                rf_audio_enqueue(w, slot, slot->count, slot->info.start_sample, generation);
+            } else if (w->resampler) {
                 w->block_enqueue_us = slot->enqueue_us;
                 w->block_source_end = w->expected_source_sample;
+                w->block_video_source_generation = slot->video_source_generation;
                 w->work_segment_us = rf_now_us(w);
                 size_t output_count = 0;
                 /* Never assign a fresh audio epoch to an old block that was
                  * already resampling when mute/reset/seek changed controls. */
                 uint64_t audio_generation=atomic_load_explicit(&w->audio_generation,memory_order_acquire);
                 size_t wide_count = 0;
-                bool narrow_needed = !w->wide_resampler ||
-                    (gui_rf_profile_has_hifi(w->profile) &&
+                bool video_enabled = !gui_rf_profile_is_audio_only(w->profile);
+                bool narrow_needed = (video_enabled && !w->wide_resampler) ||
+                    (gui_rf_profile_has_audio(w->profile) &&
                      atomic_load_explicit(&w->audio_enabled,memory_order_acquire));
                 bool resampled = true;
                 if (narrow_needed) {
-                    if (w->wide_resampler && (!w->narrow_stream_valid ||
+                    if ((w->wide_resampler || !video_enabled) && (!w->narrow_stream_valid ||
                         w->narrow_audio_generation != audio_generation)) {
-                        /* This converter supplies only ED audio. Drop any old
+                        /* This converter supplies audio only. Drop any old
                          * buffered tail after mute/control changes and restart
                          * its independent clock at the current source block. */
                         gui_rf_resampler_reset(w->resampler);
@@ -892,7 +1225,7 @@ static int rf_worker_thread(void *context) {
                     w->narrow_stream_valid = resampled;
                     w->narrow_audio_generation = audio_generation;
                 } else {
-                    /* Wide video advances normally; resume audio from fresh RF,
+                    /* Resume audio from fresh RF,
                      * rather than pretending its skipped history is contiguous. */
                     w->narrow_stream_valid = false;
                     w->output_sample = rf_scale_sample(w->expected_source_sample,w->source_rate);
@@ -901,21 +1234,23 @@ static int rf_worker_thread(void *context) {
                     resampled = gui_rf_resampler_process(w->wide_resampler, slot->samples, slot->count,
                         w->wide_output, w->wide_output_capacity, &wide_count);
                 if (resampled) {
-                    if (output_count && gui_rf_profile_has_hifi(w->profile))
-                        rf_audio_enqueue(w,w->output,output_count,w->output_sample,audio_generation,slot->audio_source_generation,control,pause_control);
+                    if (output_count && gui_rf_profile_has_audio(w->profile))
+                        rf_audio_enqueue(w, slot, output_count, w->output_sample, audio_generation);
                     if (w->wide_resampler) {
                         if (wide_count) gui_rf_decoder_process(w->decoder, w->wide_output, wide_count,
                             w->wide_output_sample, rf_frame_callback, w);
                         w->wide_output_sample += wide_count;
-                    } else if (output_count) {
+                    } else if (output_count && video_enabled) {
                         gui_rf_decoder_process(w->decoder, w->output, output_count,
                             w->output_sample, rf_frame_callback, w);
                     }
                     w->output_sample += output_count;
-                    w->work_since_frame_us += rf_now_us(w) - w->work_segment_us;
-                    gui_rf_decode_status_t status;
-                    gui_rf_decoder_get_status(w->decoder, &status);
-                    rf_accumulate_status(w, &status);
+                    if (video_enabled) {
+                        w->work_since_frame_us += rf_now_us(w) - w->work_segment_us;
+                        gui_rf_decode_status_t status;
+                        gui_rf_decoder_get_status(w->decoder, &status);
+                        rf_accumulate_status(w, &status);
+                    }
                 } else {
                     rf_reset_decoder(w, "RF resampling failed; reacquiring");
                 }
@@ -957,8 +1292,15 @@ gui_rf_preview_worker_t *gui_rf_preview_worker_create_profile(gui_rf_profile_t p
     atomic_init(&w->audio_ready,false);atomic_init(&w->audio_enabled,true);
     atomic_init(&w->audio_callback_installed,false);
     atomic_init(&w->audio_active,false);atomic_init(&w->audio_budget_waiting,false);
-    atomic_init(&w->audio_generation,1);atomic_init(&w->applied_audio_generation,1);
+    atomic_init(&w->audio_generation,RF_AUDIO_GENERATION_STEP);
+    atomic_init(&w->applied_audio_generation,RF_AUDIO_GENERATION_STEP);
     atomic_init(&w->audio_source_generation,1);
+    atomic_init(&w->video_source_generation,1);
+    atomic_init(&w->audio_finish_requested,0);
+    atomic_init(&w->audio_finish_rf_flushed,0);
+    atomic_init(&w->audio_finish_completed,0);
+    atomic_init(&w->video_finish_requested,0);
+    atomic_init(&w->video_finish_completed,0);
     atomic_init(&w->audio_read,0);atomic_init(&w->audio_write,0);atomic_init(&w->audio_dropped,0);
     atomic_init(&w->flush_requested, false);
     atomic_init(&w->producer_gap, false);
@@ -974,14 +1316,17 @@ gui_rf_preview_worker_t *gui_rf_preview_worker_create_profile(gui_rf_profile_t p
     atomic_init(&w->control, 1);
     atomic_init(&w->requested_profile, profile);
     atomic_init(&w->requested_full_frame, false);
+    atomic_init(&w->ld_sync_enabled, false);
     w->profile = profile;
     atomic_init(&w->applied_control,1);
     w->interval_start_us = rf_now_us(w);
     w->queue = calloc(RF_QUEUE_SLOTS, sizeof(*w->queue));
     w->frame = malloc(RF_FRAME_BYTES);
-    w->decoder = gui_rf_decoder_create_profile(profile);
+    /* The same worker may switch to a picture profile through set_profile. */
+    w->decoder = gui_rf_decoder_create_profile(gui_rf_profile_is_audio_only(profile)
+        ? GUI_RF_PROFILE_NTSC_VHS : profile);
     if (!w->queue || !w->frame || !w->decoder) goto fail;
-    if (gui_rf_profile_has_hifi(profile) && !rf_audio_start(w)) goto fail;
+    if (gui_rf_profile_has_audio(profile) && !rf_audio_start(w)) goto fail;
 #ifdef _WIN32
     if (!w->input_event || !w->audio_event || !w->done_event) goto fail;
 #endif
@@ -999,6 +1344,10 @@ fail:
     free(w->audio_queue);
     gui_rf_decoder_destroy(w->decoder);
     gui_beta_hifi_destroy(w->hifi);
+    gui_vhs_hifi_destroy(w->vhs_hifi);
+    gui_ld_rf_analog_destroy(w->ld_analog);
+    gui_ld_rf_digital_destroy(w->ld_digital);
+    gui_ld_rf_ac3_destroy(w->ld_ac3);
     free(w->queue);
     free(w->frame);
     rf_mutex_destroy(&w->frame_mutex);
@@ -1025,10 +1374,15 @@ void gui_rf_preview_worker_destroy(gui_rf_preview_worker_t *w) {
     gui_rf_resampler_destroy(w->wide_resampler);
     gui_rf_decoder_destroy(w->decoder);
     gui_beta_hifi_destroy(w->hifi);
+    gui_vhs_hifi_destroy(w->vhs_hifi);
+    gui_ld_rf_analog_destroy(w->ld_analog);
+    gui_ld_rf_digital_destroy(w->ld_digital);
+    gui_ld_rf_ac3_destroy(w->ld_ac3);
     free(w->output);
     free(w->wide_output);
     free(w->queue);
     free(w->frame);
+    free(w->ld_frame_pixels);
     rf_mutex_destroy(&w->frame_mutex);
 #ifdef _WIN32
     CloseHandle(w->input_event);
@@ -1062,10 +1416,49 @@ void gui_rf_preview_worker_set_audio_enabled(gui_rf_preview_worker_t *w,bool ena
         rf_audio_cut_input(w);
 }
 
+bool gui_rf_preview_worker_finish_ld_audio(gui_rf_preview_worker_t *w) {
+    if (!w || !atomic_load_explicit(&w->audio_ready, memory_order_acquire)) return true;
+    uint64_t generation = atomic_load_explicit(&w->audio_generation, memory_order_acquire);
+    if (!rf_audio_current(w, generation) ||
+        generation == atomic_load_explicit(&w->audio_finish_completed, memory_order_acquire)) return true;
+    if (atomic_exchange_explicit(&w->audio_finish_requested, generation, memory_order_acq_rel) != generation) {
+#ifdef _WIN32
+        SetEvent(w->input_event);
+#endif
+    }
+    return false;
+}
+
+bool gui_rf_preview_worker_finish_ld_video(gui_rf_preview_worker_t *w) {
+    if (!w || atomic_load_explicit(&w->stop, memory_order_acquire) ||
+        (atomic_load_explicit(&w->pause_control, memory_order_acquire) & 1u)) return true;
+    uint64_t generation = atomic_load_explicit(&w->video_source_generation, memory_order_acquire);
+    if (generation == atomic_load_explicit(&w->video_finish_completed, memory_order_acquire))
+        return true;
+    if (atomic_exchange_explicit(&w->video_finish_requested, generation, memory_order_acq_rel) != generation) {
+#ifdef _WIN32
+        SetEvent(w->input_event);
+#endif
+    }
+    return false;
+}
+
+bool gui_rf_preview_worker_set_ld_audio(gui_rf_preview_worker_t *w,gui_rf_ld_audio_t mode) {
+    if (!w || (unsigned)mode > GUI_RF_LD_AUDIO_AC3) return false;
+    uint_fast64_t generation=atomic_load_explicit(&w->audio_generation,memory_order_relaxed);
+    do {
+        if ((generation & RF_AUDIO_MODE_MASK)==(unsigned)mode) return false;
+    } while (!atomic_compare_exchange_weak_explicit(&w->audio_generation,&generation,
+                 ((generation & ~(uint_fast64_t)RF_AUDIO_MODE_MASK)+RF_AUDIO_GENERATION_STEP)|(unsigned)mode,
+                 memory_order_acq_rel,memory_order_relaxed));
+    rf_audio_wake(w);
+    return true;
+}
+
 void gui_rf_preview_worker_set_profile(gui_rf_preview_worker_t *w, gui_rf_profile_t profile) {
     if (!w || (unsigned)profile >= GUI_RF_PROFILE_COUNT) return;
     if (atomic_exchange_explicit(&w->requested_profile, profile, memory_order_relaxed) != (int)profile) {
-        rf_audio_cut_input(w);
+        rf_cut_input(w);
         atomic_fetch_add_explicit(&w->control, 1, memory_order_release);
     }
 #ifdef _WIN32
@@ -1081,7 +1474,7 @@ void gui_rf_preview_worker_set_frame_mode(gui_rf_preview_worker_t *worker,
 
 void gui_rf_preview_worker_reset(gui_rf_preview_worker_t *w) {
     if (!w) return;
-    rf_audio_cut_input(w);
+    rf_cut_input(w);
     atomic_fetch_add_explicit(&w->control, 1, memory_order_release);
 #ifdef _WIN32
     SetEvent(w->input_event);
@@ -1098,7 +1491,7 @@ void gui_rf_preview_worker_set_paused(gui_rf_preview_worker_t *w, bool paused) {
                                                   memory_order_release, memory_order_relaxed)) break;
     }
     atomic_store_explicit(&w->producer_gap, true, memory_order_release);
-    rf_audio_cut_input(w);
+    rf_cut_input(w);
 #ifdef _WIN32
     SetEvent(w->input_event);
 #endif
@@ -1108,17 +1501,27 @@ static bool rf_reject_block(gui_rf_preview_worker_t *w, bool flush) {
     atomic_fetch_add_explicit(&w->dropped, 1, memory_order_relaxed);
     atomic_store_explicit(&w->producer_gap, true, memory_order_release);
     if (flush) {
-        rf_audio_cut_input(w);
+        rf_cut_input(w);
         atomic_store_explicit(&w->flush_requested, true, memory_order_release);
     }
     return false;
 }
 
-bool gui_rf_preview_worker_submit(gui_rf_preview_worker_t *w, const int16_t *samples,
-                                  size_t count, const gui_rf_block_info_t *info) {
+static void rf_reset_paused_output(gui_rf_preview_worker_t *w,
+                                   void (*reset_output)(const void *worker)) {
+    if (!reset_output) return;
+    rf_cut_input(w);
+    reset_output(w);
+}
+
+static bool rf_submit(gui_rf_preview_worker_t *w, const void *samples, size_t count,
+                      const gui_rf_block_info_t *info,
+                      void (*reset_output)(const void *worker)) {
     if (!w) return false;
+    if (!info || !info->discontinuity) reset_output = NULL;
     uint64_t pause_control = atomic_load_explicit(&w->pause_control, memory_order_acquire);
     if (pause_control & 1u) {
+        rf_reset_paused_output(w, reset_output);
         atomic_fetch_add_explicit(&w->pause_drops, 1, memory_order_relaxed);
         return false;
     }
@@ -1129,6 +1532,7 @@ bool gui_rf_preview_worker_submit(gui_rf_preview_worker_t *w, const int16_t *sam
     if (atomic_flag_test_and_set_explicit(&w->producer_busy, memory_order_acquire))
         return rf_reject_block(w, false);
     if (atomic_load_explicit(&w->pause_control, memory_order_acquire) != pause_control) {
+        rf_reset_paused_output(w, reset_output);
         atomic_flag_clear_explicit(&w->producer_busy, memory_order_release);
         atomic_fetch_add_explicit(&w->pause_drops, 1, memory_order_relaxed);
         return false;
@@ -1137,30 +1541,40 @@ bool gui_rf_preview_worker_submit(gui_rf_preview_worker_t *w, const int16_t *sam
     uint64_t read = atomic_load_explicit(&w->read_index, memory_order_acquire);
     uint64_t freed = atomic_load_explicit(&w->freed_duration_us, memory_order_acquire);
     uint32_t rate = info->sample_rate_hz;
-    if (rate < RF_MIN_RATE) rate = RF_MIN_RATE;
+    if (!rate || (!info->iq_center_hz && rate < RF_MIN_RATE && !gui_vhs_hifi_is_native_low_rate(rate)))
+        rate = RF_MIN_RATE;
     uint64_t duration = ((uint64_t)count * 1000000u + rate - 1) / rate;
+    /* Admit one low-rate I/Q batch so the worker can report an unsupported rate. */
+    if (info->iq_center_hz && duration > RF_QUEUE_MAX_US) duration = RF_QUEUE_MAX_US;
     uint64_t end = w->producer_duration_us + duration;
     if (write - read >= RF_QUEUE_SLOTS || end - freed > RF_QUEUE_MAX_US ||
         atomic_load_explicit(&w->flush_requested, memory_order_acquire)) {
+        rf_reject_block(w, true);
+        if (reset_output) reset_output(w);
         atomic_flag_clear_explicit(&w->producer_busy, memory_order_release);
-        return rf_reject_block(w, true);
+        return false;
     }
     rf_input_slot_t *slot = &w->queue[write % RF_QUEUE_SLOTS];
     slot->info = *info;
     slot->info.discontinuity |= atomic_exchange_explicit(&w->producer_gap, false, memory_order_acq_rel);
     bool audio_boundary=slot->info.discontinuity || (w->producer_audio_seen &&
         (info->epoch!=w->producer_audio_epoch || info->sample_rate_hz!=w->producer_audio_rate ||
-         info->start_sample!=w->producer_audio_next));
-    if(audio_boundary) rf_audio_cut_input(w);
+         info->start_sample!=w->producer_audio_next || info->iq_center_hz!=w->producer_iq_center));
+    if (audio_boundary) {
+        rf_cut_input(w);
+        if (reset_output) reset_output(w);
+    }
     slot->audio_source_generation=atomic_load_explicit(&w->audio_source_generation,memory_order_acquire);
+    slot->video_source_generation=atomic_load_explicit(&w->video_source_generation,memory_order_acquire);
     w->producer_audio_seen=true;w->producer_audio_epoch=info->epoch;
     w->producer_audio_rate=info->sample_rate_hz;w->producer_audio_next=info->start_sample+count;
+    w->producer_iq_center = info->iq_center_hz;
     slot->count = count;
     slot->enqueue_us = rf_now_us(w);
     slot->duration_end_us = end;
     slot->control = atomic_load_explicit(&w->control, memory_order_acquire);
     slot->pause_control = pause_control;
-    memcpy(slot->samples, samples, count * sizeof(*samples));
+    memcpy(slot->samples, samples, count * sizeof(*slot->samples));
     w->producer_duration_us = end;
     atomic_store_explicit(&w->write_index, write + 1, memory_order_release);
 #ifdef _WIN32
@@ -1168,6 +1582,26 @@ bool gui_rf_preview_worker_submit(gui_rf_preview_worker_t *w, const int16_t *sam
 #endif
     atomic_flag_clear_explicit(&w->producer_busy, memory_order_release);
     return true;
+}
+
+bool gui_rf_preview_worker_submit_with_audio_reset(gui_rf_preview_worker_t *w,
+                                                   const int16_t *samples, size_t count,
+                                                   const gui_rf_block_info_t *info,
+                                                   void (*reset_output)(const void *worker)) {
+    if (info && info->iq_center_hz) return false;
+    return rf_submit(w, samples, count, info, reset_output);
+}
+
+bool gui_rf_preview_worker_submit_iq(gui_rf_preview_worker_t *w, const uint8_t *iq,
+                                     size_t count, const gui_rf_block_info_t *info,
+                                     void (*reset_output)(const void *worker)) {
+    if (!info || !info->iq_center_hz) return false;
+    return rf_submit(w, iq, count, info, reset_output);
+}
+
+bool gui_rf_preview_worker_submit(gui_rf_preview_worker_t *w, const int16_t *samples,
+                                  size_t count, const gui_rf_block_info_t *info) {
+    return gui_rf_preview_worker_submit_with_audio_reset(w, samples, count, info, NULL);
 }
 
 void gui_rf_preview_worker_set_monitor_frame_sink(gui_rf_preview_worker_t *w,
@@ -1180,50 +1614,115 @@ void gui_rf_preview_worker_set_monitor_frame_sink(gui_rf_preview_worker_t *w,
     rf_mutex_unlock(&w->frame_mutex);
 }
 
-bool gui_rf_preview_worker_take_frame(gui_rf_preview_worker_t *w, uint8_t *rgba,
-                                      size_t capacity, uint64_t *generation,
-                                      int *width, int *height, gui_rf_preview_stats_t *stats) {
+void gui_rf_preview_worker_set_ld_sync(gui_rf_preview_worker_t *w, bool enabled) {
+    if (w) atomic_store_explicit(&w->ld_sync_enabled, enabled, memory_order_relaxed);
+}
+
+/* frame_mutex held. Choose a frame containing the current audio tick, with
+ * the oldest/newest retained frame bounding out-of-range positions. */
+static unsigned rf_ld_frame_at(const gui_rf_preview_worker_t *w, uint64_t sample,
+                               bool clock_valid) {
+    unsigned oldest = (w->ld_frame_next + RF_LD_HISTORY_FRAMES - w->ld_frame_count)
+                      % RF_LD_HISTORY_FRAMES;
+    unsigned index = oldest;
+    while ((index + 1u) % RF_LD_HISTORY_FRAMES != w->ld_frame_next &&
+           w->ld_frames[index].end_sample <= sample)
+        index = (index + 1u) % RF_LD_HISTORY_FRAMES;
+    uint64_t end = w->ld_frames[index].end_sample;
+    /* Across a hole in decoded video, retain the prior picture until the
+     * next picture's own time interval starts. Never display it early. */
+    if (clock_valid && end > sample && end - sample > w->ld_frame_span + RF_LD_FRAME_TOLERANCE)
+        return index == oldest ? RF_LD_HISTORY_FRAMES :
+               (index + RF_LD_HISTORY_FRAMES - 1u) % RF_LD_HISTORY_FRAMES;
+    return index;
+}
+
+/* frame_mutex held. */
+static void rf_copy_stats(gui_rf_preview_worker_t *w, gui_rf_preview_stats_t *stats) {
+    *stats = w->stats;
+    stats->blocks_dropped = atomic_load_explicit(&w->dropped, memory_order_relaxed);
+    stats->pause_drops = atomic_load_explicit(&w->pause_drops, memory_order_relaxed);
+    stats->paused = (atomic_load_explicit(&w->pause_control, memory_order_acquire) & 1u) != 0;
+    stats->budget_waiting = atomic_load_explicit(&w->budget_waiting, memory_order_acquire) ||
+        atomic_load_explicit(&w->audio_budget_waiting, memory_order_acquire);
+    stats->audio_active = atomic_load_explicit(&w->audio_active, memory_order_acquire);
+    stats->audio_enabled = atomic_load_explicit(&w->audio_enabled, memory_order_acquire);
+    stats->audio_blocks_dropped = atomic_load_explicit(&w->audio_dropped, memory_order_relaxed);
+}
+
+static bool rf_take_frame(gui_rf_preview_worker_t *w, uint8_t *rgba,
+                          size_t capacity, uint64_t *generation,
+                          int *width, int *height, gui_rf_preview_stats_t *stats,
+                          bool timed, bool clock_valid, uint64_t audio_sample) {
     if (!w || !rgba || !generation) return false;
     bool copied = false;
     rf_mutex_lock(&w->frame_mutex);
     rf_refresh_interval(w, rf_now_us(w));
-    if (w->frame_valid && w->frame_control == atomic_load_explicit(&w->control, memory_order_acquire) &&
-        w->stats.generation != *generation && capacity >= (size_t)w->frame_width * w->frame_height * 4 &&
+    rf_ld_frame_t frame = {w->stats.generation, w->stats.frame_end_sample,
+                          w->frame_width, w->frame_height};
+    bool paused = (atomic_load_explicit(&w->pause_control, memory_order_acquire) & 1u) != 0;
+    if (w->frame_valid &&
+        w->frame_control == atomic_load_explicit(&w->control, memory_order_acquire) &&
+        (!w->frame_is_ld || paused || w->frame_source_generation ==
+         atomic_load_explicit(&w->video_source_generation, memory_order_acquire)) &&
         !atomic_load_explicit(&w->flush_requested, memory_order_acquire)) {
-        memcpy(rgba, w->frame, (size_t)w->frame_width * w->frame_height * 4);
-        *generation = w->stats.generation;
-        if (width) *width = w->frame_width;
-        if (height) *height = w->frame_height;
-        copied = true;
+        const uint8_t *pixels = w->frame;
+        if (w->ld_frame_count) {
+            unsigned index = (w->ld_frame_next + RF_LD_HISTORY_FRAMES - 1u) % RF_LD_HISTORY_FRAMES;
+            if (timed && !paused && atomic_load_explicit(&w->ld_sync_enabled, memory_order_relaxed)) {
+                uint64_t sample = audio_sample;
+                if (!clock_valid)
+                    sample = frame.end_sample > RF_LD_FALLBACK_DELAY
+                        ? frame.end_sample - RF_LD_FALLBACK_DELAY : 0;
+                index = rf_ld_frame_at(w, sample, clock_valid);
+            }
+            if (index < RF_LD_HISTORY_FRAMES) {
+                frame = w->ld_frames[index];
+                pixels = w->ld_frame_pixels + index * w->ld_frame_stride;
+            } else {
+                pixels = NULL;
+            }
+        }
+        size_t bytes = (size_t)frame.width * frame.height * 4u;
+        if (pixels && (timed ? frame.generation > *generation : frame.generation != *generation) &&
+            capacity >= bytes) {
+            memcpy(rgba, pixels, bytes);
+            *generation = frame.generation;
+            if (width) *width = frame.width;
+            if (height) *height = frame.height;
+            copied = true;
+        }
     }
     if (stats) {
-        *stats = w->stats;
-        stats->blocks_dropped = atomic_load_explicit(&w->dropped, memory_order_relaxed);
-        stats->pause_drops = atomic_load_explicit(&w->pause_drops, memory_order_relaxed);
-        stats->paused = (atomic_load_explicit(&w->pause_control, memory_order_acquire) & 1u) != 0;
-        stats->budget_waiting = atomic_load_explicit(&w->budget_waiting, memory_order_acquire) ||
-            atomic_load_explicit(&w->audio_budget_waiting,memory_order_acquire);
-        stats->audio_active=atomic_load_explicit(&w->audio_active,memory_order_acquire);
-        stats->audio_enabled=atomic_load_explicit(&w->audio_enabled,memory_order_acquire);
-        stats->audio_blocks_dropped=atomic_load_explicit(&w->audio_dropped,memory_order_relaxed);
+        rf_copy_stats(w, stats);
+        if (copied) {
+            stats->generation = frame.generation;
+            stats->frame_end_sample = frame.end_sample;
+        }
     }
     rf_mutex_unlock(&w->frame_mutex);
     return copied;
+}
+
+bool gui_rf_preview_worker_take_frame(gui_rf_preview_worker_t *w, uint8_t *rgba,
+                                     size_t capacity, uint64_t *generation,
+                                     int *width, int *height, gui_rf_preview_stats_t *stats) {
+    return rf_take_frame(w, rgba, capacity, generation, width, height, stats, false, false, 0);
+}
+
+bool gui_rf_preview_worker_take_ld_frame(gui_rf_preview_worker_t *w, uint8_t *rgba,
+                                        size_t capacity, uint64_t *generation, int *width,
+                                        int *height, gui_rf_preview_stats_t *stats,
+                                        bool clock_valid, uint64_t audio_sample) {
+    return rf_take_frame(w, rgba, capacity, generation, width, height, stats,
+                         true, clock_valid, audio_sample);
 }
 
 void gui_rf_preview_worker_get_stats(gui_rf_preview_worker_t *w, gui_rf_preview_stats_t *stats) {
     if (!w || !stats) return;
     rf_mutex_lock(&w->frame_mutex);
     rf_refresh_interval(w, rf_now_us(w));
-    *stats = w->stats;
-    stats->blocks_dropped = atomic_load_explicit(&w->dropped, memory_order_relaxed);
-    stats->pause_drops = atomic_load_explicit(&w->pause_drops, memory_order_relaxed);
-    stats->paused = (atomic_load_explicit(&w->pause_control, memory_order_acquire) & 1u) != 0;
-    stats->budget_waiting = atomic_load_explicit(&w->budget_waiting, memory_order_acquire) ||
-            atomic_load_explicit(&w->audio_budget_waiting,memory_order_acquire);
-        stats->audio_active=atomic_load_explicit(&w->audio_active,memory_order_acquire);
-        stats->audio_enabled=atomic_load_explicit(&w->audio_enabled,memory_order_acquire);
-        stats->audio_blocks_dropped=atomic_load_explicit(&w->audio_dropped,memory_order_relaxed);
+    rf_copy_stats(w, stats);
     rf_mutex_unlock(&w->frame_mutex);
 }
 

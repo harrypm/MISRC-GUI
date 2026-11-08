@@ -1,0 +1,519 @@
+diff --git a/include/a52.h b/include/a52.h
+--- a/include/a52.h
++++ b/include/a52.h
+@@ -2,6 +2,8 @@
+  * a52.h
+  * Copyright (C) 2000-2003 Michel Lespinasse <walken@zoy.org>
+  * Copyright (C) 1999-2000 Aaron Holtzman <aholtzma@ess.engr.uvic.ca>
++ *
++ * MISRC changes (2026-11-07): Expose an in-place reset and a sized, const input buffer.
+  *
+  * This file is part of a52dec, a free ATSC A-52 stream decoder.
+  * See http://liba52.sourceforge.net/ for updates.
+@@ -23,6 +25,9 @@
+ 
+ #ifndef A52_H
+ #define A52_H
++
++#include <stddef.h>
++#include <stdint.h>
+ 
+ #if defined(LIBA52_FIXED)
+ typedef int32_t sample_t;
+@@ -54,11 +59,12 @@
+ #define A52_ADJUST_LEVEL 32
+ 
+ a52_state_t * a52_init (uint32_t mm_accel);
++void a52_reset (a52_state_t * state);
+ sample_t * a52_samples (a52_state_t * state);
+-int a52_syncinfo (uint8_t * buf, int * flags,
++int a52_syncinfo (const uint8_t * buf, int * flags,
+ 		  int * sample_rate, int * bit_rate);
+-int a52_frame (a52_state_t * state, uint8_t * buf, int * flags,
+-	       level_t * level, sample_t bias);
++int a52_frame (a52_state_t * state, const uint8_t * buf, size_t bytes,
++               int * flags, level_t * level, sample_t bias);
+ void a52_dynrng (a52_state_t * state,
+ 		 level_t (* call) (level_t, void *), void * data);
+ int a52_block (a52_state_t * state);
+diff --git a/liba52/a52_internal.h b/liba52/a52_internal.h
+--- a/liba52/a52_internal.h
++++ b/liba52/a52_internal.h
+@@ -2,6 +2,8 @@
+  * a52_internal.h
+  * Copyright (C) 2000-2003 Michel Lespinasse <walken@zoy.org>
+  * Copyright (C) 1999-2000 Aaron Holtzman <aholtzma@ess.engr.uvic.ca>
++ *
++ * MISRC changes (2026-11-07): Track bounded bitstream state and frame block count.
+  *
+  * This file is part of a52dec, a free ATSC A-52 stream decoder.
+  * See http://liba52.sourceforge.net/ for updates.
+@@ -66,10 +68,13 @@
+ 
+     uint16_t bai;		/* bit allocation information */
+ 
+-    uint32_t * buffer_start;
++    const uint8_t * buffer_start;
++    size_t buffer_remaining;
+     uint16_t lfsr_state;	/* dither state */
+     uint32_t bits_left;
+     uint32_t current_word;
++    int bitstream_error;
++    unsigned blocks_decoded;
+ 
+     uint8_t csnroffst;		/* coarse SNR offset */
+     ba_t cplba;			/* coupling bit allocation parameters */
+diff --git a/liba52/bit_allocate.c b/liba52/bit_allocate.c
+--- a/liba52/bit_allocate.c
++++ b/liba52/bit_allocate.c
+@@ -2,6 +2,8 @@
+  * bit_allocate.c
+  * Copyright (C) 2000-2003 Michel Lespinasse <walken@zoy.org>
+  * Copyright (C) 1999-2000 Aaron Holtzman <aholtzma@ess.engr.uvic.ca>
++ *
++ * MISRC changes (2026-11-07): Provide the zero correction at the -512 log-add limit.
+  *
+  * This file is part of a52dec, a free ATSC A-52 stream decoder.
+  * See http://liba52.sourceforge.net/ for updates.
+@@ -75,7 +77,8 @@
+ 			 37, 40,  43,  46,  49,  55,  61,  67,  73,  79,
+ 			 85, 97, 109, 121, 133, 157, 181, 205, 229, 253};
+ 
+-static int8_t latab[256] = {
++/* A negative delta of exactly -512 selects the final zero correction. */
++static const int8_t latab[257] = {
+     -64, -63, -62, -61, -60, -59, -58, -57, -56, -55, -54, -53,
+     -52, -52, -51, -50, -49, -48, -47, -47, -46, -45, -44, -44,
+     -43, -42, -41, -41, -40, -39, -38, -38, -37, -36, -36, -35,
+diff --git a/liba52/bitstream.c b/liba52/bitstream.c
+--- a/liba52/bitstream.c
++++ b/liba52/bitstream.c
+@@ -2,6 +2,8 @@
+  * bitstream.c
+  * Copyright (C) 2000-2003 Michel Lespinasse <walken@zoy.org>
+  * Copyright (C) 1999-2000 Aaron Holtzman <aholtzma@ess.engr.uvic.ca>
++ *
++ * MISRC changes (2026-11-07): Refill the bit cache from a bounded byte buffer.
+  *
+  * This file is part of a52dec, a free ATSC A-52 stream decoder.
+  * See http://liba52.sourceforge.net/ for updates.
+@@ -29,69 +31,40 @@
+ #include "a52_internal.h"
+ #include "bitstream.h"
+ 
+-#define BUFFER_SIZE 4096
+-
+-void a52_bitstream_set_ptr (a52_state_t * state, uint8_t * buf)
++void a52_bitstream_set_ptr (a52_state_t * state, const uint8_t * buf, size_t bytes)
+ {
+-    int align;
+-
+-    align = (long)buf & 3;
+-    state->buffer_start = (uint32_t *) (buf - align);
++    state->buffer_start = buf;
++    state->buffer_remaining = bytes;
+     state->bits_left = 0;
+     state->current_word = 0;
+-    bitstream_get (state, align * 8);
+-    bitstream_get_2 (state, 0);	/* pretend function is used - keep gcc happy */
++    state->bitstream_error = 0;
+ }
+ 
+-static inline void bitstream_fill_current (a52_state_t * state)
+-{
+-    uint32_t tmp;
+-
+-    tmp = *(state->buffer_start++);
+-    state->current_word = swab32 (tmp);
+-}
+-
+-/*
+- * The fast paths for _get is in the
+- * bitstream.h header file so it can be inlined.
+- *
+- * The "bottom half" of this routine is suffixed _bh
+- *
+- * -ah
+- */
+-
++/* Refill the left-aligned bit cache without reading outside this frame. */
+ uint32_t a52_bitstream_get_bh (a52_state_t * state, uint32_t num_bits)
+ {
+-    uint32_t result;
++    uint32_t prefix = state->bits_left
++        ? state->current_word >> (32 - state->bits_left) : 0;
++    uint32_t wanted = num_bits - state->bits_left;
++    size_t bytes = state->buffer_remaining < 4 ? state->buffer_remaining : 4;
++    if (wanted > 8 * bytes) {
++        state->bitstream_error = 1;
++        return 0;
++    }
+ 
+-    num_bits -= state->bits_left;
+-    result = ((state->current_word << (32 - state->bits_left)) >>
+-	      (32 - state->bits_left));
++    const uint8_t * buf = state->buffer_start;
++    uint32_t word = 0;
++    if (bytes == 4) {
++        word = ((uint32_t)buf[0] << 24) | ((uint32_t)buf[1] << 16) |
++               ((uint32_t)buf[2] << 8) | buf[3];
++    } else {
++        for (size_t i = 0; i < bytes; ++i)
++            word |= (uint32_t)buf[i] << (24 - 8 * i);
++    }
+ 
+-    bitstream_fill_current (state);
+-
+-    if (num_bits != 0)
+-	result = (result << num_bits) | (state->current_word >> (32 - num_bits));
+-
+-    state->bits_left = 32 - num_bits;
+-
+-    return result;
++    state->buffer_start += bytes;
++    state->buffer_remaining -= bytes;
++    state->bits_left = 8 * bytes - wanted;
++    state->current_word = word << wanted;
++    return (prefix << wanted) | (word >> (32 - wanted));
+ }
+-
+-int32_t a52_bitstream_get_bh_2 (a52_state_t * state, uint32_t num_bits)
+-{
+-    int32_t result;
+-
+-    num_bits -= state->bits_left;
+-    result = ((((int32_t)state->current_word) << (32 - state->bits_left)) >>
+-	      (32 - state->bits_left));
+-
+-    bitstream_fill_current(state);
+-
+-    if (num_bits != 0)
+-	result = (result << num_bits) | (state->current_word >> (32 - num_bits));
+-	
+-    state->bits_left = 32 - num_bits;
+-
+-    return result;
+-}
+diff --git a/liba52/bitstream.h b/liba52/bitstream.h
+--- a/liba52/bitstream.h
++++ b/liba52/bitstream.h
+@@ -2,6 +2,8 @@
+  * bitstream.h
+  * Copyright (C) 2000-2003 Michel Lespinasse <walken@zoy.org>
+  * Copyright (C) 1999-2000 Aaron Holtzman <aholtzma@ess.engr.uvic.ca>
++ *
++ * MISRC changes (2026-11-07): Use a left-aligned bounded bit cache with unsigned shifts.
+  *
+  * This file is part of a52dec, a free ATSC A-52 stream decoder.
+  * See http://liba52.sourceforge.net/ for updates.
+@@ -21,43 +23,22 @@
+  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+  */
+ 
+-/* (stolen from the kernel) */
+-#ifdef WORDS_BIGENDIAN
+-
+-#	define swab32(x) (x)
+-
+-#else
+-
+-#	if 0 && defined (__i386__)
+-
+-#	define swab32(x) __i386_swab32(x)
+-	static inline const uint32_t __i386_swab32(uint32_t x)
+-	{
+-		__asm__("bswap %0" : "=r" (x) : "0" (x));
+-		return x;
+-	}
+-
+-#	else
+-
+-#	define swab32(x)\
+-((((uint8_t*)&x)[0] << 24) | (((uint8_t*)&x)[1] << 16) |  \
+- (((uint8_t*)&x)[2] << 8)  | (((uint8_t*)&x)[3]))
+-
+-#	endif
+-#endif
+-
+-void a52_bitstream_set_ptr (a52_state_t * state, uint8_t * buf);
++void a52_bitstream_set_ptr (a52_state_t * state, const uint8_t * buf, size_t bytes);
+ uint32_t a52_bitstream_get_bh (a52_state_t * state, uint32_t num_bits);
+-int32_t a52_bitstream_get_bh_2 (a52_state_t * state, uint32_t num_bits);
+ 
+ static inline uint32_t bitstream_get (a52_state_t * state, uint32_t num_bits)
+ {
+-    uint32_t result;
+-	
+-    if (num_bits < state->bits_left) {
+-	result = (state->current_word << (32 - state->bits_left)) >> (32 - num_bits);
+-	state->bits_left -= num_bits;
+-	return result;
++    if (!num_bits)
++        return 0;
++    if (num_bits >= 32) {
++        state->bitstream_error = 1;
++        return 0;
++    }
++    if (num_bits <= state->bits_left) {
++        uint32_t result = state->current_word >> (32 - num_bits);
++        state->current_word <<= num_bits;
++        state->bits_left -= num_bits;
++        return result;
+     }
+ 
+     return a52_bitstream_get_bh (state, num_bits);
+@@ -65,13 +46,11 @@
+ 
+ static inline int32_t bitstream_get_2 (a52_state_t * state, uint32_t num_bits)
+ {
+-    int32_t result;
+-	
+-    if (num_bits < state->bits_left) {
+-	result = (((int32_t)state->current_word) << (32 - state->bits_left)) >> (32 - num_bits);
+-	state->bits_left -= num_bits;
+-	return result;
++    if (!num_bits || num_bits >= 32) {
++        state->bitstream_error = 1;
++        return 0;
+     }
+-
+-    return a52_bitstream_get_bh_2 (state, num_bits);
++    uint32_t value = bitstream_get (state, num_bits);
++    uint32_t sign = UINT32_C(1) << (num_bits - 1);
++    return (int32_t)(value ^ sign) - (int32_t)sign;
+ }
+diff --git a/liba52/config.h b/liba52/config.h
+new file mode 100644
+--- /dev/null
++++ b/liba52/config.h
+@@ -0,0 +1,6 @@
++#ifndef MISRC_VENDOR_LIBA52_CONFIG_H
++#define MISRC_VENDOR_LIBA52_CONFIG_H
++
++/* MISRC uses the portable single-precision C decoder. */
++
++#endif
+diff --git a/liba52/imdct.c b/liba52/imdct.c
+--- a/liba52/imdct.c
++++ b/liba52/imdct.c
+@@ -6,6 +6,8 @@
+  * The ifft algorithms in this file have been largely inspired by Dan
+  * Bernstein's work, djbfft, available at http://cr.yp.to/djbfft.html
+  *
++ * MISRC changes (2026-11-07): Initialize the shared IMDCT tables once across workers.
++ *
+  * This file is part of a52dec, a free ATSC A-52 stream decoder.
+  * See http://liba52.sourceforge.net/ for updates.
+  *
+@@ -27,7 +29,7 @@
+ #include "config.h"
+ 
+ #include <math.h>
+-#include <stdio.h>
++#include <stdatomic.h>
+ #ifdef LIBA52_DJBFFT
+ #include <fftc4.h>
+ #include <fftc8.h>
+@@ -357,9 +359,24 @@
+ 
+ void a52_imdct_init (uint32_t mm_accel)
+ {
++    static atomic_int initialized;
++    static atomic_flag initializing = ATOMIC_FLAG_INIT;
++
++    if (atomic_load_explicit (&initialized, memory_order_acquire))
++        return;
++    while (atomic_flag_test_and_set_explicit (&initializing, memory_order_acquire)) {
++        if (atomic_load_explicit (&initialized, memory_order_acquire))
++            return;
++    }
++    if (atomic_load_explicit (&initialized, memory_order_relaxed)) {
++        atomic_flag_clear_explicit (&initializing, memory_order_release);
++        return;
++    }
++
+     int i, k;
+     double sum;
+     double local_imdct_window[256];
++    (void)mm_accel;
+ 
+     /* compute imdct window - kaiser-bessel derived window, alpha = 5.0 */
+     sum = 0;
+@@ -426,4 +443,7 @@
+ 	ifft128 = ifft128_c;
+ 	ifft64 = ifft64_c;
+     }
+-}
++
++    atomic_store_explicit (&initialized, 1, memory_order_release);
++    atomic_flag_clear_explicit (&initializing, memory_order_release);
++}
+diff --git a/liba52/parse.c b/liba52/parse.c
+--- a/liba52/parse.c
++++ b/liba52/parse.c
+@@ -2,6 +2,8 @@
+  * parse.c
+  * Copyright (C) 2000-2003 Michel Lespinasse <walken@zoy.org>
+  * Copyright (C) 1999-2000 Aaron Holtzman <aholtzma@ess.engr.uvic.ca>
++ *
++ * MISRC changes (2026-11-07): Check block structure and preserve in-place state reset.
+  *
+  * This file is part of a52dec, a free ATSC A-52 stream decoder.
+  * See http://liba52.sourceforge.net/ for updates.
+@@ -54,7 +56,6 @@
+ a52_state_t * a52_init (uint32_t mm_accel)
+ {
+     a52_state_t * state;
+-    int i;
+ 
+     state = (a52_state_t *) malloc (sizeof (a52_state_t));
+     if (state == NULL)
+@@ -66,16 +67,19 @@
+ 	return NULL;
+     }
+ 
+-    for (i = 0; i < 256 * 12; i++)
+-	state->samples[i] = 0;
+-
++    a52_reset (state);
++    a52_imdct_init (mm_accel);
++    return state;
++}
++
++void a52_reset (a52_state_t * state)
++{
++    sample_t * samples = state->samples;
++    memset (state, 0, sizeof (*state));
++    memset (samples, 0, 256 * 12 * sizeof (*samples));
++    state->samples = samples;
+     state->downmixed = 1;
+-
+     state->lfsr_state = 1;
+-
+-    a52_imdct_init (mm_accel);
+-
+-    return state;
+ }
+ 
+ sample_t * a52_samples (a52_state_t * state)
+@@ -83,7 +87,7 @@
+     return state->samples;
+ }
+ 
+-int a52_syncinfo (uint8_t * buf, int * flags,
++int a52_syncinfo (const uint8_t * buf, int * flags,
+ 		  int * sample_rate, int * bit_rate)
+ {
+     static int rate[] = { 32,  40,  48,  56,  64,  80,  96, 112,
+@@ -128,8 +132,8 @@
+     }
+ }
+ 
+-int a52_frame (a52_state_t * state, uint8_t * buf, int * flags,
+-	       level_t * level, sample_t bias)
++int a52_frame (a52_state_t * state, const uint8_t * buf, size_t bytes,
++               int * flags, level_t * level, sample_t bias)
+ {
+     static level_t clev[4] = { LEVEL (LEVEL_3DB), LEVEL (LEVEL_45DB),
+ 			       LEVEL (LEVEL_6DB), LEVEL (LEVEL_45DB) };
+@@ -142,7 +146,8 @@
+     state->halfrate = halfrate[buf[5] >> 3];
+     state->acmod = acmod = buf[6] >> 5;
+ 
+-    a52_bitstream_set_ptr (state, buf + 6);
++    state->blocks_decoded = 0;
++    a52_bitstream_set_ptr (state, buf + 6, bytes - 6);
+     bitstream_get (state, 3);	/* skip acmod we already parsed */
+ 
+     if ((acmod == 2) && (bitstream_get (state, 2) == 2))	/* dsurmod */
+@@ -201,7 +206,7 @@
+ 	} while (addbsil--);
+     }
+ 
+-    return 0;
++    return state->bitstream_error;
+ }
+ 
+ void a52_dynrng (a52_state_t * state,
+@@ -426,7 +431,7 @@
+ 	    continue;
+ 
+ 	default:
+-	    COEFF (coeff[i], bitstream_get_2 (state, bapi) << (16 - bapi),
++	    COEFF (coeff[i], bitstream_get_2 (state, bapi) * (1 << (16 - bapi)),
+ 		   level, factor, exp[i]);
+ 	}
+     }
+@@ -537,7 +542,7 @@
+ 		break;
+ 
+ 	    default:
+-		cplcoeff = bitstream_get_2 (state, bapi) << (16 - bapi);
++		cplcoeff = bitstream_get_2 (state, bapi) * (1 << (16 - bapi));
+ 	    }
+ #ifndef LIBA52_FIXED
+ 	    cplcoeff *= scale_factor[exp[i]];
+@@ -567,6 +572,10 @@
+     quantizer_set_t quant;
+     sample_t * samples;
+ 
++    if (state->bitstream_error || state->blocks_decoded >= 6)
++        return 1;
++    if (!state->blocks_decoded)
++        state->chincpl = 0;
+     nfchans = nfchans_tbl[state->acmod];
+ 
+     for (i = 0; i < nfchans; i++)
+@@ -617,7 +626,7 @@
+ 	    cplbegf = bitstream_get (state, 4);
+ 	    cplendf = bitstream_get (state, 4);
+ 
+-	    if (cplendf + 3 - cplbegf < 0)
++	    if (cplendf + 3 - cplbegf <= 0)
+ 		return 1;
+ 	    state->ncplbnd = ncplsubnd = cplendf + 3 - cplbegf;
+ 	    state->cplstrtbnd = bndtab[cplbegf];
+@@ -700,6 +709,15 @@
+ 	    }
+ 	}
+ 
++    if (!state->blocks_decoded) {
++        if ((state->chincpl && cplexpstr == EXP_REUSE) ||
++            (state->lfeon && lfeexpstr == EXP_REUSE))
++            return 1;
++        for (i = 0; i < nfchans; i++)
++            if (chexpstr[i] == EXP_REUSE)
++                return 1;
++    }
++
+     do_bit_alloc = 0;
+ 
+     if (cplexpstr != EXP_REUSE) {
+@@ -770,6 +788,9 @@
+ 		parse_deltba (state, state->ba[i].deltba))
+ 		return 1;
+     }
++
++    if (state->bitstream_error)
++        return 1;
+ 
+     if (do_bit_alloc) {
+ 	if (zero_snr_offsets (nfchans, state)) {
+@@ -878,6 +899,9 @@
+ 	}
+     }
+ 
++    if (state->bitstream_error)
++        return 1;
++
+     i = 0;
+     if (nfchans_tbl[state->output & A52_CHANNEL_MASK] < nfchans)
+ 	for (i = 1; i < nfchans; i++)
+@@ -936,6 +960,7 @@
+ 			       state->bias);
+     }
+ 
++    ++state->blocks_decoded;
+     return 0;
+ }
+ 

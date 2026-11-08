@@ -11,6 +11,7 @@
  * second 4fSC carrier. Expensive comb/repair/export processing is omitted.
  */
 #include "gui_rf_preview.h"
+#include "gui_ld_rf_demod.h"
 #include "gui_rf_preview_filters.h"
 #include "gui_rf_preview_geometry.h"
 #include <math.h>
@@ -33,6 +34,10 @@
 #define RF_LEVEL_GRACE 250000u /* 50 ms at the 5 MHz working rate. */
 #define RF_LEVEL_POINTS 2048
 #define RF_LEVEL_PULSES 256
+
+_Static_assert(GUI_LD_RF_INPUT_RATE_HZ == GUI_RF_DECODE_RATE_HZ &&
+               GUI_LD_RF_LUMA_RATE_HZ * GUI_LD_RF_DECIMATION == GUI_RF_DECODE_RATE_HZ,
+               "LaserDisc must use the shared RF preview clock");
 
 typedef struct { float b0, b1, b2, a1, a2, z1, z2; } rf_biquad_t;
 #if GUI_RF_PACKED_IQ
@@ -128,11 +133,23 @@ static const rf_profile_t rf_profiles[] = {
     {640,480,20,6,GUI_RF_NTSC_LINE_US,5857142.857142857,5400000.0,
      11428.57142857143,629370.6293706294,
      5.3,7.8,GUI_RF_NTSC_ACTIVE_START_US,GUI_RF_NTSC_ACTIVE_END_US,120e-9,320e-9,
-     6200000.0,2000000.0,8980000.0,500000.0,1,2,13.9794,273755.82,.462088186,false,RF_HYBRID_BLACK_IRE_NTSC,RF_HYBRID_SPAN_IRE_NTSC}
+     6200000.0,2000000.0,8980000.0,500000.0,1,2,13.9794,273755.82,.462088186,false,RF_HYBRID_BLACK_IRE_NTSC,RF_HYBRID_SPAN_IRE_NTSC},
+    /* LaserDisc stores composite video as one FM signal. Its dedicated
+     * demodulator supplies IRE directly to the shared line/field timing. */
+    {.width=768,.height=576,.active_first=22,.eq_count=5,.line_us=GUI_RF_PAL_LINE_US,
+     .blank_hz=0,.sync_hz=-300.0/7.0,.hz_ire=1,.carrier_hz=4433618.75,
+     .burst_start_us=5.6,.burst_end_us=7.85,
+     .active_start_us=GUI_RF_PAL_ACTIVE_START_US,.active_end_us=GUI_RF_PAL_ACTIVE_END_US,
+     .hybrid_black_ire=RF_HYBRID_BLACK_IRE_PAL,.hybrid_span_ire=RF_HYBRID_SPAN_IRE_PAL},
+    {.width=640,.height=480,.active_first=20,.eq_count=6,.line_us=GUI_RF_NTSC_LINE_US,
+     .blank_hz=0,.sync_hz=-40,.hz_ire=1,.carrier_hz=315000000.0/88.0,
+     .burst_start_us=5.3,.burst_end_us=7.8,
+     .active_start_us=GUI_RF_NTSC_ACTIVE_START_US,.active_end_us=GUI_RF_NTSC_ACTIVE_END_US,
+     .hybrid_black_ire=RF_HYBRID_BLACK_IRE_NTSC,.hybrid_span_ire=RF_HYBRID_SPAN_IRE_NTSC}
 };
 
-_Static_assert(sizeof(rf_profiles)/sizeof(rf_profiles[0])==GUI_RF_PROFILE_COUNT,
-               "RF profile table must match public profile IDs");
+_Static_assert(sizeof(rf_profiles)/sizeof(rf_profiles[0])==GUI_RF_PROFILE_NTSC_VHS_HIFI,
+               "RF picture profile table must match the video profile IDs");
 
 static bool rf_profile_valid(gui_rf_profile_t profile) {
     return profile>=GUI_RF_PROFILE_PAL_VHS && profile<GUI_RF_PROFILE_COUNT;
@@ -145,6 +162,7 @@ uint32_t gui_rf_profile_video_rate_hz(gui_rf_profile_t profile) {
 gui_rf_format_t gui_rf_profile_format(gui_rf_profile_t profile) {
     return profile==GUI_RF_PROFILE_PAL_VHS || profile==GUI_RF_PROFILE_SECAM_VHS
         || profile==GUI_RF_PROFILE_MESECAM_VHS || profile==GUI_RF_PROFILE_PAL_SVHS
+        || profile==GUI_RF_PROFILE_PAL_LASERDISC || profile==GUI_RF_PROFILE_PAL_VHS_HIFI
         ? GUI_RF_PAL : GUI_RF_NTSC;
 }
 
@@ -154,13 +172,14 @@ static bool rf_secam_fm(const gui_rf_decoder_t *d);
 const char *gui_rf_profile_name(gui_rf_profile_t profile) {
     static const char *names[]={"PAL VHS SP","NTSC VHS SP","NTSC Betamax","NTSC Beta Hi-Fi",
         "NTSC SuperBeta","NTSC SuperBeta Hi-Fi","SECAM VHS SP","MESECAM VHS SP","NTSC ED Beta",
-        "PAL S-VHS","NTSC S-VHS"};
+        "PAL S-VHS","NTSC S-VHS","PAL LaserDisc","NTSC LaserDisc","NTSC VHS Hi-Fi","PAL VHS Hi-Fi"};
     return rf_profile_valid(profile) ? names[profile] : "Unknown RF profile";
 }
 
 bool gui_rf_profile_has_hifi(gui_rf_profile_t profile) {
     return profile==GUI_RF_PROFILE_NTSC_BETAMAX_HIFI ||
-           profile==GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI || profile==GUI_RF_PROFILE_NTSC_ED_BETA;
+           profile==GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI || profile==GUI_RF_PROFILE_NTSC_ED_BETA ||
+           gui_rf_profile_is_audio_only(profile);
 }
 
 typedef struct {
@@ -179,6 +198,7 @@ struct gui_rf_decoder {
     rf_profile_t p;
     double raw_rate;
     unsigned raw_decimation;
+    gui_ld_rf_demod_t ld_demod;
     bool full_frame;   /* Active/Full display mode (see set_frame_mode). */
     float *storage, *luma, *sync, *ci, *cq, *envelope, *sync_luma, *secam_fm;
     uint8_t *rgba;
@@ -241,6 +261,10 @@ struct gui_rf_decoder {
     bool ready_color[2];
     gui_rf_decode_status_t status;
 };
+
+static bool rf_laserdisc(const gui_rf_decoder_t *d) {
+    return d->profile==GUI_RF_PROFILE_PAL_LASERDISC || d->profile==GUI_RF_PROFILE_NTSC_LASERDISC;
+}
 
 static bool rf_native_secam(const gui_rf_decoder_t *d) {
     return d->profile==GUI_RF_PROFILE_SECAM_VHS;
@@ -1411,6 +1435,7 @@ static bool rf_render_field(gui_rf_decoder_t *d, double field_start, int parity,
     bool valid[RF_MAX_LINES], anchors[RF_MAX_LINES+1];
     int measured_count=0, burst_count=0;
     double nominal = d->p.line_us*5.0;
+    const bool laserdisc=rf_laserdisc(d);
     const bool svhs=d->profile==GUI_RF_PROFILE_PAL_SVHS || d->profile==GUI_RF_PROFILE_NTSC_SVHS;
     rf_svhs_scratch_t *scratch = d->svhs_scratch;
     rf_complex_t canonical[RF_MAX_LINES];
@@ -1466,8 +1491,12 @@ static bool rf_render_field(gui_rf_decoder_t *d, double field_start, int parity,
     }
     for (int y=0; y<rows; ++y)
         periods[y]=rf_clamp(lines[y+1]-lines[y], nominal*.8, nominal*1.2);
-    rf_prepare_luma_wow(d,periods,anchors,rows,nominal,luma_wow);
-    rf_prepare_display_levels(d);
+    if (laserdisc) {
+        for (int y=0; y<rows; ++y) luma_wow[y]=1.0;
+    } else {
+        rf_prepare_luma_wow(d,periods,anchors,rows,nominal,luma_wow);
+        rf_prepare_display_levels(d);
+    }
     if(svhs) rf_svhs_reverse_prepare(d,lines,periods,rows);
     bool color;
     if(rf_secam_fm(d)) {
@@ -1482,7 +1511,8 @@ static bool rf_render_field(gui_rf_decoder_t *d, double field_start, int parity,
         rf_complex_t total={0,0}; double envelope=0.0; int n=0;
         for (double at=start; at<end; at+=1.0) {
             rf_complex_t z=rf_color_at(d, lines[y], periods[y], field_start, line, at);
-            envelope+=rf_read(d,d->envelope,lines[y]+at+d->sync_luma_delay-d->sync_delay);
+            if (!laserdisc)
+                envelope+=rf_read(d,d->envelope,lines[y]+at+d->sync_luma_delay-d->sync_delay);
             total.re+=z.re; total.im+=z.im; n++;
         }
         if (n) { total.re/=n; total.im/=n; }
@@ -1492,7 +1522,10 @@ static bool rf_render_field(gui_rf_decoder_t *d, double field_start, int parity,
         /* Capture sources have different ADC scaling (12-bit MISRC versus
          * left-aligned DdD). Judge burst strength relative to RF amplitude,
          * so identical signals do not change hue/saturation with input gain. */
-        valid[y]=envelope>1e-7 && magnitudes[y]>envelope*.005;
+        /* LD chroma is already normalized in the demodulated IRE domain.
+         * Reject weak porches and spikes before burst-based gain. */
+        valid[y]=laserdisc ? magnitudes[y]>=.045 && magnitudes[y]<=.32
+                           : envelope>1e-7 && magnitudes[y]>envelope*.005;
         if (valid[y]) burst_count++;
     }
     /* VHS PAL heads use 0/-90 degrees per line; NTSC heads use -90/+90.
@@ -1507,7 +1540,7 @@ static bool rf_render_field(gui_rf_decoder_t *d, double field_start, int parity,
     }
     /* Beta uses 180/0 degrees per line rather than VHS NTSC +/-90.
      * Infer the recorded track from measured burst cadence, never parity. */
-    double track_step = d->p.beta_rotation ? (dot_sum<0.0 ? RF_PI : 0.0)
+    double track_step = laserdisc ? 0.0 : d->p.beta_rotation ? (dot_sum<0.0 ? RF_PI : 0.0)
         : d->format==GUI_RF_PAL ? (abs_dot>abs_cross ? -RF_PI*.5 : 0.0)
         : (cross_sum>=0.0 ? RF_PI*.5 : -RF_PI*.5);
     rf_complex_t common={0,0};
@@ -1520,12 +1553,13 @@ static bool rf_render_field(gui_rf_decoder_t *d, double field_start, int parity,
     double coherence=burst_count ? hypot(common.re,common.im)/burst_count : 0.0;
     color = burst_count>rows*3/4 && coherence>(d->format==GUI_RF_PAL ? .40 : .65);
     if (!color) rf_color_loss(d,burst_count<=rows*3/4
-        ? "insufficient valid color bursts" : "incoherent tape track/burst phase");
+        ? "insufficient valid color bursts" :
+          laserdisc ? "incoherent composite burst phase" : "incoherent tape track/burst phase");
     /* PAL's swinging burst alternates on every physical line. Infer the
      * field's actual sequence from valid measured bursts; a single damaged
      * burst must not reverse the recovered V component for the entire line. */
     int pal_switch_parity=0;
-    if(svhs && d->format==GUI_RF_PAL) {
+    if((svhs || laserdisc) && d->format==GUI_RF_PAL) {
         int votes=0,count=0;
         for(int y=0;y<rows;y++) if(valid[y]) {
             rf_complex_t aligned=rf_rotate(corrected[y],-common_phase);
@@ -1562,7 +1596,8 @@ static bool rf_render_field(gui_rf_decoder_t *d, double field_start, int parity,
         bool phase_supported=!svhs || phase_reference_valid[y];
         /* Burst normalization supplies the chroma AGC. Reject weak bursts;
          * suppress color on invalid lines instead of amplifying noise. */
-        gain[y]=valid[y] ? (150.0/700.0)/magnitudes[y] : 0.0;
+        double burst_reference=laserdisc && d->format==GUI_RF_NTSC ? .20 : 150.0/700.0;
+        gain[y]=valid[y] ? burst_reference/magnitudes[y] : 0.0;
         if (y>0 && valid[y] && valid[y-1]) gain[y]=gain[y]*.75+gain[y-1]*.25;
         if(svhs && valid[y]) {
             int phase_first=y>16 ? y-16 : 0,phase_last=y+16<rows ? y+16 : rows-1;
@@ -1676,7 +1711,7 @@ static bool rf_render_field(gui_rf_decoder_t *d, double field_start, int parity,
                  * We skip that upconversion, so recover V from -Im here.
                  * PAL uses its separately resolved swinging-burst basis. */
                 double imaginary=re*rotate_im+im*rotate_re;
-                v=imaginary*gain[y]*vswitch*(d->format==GUI_RF_NTSC ? -1.0 : 1.0);
+                v=imaginary*gain[y]*vswitch*(!laserdisc && d->format==GUI_RF_NTSC ? -1.0 : 1.0);
             }
             double next_re=rotate_re*step_re-rotate_im*step_im;
             rotate_im=rotate_im*step_re+rotate_re*step_im; rotate_re=next_re;
@@ -1885,6 +1920,8 @@ static void rf_commit_pulse_mode(gui_rf_decoder_t *d, double start, double end,
         if (d->candidate_v_run==3) d->status.vsync_candidates++;
     } else d->candidate_v_run=0;
     if (kind==RF_PULSE_H) {
+        /* LaserDisc contributes calibrated IRE; tape profiles contribute Hz. */
+        double level_tolerance=rf_laserdisc(d) ? 25.0 : 400000.0;
         if (d->last_h>0.0) {
             double step=start-d->last_h;
             if (fabs(step-nominal)<nominal*.12) {
@@ -1898,7 +1935,7 @@ static void rf_commit_pulse_mode(gui_rf_decoder_t *d, double start, double end,
                 blank+=rf_read(d,d->sync_luma,d->last_h+at+d->sync_luma_delay-d->sync_delay); n++;
             }
             blank/=n;
-            if (fabs(blank-d->blank_anchor)<400000.0)
+            if (fabs(blank-d->blank_anchor)<level_tolerance)
                 d->blank_est=d->blank_est*.99+blank*.01;
         }
         double tip=0.0; int n=0;
@@ -1906,7 +1943,7 @@ static void rf_commit_pulse_mode(gui_rf_decoder_t *d, double start, double end,
             tip+=rf_read(d,d->sync_luma,start+at+d->sync_luma_delay-d->sync_delay); n++;
         }
         tip/=n;
-        if (fabs(tip-d->sync_anchor)<400000.0) d->sync_est=d->sync_est*.99+tip*.01;
+        if (fabs(tip-d->sync_anchor)<level_tolerance) d->sync_est=d->sync_est*.99+tip*.01;
         d->previous_h=d->last_h;d->previous_h_width=d->last_h_width;
         d->last_h=start;d->last_h_width=us;
         /* Native SECAM's higher colour-under band can disturb the falling
@@ -2117,7 +2154,7 @@ void gui_rf_decoder_set_frame_mode(gui_rf_decoder_t *d, bool full_frame) {
 }
 
 void gui_rf_decoder_reset_profile(gui_rf_decoder_t *d, gui_rf_profile_t profile) {
-    if (!d || !rf_profile_valid(profile)) return;
+    if (!d || !rf_profile_valid(profile) || gui_rf_profile_is_audio_only(profile)) return;
     float *storage=d->storage;
     uint8_t *rgba=d->rgba;
     bool full_frame=d->full_frame;
@@ -2154,6 +2191,16 @@ void gui_rf_decoder_reset_profile(gui_rf_decoder_t *d, gui_rf_profile_t profile)
     d->sync_anchor=d->p.sync_hz;d->blank_anchor=d->p.blank_hz;
     d->display_blank_hz=d->p.blank_hz;d->display_hz_ire=d->p.hz_ire;
     d->luma_wow=1.0;
+    if (rf_laserdisc(d)) {
+        gui_ld_rf_demod_reset(&d->ld_demod,d->format==GUI_RF_NTSC ? GUI_LD_RF_NTSC : GUI_LD_RF_PAL);
+        d->luma_delay=gui_ld_rf_demod_luma_delay(&d->ld_demod);
+        d->chroma_delay=gui_ld_rf_demod_chroma_delay(&d->ld_demod);
+        d->sync_alpha=(float)exp(-2.0*RF_PI*500000.0/RF_VIDEO_RATE);
+        d->sync_delay=d->luma_delay+d->sync_alpha/(1.0-d->sync_alpha);
+        memset(d->rgba,0,(size_t)GUI_RF_FRAME_MAX_WIDTH*GUI_RF_FRAME_MAX_HEIGHT*4u);
+        snprintf(d->status.reason,sizeof(d->status.reason),"waiting for %s RF sync",gui_rf_profile_name(profile));
+        return;
+    }
     d->fm_center=d->p.fm_center;
     d->y_cos=d->c_cos=1.0;
     d->y_step_cos=cos(2.0*RF_PI*d->fm_center/d->raw_rate);
@@ -2282,7 +2329,7 @@ void gui_rf_decoder_reset(gui_rf_decoder_t *d, gui_rf_format_t format) {
 }
 
 gui_rf_decoder_t *gui_rf_decoder_create_profile(gui_rf_profile_t profile) {
-    if (!rf_profile_valid(profile)) return NULL;
+    if (!rf_profile_valid(profile) || gui_rf_profile_is_audio_only(profile)) return NULL;
     gui_rf_decoder_t *d=calloc(1,sizeof(*d));
     if (!d) return NULL;
     d->storage=calloc(RF_RING_SIZE*9u,sizeof(float));
@@ -2306,6 +2353,60 @@ void gui_rf_decoder_get_status(const gui_rf_decoder_t *d, gui_rf_decode_status_t
     if (status) { if (d) *status=d->status; else memset(status,0,sizeof(*status)); }
 }
 
+static inline void rf_process_sync(gui_rf_decoder_t *d, uint64_t pos,
+                                   gui_rf_frame_callback_t callback, void *context) {
+    if (!d->have_low) {
+        d->low_first=pos; d->have_low=true;
+        d->level_search_after=pos+RF_LEVEL_GRACE;
+    }
+    d->low_last=pos;
+    if (pos-d->low_first>=RF_RING_SIZE) d->low_first=pos-RF_RING_SIZE+1u;
+    if (pos-d->low_first<128u) { d->previous_sync=d->sync_y; return; }
+    double threshold=(d->sync_est+d->blank_est)*.5;
+    bool low=d->sync_y<threshold;
+    if (low && !d->in_pulse) {
+        double delta=d->sync_y-d->previous_sync;
+        double f=fabs(delta)>1e-9 ? (threshold-d->previous_sync)/delta : 1.0;
+        d->pulse_start=(double)pos-1.0+rf_clamp(f,0,1);
+        d->in_pulse=true;
+    } else if (!low && d->in_pulse) {
+        double delta=d->sync_y-d->previous_sync;
+        double f=fabs(delta)>1e-9 ? (threshold-d->previous_sync)/delta : 1.0;
+        rf_commit_pulse(d,d->pulse_start,(double)pos-1.0+rf_clamp(f,0,1),callback,context);
+        d->in_pulse=false;
+    }
+    if (d->last_h>0.0 && (double)pos-d->last_h>d->period*40.0)
+        rf_reacquire_sync(d);
+    d->previous_sync=d->sync_y;
+}
+
+static void rf_process_laserdisc(gui_rf_decoder_t *d, const float *samples, size_t count,
+                                 uint64_t first_sample, gui_rf_frame_callback_t callback,
+                                 void *context) {
+    float luma[256],chroma_i[256],chroma_q[256];
+    const size_t block_size=GUI_LD_RF_DECIMATION*(sizeof(luma)/sizeof(luma[0]));
+    for (size_t offset=0; offset<count; offset+=block_size) {
+        size_t block=count-offset;
+        if (block>block_size) block=block_size;
+        uint64_t first=first_sample+offset;
+        size_t produced=gui_ld_rf_demod_process(&d->ld_demod,samples+offset,block,first,
+            luma,chroma_i,chroma_q,sizeof(luma)/sizeof(luma[0]));
+        uint64_t pos=first/GUI_LD_RF_DECIMATION+(first%GUI_LD_RF_DECIMATION!=0u);
+        for (size_t n=0; n<produced; ++n,++pos) {
+            unsigned at=(unsigned)(pos&RF_RING_MASK);
+            d->sync_y=d->sync_alpha*d->sync_y+(1.0f-d->sync_alpha)*luma[n];
+            d->luma[at]=luma[n];
+            d->sync[at]=d->sync_y;
+            d->sync_luma[at]=luma[n];
+            /* Composite U*sin + V*cos yields V-iU under e^-i(wt).
+             * Rotate into the common renderer's U+iV basis. */
+            d->ci[at]=-chroma_q[n];
+            d->cq[at]=chroma_i[n];
+            rf_process_sync(d,pos,callback,context);
+        }
+    }
+}
+
 void gui_rf_decoder_process(gui_rf_decoder_t *d, const float *samples, size_t count,
                             uint64_t first_sample, gui_rf_frame_callback_t callback,
                             void *context) {
@@ -2315,6 +2416,10 @@ void gui_rf_decoder_process(gui_rf_decoder_t *d, const float *samples, size_t co
         snprintf(d->status.reason,sizeof(d->status.reason),"RF gap; reacquiring sync");
     }
     d->have_raw=true; d->next_raw=first_sample+count;
+    if (rf_laserdisc(d)) {
+        rf_process_laserdisc(d,samples,count,first_sample,callback,context);
+        return;
+    }
     const bool ed=d->profile==GUI_RF_PROFILE_NTSC_ED_BETA;
     const bool svhs=d->profile==GUI_RF_PROFILE_PAL_SVHS || d->profile==GUI_RF_PROFILE_NTSC_SVHS;
     /* 20M -> 5M uses an absolute four-phase schedule.
@@ -2484,29 +2589,7 @@ void gui_rf_decoder_process(gui_rf_decoder_t *d, const float *samples, size_t co
         } else {d->ci[at]=ci;d->cq[at]=cq;}
         d->envelope[at]=(ed || d->profile==GUI_RF_PROFILE_MESECAM_VHS)
             ? rf_mesecam_magnitude(yi,yq) : hypotf(yi,yq);
-        if (!d->have_low) {
-            d->low_first=pos; d->have_low=true;
-            d->level_search_after=pos+RF_LEVEL_GRACE;
-        }
-        d->low_last=pos;
-        if (pos-d->low_first>=RF_RING_SIZE) d->low_first=pos-RF_RING_SIZE+1u;
-        if (pos-d->low_first<128u) { d->previous_sync=d->sync_y; continue; }
-        double threshold=(d->sync_est+d->blank_est)*.5;
-        bool low=d->sync_y<threshold;
-        if (low && !d->in_pulse) {
-            double delta=d->sync_y-d->previous_sync;
-            double f=fabs(delta)>1e-9 ? (threshold-d->previous_sync)/delta : 1.0;
-            d->pulse_start=(double)pos-1.0+rf_clamp(f,0,1);
-            d->in_pulse=true;
-        } else if (!low && d->in_pulse) {
-            double delta=d->sync_y-d->previous_sync;
-            double f=fabs(delta)>1e-9 ? (threshold-d->previous_sync)/delta : 1.0;
-            rf_commit_pulse(d,d->pulse_start,(double)pos-1.0+rf_clamp(f,0,1),callback,context);
-            d->in_pulse=false;
-        }
-        if (d->last_h>0.0 && (double)pos-d->last_h>d->period*40.0)
-            rf_reacquire_sync(d);
-        d->previous_sync=d->sync_y;
+        rf_process_sync(d,pos,callback,context);
     }
 #if GUI_RF_PACKED_IQ
     if(ed) {

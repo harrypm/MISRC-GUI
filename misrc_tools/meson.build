@@ -300,7 +300,7 @@ else
   message('libusb-1.0 not found, building without FX3 support')
 endif
 
-# DdD (DomesdayDuplicator) support (optional, uses libusb on all platforms)
+# DdD uses libusb for enumeration and the portable capture backend.
 ddd_enabled = false
 if libusb_common_dep.found()
   if not libusb_common_dep_added
@@ -319,7 +319,7 @@ endif
 # The RTL-SDR raw I/Q backend (gui_rtlsdr.c) is only compiled when librtlsdr
 # is found; the device-agnostic Demod panel (gui_demod.c) is always compiled.
 rtlsdr_enabled = false
-rtlsdr_pc = dependency('librtlsdr', required : false, static: windows_static_deps)
+rtlsdr_pc = dependency('librtlsdr', required: get_option('rtlsdr'), static: windows_static_deps)
 if rtlsdr_pc.found()
   if not libusb_common_dep_added
     # librtlsdr needs libusb-1.0 at link time on Windows static builds.
@@ -435,12 +435,24 @@ rf_preview_sources = [
   'misrc_gui/signal/gui_rf_preview.c',
   'misrc_gui/signal/gui_ld_rf_demod.c',
 ]
+a52_python = find_program('python3', 'python', native: true)
+dependency_fetcher = files('../scripts/fetch-patched-dependency.py')
+a52_decoder = custom_target('a52_decoder',
+  output: ['bit_allocate.c', 'bitstream.c', 'imdct.c', 'parse.c', 'downmix.c',
+           'a52.h', 'a52_internal.h', 'bitstream.h', 'config.h', 'mm_accel.h', 'tables.h'],
+  depend_files: files('../third_party/liba52/misrc.patch'),
+  command: [a52_python, dependency_fetcher, 'liba52', '@PRIVATE_DIR@', '--decoder-files', '@OUTPUT@'],
+)
 rf_audio_sources = [
   'misrc_gui/signal/gui_vhs_hifi.c',
   'misrc_gui/signal/gui_ld_rf_analog.c',
   'misrc_gui/signal/gui_ld_rf_digital.c',
   'misrc_gui/signal/gui_ld_efm_frontend.c',
-]
+  'misrc_gui/signal/gui_ld_rf_ac3.c',
+  'misrc_gui/signal/gui_ld_ac3_rf.c',
+  'misrc_gui/signal/gui_ld_ac3_frames.c',
+  'misrc_gui/signal/gui_ld_ac3_codec.c',
+] + [a52_decoder]
 
 # GUI application (requires raylib)
 raylib_dep = dependency('raylib', required: false, static: windows_static_deps)
@@ -544,6 +556,7 @@ if raylib_dep.found()
   endif
 
   # Add DdD support to GUI if available
+  ddd_winusb_enabled = false
   if ddd_enabled
     sources_gui += 'common/ddd_protocol.c'
     sources_gui += 'misrc_gui/input/gui_ddd.c'
@@ -551,6 +564,14 @@ if raylib_dep.found()
     sources_gui += 'misrc_gui/input/gui_ddd_async.c'
     sources_gui += 'misrc_gui/input/gui_ddd_clockgen.c'
     sources_gui += 'misrc_gui/ui/gui_ddd_fifo_status.c'
+    if host_system == 'windows' and libusb_common_dep.version().version_compare('>=1.0.30')
+      sources_gui += ['misrc_gui/input/gui_ddd_winusb_device.c',
+                      'misrc_gui/input/gui_ddd_winusb_io.c']
+      ddd_winusb_enabled = true
+      message('Building the native WinUSB DdD backend alongside libusb')
+    elif host_system == 'windows'
+      message('Native WinUSB DdD needs libusb 1.0.30 or newer for device identity')
+    endif
   endif
 
   # Add RTL-SDR support to GUI if available
@@ -635,6 +656,9 @@ if raylib_dep.found()
     '-ftree-vectorize',       # Enable auto-vectorization
     '-ffast-math',            # Fast floating-point (safe for video/audio processing)
   ]
+  if ddd_winusb_enabled
+    gui_cflags += ['-DENABLE_DDD_WINUSB=1']
+  endif
   # Keep rlgl.h and phosphor shader syntax consistent with the vendored raylib
   # OpenGL 2.1 build on Linux ARM64. Other platforms retain their existing path.
   if host_system == 'linux' and host_cpu_family == 'aarch64'
@@ -652,6 +676,9 @@ if raylib_dep.found()
     # MSYS2 install list does not include, so the flag breaks the link with
     # "cannot find -l:libglfw3.dll.a". OpenGL/GDI/winmm are still required.
     gui_ldflags += ['-lopengl32', '-lgdi32', '-lwinmm']
+    if ddd_winusb_enabled
+      gui_ldflags += ['-lwinusb', '-lcfgmgr32']
+    endif
     # RTL-SDR: link the static archive by filename (MSYS2 names it
     # librtlsdr_static.a; the .pc -lrtlsdr resolves to the DLL import lib
     # which -static rejects), with the .pc's OWN libdir on the search path:
@@ -660,8 +687,8 @@ if raylib_dep.found()
     # while the GUI builds with the ucrt64 toolchain for CI parity) - ld's
     # default search path only covers the compiler's own environment, so
     # the by-filename archive link failed with "cannot find
-    # -l:librtlsdr_static.a". CI is unaffected (it installs no rtlsdr:
-    # RTLSDR stays disabled there).
+    # -l:librtlsdr_static.a". Release builds use the archive built for
+    # their own toolchain in the job's dependency prefix.
     if rtlsdr_enabled
       gui_ldflags += ['-l:librtlsdr_static.a']
       rtlsdr_libdir = rtlsdr_pc.get_variable(pkgconfig : 'libdir', default_value : '')
@@ -941,7 +968,7 @@ if raylib_dep.found()
     )
     test('gui_rf_input_stamps', rf_input_stamps_test)
     rf_routes_test = executable('gui_rf_routes_test',
-      'test/gui_rf_routes_test.c',
+      ['test/gui_rf_routes_test.c', 'misrc_gui/signal/gui_vhs_hifi.c'],
       dependencies: overlay_test_deps + [dependency('threads')],
       include_directories: gui_includes,
       c_args: gui_cflags,
@@ -1033,7 +1060,7 @@ if raylib_dep.found()
 
       # Manual exact-media integration: requires one second of 20 MHz NTSC
       # s16le RF and an output directory, so it is not a default CI test.
-      rf_reconnect_sources = [
+      rf_reconnect_sources = rf_preview_sources + rf_audio_sources + [
         'test/gui_rf_playback_reconnect_test.c', 'test/gui_playback_audio_stub.c',
         'test/monitor_local_save_stub.c',
         'common/file_utils.c',
@@ -1044,7 +1071,6 @@ if raylib_dep.found()
         'common/rb_event.c', 'common/buffer_manager.c',
         'misrc_gui/processing/gui_rf_stream_marks.c',
         'misrc_gui/signal/gui_vhs_fm.c',
-        'misrc_gui/signal/gui_rf_preview.c',
         'misrc_gui/signal/gui_rf_resampler.c',
         'misrc_gui/processing/gui_rf_preview_worker.c', 'misrc_gui/signal/gui_beta_hifi.c',
         'misrc_gui/processing/gui_rf_preview_policy.c',
@@ -1103,23 +1129,27 @@ if soxr_dep.found()
 endif
 rf_test_cflags = cflags + ['-O3', '-ffast-math', '-funroll-loops', '-ftree-vectorize']
 rf_decoder_test = executable('gui_rf_preview_test',
-  ['test/gui_rf_preview_test.c', 'misrc_gui/signal/gui_rf_preview.c'],
+  rf_preview_sources + ['test/gui_rf_preview_test.c'],
   dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
 test('gui_rf_preview', rf_decoder_test, timeout: 120)
 test('gui_rf_svhs', rf_decoder_test, args: ['--svhs-only'], timeout: 90)
 test('gui_rf_svhs_color', rf_decoder_test, args: ['--svhs-color-only'], timeout: 90)
 test('gui_rf_svhs_stripe', rf_decoder_test, args: ['--svhs-stripe-only'], timeout: 30)
+test('gui_rf_laserdisc', rf_decoder_test, args: ['--laserdisc-only'], timeout: 30)
+ld_ac3_frames_test = executable('gui_ld_ac3_frames_test',
+  ['test/gui_ld_ac3_frames_test.c', 'misrc_gui/signal/gui_ld_ac3_frames.c'],
+  c_args: cflags, link_args: ldflags)
+test('gui_ld_ac3_frames', ld_ac3_frames_test)
 rf_secam_test = executable('gui_rf_secam_test',
-  ['test/gui_rf_secam_test.c', 'misrc_gui/signal/gui_rf_preview.c'],
+  rf_preview_sources + ['test/gui_rf_secam_test.c'],
   dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
 test('gui_rf_secam', rf_secam_test, timeout: 60)
 rf_mesecam_test = executable('gui_rf_mesecam_test',
-  ['test/gui_rf_mesecam_test.c', 'misrc_gui/signal/gui_rf_preview.c'],
+  rf_preview_sources + ['test/gui_rf_mesecam_test.c'],
   dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
 test('gui_rf_mesecam', rf_mesecam_test, timeout: 180)
 rf_testgen_test = executable('gui_testgen_rf_test',
-  ['test/gui_testgen_rf_test.c', 'misrc_gui/signal/gui_rf_preview.c',
-   'misrc_gui/signal/gui_testgen.c'],
+  rf_preview_sources + ['test/gui_testgen_rf_test.c', 'misrc_gui/signal/gui_testgen.c'],
   dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
 test('gui_testgen_rf', rf_testgen_test, timeout: 120)
 rf_resampler_test = executable('gui_rf_resampler_test',
@@ -1127,22 +1157,23 @@ rf_resampler_test = executable('gui_rf_resampler_test',
   dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
 test('gui_rf_resampler', rf_resampler_test)
 rf_worker_test = executable('gui_rf_preview_worker_test',
-  ['test/gui_rf_preview_worker_test.c', 'misrc_gui/processing/gui_rf_preview_worker.c',
+  rf_audio_sources + ['test/gui_rf_preview_worker_test.c', 'misrc_gui/processing/gui_rf_preview_worker.c',
    'misrc_gui/processing/gui_rf_preview_policy.c'],
   dependencies: [dependency('threads'), meson.get_compiler('c').find_library('m', required: false)], c_args: cflags, link_args: ldflags)
 test('gui_rf_preview_worker', rf_worker_test)
 if host_machine.system() == 'windows'
   rf_handoff_test = executable('gui_rf_preview_handoff_test',
-    ['test/gui_rf_preview_handoff_test.c', 'misrc_gui/processing/gui_rf_preview_policy.c'],
-    dependencies: [dependency('threads')], c_args: cflags, link_args: ldflags)
+    rf_audio_sources + ['test/gui_rf_preview_handoff_test.c', 'misrc_gui/processing/gui_rf_preview_policy.c'],
+    dependencies: [dependency('threads'), meson.get_compiler('c').find_library('m', required: false)],
+    c_args: cflags, link_args: ldflags)
   test('gui_rf_preview_handoff', rf_handoff_test)
   rf_idle_cpu_probe = executable('gui_rf_preview_idle_cpu_probe',
-    ['test/gui_rf_preview_idle_cpu_probe.c', 'misrc_gui/processing/gui_rf_preview_policy.c'],
+    rf_audio_sources + ['test/gui_rf_preview_idle_cpu_probe.c', 'misrc_gui/processing/gui_rf_preview_policy.c'],
     dependencies: [dependency('threads')], c_args: rf_test_cflags, link_args: ldflags)
   test('gui_rf_preview_idle_cpu', rf_idle_cpu_probe)
 endif
 rf_file_harness = executable('gui_rf_preview_file',
-  ['test/gui_rf_preview_file.c', 'misrc_gui/signal/gui_rf_preview.c',
+  rf_preview_sources + rf_audio_sources + ['test/gui_rf_preview_file.c',
    'misrc_gui/signal/gui_rf_resampler.c', 'misrc_gui/processing/gui_rf_preview_worker.c', 'misrc_gui/signal/gui_beta_hifi.c',
    'misrc_gui/processing/gui_rf_preview_policy.c'],
   dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
@@ -1166,9 +1197,9 @@ if flac_dep.found()
                        meson.get_compiler('c').find_library('onecore')]
   endif
   rf_record_harness = executable('gui_rf_preview_record_load',
-    ['test/gui_rf_preview_record_load.c', 'common/buffer_manager.c',
+    rf_preview_sources + rf_audio_sources + ['test/gui_rf_preview_record_load.c', 'common/buffer_manager.c',
      'common/ringbuffer.c', 'common/rb_event.c', 'common/flac_writer.c',
-     'misrc_gui/signal/gui_rf_preview.c', 'misrc_gui/signal/gui_rf_resampler.c',
+     'misrc_gui/signal/gui_rf_resampler.c',
      'misrc_gui/processing/gui_rf_preview_worker.c', 'misrc_gui/signal/gui_beta_hifi.c',
      'misrc_gui/processing/gui_rf_preview_policy.c',
      'misrc_gui/processing/gui_rf_preview_pressure.c'],

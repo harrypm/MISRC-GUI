@@ -52,6 +52,16 @@ void gui_audio_reset_playback_queue(void);
 // unique until the previous producer has stopped. Source selection flushes
 // queued PCM and the existing output stream on the next playback update.
 void gui_audio_set_hifi_source(const void *source);
+/* Packet audio needs a larger queue and a short prefill before playback. */
+void gui_audio_set_hifi_source_mode(const void *source, bool burst_audio);
+typedef enum {
+    GUI_AUDIO_RF_HIFI,
+    GUI_AUDIO_RF_LD,
+    GUI_AUDIO_RF_LD_TIMED,
+} gui_audio_rf_mode_t;
+/* Both LD file playback modes track full mixer periods for tail drain.
+ * The timed mode also uses the RF timeline to synchronize at 1x. */
+void gui_audio_set_rf_source(const void *source, bool burst_audio, gui_audio_rf_mode_t mode);
 const void *gui_audio_get_hifi_source(void);
 
 // Interleaved stereo float PCM at exactly 48 kHz, nominal range [-1, +1].
@@ -61,6 +71,28 @@ const void *gui_audio_get_hifi_source(void);
 // capture is stopped or before its first pump are ignored.
 // Overflow keeps the newest 85 ms; NaN/Inf mute.
 void gui_audio_push_hifi(const void *source, const float *stereo_48k, size_t frames);
+/* Timed LD uses the exclusive PCM block end on the 20 MSPS RF axis. */
+void gui_audio_push_rf(const void *source, const float *stereo_48k, size_t frames,
+                       uint64_t end_sample);
+/* Recheck the producer's current stream generation while the queue is locked. */
+void gui_audio_push_rf_checked(const void *source, const float *stereo_48k, size_t frames,
+                              uint64_t end_sample, bool (*current)(const void *source));
+/* LD worker only. Retry a busy queue even before EOF is known, and abandon
+ * the push if the source or its producer generation is no longer current. */
+void gui_audio_push_ld(const void *source, const float *stereo_48k, size_t frames,
+                       uint64_t end_sample, bool (*current)(const void *source));
+/* Estimate the current media position from the device callback, bounded by
+ * the PCM actually consumed. False when muted, unprimed or discontinuous. */
+bool gui_audio_get_ld_position(const void *source, uint64_t *sample);
+/* True after the GUI pump failed to open the current monitor output.
+ * A new monitor epoch remains eligible until the pump has tried it. GUI thread only. */
+bool gui_audio_rf_output_unavailable(void);
+/* The current LD output has a known mixed horizon or recent unfinished
+ * PCM work. Safe on the playback thread; stale work loses protection. */
+bool gui_audio_ld_tail_pending(void);
+/* Once the selected producer has finished, release short queued audio and
+ * report completion after playback or when no output can open. GUI thread only. */
+bool gui_audio_finish_rf_source(const void *source);
 
 // Notify a selected producer discontinuity. Safe on the worker thread; device
 // flushing happens later on the main thread. Other producers cannot reset it.

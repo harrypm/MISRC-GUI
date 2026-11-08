@@ -27,6 +27,10 @@ bool gui_rf_resampler_process(gui_rf_resampler_t *resampler,
                               const int16_t *input, size_t input_count,
                               float *output, size_t output_capacity,
                               size_t *output_count);
+/* Drain delayed output at EOF. Call again if the output buffer filled.
+ * Reset before processing a new input stream. */
+bool gui_rf_resampler_finish(gui_rf_resampler_t *resampler, float *output,
+                             size_t output_capacity, size_t *output_count);
 /* Signal alignment delay in the selected output-rate samples. This excludes buffered
  * availability latency, which the worker measures from its output cursor. */
 double gui_rf_resampler_delay_samples(const gui_rf_resampler_t *resampler);

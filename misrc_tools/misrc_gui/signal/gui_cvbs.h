@@ -584,6 +584,9 @@ void gui_cvbs_get_secam_diag(cvbs_decoder_t *decoder,
 void gui_video_update_rf_routes(gui_app_t *app);
 // Continuous RF input from extraction; samples are copied into bounded workers.
 #include "../processing/gui_rf_preview_worker.h"
+void gui_video_reset_rtlsdr(gui_app_t *app);
+void gui_video_submit_rtlsdr(gui_app_t *app, const uint8_t *iq, size_t count,
+                             const gui_rf_block_info_t *info);
 void gui_video_submit_rf(gui_app_t *app, const int16_t *samples_a, const int16_t *samples_b,
                           size_t count_a, size_t count_b, const gui_rf_block_info_t info[2],
                           bool input_supported);

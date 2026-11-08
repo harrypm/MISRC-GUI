@@ -1,9 +1,10 @@
-/* Synthetic RF contract tests, not a claim of tape/hardware qualification.
- * The fixture is FM luma plus VHS color-under, including sync/equalizing
- * cadence, PAL V-switch, alternating recording-head line rotation, and a
- * warped tape time axis. It never feeds decoded RGB/YUV to the decoder. */
+/* Synthetic RF contract tests. The tape fixture includes FM luma, color-under,
+ * sync/equalizing cadence, PAL V-switch, recording-head line rotation, and a
+ * warped tape time axis. LaserDisc uses positive FM of composite video.
+ * The fixtures never feed decoded RGB/YUV to the decoder. */
 #include "../misrc_gui/signal/gui_rf_preview.h"
 #include "../misrc_gui/signal/gui_rf_preview_filters.h"
+#include "../misrc_gui/signal/gui_ld_rf_demod.h"
 #include <assert.h>
 #include <float.h>
 #include <math.h>
@@ -176,7 +177,9 @@ static float *make_rf_signal_profile(gui_rf_profile_t profile, double jitter_us,
                             double clock_scale, int damaged_field,
                             test_vertical_t vertical_case, test_quality_t *quality,
                             size_t *length) {
-    bool pal=profile==GUI_RF_PROFILE_PAL_VHS || profile==GUI_RF_PROFILE_PAL_SVHS;
+    bool pal=profile==GUI_RF_PROFILE_PAL_VHS || profile==GUI_RF_PROFILE_PAL_SVHS ||
+        profile==GUI_RF_PROFILE_PAL_LASERDISC;
+    const bool laserdisc=profile==GUI_RF_PROFILE_PAL_LASERDISC || profile==GUI_RF_PROFILE_NTSC_LASERDISC;
     const bool svhs=profile==GUI_RF_PROFILE_PAL_SVHS || profile==GUI_RF_PROFILE_NTSC_SVHS;
     const bool ed=profile==GUI_RF_PROFILE_NTSC_ED_BETA;
     bool superbeta=profile==GUI_RF_PROFILE_NTSC_SUPERBETA || profile==GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI;
@@ -188,6 +191,13 @@ static float *make_rf_signal_profile(gui_rf_profile_t profile, double jitter_us,
     double blank=beta ? (hifi ? 4200000.0 : 3942857.1428571427) : pal ? 4100000.0 : 3685714.2857142854;
     double sync=beta ? (hifi ? 3800000.0 : 3600000.0) : pal ? 3800000.0 : 3400000.0;
     double hz_ire=beta ? (hifi ? 10000.0 : 8571.42857142857) : pal ? 7000.0 : 7142.857142857143;
+    if(laserdisc) {
+        /* IEC 60856 §9.2: 7.1 MHz blanking and 800 kHz blank-to-white.
+         * IEC 60857 §9.2: 8.1 MHz blanking and 1.7 MHz sync-to-white. */
+        blank=pal ? 7100000.0 : 8100000.0;
+        hz_ire=pal ? 8000.0 : 1700000.0/140.0;
+        sync=blank-(pal ? 300.0/7.0 : 40.0)*hz_ire;
+    }
     if(svhs) {
         /* Physical S-VHS endpoints are 5.4MHz sync and 7.0MHz white.
          * PAL's -300mV sync is below its 0..700mV active range; NTSC uses
@@ -211,6 +221,18 @@ static float *make_rf_signal_profile(gui_rf_profile_t profile, double jitter_us,
     }
     double burst_start=pal ? 5.6 : 5.3, burst_end=pal ? 7.85 : 7.8;
     double active_start=pal ? 10.5 : 9.45, active_end=pal ? 62.5 : 62.55555555555556;
+    double ld_color_step=0.0,ld_color_gain=0.0,ld_color_lead=0.0;
+    if (laserdisc && with_chroma) {
+        double subcarrier=pal ? 4433618.75 : 3579545.4545454546;
+        double omega=2.0*TEST_PI*subcarrier;
+        /* IEC 60856 Figure 12 and IEC 60857 Figure 9 define the recording
+         * shelf (1+j*w*t1)/(1+j*w*t2). Evaluate at the fixture's color
+         * subcarrier before FM. Constant luminance plateaus have unity gain. */
+        double t1=pal ? 400e-9 : 320e-9,t2=pal ? 100e-9 : 120e-9;
+        ld_color_step=omega*1e-6;
+        ld_color_gain=hypot(1.0,omega*t1)/hypot(1.0,omega*t2);
+        ld_color_lead=atan(omega*t1)-atan(omega*t2);
+    }
     int eq_count=pal ? 5 : 6;
     int field_count=quality ? quality->fields : 6;
     assert(field_count>=6 && field_count<=16);
@@ -431,6 +453,20 @@ static float *make_rf_signal_profile(gui_rf_profile_t profile, double jitter_us,
             physical_sync=quality->fm_sync_after_hz;
             physical_hz_ire=quality->fm_hz_per_ire_after;
         }
+        if (laserdisc && with_chroma) {
+            /* LaserDisc records composite C inside the FM deviation. Use a
+             * continuous broadcast subcarrier and physical PAL line order. */
+            bool burst=local_us>=vertical_end && within>=burst_start && within<burst_end;
+            if (burst) {
+                u=pal ? -.15 : -.20;
+                v=pal ? .15 : 0.0;
+            }
+            if (burst || active) {
+                int v_sign=pal && ((starts[field]+line)&1) ? -1 : 1;
+                double phase=ld_color_step*ideal_us+.37+ld_color_lead;
+                luminance+=ld_color_gain*(u*sin(phase)+v_sign*v*cos(phase));
+            }
+        }
         double frequency=sync_pulse ? physical_sync : physical_blank+100.0*physical_hz_ire*luminance;
         if (quality) {
             /* Only ordinary-line sync-tip/back-porch windows are corrupted.
@@ -453,18 +489,24 @@ static float *make_rf_signal_profile(gui_rf_profile_t profile, double jitter_us,
              * SuperBeta levels may remove the initial recording offset. */
             frequency+=quality->carrier_offset_hz;
         }
-        double base=frequency-physical_blank;
-        double pre=ed ? base : beta ? shelf[0]*base+shelf[1]*previous_base+shelf[2]*previous2_base
-            -shelf[3]*previous_pre-shelf[4]*previous2_pre
-            : b0*base+b1*previous_base-a1*previous_pre;
-        previous2_base=previous_base;previous2_pre=previous_pre;
-        previous_base=base; previous_pre=pre;
-        frequency=ed ? clamp_value(physical_blank+pre,6000000.0,11000000.0)
-            : svhs ? clamp_value(physical_blank+pre,3000000.0,9600000.0)
-            : clamp_value(physical_blank+pre,2400000.0,6800000.0);
+        if (!laserdisc) {
+            double base=frequency-physical_blank;
+            double pre=ed ? base : beta ? shelf[0]*base+shelf[1]*previous_base+shelf[2]*previous2_base
+                -shelf[3]*previous_pre-shelf[4]*previous2_pre
+                : b0*base+b1*previous_base-a1*previous_pre;
+            previous2_base=previous_base;previous2_pre=previous_pre;
+            previous_base=base; previous_pre=pre;
+            frequency=ed ? clamp_value(physical_blank+pre,6000000.0,11000000.0)
+                : svhs ? clamp_value(physical_blank+pre,3000000.0,9600000.0)
+                : clamp_value(physical_blank+pre,2400000.0,6800000.0);
+        }
         fm_phase+=2.0*TEST_PI*frequency*(ideal_us-previous_ideal_us)*1e-6;
         previous_ideal_us=ideal_us;
         if (fm_phase>2.0*TEST_PI) fm_phase=fmod(fm_phase,2.0*TEST_PI);
+        if (laserdisc) {
+            rf[n]=(float)(.72*cos(fm_phase));
+            continue;
+        }
         int vswitch=pal && (line&1) ? -1 : 1;
         bool color_burst=local_us>=vertical_end && within>=burst_start && within<burst_end;
         double burst_phase_noise=0.0;
@@ -1688,7 +1730,8 @@ static void run_superbeta_contracts(void) {
     assert(!gui_rf_profile_has_hifi((gui_rf_profile_t)1000));
     for(int profile=GUI_RF_PROFILE_PAL_VHS;profile<GUI_RF_PROFILE_COUNT;++profile) {
         bool expected=profile==GUI_RF_PROFILE_NTSC_BETAMAX_HIFI ||
-                      profile==GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI || profile==GUI_RF_PROFILE_NTSC_ED_BETA;
+                      profile==GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI || profile==GUI_RF_PROFILE_NTSC_ED_BETA ||
+                      profile==GUI_RF_PROFILE_NTSC_VHS_HIFI || profile==GUI_RF_PROFILE_PAL_VHS_HIFI;
         assert(gui_rf_profile_has_hifi((gui_rf_profile_t)profile)==expected);
     }
     assert(gui_rf_profile_format(GUI_RF_PROFILE_NTSC_SUPERBETA)==GUI_RF_NTSC);
@@ -1766,8 +1809,8 @@ static void run_superbeta_contracts(void) {
     free(reference);free(frames.rgba);gui_rf_decoder_destroy(decoder);
 }
 
-/* ED/S-VHS input positions are 20 MSPS; publication stays on the common 20 MSPS
- * clock. Compare every woven RGBA frame across input partitions. */
+/* 20 MSPS input and frame positions. Compare every woven RGBA frame across
+ * input partitions. */
 typedef struct {
     test_frames_t frame;
     uint64_t ends[16], hashes[16];
@@ -1792,6 +1835,170 @@ static void process_ed_chunks(gui_rf_decoder_t *decoder,const float *rf,size_t l
         gui_rf_decoder_process(decoder,rf+position,count,origin+position,receive_ed_frame,sequence);
         position+=count;
     }
+}
+
+static void check_laserdisc_color(const test_frames_t *f,const char *name) {
+    assert(f->frames>=2 && f->status.h_locked && f->status.v_locked && f->status.color_locked);
+    double min_gain=DBL_MAX,max_hue_error=0.0;
+    /* Average each PAL line phase separately so reversing every other line
+     * cannot cancel the V error in a whole-field mean. Both NTSC subsets
+     * should carry the same hue within each source field and patch. */
+    for (int parity=0;parity<2;++parity) for (int region=0;region<2;++region) {
+        double target_u,target_v;
+        quality_uv_target(parity,region!=0,&target_u,&target_v);
+        int center=region ? f->width*3/4 : f->width/4;
+        for (int line_phase=0;line_phase<2;++line_phase) {
+            double rgb[3]={0};
+            int count=0;
+            for (int y=40+parity+2*line_phase;y<f->height-40;y+=4)
+                for (int x=center-8;x<=center+8;++x) {
+                    const uint8_t *pixel=f->rgba+((size_t)y*f->width+x)*4u;
+                    for (int c=0;c<3;++c) rgb[c]+=pixel[c];
+                    ++count;
+                }
+            for (int c=0;c<3;++c) rgb[c]/=255.0*count;
+            double y=.299*rgb[0]+.587*rgb[1]+.114*rgb[2];
+            double u=.492*(rgb[2]-y),v=.877*(rgb[0]-y);
+            double gain=(u*target_u+v*target_v)/(target_u*target_u+target_v*target_v);
+            double hue_error=fabs(atan2(v*target_u-u*target_v,u*target_u+v*target_v));
+            if (gain<.30 || hue_error>TEST_PI/6 || fabs(y-display_level(.5))>.09)
+                fprintf(stderr,"%s field %d patch %d line phase %d: Y %.3f UV %.3f/%.3f, target %.3f/%.3f\n",
+                        name,parity,region,line_phase,y,u,v,target_u,target_v);
+            assert(gain>=.30 && hue_error<=TEST_PI/6 && fabs(y-display_level(.5))<=.09);
+            min_gain=fmin(min_gain,gain);
+            max_hue_error=fmax(max_hue_error,hue_error);
+        }
+    }
+    printf("%s composite FM color: minimum UV gain %.3f, max hue error %.1f deg\n",
+           name,min_gain,max_hue_error*180.0/TEST_PI);
+}
+
+static void check_laserdisc_partitions(const test_ed_sequence_t *reference,const test_ed_sequence_t *partition) {
+    assert(partition->frame.frames==reference->frame.frames);
+    for (int frame=0;frame<reference->frame.frames;++frame) {
+        assert(partition->ends[frame]==reference->ends[frame]);
+        assert(partition->hashes[frame]==reference->hashes[frame]);
+    }
+}
+
+/* Measure a steady 4 IRE tone on 50 IRE gray. Synthesize the IEC FM and
+ * recording pre-emphasis at 40 MSPS, then low-pass and decimate to 20 MSPS.
+ * This isolates luma transfer and aliasing from the separate field fixture. */
+static double laserdisc_luma_tone(bool pal,double tone_hz) {
+    enum { SOURCE_RATE=40000000, SOURCE_COUNT=12000, FIR_HALF=32,
+           RF_COUNT=SOURCE_COUNT/2, LUMA_COUNT=RF_COUNT/GUI_LD_RF_DECIMATION };
+    float source[SOURCE_COUNT+2*FIR_HALF],rf[RF_COUNT];
+    float luma[LUMA_COUNT],ci[LUMA_COUNT],cq[LUMA_COUNT];
+    const double hz_ire=pal ? 8000.0 : 1700000.0/140.0;
+    const double carrier=(pal ? 7100000.0 : 8100000.0)+50.0*hz_ire;
+    const double w=2.0*TEST_PI*tone_hz,t1=pal ? 400e-9 : 320e-9,t2=pal ? 100e-9 : 120e-9;
+    const double lead=atan(w*t1)-atan(w*t2);
+    const double index=4.0*hz_ire*hypot(1.0,w*t1)/(tone_hz*hypot(1.0,w*t2));
+    for (int n=-FIR_HALF;n<SOURCE_COUNT+FIR_HALF;++n) {
+        double t=(double)n/SOURCE_RATE;
+        source[n+FIR_HALF]=(float)(.72*cos(2.0*TEST_PI*carrier*t+index*sin(w*t+lead)+.37));
+    }
+    double taps[2*FIR_HALF+1],sum=0.0;
+    const double cutoff=9550000.0/SOURCE_RATE;
+    for (int n=-FIR_HALF;n<=FIR_HALF;++n) {
+        double phase=TEST_PI*n/FIR_HALF;
+        double sinc=n ? sin(2.0*TEST_PI*cutoff*n)/(TEST_PI*n) : 2.0*cutoff;
+        taps[n+FIR_HALF]=sinc*(.42+.50*cos(phase)+.08*cos(2.0*phase));
+        sum+=taps[n+FIR_HALF];
+    }
+    for (int i=0;i<RF_COUNT;++i) {
+        double sample=0.0;
+        for (int k=0;k<=2*FIR_HALF;++k) sample+=taps[k]*source[2*i+k];
+        rf[i]=(float)(sample/sum);
+    }
+    gui_ld_rf_demod_t demod;
+    gui_ld_rf_demod_reset(&demod,pal ? GUI_LD_RF_PAL : GUI_LD_RF_NTSC);
+    size_t count=gui_ld_rf_demod_process(&demod,rf,RF_COUNT,0,luma,ci,cq,LUMA_COUNT);
+    assert(count==LUMA_COUNT);
+    /* Coherent projection over the last 200 us. Sampling at 5 MSPS makes
+     * the 3.2 MHz input appear at 1.8 MHz if it escaped anti-aliasing. */
+    double mean=0.0,s=0.0,c=0.0;
+    for (size_t i=count-1000;i<count;++i) {
+        double phase=w*i/GUI_LD_RF_LUMA_RATE_HZ;
+        mean+=luma[i];s+=luma[i]*sin(phase);c+=luma[i]*cos(phase);
+    }
+    assert(fabs(mean/1000.0-50.0)<.25);
+    return 2.0*hypot(s,c)/1000.0;
+}
+
+static void check_laserdisc_luma_bandwidth(bool pal) {
+    double reference=laserdisc_luma_tone(pal,.50e6);
+    double detail=laserdisc_luma_tone(pal,1.50e6);
+    double alias=laserdisc_luma_tone(pal,3.20e6);
+    printf("%s LaserDisc luma: 0.5/1.5 MHz %.3f/%.3f IRE, 3.2 MHz alias %.4f IRE\n",
+           pal ? "PAL" : "NTSC",reference,detail,alias);
+    assert(reference>3.2 && reference<4.4);
+    assert(detail/reference>(pal ? .65 : .36) && alias<.055);
+}
+
+static void run_laserdisc_contracts(void) {
+    const gui_rf_profile_t profiles[]={GUI_RF_PROFILE_PAL_LASERDISC,GUI_RF_PROFILE_NTSC_LASERDISC};
+    const size_t capacity=(size_t)GUI_RF_FRAME_MAX_WIDTH*GUI_RF_FRAME_MAX_HEIGHT*4u;
+    const uint64_t origin=UINT64_C(10000000003);
+    test_ed_sequence_t reference={0},partition={0};
+    reference.frame.rgba=malloc(capacity);partition.frame.rgba=malloc(capacity);
+    assert(reference.frame.rgba && partition.frame.rgba);
+    for (size_t system=0;system<sizeof(profiles)/sizeof(profiles[0]);++system) {
+        bool pal=system==0;
+        gui_rf_profile_t profile=profiles[system];
+        const char *name=pal ? "PAL LaserDisc" : "NTSC LaserDisc";
+        check_laserdisc_luma_bandwidth(pal);
+        assert(gui_rf_profile_video_rate_hz(profile)==20000000u && !gui_rf_profile_has_hifi(profile));
+        assert(gui_rf_profile_format(profile)==(pal ? GUI_RF_PAL : GUI_RF_NTSC));
+        assert(strcmp(gui_rf_profile_name(profile),name)==0);
+        gui_rf_decoder_t *decoder=gui_rf_decoder_create_profile(profile);assert(decoder);
+        test_quality_t gray={.pattern=TEST_Q_GRAY,.fields=6};
+        size_t length;
+        float *rf=make_rf_signal_profile(profile,0.0,false,1.0,-1,TEST_V_NORMAL,&gray,&length);
+        reference.frame=(test_frames_t){.rgba=reference.frame.rgba};
+        process_ed_chunks(decoder,rf,length,origin,false,&reference);
+        check_quality_gray(&reference.frame,name,0.0,.035,.015,.06);
+        assert(!reference.frame.status.color_locked);
+        assert(reference.frame.width==(pal ? 768 : 640) && reference.frame.height==(pal ? 576 : 480));
+        assert(reference.frame.first_end_sample>=origin+gray.field_start_sample[2]);
+        assert(reference.frame.end_sample<=origin+length+4);
+        for (size_t p=0;p<(size_t)reference.frame.width*reference.frame.height*4u;p+=4u) {
+            const uint8_t *pixel=reference.frame.rgba+p;
+            assert(pixel[0]==pixel[1] && pixel[1]==pixel[2] && pixel[3]==255);
+        }
+
+        gui_rf_decoder_reset_profile(decoder,profile);
+        partition.frame=(test_frames_t){.rgba=partition.frame.rgba};
+        process_ed_chunks(decoder,rf,length,origin,true,&partition);
+        check_laserdisc_partitions(&reference,&partition);
+
+        float silence[257]={0};
+        uint64_t gap=origin+length+UINT64_C(4000001);
+        partition.frame=(test_frames_t){.rgba=partition.frame.rgba};
+        gui_rf_decoder_process(decoder,silence,257,gap,receive_ed_frame,&partition);
+        gui_rf_decode_status_t state;gui_rf_decoder_get_status(decoder,&state);
+        assert(!state.h_locked && !state.v_locked && state.frames_decoded==0 && partition.frame.frames==0);
+        uint64_t resume=gap+257;
+        process_ed_chunks(decoder,rf,length,resume,true,&partition);
+        check_quality_gray(&partition.frame,name,0.0,.035,.015,.06);
+        assert(partition.frame.first_end_sample>=resume+gray.field_start_sample[2]);
+        assert(partition.frame.end_sample<=resume+length+4);
+        printf("%s partition/gap: %d identical frames before gap\n",name,reference.frame.frames);
+        free(rf);
+
+        test_quality_t color={.pattern=TEST_Q_UV_VERTICAL,.fields=6};
+        rf=make_rf_signal_profile(profile,0.0,true,1.0,-1,TEST_V_NORMAL,&color,&length);
+        gui_rf_decoder_reset_profile(decoder,profile);
+        reference.frame=(test_frames_t){.rgba=reference.frame.rgba};
+        process_ed_chunks(decoder,rf,length,origin,false,&reference);
+        check_laserdisc_color(&reference.frame,name);
+        gui_rf_decoder_reset_profile(decoder,profile);
+        partition.frame=(test_frames_t){.rgba=partition.frame.rgba};
+        process_ed_chunks(decoder,rf,length,origin,true,&partition);
+        check_laserdisc_partitions(&reference,&partition);
+        gui_rf_decoder_destroy(decoder);free(rf);
+    }
+    free(reference.frame.rgba);free(partition.frame.rgba);
 }
 
 /* External libm calls prevent constant-folded NaN/signed-zero expectations
@@ -2246,8 +2453,10 @@ static void run_svhs_dc_contracts(void) {
  * orders and weave adjacent fields, with identical output across partitions. */
 static void run_svhs_contracts(void) {
     _Static_assert(GUI_RF_PROFILE_NTSC_ED_BETA==8 && GUI_RF_PROFILE_PAL_SVHS==9 &&
-        GUI_RF_PROFILE_NTSC_SVHS==10 && GUI_RF_PROFILE_COUNT==11,
-        "S-VHS appends without changing existing persisted profile IDs");
+        GUI_RF_PROFILE_NTSC_SVHS==10 && GUI_RF_PROFILE_PAL_LASERDISC==11 &&
+        GUI_RF_PROFILE_NTSC_LASERDISC==12 && GUI_RF_PROFILE_NTSC_VHS_HIFI==13 &&
+        GUI_RF_PROFILE_PAL_VHS_HIFI==14 && GUI_RF_PROFILE_COUNT==15,
+        "RF profiles append without changing existing persisted profile IDs");
     const gui_rf_profile_t profiles[]={GUI_RF_PROFILE_PAL_SVHS,GUI_RF_PROFILE_NTSC_SVHS};
     const size_t capacity=(size_t)GUI_RF_FRAME_MAX_WIDTH*GUI_RF_FRAME_MAX_HEIGHT*4u;
     gui_rf_decoder_t *decoder=gui_rf_decoder_create_profile(profiles[0]);assert(decoder);
@@ -3159,6 +3368,9 @@ static void run_svhs_stripe_contract(void) {
 }
 
 int main(int argc, char **argv) {
+    if (argc==2 && strcmp(argv[1],"--laserdisc-only")==0) {
+        run_laserdisc_contracts();puts("PAL/NTSC LaserDisc 20MSPS physical RF contracts passed");return 0;
+    }
     if (argc==2 && strcmp(argv[1],"--svhs-stripe-only")==0) {
         run_svhs_stripe_contract();
         return 0;
@@ -3254,7 +3466,7 @@ int main(int argc, char **argv) {
         run_full_frame_contracts();puts("Full-frame geometry and level contracts passed");return 0;
     }
     if (argc!=1 && (argc!=3 || strcmp(argv[1],"--real-ntsc-bars")!=0)) {
-        fprintf(stderr,"usage: %s [--real-ntsc-bars excerpt.s16le] [--full-frame-only] [--ed-beta-only] [--svhs-only] [--svhs-color-only] [--svhs-burst-outlier-only] [--svhs-pal-cadence-only] [--svhs-detail-only] [--svhs-cnr-noise-only] [--svhs-gray-identity-only] [--svhs-frontend-only]\n",argv[0]);
+        fprintf(stderr,"usage: %s [--real-ntsc-bars excerpt.s16le] [--full-frame-only] [--ed-beta-only] [--laserdisc-only] [--svhs-only] [--svhs-color-only] [--svhs-burst-outlier-only] [--svhs-pal-cadence-only] [--svhs-detail-only] [--svhs-cnr-noise-only] [--svhs-gray-identity-only] [--svhs-frontend-only]\n",argv[0]);
         return 2;
     }
     run_deemphasis_contract();
@@ -3264,8 +3476,6 @@ int main(int argc, char **argv) {
     run_superbeta_acquire_contracts();
     run_superbeta_display_level_contracts();
     run_ed_beta_contracts();
-    run_svhs_contracts();
-    run_svhs_color_contracts();
     run_registration_contract();
     run_quality_contracts();
     run_stop_resume();
