@@ -171,7 +171,7 @@ def main():
     src_path = sys.argv[1] if len(sys.argv) > 1 else 'assets/Icons/MISRC_Icon.png'
     out_dir = sys.argv[2] if len(sys.argv) > 2 else '.'
     bg = 'auto'
-    margin = 15  # white border % -> art occupies 70%, Android-legacy look
+    margin = 10  # white border % -> art occupies 80%, Android-legacy look
     args = sys.argv[3:]
     i = 0
     while i < len(args):
