@@ -171,7 +171,7 @@ def main():
     src_path = sys.argv[1] if len(sys.argv) > 1 else 'assets/Icons/MISRC_Icon.png'
     out_dir = sys.argv[2] if len(sys.argv) > 2 else '.'
     bg = 'auto'
-    margin = 6
+    margin = 15  # white border % -> art occupies 70%, Android-legacy look
     args = sys.argv[3:]
     i = 0
     while i < len(args):
@@ -220,29 +220,36 @@ def main():
                 artflat[d + 2] = (rgba[so + 2] * a + bgc[2] * ia + 127) // 255
                 artflat[d + 3] = 255
 
+    # Android-app look: the full artwork scaled INTO THE CENTER over a
+    # white background (Android legacy launcher masks the raw 500x500
+    # ic_launcher small inside a light background; --margin sets the white
+    # border percentage, default 15% -> art occupies 70% of the icon).
     sizes = [
         ('AppIcon60x60@2x.png', 120),
         ('AppIcon60x60@3x.png', 180),
         ('AppIcon76x76@2x~ipad.png', 152),
         ('AppIcon83.5x83.5@2x~ipad.png', 167),
     ]
+    inner = max(0.1, 1.0 - 2.0 * (margin / 100.0))
     for name, size in sizes:
-        scaled = box_downscale_rgba(artflat, w, h, size, size)
+        w2 = max(1, round(size * inner * w / max(w, h)))
+        h2 = max(1, round(size * inner * h / max(w, h)))
+        scaled = box_downscale_rgba(artflat, w, h, w2, h2)
+        ox = (size - w2) // 2
+        oy = (size - h2) // 2
         rgb = bytearray(size * size * 3)
         for p in range(size * size):
-            o = p * 4
-            d = p * 3
-            if scaled[o + 3] == 255:
-                rgb[d:d + 3] = scaled[o:o + 3]
-            else:
-                a = scaled[o + 3]
-                ia = 255 - a
-                rgb[d] = (scaled[o] * a + bgc[0] * ia + 127) // 255
-                rgb[d + 1] = (scaled[o + 1] * a + bgc[1] * ia + 127) // 255
-                rgb[d + 2] = (scaled[o + 2] * a + bgc[2] * ia + 127) // 255
+            rgb[p * 3:p * 3 + 3] = bgc
+        for yy in range(h2):
+            for xx in range(w2):
+                so = (yy * w2 + xx) * 4
+                d = ((oy + yy) * size + (ox + xx)) * 3
+                rgb[d] = scaled[so]
+                rgb[d + 1] = scaled[so + 1]
+                rgb[d + 2] = scaled[so + 2]
         encode_png_rgb('%s/%s' % (out_dir, name), size, size, rgb)
-        print('wrote %s/%s (%dx%d, opaque, full original art on white)' %
-              (out_dir, name, size, size))
+        print('wrote %s/%s (%dx%d, opaque, art %dx%d centered on white)' %
+              (out_dir, name, size, size, w2, h2))
 
 
 if __name__ == '__main__':
