@@ -33,8 +33,7 @@ that same captured RF channel; a separate audio-only RF feed does not produce
 a picture. Linear tape audio is outside this preview. See
 [NTSC Betamax details](betamax_preview_README.md) and
 [ordinary NTSC SuperBeta details](superbeta_preview_README.md) for profile,
-parameter and audio limits. See [PAL/NTSC S-VHS details](svhs_preview_README.md)
-for its video-only preset, wider RF conversion and reduced-bandwidth limits.
+parameter and audio limits.
 
 The OSD reports physical input rate, H/V/color lock, decoded/displayed fps,
 DSP time, worker age, vertical candidates, accepted/rejected fields, queue
@@ -148,7 +147,7 @@ informed by vhs-decode-dotnet. The halfband coefficients originate from its
 .NET TBC/color pipeline or promise output equivalence. VHS LP/EP,
 PAL Betamax, dropout repair and advanced comb filtering are not implemented.
 The S-VHS preview omits its additional linear/nonlinear sub-deemphasis and
-full RF equalization; see [S-VHS limits](svhs_preview_README.md).
+full RF equalization.
 
 ## Capture protection
 
