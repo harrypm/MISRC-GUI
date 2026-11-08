@@ -9,6 +9,7 @@
 #   FFTW 3.3.10     - single-precision (fftw3f), required by misrc_gui
 #   libsoxr 0.1.3   - optional resampler (LIBSOXR_ENABLED)
 #   libusb 1.0.27   - Android backend (highest risk; FX3/DdD/hsdaoh depend on it)
+#   librtlsdr       - pinned RTL-SDR with Android USB patches, links target libusb
 #   hsdaoh          - vendored (third_party/hsdaoh); links libusb + libFLAC
 #   raylib 5.5      - PLATFORM=Android, GLES 3.0, rcore_android.c
 #
@@ -266,6 +267,20 @@ else
   )
 fi
 record "libusb" "${LIBUSB_VERSION} (sha256 ${LIBUSB_SHA:-$(sha256sum "$DEPS_SRC_DIR/$LIBUSB_TARBALL" 2>/dev/null | awk '{print $1}')})"
+
+# ---------------- librtlsdr (pinned and patched) ----------------
+log "=== librtlsdr (pinned and patched) ==="
+DEPS_PREFIX="$DEPS_PREFIX" RTLSDR_BUILD_DIR="$DEPS_SRC_DIR/rtlsdr-build" \
+  PKG_CONFIG="$SCRIPT_DIR/android-pkg-config" \
+  bash "$REPO_ROOT/scripts/build-rtlsdr.sh" \
+    -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
+    -DANDROID_ABI="$ABI" \
+    -DANDROID_PLATFORM="$PLATFORM" \
+    -DANDROID_NDK="$NDK" \
+    -DCMAKE_FIND_ROOT_PATH="$DEPS_PREFIX"
+[[ -s "$DEPS_PREFIX/lib/librtlsdr.a" && -n "$(pc_version librtlsdr)" ]] || fail \
+  "Android-cross static librtlsdr missing after install"
+record "librtlsdr" "2.0.2 (pinned source with Android USB patches)"
 
 # ---------------- libuvc (vendored from github; hsdaoh hard-requires it) ----------------
 # hsdaoh CMakeLists:132 does FATAL_ERROR if libuvc is not found, so this is

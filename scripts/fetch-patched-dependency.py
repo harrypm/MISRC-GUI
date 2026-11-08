@@ -22,6 +22,13 @@ PINS = {
         "a52dec-0.8.0",
         "misrc.patch",
     ),
+    "rtl-sdr": (
+        "https://codeload.github.com/osmocom/rtl-sdr/tar.gz/619ac3186ea0ffc092615e1f59f7397e5e6f668c",
+        "rtl-sdr-619ac31.tar.gz",
+        "bbae67bccc35dae95b77a6559d5f9d09b0526626a86685577661fffd2fd543a1",
+        "rtl-sdr-619ac3186ea0ffc092615e1f59f7397e5e6f668c",
+        "patches/0001-misrc.patch",
+    ),
 }
 
 

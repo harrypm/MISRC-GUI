@@ -5,13 +5,8 @@
 # fftw3f/flac/libusb-1.0/soxr/libuvc come from the system package manager
 # (apt libuvc-dev/libfftw3-dev/libflac-dev/libsoxr-dev/libusb-1.0-0-dev on
 # Debian/Ubuntu, `brew install fftw flac libusb libuvc libsoxr` on macOS) -- the
-# same versions CI installs. Everything else the GUI hard-requires is built
-# VENDORED from committed, pinned sources in third_party/ into
-# .deps/install (2026-11-08: opus and openh264 joined hsdaoh + raylib after
-# the Monitor codecs became hard GUI deps). No build-time downloads: the
-# trees live in the repository and change only through reviewed,
-# human-approved commits (HARD rule:
-# misrc_tools/misrc_gui/dev/self_contained_deps_rules.md).
+# same versions CI installs. hsdaoh, Opus and OpenH264 are built from
+# committed sources. raylib and RTL-SDR use pinned upstream sources.
 # Idempotent: skips work whose stamp matches the current inputs, so repeated runs
 # or new terminal sessions reuse .deps/install until an input changes.
 #
@@ -52,7 +47,13 @@ require_tools() {
   for t in "$@"; do command -v "$t" >/dev/null 2>&1 || { echo "[build-deps-unix] Missing: $t" >&2; missing=1; }; done
   [[ $missing -eq 0 ]] || fail "Install missing tools and retry."
 }
-require_tools cmake pkg-config cc git
+require_tools cmake ninja pkg-config cc git python3
+
+if command -v sha256sum >/dev/null 2>&1; then
+  hash_files=(sha256sum)
+else
+  hash_files=(shasum -a 256)
+fi
 
 # Prefer vendored .pc files (especially FLAC 1.5.0 on Ubuntu 22.04) when
 # validating libraries. Check BEFORE invoking CMake or reusing the stamp.
@@ -73,16 +74,18 @@ compute_stamp() {
       git -C "$HSDAOH_SOURCE_DIR" rev-parse HEAD 2>/dev/null || true
     fi
     find "$HSDAOH_SOURCE_DIR" -type f \( -name '*.c' -o -name '*.h' -o -name 'CMakeLists.txt' -o -name '*.in' \) \
-      -exec sha256sum {} + 2>/dev/null | sort
+      -exec "${hash_files[@]}" {} + 2>/dev/null | sort
+    "${hash_files[@]}" "$SCRIPT_DIR/build-rtlsdr.sh" "$SCRIPT_DIR/fetch-patched-dependency.py" \
+      "$REPO_ROOT/third_party/rtl-sdr/patches/0001-misrc.patch"
     for m in fftw3f flac libusb-1.0 soxr libuvc libzstd openh264 opus; do
       printf '%s=%s\n' "$m" "$(pkg-config --modversion "$m" 2>/dev/null || echo missing)"
     done
     echo "opus_tag=$OPUS_TAG"
     echo "openh264_tag=$OPENH264_TAG"
-  } | sha256sum | awk '{print $1}'
+  } | "${hash_files[@]}" | awk '{print $1}'
 }
 
-if [[ -f "$stamp_file" && -f "$DEPS_PREFIX/lib/pkgconfig/hsdaoh.pc" ]]; then
+if [[ -f "$stamp_file" && -f "$DEPS_PREFIX/lib/pkgconfig/hsdaoh.pc" && -f "$DEPS_PREFIX/lib/pkgconfig/librtlsdr.pc" ]]; then
   prev="$(cat "$stamp_file" 2>/dev/null || echo none)"
   cur="$(compute_stamp)"
   if [[ "$prev" == "$cur" ]]; then
@@ -103,6 +106,7 @@ git config --global --add safe.directory "$REPO_ROOT/.deps/raylib" 2>/dev/null |
 
 HS_CMAKE_ARGS=(-DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DCMAKE_INSTALL_PREFIX="$DEPS_PREFIX" -DINSTALL_UDEV_RULES=OFF)
 RAY_CMAKE_ARGS=(-DCMAKE_BUILD_TYPE=Release -DBUILD_EXAMPLES=OFF -DBUILD_GAMES=OFF -DOPENGL_VERSION="$RAYLIB_OPENGL_VERSION" -DCMAKE_INSTALL_PREFIX="$DEPS_PREFIX")
+build_rtlsdr=(bash "$SCRIPT_DIR/build-rtlsdr.sh")
 if [[ "$HOST_SYSTEM" == "darwin" ]]; then
   BREW_PREFIX="$(brew --prefix 2>/dev/null || echo /opt/homebrew)"
   FLAC_PREFIX="$(brew --prefix flac 2>/dev/null || echo "$BREW_PREFIX/opt/flac")"
@@ -111,6 +115,7 @@ if [[ "$HOST_SYSTEM" == "darwin" ]]; then
   HS_CMAKE_ARGS+=(-DCMAKE_C_FLAGS="-I${FLAC_PREFIX}/include -I${BREW_PREFIX}/include -arch ${HOST_ARCH}"
                   -DCMAKE_OSX_ARCHITECTURES="$HOST_ARCH")
   RAY_CMAKE_ARGS+=(-DCMAKE_OSX_ARCHITECTURES="$HOST_ARCH")
+  build_rtlsdr+=(-DCMAKE_OSX_ARCHITECTURES="$HOST_ARCH")
 fi
 
 # --- hsdaoh (static, vendored) ----------------------------------------------
@@ -161,6 +166,8 @@ meson setup "$REPO_ROOT/.deps/openh264/build" "$REPO_ROOT/.deps/openh264" \
   --default-library static
 meson compile -C "$REPO_ROOT/.deps/openh264/build"
 meson install -C "$REPO_ROOT/.deps/openh264/build"
+
+DEPS_PREFIX="$DEPS_PREFIX" "${build_rtlsdr[@]}"
 
 # --- sanity -----------------------------------------------------------------
 export PKG_CONFIG_PATH="$DEPS_PREFIX/lib/pkgconfig:$DEPS_PREFIX/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"

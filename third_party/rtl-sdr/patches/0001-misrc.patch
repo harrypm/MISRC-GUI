@@ -1,0 +1,157 @@
+diff --git a/include/rtl-sdr.h b/include/rtl-sdr.h
+--- a/include/rtl-sdr.h
++++ b/include/rtl-sdr.h
+@@ -61,6 +61,16 @@
+ RTLSDR_API int rtlsdr_get_index_by_serial(const char *serial);
+ 
+ RTLSDR_API int rtlsdr_open(rtlsdr_dev_t **dev, uint32_t index);
++
++#ifdef __ANDROID__
++RTLSDR_API const char *rtlsdr_get_device_name_by_usb_id(uint16_t vid, uint16_t pid);
++/* Borrows an Android USB host descriptor. Keep it open until rtlsdr_close. */
++RTLSDR_API int rtlsdr_open_fd(rtlsdr_dev_t **dev, int fd);
++/* A nonzero timeout bounds the read. n_read includes any bytes received
++ * before a timeout, as with libusb_bulk_transfer(). */
++RTLSDR_API int rtlsdr_read_sync_timeout(rtlsdr_dev_t *dev, void *buf, int len,
++                                        int *n_read, unsigned int timeout_ms);
++#endif
+ 
+ RTLSDR_API int rtlsdr_close(rtlsdr_dev_t *dev);
+ 
+diff --git a/src/librtlsdr.c b/src/librtlsdr.c
+--- a/src/librtlsdr.c
++++ b/src/librtlsdr.c
+@@ -1294,6 +1294,14 @@
+ 	return device;
+ }
+ 
++#ifdef __ANDROID__
++const char *rtlsdr_get_device_name_by_usb_id(uint16_t vid, uint16_t pid)
++{
++	rtlsdr_dongle_t *device = find_known_device(vid, pid);
++	return device ? device->name : NULL;
++}
++#endif
++
+ uint32_t rtlsdr_get_device_count(void)
+ {
+ 	int i,r;
+@@ -1442,7 +1450,7 @@
+ }
+ 
+ 
+-int rtlsdr_open(rtlsdr_dev_t **out_dev, uint32_t index)
++static int rtlsdr_open_internal(rtlsdr_dev_t **out_dev, uint32_t index, int fd)
+ {
+ 	int r;
+ 	int i;
+@@ -1461,6 +1469,15 @@
+ 	memset(dev, 0, sizeof(rtlsdr_dev_t));
+ 	memcpy(dev->fir, fir_default, sizeof(fir_default));
+ 
++#ifdef __ANDROID__
++	if (fd >= 0) {
++		const struct libusb_init_option option = {
++			.option = LIBUSB_OPTION_NO_DEVICE_DISCOVERY,
++			.value.ival = 1,
++		};
++		r = libusb_init_context(&dev->ctx, &option, 1);
++	} else
++#endif
+ 	r = libusb_init(&dev->ctx);
+ 	if(r < 0){
+ 		free(dev);
+@@ -1468,6 +1485,26 @@
+ 	}
+ 
+ 	dev->dev_lost = 1;
++
++#ifdef __ANDROID__
++	if (fd >= 0) {
++		r = libusb_wrap_sys_device(dev->ctx, (intptr_t)fd, &dev->devh);
++		if (r < 0)
++			goto err;
++		device = libusb_get_device(dev->devh);
++		r = libusb_get_device_descriptor(device, &dd);
++		if (r < 0)
++			goto err;
++		if (!find_known_device(dd.idVendor, dd.idProduct)) {
++			r = LIBUSB_ERROR_NOT_SUPPORTED;
++			goto err;
++		}
++		(void)libusb_set_auto_detach_kernel_driver(dev->devh, 1);
++		goto claim_interface;
++	}
++#else
++	(void)fd;
++#endif
+ 
+ 	cnt = libusb_get_device_list(dev->ctx, &list);
+ 
+@@ -1523,6 +1560,9 @@
+ #endif
+ 	}
+ 
++#ifdef __ANDROID__
++claim_interface:
++#endif
+ 	r = libusb_claim_interface(dev->devh, 0);
+ 	if (r < 0) {
+ 		fprintf(stderr, "usb_claim_interface error %d\n", r);
+@@ -1656,6 +1696,20 @@
+ 	return r;
+ }
+ 
++int rtlsdr_open(rtlsdr_dev_t **out_dev, uint32_t index)
++{
++	return rtlsdr_open_internal(out_dev, index, -1);
++}
++
++#ifdef __ANDROID__
++int rtlsdr_open_fd(rtlsdr_dev_t **out_dev, int fd)
++{
++	if (!out_dev || fd < 0)
++		return LIBUSB_ERROR_INVALID_PARAM;
++	return rtlsdr_open_internal(out_dev, 0, fd);
++}
++#endif
++
+ int rtlsdr_close(rtlsdr_dev_t *dev)
+ {
+ 	if (!dev)
+@@ -1705,13 +1759,30 @@
+ 	return 0;
+ }
+ 
++static int rtlsdr_read_sync_internal(rtlsdr_dev_t *dev, void *buf, int len,
++                                     int *n_read, unsigned int timeout_ms)
++{
++	if (!dev)
++		return -1;
++
++	return libusb_bulk_transfer(dev->devh, 0x81, buf, len, n_read, timeout_ms);
++}
++
+ int rtlsdr_read_sync(rtlsdr_dev_t *dev, void *buf, int len, int *n_read)
+ {
+-	if (!dev)
+-		return -1;
+-
+-	return libusb_bulk_transfer(dev->devh, 0x81, buf, len, n_read, BULK_TIMEOUT);
+-}
++	return rtlsdr_read_sync_internal(dev, buf, len, n_read, BULK_TIMEOUT);
++}
++
++#ifdef __ANDROID__
++int rtlsdr_read_sync_timeout(rtlsdr_dev_t *dev, void *buf, int len, int *n_read,
++                             unsigned int timeout_ms)
++{
++	if (!timeout_ms)
++		return LIBUSB_ERROR_INVALID_PARAM;
++
++	return rtlsdr_read_sync_internal(dev, buf, len, n_read, timeout_ms);
++}
++#endif
+ 
+ static void LIBUSB_CALL _libusb_callback(struct libusb_transfer *xfer)
+ {
