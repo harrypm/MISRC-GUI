@@ -3,6 +3,7 @@
 
 import argparse
 import hashlib
+from http.client import HTTPException
 import os
 from pathlib import Path, PurePosixPath
 import shutil
@@ -16,14 +17,17 @@ import urllib.request
 ROOT = Path(__file__).resolve().parents[1]
 PINS = {
     "liba52": (
-        "https://distfiles.adelielinux.org/source/a52dec/a52dec-0.8.0.tar.gz",
+        (
+            "https://distfiles.macports.org/a52dec/a52dec-0.8.0.tar.gz",
+            "https://mirrors.mit.edu/macports/distfiles/a52dec/a52dec-0.8.0.tar.gz",
+        ),
         "a52dec-0.8.0.tar.gz",
         "03c181ce9c3fe0d2f5130de18dab9bd8bc63c354071515aa56983c74a9cffcc9",
         "a52dec-0.8.0",
         "misrc.patch",
     ),
     "rtl-sdr": (
-        "https://codeload.github.com/osmocom/rtl-sdr/tar.gz/619ac3186ea0ffc092615e1f59f7397e5e6f668c",
+        ("https://codeload.github.com/osmocom/rtl-sdr/tar.gz/619ac3186ea0ffc092615e1f59f7397e5e6f668c",),
         "rtl-sdr-619ac31.tar.gz",
         "bbae67bccc35dae95b77a6559d5f9d09b0526626a86685577661fffd2fd543a1",
         "rtl-sdr-619ac3186ea0ffc092615e1f59f7397e5e6f668c",
@@ -42,7 +46,7 @@ def verify(path, expected):
         raise ValueError(f"SHA-256 mismatch for {path}: expected {expected}, got {actual}")
 
 
-def verified_archive(url, name, sha):
+def verified_archive(urls, name, sha):
     cache = ROOT / (os.environ.get("MISRC_DEP_CACHE") or ".deps/downloads")
     archive = cache / name
     if archive.is_file():
@@ -52,10 +56,18 @@ def verified_archive(url, name, sha):
     cache.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=f"{name}-", dir=cache) as work:
         download = Path(work) / name
-        print(f"Downloading {url}", flush=True)
-        with urllib.request.urlopen(url, timeout=60) as response, download.open("wb") as out:
-            shutil.copyfileobj(response, out)
-        verify(download, sha)
+        for index, url in enumerate(urls):
+            print(f"Downloading {url}", flush=True)
+            try:
+                with urllib.request.urlopen(url, timeout=60) as response, download.open("wb") as out:
+                    shutil.copyfileobj(response, out)
+                verify(download, sha)
+            except (OSError, HTTPException, ValueError) as error:
+                if index + 1 == len(urls):
+                    raise
+                print(f"Download from {url} failed: {error}", file=sys.stderr, flush=True)
+            else:
+                break
         try:
             download.replace(archive)
         except PermissionError:
@@ -121,10 +133,10 @@ def main():
     if args.decoder_files and args.dependency != "liba52":
         parser.error("--decoder-files is only valid for liba52")
 
-    url, name, sha, archive_root, patch_name = PINS[args.dependency]
+    urls, name, sha, archive_root, patch_name = PINS[args.dependency]
     patch_file = ROOT / "third_party" / args.dependency / patch_name
     patch = patch_file.read_bytes().replace(b"\r\n", b"\n")
-    archive = verified_archive(url, name, sha)
+    archive = verified_archive(urls, name, sha)
     destination = args.destination.resolve()
     marker = destination / ".misrc-source-pin"
     helper = Path(__file__).read_bytes().replace(b"\r\n", b"\n")
@@ -148,6 +160,6 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except (OSError, ValueError, tarfile.TarError, subprocess.CalledProcessError) as error:
+    except (OSError, HTTPException, ValueError, tarfile.TarError, subprocess.CalledProcessError) as error:
         print(f"Dependency preparation failed: {error}", file=sys.stderr)
         sys.exit(1)
