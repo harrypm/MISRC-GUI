@@ -1030,13 +1030,14 @@ int main(int argc, char **argv) {
     app.settings.ui_scale_percent = GUI_UI_SCALE_DEFAULT_PERCENT;
 #elif defined(MISRC_IOS)
     /* Android-model layout (canvas == layout, 1:1 physical), but iOS
-     * screens are physically smaller than desktop monitors, so stock
-     * absolute-px elements read small. A MODEST 120% default (only when
-     * the setting is untouched) enlarges elements 20% while the layout
-     * stays ~1990px wide — far above the 640x360 minimum that squashed
-     * the earlier 150% attempt. Still user-tunable via the scale HUD. */
+     * screens are physically much smaller than desktop monitors, so
+     * stock absolute-px elements read small. A 200% default (only when
+     * the setting is untouched) doubles element size; the layout stays
+     * ~1194x603 px — above the 640x360 minimum (the failed 150%-on-
+     * points attempt squashed ONLY because that layout was 498px wide).
+     * Still user-tunable via the scale HUD. */
     if (app.settings.ui_scale_percent == GUI_UI_SCALE_DEFAULT_PERCENT) {
-        app.settings.ui_scale_percent = 120;
+        app.settings.ui_scale_percent = 200;
     }
 #endif
     gui_ui_set_scale_percent(app.settings.ui_scale_percent);
