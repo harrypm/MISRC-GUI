@@ -431,6 +431,13 @@ if host_system != 'android'
                 install: true)
 endif
 
+rf_preview_sources = [
+  'misrc_gui/signal/gui_rf_preview.c',
+]
+rf_audio_sources = [
+  'misrc_gui/signal/gui_vhs_hifi.c',
+]
+
 # GUI application (requires raylib)
 raylib_dep = dependency('raylib', required: false, static: windows_static_deps)
 
@@ -438,7 +445,7 @@ if raylib_dep.found()
   if not fftw3f_dep.found()
     error('FFTW3 (fftw3f) is required for misrc_gui. Install fftw3f and reconfigure (use --wipe if reusing an existing build directory).')
   endif
-  sources_gui = [
+  sources_gui = rf_preview_sources + rf_audio_sources + [
     # Core
     'misrc_gui/core/misrc_gui.c',
     'misrc_gui/core/gui_settings.c',
@@ -459,7 +466,6 @@ if raylib_dep.found()
     'misrc_gui/signal/gui_trigger.c',
     'misrc_gui/signal/gui_cvbs.c',
     'misrc_gui/signal/gui_vhs_fm.c',
-    'misrc_gui/signal/gui_rf_preview.c',
     'misrc_gui/signal/gui_rf_resampler.c',
     'misrc_gui/processing/gui_rf_preview_worker.c', 'misrc_gui/signal/gui_beta_hifi.c',
     'misrc_gui/processing/gui_rf_preview_policy.c',
