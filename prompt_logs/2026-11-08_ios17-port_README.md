@@ -198,9 +198,21 @@ raw icon and the launcher masks it small on a light bg). Earlier attempts
 reverted. NOTE: this simulator caches icons across installs — an uninstall
 + reinstall + device reboot is required to see icon changes.
 
+RENDER MODEL (resolved, user-approved 2026-11-08 ~10:41, commits
+39b39f8 + e90b785): Android-model layout — Clay layout == the PHYSICAL
+letterbox canvas (inset 64pt*dpi from the corner curve), 1:1 blit, no
+point-space indirection. iOS UI scale default 200% (fresh-install only,
+HUD-tunable). The dpi pre-scale + 150% attempts were reverted (squashed
+the layout below the 640x360 minimum). Raylib iOS patches now also fix
+the drawable size at init AND in the SIZE_CHANGED handler
+(SDL_GL_GetDrawableSize; the stock code renders 1x into a 3x framebuffer).
+
 Also fixed en route: /opt/homebrew pollution incident (openh264 meson
-default prefix) — remediated with brew reinstall. Device slice not yet
-built.
+default prefix) — remediated with brew reinstall. Device slice built +
+installed on Harry's iPhone 14 (devicectl; landscape lock, sysconf
+core count, FLAC popup suppressed on iOS). OPEN: click-through of UI
+elements/sub-menus still being verified; temporary GL + input debug
+logging still compiled in (ios_gl_debug_dump + ios_view_input_log).
 
 ## Output artifacts (this session)
 
