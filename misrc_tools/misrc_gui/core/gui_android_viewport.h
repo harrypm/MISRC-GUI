@@ -204,6 +204,7 @@ void gui_android_viewport_update(void)
                 s_touch_valid[i] = true;
             }
         }
+    }
 #define TOUCH_POS(i_) (((i_) < n && (i_) < MISRC_TOUCH_SLOTS) \
                        ? s_last_touch[(i_)] : GetTouchPosition(i_))
 #else
