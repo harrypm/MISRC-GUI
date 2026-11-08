@@ -7,11 +7,11 @@
 #include "gui_phosphor_rt.h"
 #include "rlgl.h"
 
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(MISRC_IOS)
 #include "../core/gui_android_viewport.h"
 /* Nested render textures are not a stack in raylib: EndTextureMode() always
- * switches to the default framebuffer. Restore the Android full-UI canvas
- * after finishing any inner phosphor/FFT texture pass. */
+ * switches to the default framebuffer. Restore the touch full-UI canvas
+ * (Android + iOS) after finishing any inner phosphor/FFT texture pass. */
 #define PHOSPHOR_END_TEXTURE_MODE() do { \
     EndTextureMode(); \
     gui_android_viewport_restore_canvas_after_texture(); \

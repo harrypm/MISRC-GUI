@@ -1,11 +1,14 @@
 #ifndef MISRC_GUI_ANDROID_VIEWPORT_H
 #define MISRC_GUI_ANDROID_VIEWPORT_H
 
-/* Full-frame Android pinch zoom.  Only the core translation unit defines
- * GUI_ANDROID_VIEWPORT_IMPLEMENTATION; GUI/UI modules use the declarations.
- * Keeping the implementation here avoids adding a new Meson source file.
+/* Full-frame touch pinch zoom (Android + iOS).  Only the core translation
+ * unit defines GUI_ANDROID_VIEWPORT_IMPLEMENTATION; GUI/UI modules use the
+ * declarations. Keeping the implementation here avoids adding a new Meson
+ * source file. The implementation is plain raylib API (touch events +
+ * render textures), so the same code serves Android (rcore_android.c) and
+ * iOS (rcore_desktop_sdl.c) touch input unchanged.
  */
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(MISRC_IOS)
 #include <stdbool.h>
 #include <raylib.h>
 
@@ -280,5 +283,5 @@ void gui_android_viewport_shutdown(void)
     SetMouseScale(1, 1);
 }
 #endif /* GUI_ANDROID_VIEWPORT_IMPLEMENTATION */
-#endif /* __ANDROID__ */
+#endif /* __ANDROID__ || MISRC_IOS */
 #endif /* MISRC_GUI_ANDROID_VIEWPORT_H */

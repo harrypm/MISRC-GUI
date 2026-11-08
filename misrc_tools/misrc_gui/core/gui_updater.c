@@ -532,6 +532,8 @@ const char *gui_updater_platform_asset_pattern(const gui_updater_manifest_t *man
     if (!manifest || !manifest->parsed) return NULL;
 #if defined(__ANDROID__)
     return manifest->asset_android;
+#elif defined(MISRC_IOS)
+    return NULL; /* no installable iOS asset: releases-page button (browser) only */
 #elif defined(__APPLE__)
     return manifest->asset_macos;
 #elif defined(_WIN32)
@@ -610,7 +612,7 @@ bool gui_updater_get_executable_path(char *out, size_t out_len)
 {
     if (!out || out_len == 0) return false;
     out[0] = '\0';
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(MISRC_IOS)
     (void)out_len;
     return false; /* guided browser download path instead (gui_ui.c) */
 #elif defined(_WIN32)
@@ -705,7 +707,7 @@ bool gui_updater_get_updates_dir(char *out, size_t out_len)
 {
     if (!out || out_len == 0) return false;
     out[0] = '\0';
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(MISRC_IOS)
     return false; /* guided browser download path instead (gui_ui.c) */
 #elif defined(_WIN32)
     const char *base = getenv("LOCALAPPDATA");
@@ -826,9 +828,9 @@ bool gui_updater_install_asset(const char *asset_url, const char *asset_name,
 {
     if (status_out && status_len > 0) status_out[0] = '\0';
     if (archive_path_out && archive_path_len > 0) archive_path_out[0] = '\0';
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(MISRC_IOS)
     (void)asset_url; (void)asset_name; (void)current_version;
-    if (status_out) snprintf(status_out, status_len, "self-update unsupported on Android");
+    if (status_out) snprintf(status_out, status_len, "self-update unsupported on mobile app builds");
     return false;
 #else
     if (!asset_url || !asset_url[0] || !asset_name || !asset_name[0] ||

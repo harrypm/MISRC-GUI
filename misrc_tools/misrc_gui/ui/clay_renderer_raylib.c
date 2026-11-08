@@ -10,7 +10,7 @@
 #include "../visualization/gui_panel.h"
 #include "../visualization/gui_vu_meter.h"
 #include "gui_ui.h"
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(MISRC_IOS)
 #include "../core/gui_android_viewport.h"
 #endif
 #include "gui_font.h"
@@ -63,7 +63,7 @@ void Clay_Raylib_Render(Clay_RenderCommandArray renderCommands, Font* fonts)
 {
     float ui_scale = gui_ui_get_scale_factor();
     float canvas_zoom = 1.0f, canvas_x = 0.0f, canvas_y = 0.0f;
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(MISRC_IOS)
     gui_android_viewport_get_render_transform(&canvas_zoom, &canvas_x, &canvas_y);
 #endif
     Matrix outer_modelview = rlGetMatrixModelview();

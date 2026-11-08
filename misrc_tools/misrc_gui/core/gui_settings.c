@@ -45,7 +45,7 @@
 // Stock threads = min(8, available cores) so an 8+-core system gets 8,
 // a smaller system gets its core count, and a detection failure falls
 // back to 0 (auto).
-#if !defined(__ANDROID__)
+#if !defined(__ANDROID__) && !defined(MISRC_IOS)
 extern uint32_t get_num_cores(void);
 #endif
 
@@ -145,6 +145,12 @@ static const char* get_settings_file_path(void) {
     const char *ext = android_get_storage_path();
     gui_settings_format(settings_path, sizeof(settings_path), "%s/misrc_gui_settings.json",
                         ext && ext[0] ? ext : "/sdcard/Android/data/dev.misrc.gui/files");
+#elif defined(MISRC_IOS)
+    /* App sandbox Documents dir (Files.app-visible via UIFileSharingEnabled). */
+    extern const char *ios_get_storage_path(void);
+    const char *docs = ios_get_storage_path();
+    gui_settings_format(settings_path, sizeof(settings_path), "%s/misrc_gui_settings.json",
+                        docs && docs[0] ? docs : ".");
 #elif defined(_WIN32) || defined(_WIN64)
     base = file_getenv_utf8("APPDATA");
     if (!base || !base[0]) { free(base); base = file_getenv_utf8("LOCALAPPDATA"); }
@@ -230,6 +236,12 @@ const char* gui_settings_get_desktop_path(void) {
     const char *ext = android_get_storage_path();
     gui_settings_format(desktop_path, sizeof(desktop_path), "%s",
                         ext && ext[0] ? ext : "/sdcard/Android/data/dev.misrc.gui/files");
+#elif defined(MISRC_IOS)
+    /* Default output dir: app Documents (user-visible in Files.app). */
+    extern const char *ios_get_storage_path(void);
+    const char *docs = ios_get_storage_path();
+    gui_settings_format(desktop_path, sizeof(desktop_path), "%s",
+                        docs && docs[0] ? docs : ".");
 #elif defined(_WIN32) || defined(_WIN64)
     PWSTR path = NULL;
     if (SUCCEEDED(SHGetKnownFolderPath(&FOLDERID_Desktop, 0, NULL, &path))) {
@@ -464,7 +476,7 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     // CPU allowance. Actual cost depends on the profile and hardware. 12+ cores
     // -> 300%, 6-11 -> 200%, else 100%. The Budget button overrides per session.
     settings->rf_preview_budget_percent = 100;
-#if !defined(__ANDROID__)
+#if !defined(__ANDROID__) && !defined(MISRC_IOS)
     {
         uint32_t cores = get_num_cores();
         if (cores >= 12) settings->rf_preview_budget_percent = 300;
@@ -540,7 +552,7 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     // falls back to 0 (auto) so the encoder picks something sane.
     // Android doesn't link the CLI lib (where get_num_cores lives), so it
     // uses 0 (auto) there.
-#if !defined(__ANDROID__)
+#if !defined(__ANDROID__) && !defined(MISRC_IOS)
     {
         uint32_t cores = get_num_cores();
         if (cores >= 8) {
@@ -997,6 +1009,9 @@ static bool gui_settings_pick_path(char *picked, size_t cap, bool folder) {
 #if defined(__ANDROID__)
     (void)picked; (void)cap; (void)folder;
     return false; // Android uses the async SAF picker.
+#elif defined(MISRC_IOS)
+    (void)picked; (void)cap; (void)folder;
+    return false; // iOS v1: no in-app picker; output defaults to app Documents (Files.app visible).
 #elif defined(_WIN32) || defined(_WIN64)
     HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     IFileOpenDialog *pfd = NULL;

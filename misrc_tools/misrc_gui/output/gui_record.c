@@ -2057,7 +2057,7 @@ static uint64_t gui_record_direct_spill_backlog_cb(void *user, int channel) {
 }
 
 static void gui_record_direct_set_write_error_cb(void *user, int channel, bool active) {
-#if defined(__APPLE__)
+#if (defined(__APPLE__) && !defined(MISRC_IOS))
     if (active && gui_cxadc_macos_active()) {
         gui_app_t *app = user;
         gui_cxadc_macos_mark_failed();
@@ -2095,11 +2095,11 @@ static void gui_record_direct_report_drop(int card, uint32_t frame_index, size_t
              card == 0 ? 'A' : 'B', frame_index, len);
     gui_record_log_capture_event(app, "ERROR", msg, GUI_ERROR_CLASS_SYSTEM, 1);
     fprintf(stderr, "[DIRECT] %s\n", msg);
-#if defined(__APPLE__)
+#if (defined(__APPLE__) && !defined(MISRC_IOS))
     if (gui_cxadc_macos_active()) gui_cxadc_macos_mark_failed();
 #endif
     if ((app->settings.stop_on_dropout
-#if defined(__APPLE__)
+#if (defined(__APPLE__) && !defined(MISRC_IOS))
          || gui_cxadc_macos_active()
 #endif
         ) && !atomic_load(&app->dropout_stop_requested)) {
@@ -2655,7 +2655,7 @@ static bool gui_record_check_output_paths(gui_app_t *app, unsigned *existing_cou
 
 // Start recording - checks for file existence first
 int gui_record_start(gui_app_t *app) {
-#if defined(__APPLE__)
+#if (defined(__APPLE__) && !defined(MISRC_IOS))
     if(gui_cxadc_macos_active() && (app->settings.use_flac || app->settings.enable_resample_a ||
         app->settings.rf_bits_a!=8 || app->settings.capture_b || app->settings.enable_audio_4ch || app->settings.enable_audio_2ch_12 ||
         app->settings.enable_audio_2ch_34 || app->settings.enable_audio_1ch[0] || app->settings.enable_audio_1ch[1] ||
@@ -2720,7 +2720,7 @@ int gui_record_start(gui_app_t *app) {
 
     // No files exist, start recording directly
     int native_record_result=gui_record_start_confirmed(app);
-#if defined(__APPLE__)
+#if (defined(__APPLE__) && !defined(MISRC_IOS))
     if(native_record_result==0)gui_cxadc_macos_log(app);
 #endif
     return native_record_result;
@@ -2749,7 +2749,7 @@ void gui_record_check_popup(gui_app_t *app) {
     if (result == POPUP_RESULT_YES) {
         // User confirmed, start recording
         int result=gui_record_start_confirmed(app);
-#if defined(__APPLE__)
+#if (defined(__APPLE__) && !defined(MISRC_IOS))
         if(result==0)gui_cxadc_macos_log(app);
 #else
         (void)result;
@@ -3085,7 +3085,7 @@ static int gui_record_start_confirmed(gui_app_t *app) {
             started_b = true;
         }
         s_writer_threads_running = started_a || started_b;
-#if defined(__APPLE__)
+#if (defined(__APPLE__) && !defined(MISRC_IOS))
         /* Recording startup may create late helper threads in encoder/runtime
          * paths; promote them immediately so capture load stays P-core-biased. */
         macos_promote_all_task_threads();
@@ -3269,7 +3269,7 @@ static int gui_record_start_confirmed(gui_app_t *app) {
             started_b = true;
         }
         s_writer_threads_running = started_a || started_b;
-#if defined(__APPLE__)
+#if (defined(__APPLE__) && !defined(MISRC_IOS))
         /* Recording startup may create late helper threads in encoder/runtime
          * paths; promote them immediately so capture load stays P-core-biased. */
         macos_promote_all_task_threads();

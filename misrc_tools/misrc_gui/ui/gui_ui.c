@@ -5,9 +5,10 @@
  */
 
 #include "gui_ui.h"
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(MISRC_IOS)
 #include "../core/gui_android_viewport.h"
-// Gesture-filtered single taps replace native mouse-press events on Android.
+// Gesture-filtered single taps replace native mouse-press events on touch
+// platforms (Android + iOS).
 #define IsMouseButtonPressed(button) gui_android_viewport_click_pressed(button)
 #endif
 #include "gui_dropdown.h"
@@ -53,6 +54,16 @@
 extern void android_set_keyboard_visible(int visible);
 extern size_t android_drain_text_input(char *out, size_t out_len);
 extern const char *android_get_storage_path(void);
+#include <pthread.h>
+#include <stdatomic.h>
+#elif defined(MISRC_IOS)
+/* iOS bridge (misrc_gui/input/ios_platform.c): SDL soft keyboard, Documents
+ * storage, SDL_OpenURL for the releases-page button. Text itself arrives
+ * through the normal GetCharPressed() path via SDL_TEXTINPUT, so there is no
+ * drain/inject bridge like Android's. */
+extern void ios_set_keyboard_visible(int visible);
+extern const char *ios_get_storage_path(void);
+extern int ios_open_url(const char *url);
 #include <pthread.h>
 #include <stdatomic.h>
 #endif
@@ -177,7 +188,7 @@ Vector2 gui_ui_get_render_scale(void)
 
 Vector2 gui_ui_get_mouse_position(void)
 {
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(MISRC_IOS)
     Vector2 position = gui_android_viewport_pointer();
 #else
     Vector2 position = GetMousePosition();
@@ -805,7 +816,7 @@ static double s_record_limit_deadline_s = 0.0;
 #define RECORD_LIMIT_TIMECODE_SCALE 1.30f
 #define RECORD_LIMIT_TIMECODE_BORDER_X 5
 #define RECORD_LIMIT_TIMECODE_BORDER_Y 3
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(MISRC_IOS)
 static bool s_android_keyboard_visible = false;
 #endif
 // Update checker (manifest-driven; see core/gui_updater.h): the releases
@@ -851,6 +862,14 @@ static bool gui_ui_open_url_external(const char *url, char *error_out, size_t er
     int written = 0;
 #if defined(_WIN32)
     written = snprintf(cmd, sizeof(cmd), "start \"\" \"%s\"", url);
+#elif defined(MISRC_IOS)
+    /* No shell on iOS: SDL2's URL opener hands off to the system browser. */
+    (void)cmd; (void)written;
+    if (!ios_open_url(url)) {
+        snprintf(error_out, error_out_len, "failed to open URL");
+        return false;
+    }
+    return true;
 #elif defined(__APPLE__)
     written = snprintf(cmd, sizeof(cmd), "open \"%s\"", url);
 #elif defined(__ANDROID__)
@@ -861,6 +880,9 @@ static bool gui_ui_open_url_external(const char *url, char *error_out, size_t er
     snprintf(error_out, error_out_len, "unsupported platform");
     return false;
 #endif
+#if !defined(MISRC_IOS)
+    /* iOS returns early via SDL_OpenURL above; system() is marked
+     * __attribute__((unavailable)) on iOS and errors even in dead code. */
     if (written <= 0 || (size_t)written >= sizeof(cmd)) {
         snprintf(error_out, error_out_len, "download command too long");
         return false;
@@ -870,6 +892,7 @@ static bool gui_ui_open_url_external(const char *url, char *error_out, size_t er
         snprintf(error_out, error_out_len, "failed to open download URL");
         return false;
     }
+#endif
     return true;
 }
 
@@ -1081,10 +1104,15 @@ static void gui_ui_update_check_tick(gui_app_t *app)
 }
 
 void gui_ui_sync_android_keyboard_state(void) {
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(MISRC_IOS)
     bool want_visible = (s_active_text_field != UI_TEXT_FIELD_NONE) || s_record_limit_timecode_edit;
     if (want_visible != s_android_keyboard_visible) {
+#if defined(__ANDROID__)
         android_set_keyboard_visible(want_visible ? 1 : 0);
+#else
+        /* iOS: SDL2 on-screen keyboard; SDL_TEXTINPUT feeds GetCharPressed. */
+        ios_set_keyboard_visible(want_visible ? 1 : 0);
+#endif
         s_android_keyboard_visible = want_visible;
     }
 #endif
@@ -5885,7 +5913,12 @@ static void render_toolbar(gui_app_t *app, bool ddd_compact_labels) {
         app->selected_device >= 0 && app->selected_device < app->device_count
             ? &app->devices[app->selected_device] : NULL;
     gui_ui_format_device_label(selected_device,
+#if defined(ENABLE_DDD)
         selected_device && selected_device->type == DEVICE_TYPE_DDD ? ddd_compact_labels : toolbar_compact,
+#else
+        /* No libusb -> no DdD backend: DEVICE_TYPE_DDD is enum-gated. */
+        toolbar_compact,
+#endif
                                device_dropdown_buf, sizeof(device_dropdown_buf));
     bool cxadc_clockgen_mode = false;
     bool cxadc_mode = gui_ui_selected_device_is_cxadc(app, &cxadc_clockgen_mode);
@@ -8933,7 +8966,11 @@ void gui_render_layout(gui_app_t *app) {
                                                              overlay_max_width);
         }
         for (int i = 0; i < app->device_count; i++) {
+#if defined(ENABLE_DDD)
             bool ddd_option = app->devices[i].type == DEVICE_TYPE_DDD;
+#else
+            bool ddd_option = false;
+#endif
             int option_max_width = overlay_max_width;
             if (ddd_option && !ddd_compact_labels) {
                 int left = device_dropdown_data.found
@@ -9115,13 +9152,13 @@ static void gui_ui_poll_android_results(gui_app_t *app)
 
 // Handle UI interactions
 void gui_handle_interactions(gui_app_t *app) {
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(MISRC_IOS)
     if (gui_android_viewport_block_controls()) {
         gui_ui_set_click_consumed();
         return;
     }
 #endif
-#if defined(__APPLE__)
+#if defined(__APPLE__) && !defined(MISRC_IOS)
     if(gui_cxadc_macos_ui_handle(app))return;
 #endif
     // Reset click consumed flag at start of each frame

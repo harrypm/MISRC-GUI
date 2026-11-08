@@ -109,7 +109,12 @@ if host_system == 'windows'
   ldflags += ['-lshell32']
 endif
 
-if host_system == 'darwin'
+if host_system == 'darwin' or host_system == 'ios'
+  # _DARWIN_C_SOURCE exposes the non-POSIX Darwin members the sources use
+  # (struct stat st_mtimespec, pthread QoS APIs in pthread/qos.h). Without
+  # it the strict -D_POSIX_C_SOURCE above hides them on BOTH Apple targets
+  # (iOS compiles failed on st_mtimespec + qos_class_t until this matched
+  # the macOS branch).
   cflags += ['-D_DARWIN_C_SOURCE']
 endif
 
@@ -168,7 +173,19 @@ endif
 # that lacks the v1.0.9 connect fixes (e.g. /usr/local/lib/libhsdaoh.so.0.1.0
 # from an old `make install`). Fall back to pkg-config only if the vendored
 # install is absent, and warn loudly there so the gap is visible.
+#
+# iOS is the exception: it is a no-USB platform (no libusb backend, no public
+# USB host API), so the real hsdaoh cannot be built at all — and the vendored
+# .deps/install prefix below holds HOST macOS libs which must never leak into
+# a cross build. ios/build-deps-ios.sh installs a no-device stub libhsdaoh +
+# hsdaoh.pc into the slice prefix (.deps/install-ios*), resolved exclusively
+# through the cross pkg-config wrapper (ios/gen-cross-file.sh).
+if host_system == 'ios'
+  hsdaoh_dep = dependency('hsdaoh')
+  message('iOS no-USB build: using the hsdaoh stub from the cross prefix (USB capture unsupported on iOS)')
+endif
 fs = import('fs')
+if host_system != 'ios'
 hsdaoh_vendored_prefix = meson.current_source_dir() / '..' / '.deps' / 'install'
 # A local checkout may also contain a Linux .deps/install. Keep Windows
 # archives in the existing install-win prefix separate from ELF libraries.
@@ -194,6 +211,7 @@ else
   warning('Vendored hsdaoh not found in .deps/install; falling back to system hsdaoh. ' +
           'Build third_party/hsdaoh into .deps/install (see .github/workflows/build.yml) to mirror CI.')
 endif
+endif  # not ios (stub path above already set hsdaoh_dep)
 deps = [ hsdaoh_dep ]
 libusb_common_dep = dependency('libusb-1.0', required : false, static: windows_static_deps)
 libusb_common_dep_added = false
@@ -388,24 +406,34 @@ elif host_system == 'android'
   # capture is out of scope for the basic Android release).
   sources_capture += 'misrc_capture/simple_capture/simple_capture_android.c'
   ldflags_capture += [ '-lm' ]
+elif host_system == 'ios'
+  # No V4L2/AVFoundation device capture on iOS; simple_capture_ios.c is a
+  # no-device stub (CXADC capture is out of scope for the iOS port; the app
+  # ships simulated/playback + network client/monitor modes).
+  sources_capture += 'misrc_capture/simple_capture/simple_capture_ios.c'
+  ldflags_capture += [ '-lm' ]
+  # Platform define consumed by the iOS gates in the GUI sources (paths,
+  # keyboard bridge, updater gating, macOS-only-call exclusions).
+  cflags += [ '-DMISRC_IOS=1' ]
 elif host_system == 'darwin'
   add_languages('objc', native: false)
   ldflags_capture += ['-Wl,-framework,Cocoa', '-Wl,-framework,AVFoundation', '-Wl,-framework,CoreMedia', '-Wl,-framework,CoreVideo', '-Wl,-framework,IOKit', '-Wl,-framework,CoreFoundation', '-Wl,-framework,Security']
   sources_capture += 'misrc_capture/simple_capture/simple_capture_avfoundation.m'
 endif
 
-if host_system == 'android'
-  # raylib was cross-built with GRAPHICS_API_OPENGL_ES3 (rcore_android.c +
-  # rlgl ES3 paths). GUI sources that include rlgl.h must match, else
-  # rlActiveDrawBuffers references the glDrawBuffersEXT extension symbol
-  # which is absent on Android GLES and fails at link time.
+if host_system == 'android' or host_system == 'ios'
+  # raylib was cross-built with GRAPHICS_API_OPENGL_ES3 (rcore_android.c on
+  # Android; rcore_desktop_sdl.c on iOS). GUI sources that include rlgl.h
+  # must match, else rlActiveDrawBuffers references the glDrawBuffersEXT
+  # extension symbol which is absent on GLES3 and fails at link time.
   cflags += ['-DGRAPHICS_API_OPENGL_ES3']
 endif
 
-# The CLI tools (misrc_extract, misrc_capture) are not built for Android: an
-# APK has no terminal to run them, and they would only add cross-link risk.
-# The Android build target is the libmisrc_gui.so NativeActivity library below.
-if host_system != 'android'
+# The CLI tools (misrc_extract, misrc_capture) are not built for Android or
+# iOS: an APK/app has no terminal to run them, and they would only add
+# cross-link risk. The Android target is the libmisrc_gui.so NativeActivity
+# library; the iOS target is the misrc_gui app executable below.
+if host_system != 'android' and host_system != 'ios'
   extract_exe = executable('misrc_extract',
                 sources_extract,
                 dependencies: [],
@@ -578,6 +606,10 @@ if raylib_dep.found()
       endif
     elif host_system == 'android'
       gui_deps += [meson.get_compiler('c').find_library('c++', required: true)]
+    elif host_system == 'ios'
+      # Static OpenH264 archive from the iOS cross prefix -> libc++ runtime
+      # (same rule as Android; clang links libc++ by default on iOS).
+      gui_deps += [meson.get_compiler('c').find_library('c++', required: true)]
     elif host_system == 'linux' or host_system == 'darwin'
       # The vendored in-repo openh264 (third_party/openh264, built by
       # scripts/build-deps-unix.sh) is a STATIC archive, so the link needs
@@ -689,6 +721,30 @@ if raylib_dep.found()
     # JNI bridge: MainActivity.nativeSetUsbFd -> android_usb_get_fd() so the
     # hsdaoh capture path can wrap the Java-granted USB fd with uvc_wrap().
     sources_gui += 'misrc_gui/input/android_usb_jni.c'
+  elif host_system == 'ios'
+    # raylib was cross-built with PLATFORM=SDL + GRAPHICS_API_OPENGL_ES3
+    # (rcore_desktop_sdl.c against an iOS-built SDL2: UIKit window + EAGL
+    # GLES3 context + touch + on-screen keyboard). No -lGL/-lX11 — SDL2
+    # provides the windowing. The framework list covers SDL2's UIKit
+    # dependencies plus raylib raudio's CoreAudio backend. -lSDL2main pulls
+    # in SDL_uikit_main.c's real main() which runs UIApplicationMain and then
+    # calls SDL_main — the app TU renames its main to SDL_main under
+    # MISRC_IOS (misrc_gui.c entry gate). No -lpthread: iOS libc provides
+    # pthread. No -ldl: iOS dlopen is unused here.
+    gui_ldflags += [
+      '-Wl,-framework,Foundation', '-Wl,-framework,UIKit',
+      '-Wl,-framework,OpenGLES', '-Wl,-framework,CoreFoundation',
+      '-Wl,-framework,CoreAudio', '-Wl,-framework,AudioToolbox',
+      '-Wl,-framework,AVFoundation', '-Wl,-framework,CoreGraphics',
+      '-Wl,-framework,QuartzCore', '-Wl,-framework,CoreVideo',
+      '-Wl,-framework,CoreMotion', '-Wl,-framework,GameController',
+      '-Wl,-framework,CoreHaptics', '-Wl,-framework,Metal',
+      '-lSDL2main', '-lm',
+    ]
+    sources_gui += 'misrc_capture/simple_capture/simple_capture_ios.c'
+    # iOS platform bridge: Documents storage path + SDL soft keyboard
+    # (mirrors android_usb_jni.c's role, minus USB which cannot exist).
+    sources_gui += 'misrc_gui/input/ios_platform.c'
   elif host_system == 'darwin'
     gui_ldflags += ['-Wl,-framework,OpenGL', '-Wl,-framework,Cocoa', '-Wl,-framework,IOKit', '-Wl,-framework,CoreAudio', '-Wl,-framework,CoreVideo']
     gui_ldflags += ['-Wl,-framework,AVFoundation', '-Wl,-framework,CoreMedia', '-Wl,-framework,Security']
@@ -708,8 +764,9 @@ if raylib_dep.found()
   endif
 
   # Headless CLI capture mode: compile misrc_capture.c into the GUI binary
-  # (non-Android only) with main renamed to misrc_capture_main, so the GUI
-  # binary can run as the full misrc_capture CLI when capture args are passed.
+  # (desktop platforms only) with main renamed to misrc_capture_main, so the
+  # GUI binary can run as the full misrc_capture CLI when capture args are
+  # passed. Not on Android/iOS (no terminal, cross-link risk).
   # The static lib's extern symbols (usage/list_devices/audio_file_writer/etc.)
   # are unique to this TU and don't collide with the GUI's; common symbols are
   # resolved from the GUI's own common/ objects at link time.
@@ -719,7 +776,7 @@ if raylib_dep.found()
   # this TU before version.h exists (the standalone misrc_capture gets this via
   # version_target in sources_capture).
   gui_extra_link_with = []
-  if host_system != 'android'
+  if host_system != 'android' and host_system != 'ios'
     misrc_capture_cli_lib = static_library('misrc_capture_cli',
                 'misrc_capture/misrc_capture.c',
                 version_target,
@@ -743,8 +800,10 @@ if raylib_dep.found()
                 c_args: gui_cflags,
                 install: true)
   else
-    # Captured into misrc_gui_exe so the update_cli test can depend on the
-    # real built binary (it drives the headless update CLI end to end).
+    # Desktop + iOS: a plain executable. On iOS this is the MISRC.app
+    # bundle executable (ios/build-app-ios.sh packages it); its entry is
+    # SDL_main via the MISRC_IOS rename in misrc_gui.c, called by
+    # SDL2main's main() after UIApplicationMain finishes launching.
     misrc_gui_exe = executable('misrc_gui',
                 sources_gui + gui_win_resources,
                 dependencies: gui_deps,
@@ -756,7 +815,7 @@ if raylib_dep.found()
                 install: true)
   endif
 
-  if host_system != 'android'
+  if host_system != 'android' and host_system != 'ios'
     font_test = executable('gui_font_test',
       ['test/gui_font_test.c', 'common/file_utils.c'],
       dependencies: [raylib_dep], c_args: cflags, link_args: gui_ldflags)

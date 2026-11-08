@@ -85,7 +85,7 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
-#if defined(__APPLE__)
+#if (defined(__APPLE__) && !defined(MISRC_IOS))
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/pwr_mgt/IOPMLib.h>
 #endif
@@ -174,7 +174,7 @@ static void gui_capture_pop_upstream_audio(upstream_audio_queue_t *queue)
     queue->count--;
 }
 
-#if defined(__APPLE__)
+#if (defined(__APPLE__) && !defined(MISRC_IOS))
 static IOPMAssertionID s_idle_sleep_assertion_id = kIOPMNullAssertionID;
 static IOPMAssertionID s_display_sleep_assertion_id = kIOPMNullAssertionID;
 
@@ -1529,7 +1529,7 @@ void gui_app_enumerate_devices(gui_app_t *app) {
     // MISRC Clockgen entries are offered (the clockgen drives either backend).
     bool misrc_clockgen_audio_present = gui_cxadc_detect_misrc_clockgen_audio();
 
-#if defined(__APPLE__)
+#if (defined(__APPLE__) && !defined(MISRC_IOS))
     for(int i=0;i<cxadc_card_count && app->device_count<MAX_DEVICES;i++) {
         device_info_t *dst=&app->devices[app->device_count++];
         snprintf(dst->name,sizeof(dst->name),"[CXADC] %s",gui_cxadc_macos_name(i));
@@ -2469,7 +2469,7 @@ windows_mf_open_hid:
         app->reconnect_pending = false;
         app->reconnect_attempts = 0;
 
-#if defined(__APPLE__)
+#if (defined(__APPLE__) && !defined(MISRC_IOS))
     /* hsdaoh_start_stream() / sc_start_capture() have now spawned their
      * internal libusb/libuvc transport threads. Walk the task one more time
      * and force every thread (ours + third-party) off the timeshare class so
@@ -2528,7 +2528,7 @@ windows_mf_open_hid:
     }
     gui_capture_hold_power_assertions();
 
-#if defined(__APPLE__)
+#if (defined(__APPLE__) && !defined(MISRC_IOS))
     /* Final sweep: catch any late-created dispatch/workqueue/Metal helper
      * threads that spun up during extraction/display thread init. */
     macos_promote_all_task_threads();

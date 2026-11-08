@@ -26,11 +26,11 @@
 
 #include "gui_app.h"
 #include "gui_updater.h"
-#if !defined(__ANDROID__)
+#if !defined(__ANDROID__) && !defined(MISRC_IOS)
 #include "../../misrc_capture/misrc_capture_cli.h"
 #endif
 #include "../ui/gui_ui.h"
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(MISRC_IOS)
 #define GUI_ANDROID_VIEWPORT_IMPLEMENTATION
 #include "gui_android_viewport.h"
 #endif
@@ -170,11 +170,11 @@ static void print_usage(const char *program_name) {
             MIRSC_TOOLS_VERSION,
             program_name ? program_name : "misrc_gui",
             program_name ? program_name : "misrc_gui");
-#if !defined(__ANDROID__)
+#if !defined(__ANDROID__) && !defined(MISRC_IOS)
     /* Append the full misrc_capture CLI option list (single source of truth). */
     misrc_capture_print_usage();
 #else
-    fprintf(stdout, "(Headless CLI capture mode is not available in the Android build.)\n");
+    fprintf(stdout, "(Headless CLI capture mode is not available in mobile app builds.)\n");
 #endif
 }
 // Headless update CLI (--check-update / --update-dry-run / --install-update):
@@ -467,7 +467,13 @@ static int gui_find_reconnect_device(const gui_app_t *app, const gui_reconnect_t
     return fallback_same_type;
 }
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) && !defined(MISRC_IOS)
+/* macOS-only admin relaunch machinery. MUST NOT compile on iOS: on the
+ * iOS *simulator* the app runs as the host user, so /usr/bin/osascript
+ * EXISTS and posix_spawn() succeeds -> the helper returns 1 -> main()
+ * returns 0 instantly -> black screen with the UIKit runloop idling
+ * forever (the 2026-11-08 sim launch hang). USB elevation is meaningless
+ * on iOS anyway (no libusb). */
 static bool gui_append_text(char *dst, size_t dst_cap, size_t *len, const char *src)
 {
     if (!dst || !len || !src || dst_cap == 0) return false;
@@ -764,7 +770,18 @@ static int gui_run_role_headless_server(const char *config_path,
 }
 #endif
 
+#if defined(MISRC_IOS)
+/* iOS entry contract: libSDL2main (SDL_uikit_main.c) provides the real
+ * main(), which runs UIApplicationMain; the UIKit app delegate then calls
+ * SDL_main on the main thread after launch (postFinishLaunch). raylib's SDL
+ * backend pumps the UIKit runloop from inside SDL_PollEvent each frame, so
+ * the while(!WindowShouldClose()) loop below IS the runloop pump. Same
+ * rename trick as the desktop CLI embedding (-Dmain=misrc_capture_main),
+ * applied via a source gate because this TU is shared with all platforms. */
+int SDL_main(int argc, char **argv) {
+#else
 int main(int argc, char **argv) {
+#endif
     if (!file_init_utf8_argv(&argc, &argv)) return 1;
     bool debug_view = false;
     bool show_help = false;
@@ -919,7 +936,7 @@ int main(int argc, char **argv) {
         }
         has_capture_arg = true;
     }
-#if !defined(__ANDROID__)
+#if !defined(__ANDROID__) && !defined(MISRC_IOS)
     // Headless CLI capture mode: run as the full misrc_capture CLI (no window).
     // misrc_capture_main handles --device-list/--devices, -a/-b/-r/-x, -f, -n/-t,
     // resample/audio opts, and prints full CLI usage on an incomplete combo.
@@ -970,7 +987,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "--auto-connect requires --config <path> (need a server/client config)\n");
         return 1;
     }
-#if defined(__APPLE__)
+#if defined(__APPLE__) && !defined(MISRC_IOS)
     int elevate_rc = gui_macos_relaunch_as_admin_if_needed(argc, argv);
     if (elevate_rc > 0) {
         return 0;
@@ -1058,7 +1075,16 @@ int main(int argc, char **argv) {
     app.settings.capture_limit_seconds = 0;
 
     // Initialize raylib window
+#if defined(MISRC_IOS)
+    /* iOS: SDL/UIKit presents reliably with a FULLSCREEN-sized window (the
+     * window is the whole screen; MSAA/vsync/resizable desktop flags are
+     * meaningless here). A 1425x720 "desktop" window on iOS produced a
+     * drawable that never composited on screen even though the GL
+     * framebuffer had the rendered content. */
+    unsigned int window_flags = FLAG_FULLSCREEN_MODE | FLAG_VSYNC_HINT;
+#else
     unsigned int window_flags = FLAG_WINDOW_RESIZABLE | FLAG_MSAA_4X_HINT | FLAG_VSYNC_HINT;
+#endif
     SetConfigFlags(window_flags);
     // Keep defaults usable while fitting common laptop screens.
     const int default_window_width = 1425;
@@ -1658,7 +1684,7 @@ int main(int argc, char **argv) {
             } else if (auto_rec_phase == AUTO_REC_RECORDING) {
                 if (!app.is_recording) {
                     fprintf(stderr, "[AUTO] recording stopped early; finishing\n");
-#if defined(__APPLE__)
+#if defined(__APPLE__) && !defined(MISRC_IOS)
                     if (gui_cxadc_macos_active()) auto_rec_failed = true;
 #endif
                     auto_rec_phase = AUTO_REC_FINALIZING;
@@ -1673,7 +1699,7 @@ int main(int argc, char **argv) {
                         gui_app_stop_capture(&app);
                         fprintf(stderr, "[AUTO] capture stopped\n");
                     }
-#if defined(__APPLE__)
+#if defined(__APPLE__) && !defined(MISRC_IOS)
                     if (gui_cxadc_macos_failed()) auto_rec_failed = true;
 #endif
                     fprintf(stderr, "[AUTO] record cycle complete%s; exiting\n",
@@ -1684,15 +1710,16 @@ int main(int argc, char **argv) {
             }
         }
 
-        // Apply Android gestures before Clay hit testing. Only a verified
-        // single tap triggers controls; a pan/pinch must never click them.
-#if defined(__ANDROID__)
+        // Apply touch gestures before Clay hit testing (Android + iOS).
+        // Only a verified single tap triggers controls; a pan/pinch must
+        // never click them.
+#if defined(__ANDROID__) || defined(MISRC_IOS)
         gui_android_viewport_update();
 #endif
         // Update Clay mouse state
         Vector2 mouse_pos = gui_ui_get_mouse_position();
         Clay_SetPointerState((Clay_Vector2){ mouse_pos.x, mouse_pos.y },
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(MISRC_IOS)
                              gui_android_viewport_click_pressed(MOUSE_LEFT_BUTTON));
 #else
                              IsMouseButtonDown(MOUSE_LEFT_BUTTON));
@@ -1959,26 +1986,45 @@ int main(int argc, char **argv) {
 
         // Render
         BeginDrawing();
-#if defined(__ANDROID__)
+#if defined(MISRC_IOS)
+        /* RENDER BISECT step A (2026-11-08): touch canvas ON, Clay render
+         * still OFF. Isolates the canvas path. */
+        const bool android_canvas_active = gui_android_viewport_begin_canvas();
+        ClearBackground(COLOR_BG);
+        DrawRectangle(80, 80, 600, 300, MAROON);
+        DrawText("MISRC iOS CANVAS BISECT", 40, 40, 28, RAYWHITE);
+        DrawFPS(40, 500);
+#else
+#if defined(__ANDROID__) || defined(MISRC_IOS)
         const bool android_canvas_active = gui_android_viewport_begin_canvas();
 #endif
         ClearBackground(COLOR_BG);
 
         // Render Clay UI (custom elements are handled via CLAY_RENDER_COMMAND_TYPE_CUSTOM)
         Clay_Raylib_Render(render_commands, fonts);
+#endif
 
         // Draw FPS in debug mode
         #ifdef DEBUG
         DrawFPS(10, 10);
         #endif
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) && !defined(MISRC_IOS)
         gui_cxadc_macos_ui_draw(&app);
 #endif
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(MISRC_IOS)
         gui_android_viewport_present_canvas(android_canvas_active);
 #endif
         EndDrawing();
+#if defined(MISRC_IOS)
+        {
+            /* TEMPORARY DEBUG (black-screen investigation; see ios_platform.c) */
+            extern void ios_gl_debug_dump(int frame);
+            static int s_ios_dbg_frame = 0;
+            if ((s_ios_dbg_frame % 30) == 0) ios_gl_debug_dump(s_ios_dbg_frame);
+            s_ios_dbg_frame++;
+        }
+#endif
     }
 
     // Restore the original window proc (Windows modal move/size driver)
@@ -2009,7 +2055,7 @@ int main(int argc, char **argv) {
         UnloadFont(fonts[1]);
     }
 
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(MISRC_IOS)
     gui_android_viewport_shutdown();
 #endif
     CloseWindow();
