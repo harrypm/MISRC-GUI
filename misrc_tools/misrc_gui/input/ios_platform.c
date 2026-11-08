@@ -34,6 +34,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <unistd.h>
 
 #ifndef MISRC_IOS
 #error "ios_platform.c must only be compiled for iOS builds (-DMISRC_IOS)"
@@ -67,6 +68,22 @@ const char *ios_get_storage_path(void)
 
 void ios_set_keyboard_visible(int visible)
 {
+    /* TEMPORARY debug (touch-eater investigation): SDL_StartTextInput on
+     * iOS creates a hidden UITextField and makes it FIRST RESPONDER,
+     * which can swallow all touches. Log every call. */
+    {
+        const char *home = getenv("HOME");
+        if (home) {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/misrc_input.log", home);
+            FILE *f = fopen(path, "a");
+            if (f) {
+                fprintf(f, "KBD visible=%d (SDL_%s)\n",
+                        visible, visible ? "StartTextInput" : "StopTextInput");
+                fclose(f);
+            }
+        }
+    }
     if (visible) {
         SDL_StartTextInput();
     } else {
@@ -79,6 +96,14 @@ int ios_open_url(const char *url)
     if (!url || !*url) return 0;
     /* SDL2 hands off to the system browser on iOS (no shell to spawn). */
     return SDL_OpenURL(url) == 0;
+}
+
+/* CPU core detection for the info panel / FLAC thread defaults (the CLI
+ * lib's get_num_cores is not linked on iOS; sysconf does the same job). */
+uint32_t get_num_cores(void)
+{
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return (n > 0) ? (uint32_t)n : 0;
 }
 
 /* TEMPORARY DEBUG (2026-11-08 black-screen investigation): dump the GL state

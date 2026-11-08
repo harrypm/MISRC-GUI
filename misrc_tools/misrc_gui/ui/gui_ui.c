@@ -135,7 +135,12 @@ void gui_ui_show_scale_hud(int percent)
 
 static int gui_ui_get_base_layout_width(void)
 {
-#if defined(__APPLE__)
+#if defined(MISRC_IOS)
+    /* Layout = the native-res inset letterbox rect (matches the render
+     * canvas), NOT the raw screen: the UI must lay out to what is drawn. */
+    int width = 0, height = 0;
+    gui_ios_view_layout_size(&width, &height);
+#elif defined(__APPLE__)
     int width = GetScreenWidth();
 #else
     int width = GetRenderWidth();
@@ -146,7 +151,10 @@ static int gui_ui_get_base_layout_width(void)
 
 static int gui_ui_get_base_layout_height(void)
 {
-#if defined(__APPLE__)
+#if defined(MISRC_IOS)
+    int width = 0, height = 0;
+    gui_ios_view_layout_size(&width, &height);
+#elif defined(__APPLE__)
     int height = GetScreenHeight();
 #else
     int height = GetRenderHeight();
@@ -175,8 +183,16 @@ Vector2 gui_ui_get_render_scale(void)
     Vector2 render_scale = { app_scale, app_scale };
     int layout_width = gui_ui_get_layout_width();
     int layout_height = gui_ui_get_layout_height();
+#if defined(MISRC_IOS)
+    /* The drawing surface is the inset letterbox canvas, whose size equals
+     * the layout size -> factor 1 (using the raw screen here would scale
+     * the UI up beyond the canvas). */
+    int render_width = layout_width;
+    int render_height = layout_height;
+#else
     int render_width = GetRenderWidth();
     int render_height = GetRenderHeight();
+#endif
     if (render_width > 0 && layout_width > 0) {
         render_scale.x = (float)render_width / (float)layout_width;
     }

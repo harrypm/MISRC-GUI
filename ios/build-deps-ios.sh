@@ -641,6 +641,105 @@ else:
     open(p, 'w').write(s)
     print('[ios-deps] rlgl.h: viewRenderbuffer patch applied (%d RB-zero sites, %d FBO-restore sites extended)' % (n1, n2))
 PY
+    # (5) HIGHDPI: the SDL backend assigns render = screen (POINT space)
+    #     and never queries the physical drawable, so with
+    #     SDL_WINDOW_ALLOW_HIGHDPI the GL viewport stays 1x while the
+    #     framebuffer is 3x -> the UI renders tiny in the corner. Query
+    #     SDL_GL_GetDrawableSize on iOS and set the render size to it.
+    python3 - "$RAYLIB_SRC/src/platforms/rcore_desktop_sdl.c" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+if 'MISRC_IOS_DRAWABLE_SIZE' in s:
+    print('[ios-deps] rcore_desktop_sdl.c drawable-size patch already applied')
+else:
+    anchor = '''        CORE.Window.render.width = CORE.Window.screen.width;
+        CORE.Window.render.height = CORE.Window.screen.height;
+        CORE.Window.currentFbo.width = CORE.Window.render.width;
+        CORE.Window.currentFbo.height = CORE.Window.render.height;'''
+    patch = anchor + '''
+
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+        /* MISRC iOS port (MISRC_IOS_DRAWABLE_SIZE): with
+         * SDL_WINDOW_ALLOW_HIGHDPI the GL framebuffer is the PHYSICAL
+         * size (points * scale) while screen.width stays points; the
+         * stock code above leaves render at points -> a 1x viewport in
+         * the corner of a 3x framebuffer (tiny UI). Use the drawable. */
+        {
+            int drawable_w = 0, drawable_h = 0;
+            SDL_GL_GetDrawableSize(platform.window, &drawable_w, &drawable_h);
+            if (drawable_w > 0 && drawable_h > 0) {
+                CORE.Window.render.width = drawable_w;
+                CORE.Window.render.height = drawable_h;
+                CORE.Window.currentFbo.width = drawable_w;
+                CORE.Window.currentFbo.height = drawable_h;
+                TRACELOG(LOG_INFO, "GL: [iOS] drawable (physical) size: %i x %i", drawable_w, drawable_h);
+            }
+        }
+#endif'''
+    if anchor not in s:
+        sys.exit('rcore_desktop_sdl.c render-size block not found')
+    open(p, 'w').write(s.replace(anchor, patch, 1))
+    print('[ios-deps] rcore_desktop_sdl.c: drawable-size patch applied')
+PY
+    # (5b) Same drawable fix for the RESIZE path: SDL_WINDOWEVENT_SIZE_CHANGED
+    #      reports POINT sizes and calls SetupViewport(points) — on iOS with
+    #      ALLOW_HIGHDPI that resets the viewport back to 1x after the
+    #      init-time fix. Query the drawable in the handler as well.
+    python3 - "$RAYLIB_SRC/src/platforms/rcore_desktop_sdl.c" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+if 'MISRC_IOS_DRAWABLE_RESIZE' in s:
+    print('[ios-deps] rcore_desktop_sdl.c drawable-resize patch already applied')
+else:
+    anchor = '''                    case SDL_WINDOWEVENT_RESIZED:
+                    case SDL_WINDOWEVENT_SIZE_CHANGED:
+                    {
+                        const int width = event.window.data1;
+                        const int height = event.window.data2;
+                        SetupViewport(width, height);
+                        CORE.Window.screen.width = width;
+                        CORE.Window.screen.height = height;
+                        CORE.Window.currentFbo.width = width;
+                        CORE.Window.currentFbo.height = height;
+                        CORE.Window.resizedLastFrame = true;
+                    } break;'''
+    patch = '''                    case SDL_WINDOWEVENT_RESIZED:
+                    case SDL_WINDOWEVENT_SIZE_CHANGED:
+                    {
+                        const int width = event.window.data1;
+                        const int height = event.window.data2;
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+                        /* MISRC iOS port (MISRC_IOS_DRAWABLE_RESIZE): the
+                         * event carries POINT sizes; with ALLOW_HIGHDPI the
+                         * GL framebuffer is points*scale, so viewport and
+                         * fbo bookkeeping must use the drawable size. */
+                        {
+                            int dw = width, dh = height;
+                            SDL_GL_GetDrawableSize(platform.window, &dw, &dh);
+                            SetupViewport(dw, dh);
+                            CORE.Window.screen.width = width;
+                            CORE.Window.screen.height = height;
+                            CORE.Window.render.width = dw;
+                            CORE.Window.render.height = dh;
+                            CORE.Window.currentFbo.width = dw;
+                            CORE.Window.currentFbo.height = dh;
+                        }
+#else
+                        SetupViewport(width, height);
+                        CORE.Window.screen.width = width;
+                        CORE.Window.screen.height = height;
+                        CORE.Window.currentFbo.width = width;
+                        CORE.Window.currentFbo.height = height;
+#endif
+                        CORE.Window.resizedLastFrame = true;
+                    } break;'''
+    if anchor not in s:
+        sys.exit('rcore_desktop_sdl.c SIZE_CHANGED block not found')
+    open(p, 'w').write(s.replace(anchor, patch, 1))
+    print('[ios-deps] rcore_desktop_sdl.c: drawable-resize patch applied')
+PY
     python3 - "$RAYLIB_SRC/src/platforms/rcore_desktop_sdl.c" <<'PY'
 import sys
 p = sys.argv[1]

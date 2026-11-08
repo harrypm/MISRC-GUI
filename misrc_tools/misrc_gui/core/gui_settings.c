@@ -45,7 +45,10 @@
 // Stock threads = min(8, available cores) so an 8+-core system gets 8,
 // a smaller system gets its core count, and a detection failure falls
 // back to 0 (auto).
-#if !defined(__ANDROID__) && !defined(MISRC_IOS)
+#if defined(MISRC_IOS)
+/* ios_platform.c provides get_num_cores() via sysconf(_SC_NPROCESSORS_ONLN). */
+extern uint32_t get_num_cores(void);
+#elif !defined(__ANDROID__)
 extern uint32_t get_num_cores(void);
 #endif
 
@@ -476,7 +479,7 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     // CPU allowance. Actual cost depends on the profile and hardware. 12+ cores
     // -> 300%, 6-11 -> 200%, else 100%. The Budget button overrides per session.
     settings->rf_preview_budget_percent = 100;
-#if !defined(__ANDROID__) && !defined(MISRC_IOS)
+#if defined(MISRC_IOS) || ( !defined(__ANDROID__) )
     {
         uint32_t cores = get_num_cores();
         if (cores >= 12) settings->rf_preview_budget_percent = 300;
@@ -552,7 +555,7 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     // falls back to 0 (auto) so the encoder picks something sane.
     // Android doesn't link the CLI lib (where get_num_cores lives), so it
     // uses 0 (auto) there.
-#if !defined(__ANDROID__) && !defined(MISRC_IOS)
+#if defined(MISRC_IOS) || ( !defined(__ANDROID__) )
     {
         uint32_t cores = get_num_cores();
         if (cores >= 8) {

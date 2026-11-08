@@ -1028,6 +1028,14 @@ int main(int argc, char **argv) {
     // Render the existing UI without layout zoom on Android. The touch
     // viewport scales the whole frame, including its outer borders.
     app.settings.ui_scale_percent = GUI_UI_SCALE_DEFAULT_PERCENT;
+#elif defined(MISRC_IOS)
+    /* Phone UI: the letterbox layout is ~716pt wide vs the desktop's
+     * 1425px, so absolute-px controls render visually tiny. Scale the
+     * layout up 150% (elements 1.5x bigger, layout width shrinks
+     * accordingly - the same knob as the desktop Ctrl+wheel UI scale). */
+    if (app.settings.ui_scale_percent == GUI_UI_SCALE_DEFAULT_PERCENT) {
+        app.settings.ui_scale_percent = 150;
+    }
 #endif
     gui_ui_set_scale_percent(app.settings.ui_scale_percent);
     // --gen-system / --gen-format launch overrides (hard rule
@@ -1081,7 +1089,7 @@ int main(int argc, char **argv) {
      * meaningless here). A 1425x720 "desktop" window on iOS produced a
      * drawable that never composited on screen even though the GL
      * framebuffer had the rendered content. */
-    unsigned int window_flags = FLAG_FULLSCREEN_MODE | FLAG_VSYNC_HINT;
+    unsigned int window_flags = FLAG_FULLSCREEN_MODE | FLAG_VSYNC_HINT | FLAG_WINDOW_HIGHDPI;
 #else
     unsigned int window_flags = FLAG_WINDOW_RESIZABLE | FLAG_MSAA_4X_HINT | FLAG_VSYNC_HINT;
 #endif
@@ -1496,6 +1504,9 @@ int main(int argc, char **argv) {
             flac_threads_zero_warned = true;
             // Suppress when FLAC is turned off: the encoder thread setting is
             // meaningless (no FLAC writer runs), so a startup popup is noise.
+            // iOS also suppresses: mobile builds DEFAULT to 0 (auto) - the
+            // popup would fire on every first launch with no user error.
+#if !defined(MISRC_IOS)
             if (app.settings.use_flac && app.settings.flac_threads == 0) {
                 gui_popup_info("FLAC threads set to auto (0)",
                     "FLAC encoder threads is 0 (auto).\n\n"
@@ -1504,6 +1515,7 @@ int main(int argc, char **argv) {
                     "explicit thread count (e.g. 4, 6, or 8) in Settings.\n\n"
                     "You can raise it with the + button.");
             }
+#endif
         }
         // One-time startup warning: if FLAC level is 1-3 (low compression),
         // warn once. Same pattern as the threads=0 check above.

@@ -103,8 +103,10 @@ BUILD_NUM="$(git -C "$REPO_ROOT" rev-list --count HEAD 2>/dev/null || date +%Y%m
 
 cp "$BIN" "$APP/misrc_gui"
 
+BUNDLE_ID="${BUNDLE_ID:-org.misrc.gui}"
 sed -e "s|<string>1.0.0</string>|<string>$VERSION_CLEAN</string>|" \
     -e "s|<string>1</string>|<string>$BUILD_NUM</string>|" \
+    -e "s|org.misrc.gui|$BUNDLE_ID|" \
     "$SCRIPT_DIR/Info.plist" > "$APP/Info.plist"
 
 # Icons: opaque + centered via ios/make_icons.py. The source art is a
@@ -129,8 +131,32 @@ else
   if [[ -n "$PROFILE" ]]; then
     cp "$PROFILE" "$APP/embedded.mobileprovision"
   fi
-  codesign --force --sign "$SIGN_IDENTITY" --timestamp=none "$APP"
-  log "codesigned with: $SIGN_IDENTITY"
+  # Entitlements derived from the profile (team + app identifier) so the
+  # signature matches what the device expects from a personal-team install.
+  TEAM_ID="${TEAM_ID:-}"
+  if [[ -z "$TEAM_ID" && -n "$PROFILE" ]]; then
+    TEAM_ID="$(security cms -D -i "$PROFILE" 2>/dev/null | plutil -extract TeamIdentifier.0 raw -o - - 2>/dev/null)"
+  fi
+  if [[ -n "$TEAM_ID" ]]; then
+    cat > "$APP/entitlements.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>application-identifier</key>
+	<string>$TEAM_ID.$BUNDLE_ID</string>
+	<key>com.apple.developer.team-identifier</key>
+	<string>$TEAM_ID</string>
+	<key>get-task-allow</key>
+	<true/>
+</dict>
+</plist>
+EOF
+    codesign --force --sign "$SIGN_IDENTITY" --entitlements "$APP/entitlements.plist" --timestamp=none "$APP"
+  else
+    codesign --force --sign "$SIGN_IDENTITY" --timestamp=none "$APP"
+  fi
+  log "codesigned with: $SIGN_IDENTITY (team: ${TEAM_ID:-unknown})"
 fi
 
 log "built $APP"

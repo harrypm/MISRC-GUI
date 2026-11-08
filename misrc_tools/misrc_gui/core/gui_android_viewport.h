@@ -19,6 +19,11 @@ Vector2 gui_android_viewport_pointer(void);
 bool gui_android_viewport_begin_canvas(void);
 void gui_android_viewport_present_canvas(bool active);
 void gui_android_viewport_restore_canvas_after_texture(void);
+/* Native-resolution render target size on iOS (the inset letterbox rect);
+ * layout code uses this instead of the raw screen size. Android n/a. */
+#if defined(MISRC_IOS)
+void gui_ios_view_layout_size(int *w, int *h);
+#endif
 /* Native-resolution zoom transform, also used for Clay scissor bounds. */
 void gui_android_viewport_get_render_transform(float *zoom, float *x, float *y);
 void gui_android_viewport_shutdown(void);
@@ -48,32 +53,75 @@ typedef struct {
 static gui_android_viewport_state_t s_android_view = { .zoom = 1.0f };
 
 #if defined(MISRC_IOS)
-/* 16:9 letterbox ("video with bars"): the full-resolution UI canvas is
- * blitted into a centered 16:9 rect so no UI is chopped by the rounded
- * corners / camera cutout. Bars are the black full-screen clear in
- * gui_android_viewport_present_canvas(). Touch/zoom math maps through the
- * letterbox (identity on Android, which keeps the full-screen blit). */
-#define MISRC_IOS_UI_ASPECT (16.0f / 9.0f)
+/* Letterbox: the UI canvas is rendered NATIVE-RESOLUTION into an inset
+ * rect that starts at the corner curve (~64pt, clearing the rounded
+ * corners and the camera cutout); the rest is black bars (the full-screen
+ * clear in present_canvas). Native res = no downscale blur; the layout
+ * sizes itself to the inset rect via gui_ios_view_layout_size(). */
+#include <stdio.h>
+#include <stdlib.h>
+#define MISRC_IOS_VIEW_INSET 64
+/* DPI scale: physical render px per screen POINT. Without
+ * FLAG_WINDOW_HIGHDPI this is 1 (the old blurry 1x rendering). */
+static float ios_view_dpi(void)
+{
+    const int sw = GetScreenWidth();
+    return (sw > 0) ? (float)GetRenderWidth() / (float)sw : 1.0f;
+}
+/* Fit rect in POINT space (layout/input/pan live in points; the canvas
+ * and blit rect are physical = points * dpi). */
 static void ios_view_fit_rect(int *ox, int *oy, int *cw, int *ch)
 {
-    const int W = GetRenderWidth(), H = GetRenderHeight();
+    const int W = GetScreenWidth(), H = GetScreenHeight();
     if (W <= 0 || H <= 0) {
         *ox = *oy = 0;
         *cw = (W > 0) ? W : 1;
         *ch = (H > 0) ? H : 1;
         return;
     }
-    if ((float)W / (float)H > MISRC_IOS_UI_ASPECT) {
-        *ch = H;
-        *cw = (int)roundf((float)H * MISRC_IOS_UI_ASPECT);
-        *oy = 0;
-        *ox = (W - *cw) / 2;
+    if (W > H) {
+        /* Landscape: bars on the left/right, full height. */
+        *oy = 0;      *ch = H;
+        *ox = MISRC_IOS_VIEW_INSET;
+        *cw = W - 2 * MISRC_IOS_VIEW_INSET;
     } else {
-        *cw = W;
-        *ch = (int)roundf((float)W / MISRC_IOS_UI_ASPECT);
-        *ox = 0;
-        *oy = (H - *ch) / 2;
+        /* Portrait: bars top/bottom, full width. */
+        *ox = 0;      *cw = W;
+        *oy = MISRC_IOS_VIEW_INSET;
+        *ch = H - 2 * MISRC_IOS_VIEW_INSET;
     }
+    if (*cw < 1) *cw = 1;
+    if (*ch < 1) *ch = 1;
+}
+
+void gui_ios_view_layout_size(int *w, int *h)
+{
+    int ox, oy;
+    ios_view_fit_rect(&ox, &oy, w, h);
+}
+
+/* TEMPORARY input debug (click investigation): append input events/state
+ * to <home>/misrc_input.log so the host can verify what SDL delivers
+ * (finger touches vs mouse) and the coordinate mapping. */
+static void ios_view_input_log(const char *what, float a_x, float a_y,
+                               float b_x, float b_y, int touches, int mdown)
+{
+    const char *home = getenv("HOME");
+    if (!home) return;
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/misrc_input.log", home);
+    FILE *f = fopen(path, "a");
+    if (!f) return;
+    int ox, oy, cw, ch;
+    ios_view_fit_rect(&ox, &oy, &cw, &ch);
+    gui_android_viewport_state_t *v = &s_android_view;
+    fprintf(f, "%s A=(%.0f,%.0f) B=(%.1f,%.1f) touches=%d mdown=%d "
+               "screen=(%dx%d) rect=(%d,%d %dx%d) canvas=(%dx%d) "
+               "zoom=%.2f pan=(%.0f,%.0f)\n",
+            what, a_x, a_y, b_x, b_y, touches, mdown,
+            GetScreenWidth(), GetScreenHeight(), ox, oy, cw, ch,
+            v->canvas_width, v->canvas_height, v->zoom, v->x, v->y);
+    fclose(f);
 }
 #endif
 
@@ -84,8 +132,20 @@ static float android_view_clamp(float x, float lo, float hi)
 
 static void android_view_limit_translation(void)
 {
-    const float w = (float)GetRenderWidth();
-    const float h = (float)GetRenderHeight();
+    /* Clamp pan to the logical UI bounds. Android: the canvas (== the full
+     * physical screen == layout). iOS: the inset letterbox rect in POINTS
+     * (pan state is point-space there). */
+#if defined(MISRC_IOS)
+    int ox, oy, cw, ch;
+    ios_view_fit_rect(&ox, &oy, &cw, &ch);
+    const float w = (float)cw;
+    const float h = (float)ch;
+#else
+    const float w = (s_android_view.canvas_width > 0)
+                        ? (float)s_android_view.canvas_width : (float)GetRenderWidth();
+    const float h = (s_android_view.canvas_height > 0)
+                        ? (float)s_android_view.canvas_height : (float)GetRenderHeight();
+#endif
     gui_android_viewport_state_t *v = &s_android_view;
     if (v->zoom <= 1.001f || w <= 0 || h <= 0) {
         v->zoom = 1.0f;
@@ -118,22 +178,39 @@ void gui_android_viewport_update(void)
     const double now = GetTime();
     v->click_pulse = false;
     v->block_controls = (n != 0);
+#if defined(MISRC_IOS)
+    /* TEMPORARY: per-frame input watcher — logs when touches or mouse
+     * activity exist (plus a 1/45-frame heartbeat) so the host can see
+     * exactly what SDL delivers. */
+    {
+        static int s_watch_frame = 0;
+        static int s_last_n = -1;
+        static bool s_last_mdown = false;
+        const bool mdown = IsMouseButtonDown(MOUSE_BUTTON_LEFT);
+        if (n > 0 || mdown || s_last_n != n || s_last_mdown != mdown ||
+            (s_watch_frame % 45) == 0) {
+            const Vector2 mp = GetMousePosition();
+            const Vector2 t0 = (n > 0) ? GetTouchPosition(0) : (Vector2){ -1.0f, -1.0f };
+            ios_view_input_log("WATCH", mp.x, mp.y, t0.x, t0.y, n, mdown ? 1 : 0);
+        }
+        s_last_n = n;
+        s_last_mdown = mdown;
+        s_watch_frame++;
+    }
+#endif
 
     if (n >= 2) {
         const Vector2 a = GetTouchPosition(0);
         const Vector2 b = GetTouchPosition(1);
         Vector2 mid = { (a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f };
 #if defined(MISRC_IOS)
-        /* Focus point is in UI-canvas coordinates; convert from raw screen
-         * through the letterbox (identity when no bars on that axis). */
+        /* Focus point in canvas coordinates: shift by the letterbox
+         * origin (the blit is 1:1, no scaling). */
         {
-            int ox, oy, cw, ch;
-            ios_view_fit_rect(&ox, &oy, &cw, &ch);
-            const int W = GetRenderWidth(), H = GetRenderHeight();
-            if (cw > 0 && ch > 0 && W > 0 && H > 0) {
-                mid.x = (mid.x - (float)ox) * ((float)W / (float)cw);
-                mid.y = (mid.y - (float)oy) * ((float)H / (float)ch);
-            }
+            int ox, oy, cw2, ch2;
+            ios_view_fit_rect(&ox, &oy, &cw2, &ch2);
+            mid.x -= (float)ox;
+            mid.y -= (float)oy;
         }
 #endif
         const float distance = hypotf(a.x - b.x, a.y - b.y);
@@ -201,6 +278,16 @@ void gui_android_viewport_update(void)
             v->click_screen = v->queued_screen;
             v->click_pulse = true;
             v->queued_tap = false;
+#if defined(MISRC_IOS)
+            {
+                int ox, oy, cw, ch;
+                ios_view_fit_rect(&ox, &oy, &cw, &ch);
+                ios_view_input_log("TAP", v->click_screen.x, v->click_screen.y,
+                                   (v->click_screen.x - (float)ox - v->x) / v->zoom,
+                                   (v->click_screen.y - (float)oy - v->y) / v->zoom,
+                                   0, 0);
+            }
+#endif
         }
     }
     v->last_contacts = n;
@@ -211,14 +298,10 @@ void gui_android_viewport_update(void)
     {
         int ox, oy, cw, ch;
         ios_view_fit_rect(&ox, &oy, &cw, &ch);
-        const int W = GetRenderWidth(), H = GetRenderHeight();
-        const float sx = (cw > 0 && W > 0) ? (float)W / (float)cw : 1.0f;
-        const float sy = (ch > 0 && H > 0) ? (float)H / (float)ch : 1.0f;
-        /* screen px r -> canvas px ((r-ox)*W/cw - pan)/zoom:
-         * offset = -(ox + pan*cw/W), scale = W/(cw*zoom). */
-        SetMouseOffset((int)roundf(-(ox + v->x * ((float)cw / (float)(W > 0 ? W : 1)))),
-                       (int)roundf(-(oy + v->y * ((float)ch / (float)(H > 0 ? H : 1)))));
-        SetMouseScale(sx / v->zoom, sy / v->zoom);
+        /* 1:1 blit: canvas px == UI px; subtract the letterbox origin and
+         * the pan, then divide by the pinch zoom. */
+        SetMouseOffset((int)roundf(-(ox + v->x)), (int)roundf(-(oy + v->y)));
+        SetMouseScale(1.0f / v->zoom, 1.0f / v->zoom);
     }
 #else
     SetMouseOffset((int)roundf(-v->x), (int)roundf(-v->y));
@@ -244,15 +327,12 @@ Vector2 gui_android_viewport_pointer(void)
     if (!v->click_pulse) return GetMousePosition();
 #if defined(MISRC_IOS)
     {
-        /* click_screen is RAW screen px; map through the letterbox into
-         * UI-canvas coordinates (identity on Android). */
+        /* click_screen is RAW screen px; 1:1 letterbox: subtract the rect
+         * origin and pan, divide by zoom (identity on Android). */
         int ox, oy, cw, ch;
         ios_view_fit_rect(&ox, &oy, &cw, &ch);
-        const int W = GetRenderWidth(), H = GetRenderHeight();
-        const float sx = (cw > 0 && W > 0) ? (float)W / (float)cw : 1.0f;
-        const float sy = (ch > 0 && H > 0) ? (float)H / (float)ch : 1.0f;
-        return (Vector2){ ((v->click_screen.x - (float)ox) * sx - v->x) / v->zoom,
-                          ((v->click_screen.y - (float)oy) * sy - v->y) / v->zoom };
+        return (Vector2){ (v->click_screen.x - (float)ox - v->x) / v->zoom,
+                          (v->click_screen.y - (float)oy - v->y) / v->zoom };
     }
 #else
     return (Vector2){ (v->click_screen.x - v->x) / v->zoom,
@@ -268,8 +348,16 @@ Vector2 gui_android_viewport_pointer(void)
  */
 static void android_view_apply_canvas_transform(const gui_android_viewport_state_t *v)
 {
+#if defined(MISRC_IOS)
+    /* Canvas is PHYSICAL px; UI layout and pan state are POINTS: scale by
+     * the DPI factor so the point-space UI fills the physical canvas. */
+    const float dpi = ios_view_dpi();
+    rlTranslatef(v->x * dpi, v->y * dpi, 0.0f);
+    rlScalef(v->zoom * dpi, v->zoom * dpi, 1.0f);
+#else
     rlTranslatef(v->x, v->y, 0.0f);
     rlScalef(v->zoom, v->zoom, 1.0f);
+#endif
 }
 
 void gui_android_viewport_get_render_transform(float *zoom, float *x, float *y)
@@ -284,7 +372,20 @@ bool gui_android_viewport_begin_canvas(void)
     gui_android_viewport_state_t *v = &s_android_view;
     /* Always draw through the canvas, including 1x. The direct-screen path
      * previously produced the clipping seen on some Android handsets. */
+#if defined(MISRC_IOS)
+    /* PHYSICAL-resolution canvas: fit rect (points) * DPI. The UI layout
+     * stays point-space (gui_ios_view_layout_size) and is scaled up by
+     * the DPI factor inside the canvas transform. */
+    int fit_w, fit_h;
+    {
+        int ox, oy;
+        ios_view_fit_rect(&ox, &oy, &fit_w, &fit_h);
+    }
+    const float dpi = ios_view_dpi();
+    const int w = (int)(fit_w * dpi), h = (int)(fit_h * dpi);
+#else
     const int w = GetRenderWidth(), h = GetRenderHeight();
+#endif
     if (w <= 0 || h <= 0) return false;
     if (w != v->canvas_width || h != v->canvas_height) {
         if (v->canvas.id) UnloadRenderTexture(v->canvas);
@@ -316,12 +417,15 @@ void gui_android_viewport_present_canvas(bool active)
     /* Already drawn at pinch zoom; present at native pixel size. Scaling
      * the finished canvas again would reintroduce blurred text. */
 #if defined(MISRC_IOS)
-    /* 16:9 "video with bars": the canvas is blitted into the centered fit
-     * rect; the full-screen clear above leaves the bars. */
+    /* Letterbox: blit the physical canvas 1:1 into the PHYSICAL inset
+     * rect (fit points * DPI); the full-screen clear leaves the bars
+     * starting at the corner curve. */
     {
         int ox, oy, cw, ch;
         ios_view_fit_rect(&ox, &oy, &cw, &ch);
-        const Rectangle dest = { (float)ox, (float)oy, (float)cw, (float)ch };
+        const float dpi = ios_view_dpi();
+        const Rectangle dest = { (float)ox * dpi, (float)oy * dpi,
+                                 (float)cw * dpi, (float)ch * dpi };
         DrawTexturePro(v->canvas.texture, source, dest, (Vector2){0, 0}, 0, WHITE);
     }
 #else
