@@ -1610,3 +1610,51 @@ jobs:
         run: |
           set -eux
           python3 misrc_tools/test/release_link_check.py --tag "${{ steps.tag.outputs.tag }}"
+
+  ios-simulator-build:
+    name: iOS simulator app (unsigned)
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install build tools
+        run: |
+          set -eux
+          xcodebuild -version
+          command -v meson || brew install meson
+          command -v ninja || brew install ninja
+          command -v pkg-config || brew install pkg-config
+          command -v cmake || brew install cmake
+          meson --version
+
+      - name: Build iOS simulator dependencies (SDL2/FLAC/Opus/zstd/FFTW/soxr/OpenH264/hsdaoh-stub/raylib)
+        run: |
+          set -eux
+          SLICES=sim ios/build-deps-ios.sh
+          test -f .deps/install-ios-sim-arm64/lib/pkgconfig/raylib.pc
+          test -f .deps/install-ios-sim-arm64/lib/pkgconfig/sdl2.pc
+
+      - name: Build MISRC.app (simulator slice, ad-hoc signed)
+        run: |
+          set -eux
+          ios/build-app-ios.sh sim --no-launch
+          test -x build-ios-sim/MISRC.app/misrc_gui
+          plutil -lint build-ios-sim/MISRC.app/Info.plist
+          test "$(lipo -archs build-ios-sim/MISRC.app/misrc_gui)" = "arm64"
+          test -f build-ios-sim/MISRC.app/AppIcon60x60@3x.png
+
+      - name: Package artifact
+        run: |
+          set -eux
+          VERSION="$(git describe --tags --always 2>/dev/null || echo v0.0.0)"
+          mkdir -p dist
+          ditto -c -k --keepParent build-ios-sim/MISRC.app "dist/iOS_MISRC_Simulator_${VERSION}_arm64.app.zip"
+          ls -la dist/
+
+      - name: Upload simulator app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: iOS_MISRC_Simulator_app
+          path: dist/iOS_MISRC_Simulator_*_arm64.app.zip
+          if-no-files-found: error
