@@ -5712,6 +5712,7 @@ static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *ap
 
     decoder->overlay.tape_rect = decoder->overlay.beta_preset_rect = (Rectangle){0};
     for (int i = 0; i < 2; ++i) decoder->overlay.tape_opts_rect[i] = (Rectangle){0};
+    decoder->overlay.vhs_preset_rect = (Rectangle){0};
     for (int i = 0; i < 3; ++i) decoder->overlay.stats_opts_rect[i] = (Rectangle){0};
     if (bounds.width <= 0 || bounds.height <= 0) {
         decoder->overlay.is_visible = false;
@@ -5793,14 +5794,16 @@ static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *ap
     gui_text_draw(format_label, decoder->overlay.format_rect.x + 8, text_y,
                    FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
     control_y += btn_h + 6;
-    if (decoder->overlay.selected_tape) {
+    {
         char preset_label[40];
-        snprintf(preset_label, sizeof(preset_label), "Preset: %s", gui_vhs_fm_get_beta_preset_name(decoder));
+        snprintf(preset_label, sizeof(preset_label), "Preset: %s", decoder->overlay.selected_tape
+            ? gui_vhs_fm_get_beta_preset_name(decoder) : gui_vhs_fm_get_vhs_preset_name(decoder));
         float preset_w = (float)gui_text_measure(preset_label, FONT_SIZE_DROPDOWN_OPT) * to_logical_w + 16;
-        decoder->overlay.beta_preset_rect =
-            (Rectangle){x_right - preset_w, control_y, preset_w, btn_h};
-        DrawRectangleRounded(decoder->overlay.beta_preset_rect, 0.15f, 4, COLOR_BUTTON_HOVER);
-        gui_text_draw(preset_label, decoder->overlay.beta_preset_rect.x + 8,
+        Rectangle *preset_rect = decoder->overlay.selected_tape
+            ? &decoder->overlay.beta_preset_rect : &decoder->overlay.vhs_preset_rect;
+        *preset_rect = (Rectangle){x_right - preset_w, control_y, preset_w, btn_h};
+        DrawRectangleRounded(*preset_rect, 0.15f, 4, COLOR_BUTTON_HOVER);
+        gui_text_draw(preset_label, preset_rect->x + 8,
                       control_y + (btn_h - FONT_SIZE_DROPDOWN_OPT) * 0.5f,
                       FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
         control_y += btn_h + 6;
@@ -6019,6 +6022,12 @@ static bool cvbs_vtable_handle_click(void *state, gui_app_t *app, int channel,
             CheckCollisionPointRec(mouse_pos,vhs->overlay.beta_preset_rect)) {
             panel->chrome.last_click_ms=0;
             gui_vhs_fm_set_beta_preset(vhs, (vhs->overlay.beta_preset + 1) % GUI_BETA_PRESET_COUNT);
+            return true;
+        }
+        if (chrome_visible && !vhs->overlay.selected_tape &&
+            CheckCollisionPointRec(mouse_pos,vhs->overlay.vhs_preset_rect)) {
+            panel->chrome.last_click_ms=0;
+            gui_vhs_fm_set_vhs_preset(vhs, (vhs->overlay.vhs_preset + 1) % GUI_VHS_PRESET_COUNT);
             return true;
         }
         if (chrome_visible && CheckCollisionPointRec(mouse_pos,vhs->overlay.budget_rect)) {

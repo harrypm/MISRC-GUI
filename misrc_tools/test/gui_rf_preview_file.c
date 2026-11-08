@@ -98,10 +98,11 @@ int main(int argc, char **argv) {
     double seconds_cap = 0.0, budget = 0.0;
     const char *audio_path = NULL;
     if (argc < 5 ||
-        (strcmp(argv[3], "pal") != 0 && strcmp(argv[3], "ntsc") != 0 && strcmp(argv[3], "secam") != 0 && strcmp(argv[3], "mesecam") != 0 &&
+        (strcmp(argv[3], "pal") != 0 && strcmp(argv[3], "ntsc") != 0 && strcmp(argv[3], "pal-svhs") != 0 && strcmp(argv[3], "ntsc-svhs") != 0 &&
+         strcmp(argv[3], "secam") != 0 && strcmp(argv[3], "mesecam") != 0 &&
          strcmp(argv[3], "ntsc-beta") != 0 && strcmp(argv[3], "ntsc-beta-hifi") != 0 &&
          strcmp(argv[3], "ntsc-superbeta") != 0 && strcmp(argv[3], "ntsc-superbeta-hifi") != 0 && strcmp(argv[3], "ntsc-ed-beta") != 0)) {
-        fprintf(stderr, "Usage: %s input.s16le sample_rate_hz pal|ntsc|secam|mesecam|ntsc-beta|ntsc-beta-hifi|ntsc-superbeta|ntsc-superbeta-hifi|ntsc-ed-beta output.ppm"
+        fprintf(stderr, "Usage: %s input.s16le sample_rate_hz pal|ntsc|pal-svhs|ntsc-svhs|secam|mesecam|ntsc-beta|ntsc-beta-hifi|ntsc-superbeta|ntsc-superbeta-hifi|ntsc-ed-beta output.ppm"
                         " [--max|--realtime] [--full] [--no-audio] [output.wav] [seconds_cap] [realtime_budget_cores]\n", argv[0]);
         return 1;
     }
@@ -146,6 +147,8 @@ int main(int argc, char **argv) {
     }
     uint32_t rate = (uint32_t)parsed_rate;
     gui_rf_profile_t profile = strcmp(argv[3],"pal")==0 ? GUI_RF_PROFILE_PAL_VHS :
+        strcmp(argv[3],"pal-svhs")==0 ? GUI_RF_PROFILE_PAL_SVHS :
+        strcmp(argv[3],"ntsc-svhs")==0 ? GUI_RF_PROFILE_NTSC_SVHS :
         strcmp(argv[3],"secam")==0 ? GUI_RF_PROFILE_SECAM_VHS :
         strcmp(argv[3],"mesecam")==0 ? GUI_RF_PROFILE_MESECAM_VHS :
         strcmp(argv[3],"ntsc-beta")==0 ? GUI_RF_PROFILE_NTSC_BETAMAX :
@@ -237,14 +240,14 @@ int main(int argc, char **argv) {
     free(bytes); free(samples); free(frame);
     uint64_t wall_end = file_now_us();
     double processing_ms = (double)(processing_end - wall_start) / 1000.0;
-    printf("{\"sample_rate_hz\":%u,\"format\":\"%s\",\"mode\":\"%s\",\"budget_cores\":%.2f,"
+    printf("{\"sample_rate_hz\":%u,\"video_rate_hz\":%u,\"format\":\"%s\",\"mode\":\"%s\",\"budget_cores\":%.2f,"
            "\"frame_mode\":\"%s\",\"seconds_cap\":%.3f,\"samples\":%llu,\"input_seconds\":%.9f,\"blocks_submitted\":%llu,"
            "\"blocks_rejected\":%llu,\"blocks_dropped\":%llu,\"frames\":%llu,"
            "\"width\":%d,\"height\":%d,\"frame_saved\":%s,\"resets\":%llu,"
            "\"processing_wall_ms\":%.3f,\"wall_ms\":%.3f,\"throughput_msps\":%.3f,"
            "\"fps\":%.3f,\"decode_ms\":%.3f,\"latency_ms\":%.3f,"
            "\"h_locked\":%s,\"v_locked\":%s,\"color_locked\":%s,\"reason\":",
-           rate, argv[3], realtime ? "realtime" : "max", budget, full_frame ? "full" : "active",
+           rate, gui_rf_profile_video_rate_hz(profile), argv[3], realtime ? "realtime" : "max", budget, full_frame ? "full" : "active",
            seconds_cap, (unsigned long long)total_samples,
            (double)total_samples / rate, (unsigned long long)submitted,
            (unsigned long long)rejected, (unsigned long long)stats.blocks_dropped,

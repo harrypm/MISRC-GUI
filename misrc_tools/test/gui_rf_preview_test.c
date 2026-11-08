@@ -74,7 +74,8 @@ typedef enum {
 } test_vertical_t;
 
 typedef enum { TEST_Q_GRAY, TEST_Q_COLOR_BARS, TEST_Q_FADE, TEST_Q_MID_BARS,
-               TEST_Q_LEVEL_BARS } test_quality_pattern_t;
+               TEST_Q_LEVEL_BARS, TEST_Q_UV_VERTICAL, TEST_Q_UV_HORIZONTAL, TEST_Q_UV_DETAIL, TEST_Q_UV_HORIZONTAL_SINE, TEST_Q_UV_STRIPES } test_quality_pattern_t;
+typedef enum { STRIPE_BACKGROUND, STRIPE_CHART, STRIPE_CORRUPTED, STRIPE_LEGAL_SHORT } test_stripe_scene_t;
 typedef struct {
     test_quality_pattern_t pattern;
     int fields;
@@ -85,12 +86,83 @@ typedef struct {
     int fm_change_field;
     double fm_blank_hz, fm_sync_hz, fm_hz_per_ire;
     double fm_blank_after_hz, fm_sync_after_hz, fm_hz_per_ire_after;
+    double burst_gain_jitter, burst_phase_jitter;
+    uint32_t burst_noise_seed;
+    bool suppress_burst;
+    test_stripe_scene_t stripe_scene;
+    int chroma_jump_line;
+    double chroma_jump_radians;
+    bool sparse_bad_bursts;
+    int bad_burst_first_line, bad_burst_line_step;
+    double bad_burst_gain, bad_burst_phase;
+    double detail_amplitude, detail_phase;
+    double c_sine_hz, c_sine_amplitude, c_sine_phase;
+    double chroma_noise_amplitude, generated_c_noise_rms;
+    uint32_t chroma_noise_seed;
 } test_quality_t;
+
+/* Active source rows. A two-line color stroke can align with the
+ * decoder's output pair or cross its boundary. */
+static const struct {
+    int row, span;
+    double amplitude, x0, x1, min_gain;
+} svhs_stripes[] = {
+    {64, 2, .085, .12, .84, .375},
+    {145, 2, .085, .12, .84, .255},
+    {188, 1, .055, .34, .67, .090},
+};
+static const int svhs_pulse_row = 104;
+static const double svhs_pulse_u = .80;
+static const int svhs_legal_short_row = 177;
+static const double svhs_legal_y = .72;
+
+static double svhs_stripe_polarity(int parity) { return parity ? -1.0 : 1.0; }
 
 /* Video values are a physical FM oracle: blank + 100*Hz/IRE*gray, not a
  * reconstruction of the decoder's porch estimator or render algorithm. */
 static double quality_gray(int field,test_quality_pattern_t pattern) {
     return pattern==TEST_Q_FADE ? fmax(0.0,.70-.10*field) : field&1 ? .25 : .65;
+}
+
+/* Safe, equal-luminance colors are prescribed in physical UV units. Both
+ * original fields have distinct colors and moving boundaries; an interfield
+ * blend or a luma-only comb cannot pass by making the image uniformly gray. */
+static void quality_uv_target(int parity,bool second,double *u,double *v) {
+    *u=parity ? -.10 : .12;
+    *v=parity ? .10 : .08;
+    if(second) { *u=-*u;*v=-*v; }
+}
+
+static double quality_uv_boundary(int parity) { return parity ? .57 : .43; }
+
+/* Independently prescribed equal-Y chroma chart: strong/weak horizontal
+ * edges, legitimate vertical color texture and a small E-shaped color glyph.
+ * No decoder coefficients or reconstructed output enter this RF oracle. */
+static void quality_detail_uv(int parity,double x,int field_line,double amplitude,double phase,double *u,double *v) {
+    double q=0.0;
+    int column=(int)(x*5.0);if(column>4) column=4;
+    if(column==0) q=field_line<80 ? -.08 : .08;
+    else if(column==1) q=field_line<80 ? -.0125 : .0125;
+    else if(column==2 || column==3) {
+        double period=column==2 ? 16.0 : 8.0;
+        q=amplitude*sin(2.0*TEST_PI*field_line/period+phase);
+    } else {
+        bool upright=x>=.825 && x<.845 && field_line>=64 && field_line<100;
+        bool cap=x>=.825 && x<.955 && ((field_line>=64 && field_line<68) ||
+            (field_line>=80 && field_line<84) || (field_line>=96 && field_line<100));
+        if(upright || cap) q=.025;
+    }
+    *u=(parity ? -.04 : .05)+q;
+    *v=(parity ? .05 : .04)+.7*q;
+}
+
+/* Fixed-seed, non-periodic burst noise. The known active UV target does not
+ * depend on this sequence or on any decoder/candidate coefficients. */
+static double quality_burst_noise(uint32_t line,uint32_t seed) {
+    uint32_t x=line^seed;
+    x^=x>>16;x*=UINT32_C(0x7feb352d);x^=x>>15;
+    x*=UINT32_C(0x846ca68b);x^=x>>16;
+    return (double)(x&UINT32_C(0xffff))/32767.5-1.0;
 }
 
 /* Explicit membership: later SECAM profile IDs are not Beta video. */
@@ -104,7 +176,8 @@ static float *make_rf_signal_profile(gui_rf_profile_t profile, double jitter_us,
                             double clock_scale, int damaged_field,
                             test_vertical_t vertical_case, test_quality_t *quality,
                             size_t *length) {
-    bool pal=profile==GUI_RF_PROFILE_PAL_VHS;
+    bool pal=profile==GUI_RF_PROFILE_PAL_VHS || profile==GUI_RF_PROFILE_PAL_SVHS;
+    const bool svhs=profile==GUI_RF_PROFILE_PAL_SVHS || profile==GUI_RF_PROFILE_NTSC_SVHS;
     const bool ed=profile==GUI_RF_PROFILE_NTSC_ED_BETA;
     bool superbeta=profile==GUI_RF_PROFILE_NTSC_SUPERBETA || profile==GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI;
     bool beta=test_beta_profile(profile);
@@ -115,6 +188,14 @@ static float *make_rf_signal_profile(gui_rf_profile_t profile, double jitter_us,
     double blank=beta ? (hifi ? 4200000.0 : 3942857.1428571427) : pal ? 4100000.0 : 3685714.2857142854;
     double sync=beta ? (hifi ? 3800000.0 : 3600000.0) : pal ? 3800000.0 : 3400000.0;
     double hz_ire=beta ? (hifi ? 10000.0 : 8571.42857142857) : pal ? 7000.0 : 7142.857142857143;
+    if(svhs) {
+        /* Physical S-VHS endpoints are 5.4MHz sync and 7.0MHz white.
+         * PAL's -300mV sync is below its 0..700mV active range; NTSC uses
+         * -40..100 IRE. VHS color-under and head rotation are unchanged. */
+        sync=5400000.0;
+        hz_ire=pal ? 11200.0 : 11428.57142857143;
+        blank=pal ? 5880000.0 : 5857142.857142857;
+    }
     if(superbeta) {
         /* Independent ordinary-SuperBeta physical endpoints: 4.4MHz at
          * -40 IRE sync and 5.6MHz at 100 IRE white. Hi-Fi does not move them.
@@ -172,6 +253,9 @@ static float *make_rf_signal_profile(gui_rf_profile_t profile, double jitter_us,
         shelf[3]=2.0*((amplitude-1.0)-(amplitude+1.0)*cs)/den;
         shelf[4]=((amplitude+1.0)-(amplitude-1.0)*cs-2.0*root*alpha)/den;
     }
+    double c_noise[2][3]={{0}},c_noise_square=0.0;
+    uint32_t c_noise_state=quality && quality->chroma_noise_seed ? quality->chroma_noise_seed : UINT32_C(0x5eeda5e5);
+    const double c_noise_alpha=1.0-exp(-2.0*TEST_PI*800000.0/TEST_RATE);
     for (size_t n=0; n<*length; ++n) {
         double real_us=n/(ed ? TEST_ED_RATE/1e6 : TEST_RATE/1e6);
         while (half+1<half_lines && timeline[half+1]<=real_us) half++;
@@ -288,6 +372,54 @@ static float *make_rf_signal_profile(gui_rf_profile_t profile, double jitter_us,
             }
             luminance=.299*r+.587*g+.114*b;
             u=.492*(b-luminance); v=.877*(r-luminance);
+            if(quality && (quality->pattern==TEST_Q_UV_VERTICAL ||
+                           quality->pattern==TEST_Q_UV_HORIZONTAL)) {
+                double color_boundary=quality_uv_boundary(parity);
+                bool second=quality->pattern==TEST_Q_UV_VERTICAL
+                    ? (within-active_start)/(active_end-active_start)>=color_boundary
+                    : line>=(pal ? 22 : 20)+(int)(color_boundary*(pal ? 288 : 240));
+                luminance=.5;
+                quality_uv_target(parity,second,&u,&v);
+            }
+            if(quality && quality->pattern==TEST_Q_UV_HORIZONTAL_SINE) {
+                luminance=.5;
+                double wave=quality->c_sine_amplitude*sin(2.0*TEST_PI*quality->c_sine_hz*
+                    (within-active_start)*1e-6+quality->c_sine_phase+(parity ? -.71 : .37));
+                u=(parity ? -.04 : .05)+wave;v=(parity ? .05 : .04)+.7*wave;
+            }
+            if (quality && quality->pattern==TEST_Q_UV_STRIPES) {
+                double x = (within-active_start)/(active_end-active_start);
+                int row = line-(pal ? 22 : 20);
+                if (quality->stripe_scene==STRIPE_LEGAL_SHORT) {
+                    /* Legal yellow: R=G=Y/(.299+.587), B=0. Retain both
+                     * patches from the original short-stroke RF chart. */
+                    luminance = svhs_legal_y;
+                    bool yellow = (row==102 && x>=.12 && x<.84) ||
+                                  (row==svhs_legal_short_row && x>=.488 && x<.512);
+                    u = yellow ? -.492*luminance : 0.0;
+                    v = yellow ? .877*(luminance/(.299+.587)-luminance) : 0.0;
+                } else {
+                    luminance = .5;
+                    u = parity ? -.04 : .05;
+                    v = parity ? .05 : .04;
+                    if (quality->stripe_scene!=STRIPE_BACKGROUND) {
+                        for (size_t s=0; s<sizeof(svhs_stripes)/sizeof(svhs_stripes[0]); ++s) {
+                            if (row<svhs_stripes[s].row || row>=svhs_stripes[s].row+svhs_stripes[s].span ||
+                                x<svhs_stripes[s].x0 || x>=svhs_stripes[s].x1)
+                                continue;
+                            double step = svhs_stripes[s].amplitude*svhs_stripe_polarity(parity);
+                            u += step;
+                            v += .7*step;
+                        }
+                    }
+                }
+            }
+            if(quality && quality->pattern==TEST_Q_UV_DETAIL) {
+                luminance=.5;
+                quality_detail_uv(parity,(within-active_start)/(active_end-active_start),
+                    line-(pal ? 22 : 20),quality->detail_amplitude>0 ? quality->detail_amplitude : .025,
+                    quality->detail_phase,&u,&v);
+            }
         }
         double physical_blank=blank,physical_sync=sync,physical_hz_ire=hz_ire;
         if(quality && quality->fm_hz_per_ire>0) {
@@ -328,14 +460,33 @@ static float *make_rf_signal_profile(gui_rf_profile_t profile, double jitter_us,
         previous2_base=previous_base;previous2_pre=previous_pre;
         previous_base=base; previous_pre=pre;
         frequency=ed ? clamp_value(physical_blank+pre,6000000.0,11000000.0)
+            : svhs ? clamp_value(physical_blank+pre,3000000.0,9600000.0)
             : clamp_value(physical_blank+pre,2400000.0,6800000.0);
         fm_phase+=2.0*TEST_PI*frequency*(ideal_us-previous_ideal_us)*1e-6;
         previous_ideal_us=ideal_us;
         if (fm_phase>2.0*TEST_PI) fm_phase=fmod(fm_phase,2.0*TEST_PI);
         int vswitch=pal && (line&1) ? -1 : 1;
-        if (local_us>=vertical_end && within>=burst_start && within<burst_end) {
+        bool color_burst=local_us>=vertical_end && within>=burst_start && within<burst_end;
+        double burst_phase_noise=0.0;
+        if (color_burst) {
             u=pal ? -(150.0/700.0)/sqrt(2.0) : -(150.0/700.0);
             v=pal ? (150.0/700.0)/sqrt(2.0) : 0.0;
+            if(quality) {
+                uint32_t source_line=(uint32_t)(starts[field]+line);
+                double gain=1.0+quality->burst_gain_jitter*
+                    quality_burst_noise(source_line,quality->burst_noise_seed);
+                u*=gain;v*=gain;
+                burst_phase_noise=quality->burst_phase_jitter*
+                    quality_burst_noise(source_line,quality->burst_noise_seed^UINT32_C(0xa5a5c3c3));
+                int bad_first=quality->bad_burst_first_line>0 ? quality->bad_burst_first_line : 101;
+                int bad_step=quality->bad_burst_line_step>0 ? quality->bad_burst_line_step : 50;
+                if(quality->sparse_bad_bursts && (line==bad_first || line==bad_first+bad_step ||
+                                                  line==bad_first+2*bad_step)) {
+                    u*=quality->bad_burst_gain;v*=quality->bad_burst_gain;
+                    burst_phase_noise+=quality->bad_burst_phase;
+                }
+                if(quality->suppress_burst) u=v=0.0;
+            }
         }
         int track=parity^(quality ? quality->swap_tracks : 0);
         if (quality && quality->switch_track_line>0 && line>=quality->switch_track_line) track^=1;
@@ -343,6 +494,9 @@ static float *make_rf_signal_profile(gui_rf_profile_t profile, double jitter_us,
             : pal ? (track ? -TEST_PI*.5 : 0.0)
             : (track ? TEST_PI*.5 : -TEST_PI*.5);
         double chroma_phase=2.0*TEST_PI*carrier*ideal_us*1e-6+track_step*line+.37;
+        if(color_burst) chroma_phase+=burst_phase_noise;
+        if(quality && quality->chroma_jump_line>0 && line>=quality->chroma_jump_line)
+            chroma_phase+=quality->chroma_jump_radians;
         /* NTSC color-under records U*cos+V*sin: the sum-frequency VHS
          * playback heterodyne conjugates this quadrature. PAL uses a swinging
          * burst with its V switch; do not copy the decoder IQ sign as an oracle. */
@@ -360,8 +514,39 @@ static float *make_rf_signal_profile(gui_rf_profile_t profile, double jitter_us,
                 audio+=quality->beta_audio_amplitude*cos(angle);
             }
         }
-        rf[n]=(float)(.72*cos(fm_phase)+(with_chroma ? .20*color : 0.0)+audio);
+        double rf_c_noise=0.0;
+        if(quality && quality->chroma_noise_amplitude>0.0) {
+            /* Continuous fixed-seed baseband IQ noise is low-passed three
+             * times BEFORE RF modulation. It covers sync, burst and active
+             * intervals, with no zero-order-held wideband images or direct
+             * additions to the physical FM/Y oscillator. */
+            for(int channel=0;channel<2;channel++) {
+                c_noise_state^=c_noise_state<<13;c_noise_state^=c_noise_state>>17;c_noise_state^=c_noise_state<<5;
+                double value=(double)(c_noise_state&UINT32_C(0xffff))/32767.5-1.0;
+                for(int pole=0;pole<3;pole++) {
+                    c_noise[channel][pole]+=c_noise_alpha*(value-c_noise[channel][pole]);
+                    value=c_noise[channel][pole];
+                }
+            }
+            double angle=2.0*TEST_PI*carrier*real_us*1e-6+.123;
+            rf_c_noise=.20*quality->chroma_noise_amplitude*
+                (c_noise[0][2]*cos(angle)+c_noise[1][2]*sin(angle));
+            c_noise_square+=rf_c_noise*rf_c_noise;
+        }
+        /* Add a severe, short C-band RF pulse to only one active line.
+         * Alternate the affected pair member between the original fields.
+         * The physical FM, burst, and continuous C noise stay identical. */
+        if (quality && quality->pattern==TEST_Q_UV_STRIPES &&
+            quality->stripe_scene==STRIPE_CORRUPTED && active &&
+            line-(pal ? 22 : 20)==svhs_pulse_row+parity) {
+            double x = (within-active_start)/(active_end-active_start);
+            if (x>=.490 && x<.510)
+                rf_c_noise += .20*svhs_pulse_u*svhs_stripe_polarity(parity)*
+                    (cos(chroma_phase)+(pal ? -vswitch : 1)*.7*sin(chroma_phase));
+        }
+        rf[n]=(float)(.72*cos(fm_phase)+(with_chroma ? .20*color : 0.0)+audio+rf_c_noise);
     }
+    if(quality) quality->generated_c_noise_rms=sqrt(c_noise_square/(*length));
     free(timeline);
     return rf;
 }
@@ -1581,7 +1766,7 @@ static void run_superbeta_contracts(void) {
     free(reference);free(frames.rgba);gui_rf_decoder_destroy(decoder);
 }
 
-/* ED input positions are 20 MSPS; publication stays on the common 20 MSPS
+/* ED/S-VHS input positions are 20 MSPS; publication stays on the common 20 MSPS
  * clock. Compare every woven RGBA frame across input partitions. */
 typedef struct {
     test_frames_t frame;
@@ -1753,7 +1938,7 @@ static void run_ed_beta_contracts(void) {
         GUI_RF_PROFILE_NTSC_BETAMAX==2 && GUI_RF_PROFILE_NTSC_BETAMAX_HIFI==3 &&
         GUI_RF_PROFILE_NTSC_SUPERBETA==4 && GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI==5 &&
         GUI_RF_PROFILE_SECAM_VHS==6 && GUI_RF_PROFILE_MESECAM_VHS==7 &&
-        GUI_RF_PROFILE_NTSC_ED_BETA==8 && GUI_RF_PROFILE_COUNT==9,
+        GUI_RF_PROFILE_NTSC_ED_BETA==8,
         "ED appends without changing any existing profile ID");
     for(int profile=0;profile<GUI_RF_PROFILE_COUNT;profile++)
         assert(gui_rf_profile_video_rate_hz((gui_rf_profile_t)profile)==
@@ -1938,7 +2123,1068 @@ static void run_superbeta_display_level_contracts(void) {
     free(reference);free(frames.rgba);gui_rf_decoder_destroy(decoder);
 }
 
+/* Compare stable bar interiors, retaining every original woven row. A DC
+ * defect can average away in a bar mean while leaving large false-color
+ * ripple, so this checks actual RGB and reconstructed Y/U/V pixel errors. */
+static void check_svhs_dc_pixels(const test_frames_t *reference,const test_frames_t *actual) {
+    assert(reference->width==actual->width && reference->height==actual->height);
+    assert(reference->frames==actual->frames && reference->end_sample==actual->end_sample);
+    double rgb_square=0.0,yuv_square[3]={0},maximum_rgb=0.0;
+    size_t samples=0;
+    for(int y=80;y<actual->height-80;y++) for(int bar=0;bar<8;bar++) {
+        int centre=(int)((bar+.5)*actual->width/8.0);
+        for(int x=centre-8;x<=centre+8;x++) {
+            size_t at=((size_t)y*actual->width+x)*4u;
+            double delta[3];
+            for(int channel=0;channel<3;channel++) {
+                delta[channel]=((double)actual->rgba[at+channel]-reference->rgba[at+channel])/255.0;
+                rgb_square+=delta[channel]*delta[channel];
+                maximum_rgb=fmax(maximum_rgb,fabs(delta[channel]));
+            }
+            double dy=.299*delta[0]+.587*delta[1]+.114*delta[2];
+            double du=(delta[2]-dy)/2.032,dv=(delta[0]-dy)/1.140;
+            yuv_square[0]+=dy*dy;yuv_square[1]+=du*du;yuv_square[2]+=dv*dv;
+            samples++;
+        }
+    }
+    assert(samples>10000);
+    double rms=sqrt(rgb_square/(3.0*samples));
+    printf("S-VHS ADC offset stable pixels: RGB RMS %.6f max %.6f, YUV RMS %.6f/%.6f/%.6f\n",
+        rms,maximum_rgb,sqrt(yuv_square[0]/samples),sqrt(yuv_square[1]/samples),sqrt(yuv_square[2]/samples));
+    assert(rms<=.006 && maximum_rgb<=.03);
+    for(int channel=0;channel<3;channel++) assert(sqrt(yuv_square[channel]/samples)<=.005);
+}
+
+/* Add ADC bias to physical FM+color-under samples, never decoded pixels.
+ * The +/-0.8 offsets are comparable with the 0.72 peak luma RF and much
+ * larger than the recorded burst. This independently exposes DC translated
+ * into the color band, its AGC amplification, and state lost at block splits. */
+static void run_svhs_dc_contracts(void) {
+    const gui_rf_profile_t profiles[]={GUI_RF_PROFILE_PAL_SVHS,GUI_RF_PROFILE_NTSC_SVHS};
+    const size_t capacity=(size_t)GUI_RF_FRAME_MAX_WIDTH*GUI_RF_FRAME_MAX_HEIGHT*4u;
+    test_ed_sequence_t reference={0},biased={0},partition={0};
+    reference.frame.rgba=malloc(capacity);biased.frame.rgba=malloc(capacity);
+    partition.frame.rgba=malloc(capacity);
+    assert(reference.frame.rgba && biased.frame.rgba && partition.frame.rgba);
+    gui_rf_decoder_t *decoder=gui_rf_decoder_create_profile(profiles[0]);assert(decoder);
+    for(size_t system=0;system<sizeof(profiles)/sizeof(profiles[0]);system++) {
+        for(int gray=0;gray<2;gray++) {
+            test_quality_t quality={.pattern=gray ? TEST_Q_GRAY : TEST_Q_COLOR_BARS,
+                .fields=8,.swap_tracks=1};
+            size_t length;
+            float *rf=make_rf_signal_profile(profiles[system],.08,true,1.001,-1,
+                TEST_V_NORMAL,&quality,&length);
+            float *offset_rf=malloc(length*sizeof(*offset_rf));assert(offset_rf);
+            const uint64_t origin=UINT64_C(10000000003);
+            gui_rf_decoder_reset_profile(decoder,profiles[system]);
+            reference.frame=(test_frames_t){.rgba=reference.frame.rgba};
+            process_ed_chunks(decoder,rf,length,origin,false,&reference);
+            if(gray) check_quality_gray(&reference.frame,"S-VHS ADC bias reference",0,.035,.015,.06);
+            else check_bars(&reference.frame,.10);
+            assert(reference.frame.status.color_locked);
+            /* The step occurs inside an ordinary line of the fourth field,
+             * not at a producer block or field boundary. Publication waits
+             * for the following V sync, so eight input fields are needed
+             * to compare a later complete frame beyond the causal transient. */
+            size_t step=(size_t)quality.field_start_sample[3]+123457u;
+            assert(step<quality.field_start_sample[4] && step<length);
+            assert(reference.frame.end_sample-origin>=quality.field_start_sample[6]);
+            printf("S-VHS ADC recovery window: step at %llu, last frame end %llu, stable boundary %llu\n",
+                (unsigned long long)step,(unsigned long long)(reference.frame.end_sample-origin),
+                (unsigned long long)quality.field_start_sample[6]);
+            for(int bias=0;bias<3;bias++) {
+                for(size_t n=0;n<length;n++) {
+                    double dc=bias==0 ? .8 : bias==1 ? -.8 : n<step ? -.8 : .8;
+                    offset_rf[n]=(float)(rf[n]+dc);
+                }
+                gui_rf_decoder_reset_profile(decoder,profiles[system]);
+                gui_rf_decode_status_t initial;gui_rf_decoder_get_status(decoder,&initial);
+                assert(!initial.h_locked && !initial.v_locked && !initial.color_locked && initial.frames_decoded==0);
+                biased.frame=(test_frames_t){.rgba=biased.frame.rgba};
+                process_ed_chunks(decoder,offset_rf,length,origin,bias!=0,&biased);
+                printf("%s %s ADC bias %s: ",gui_rf_profile_name(profiles[system]),
+                    gray ? "gray" : "bars",bias==0 ? "+0.8" : bias==1 ? "-0.8" : "-0.8 to +0.8 step");
+                if(gray) {
+                    check_quality_gray(&biased.frame,"S-VHS biased gray",0,.035,.015,.06);
+                    assert(biased.frame.status.color_locked);
+                    for(int parity=0;parity<2;parity++) {
+                        double red=plane_mean(&biased.frame,4,parity,0);
+                        assert(fabs(red-plane_mean(&biased.frame,4,parity,1))<.01);
+                        assert(fabs(red-plane_mean(&biased.frame,4,parity,2))<.01);
+                    }
+                } else check_bars(&biased.frame,.10);
+                check_svhs_dc_pixels(&reference.frame,&biased.frame);
+                if(!gray && bias==2) {
+                    gui_rf_decoder_reset_profile(decoder,profiles[system]);
+                    partition.frame=(test_frames_t){.rgba=partition.frame.rgba};
+                    process_ed_chunks(decoder,offset_rf,length,origin,false,&partition);
+                    assert(partition.frame.frames==biased.frame.frames);
+                    for(int frame=0;frame<biased.frame.frames;frame++) {
+                        assert(partition.ends[frame]==biased.ends[frame]);
+                        assert(partition.hashes[frame]==biased.hashes[frame]);
+                    }
+                }
+            }
+            /* A fresh reset after biased input must also recover the clean
+             * waveform without inheriting the previous ADC offset. */
+            gui_rf_decoder_reset_profile(decoder,profiles[system]);
+            partition.frame=(test_frames_t){.rgba=partition.frame.rgba};
+            process_ed_chunks(decoder,rf,length,origin,true,&partition);
+            assert(partition.frame.frames==reference.frame.frames);
+            for(int frame=0;frame<reference.frame.frames;frame++) {
+                assert(partition.ends[frame]==reference.ends[frame]);
+                assert(partition.hashes[frame]==reference.hashes[frame]);
+            }
+            free(offset_rf);free(rf);
+        }
+    }
+    gui_rf_decoder_destroy(decoder);free(reference.frame.rgba);free(biased.frame.rgba);free(partition.frame.rgba);
+}
+
+/* The same physical oracle changes only the tape's FM modulation. The
+ * independent VHS color-under recording law must still recover both head
+ * orders and weave adjacent fields, with identical output across partitions. */
+static void run_svhs_contracts(void) {
+    _Static_assert(GUI_RF_PROFILE_NTSC_ED_BETA==8 && GUI_RF_PROFILE_PAL_SVHS==9 &&
+        GUI_RF_PROFILE_NTSC_SVHS==10 && GUI_RF_PROFILE_COUNT==11,
+        "S-VHS appends without changing existing persisted profile IDs");
+    const gui_rf_profile_t profiles[]={GUI_RF_PROFILE_PAL_SVHS,GUI_RF_PROFILE_NTSC_SVHS};
+    const size_t capacity=(size_t)GUI_RF_FRAME_MAX_WIDTH*GUI_RF_FRAME_MAX_HEIGHT*4u;
+    gui_rf_decoder_t *decoder=gui_rf_decoder_create_profile(profiles[0]);assert(decoder);
+    test_ed_sequence_t reference={0},partition={0};
+    reference.frame.rgba=malloc(capacity);partition.frame.rgba=malloc(capacity);
+    assert(reference.frame.rgba && partition.frame.rgba);
+    for(size_t system=0;system<sizeof(profiles)/sizeof(profiles[0]);system++) {
+        gui_rf_profile_t profile=profiles[system];
+        bool pal=profile==GUI_RF_PROFILE_PAL_SVHS;
+        const char *name=pal ? "PAL S-VHS" : "NTSC S-VHS";
+        assert(gui_rf_profile_format(profile)==(pal ? GUI_RF_PAL : GUI_RF_NTSC));
+        assert(gui_rf_profile_video_rate_hz(profile)==20000000u);
+        assert(!gui_rf_profile_has_hifi(profile));
+        assert(strcmp(gui_rf_profile_name(profile),name)==0);
+        test_quality_t color={.pattern=TEST_Q_COLOR_BARS,.fields=6,.swap_tracks=1};
+        size_t length;float *rf=make_rf_signal_profile(profile,.08,true,1.001,-1,
+            TEST_V_NORMAL,&color,&length);
+        const uint64_t origin=UINT64_C(10000000003);
+        gui_rf_decoder_reset_profile(decoder,profile);
+        reference.frame.frames=0;reference.frame.end_sample=0;
+        process_ed_chunks(decoder,rf,length,origin,false,&reference);
+        printf("%s physical high-carrier RF: ",name);check_bars(&reference.frame,.10);
+        assert(reference.frame.width==(pal ? 768 : 640) && reference.frame.height==(pal ? 576 : 480));
+        assert(reference.frame.first_end_sample>=origin && reference.frame.end_sample<=origin+length+4);
+        gui_rf_decoder_reset_profile(decoder,profile);
+        partition.frame.frames=0;partition.frame.end_sample=0;
+        process_ed_chunks(decoder,rf,length,origin,true,&partition);
+        assert(partition.frame.frames==reference.frame.frames);
+        for(int frame=0;frame<reference.frame.frames;frame++) {
+            assert(partition.ends[frame]==reference.ends[frame]);
+            assert(partition.hashes[frame]==reference.hashes[frame]);
+        }
+        /* A real sample-clock jump must discard partially assembled fields
+         * while retaining S-VHS modulation for the recovered source. */
+        float silence[257]={0};uint64_t gap=origin+length+UINT64_C(4000001);
+        partition.frame.frames=0;partition.frame.end_sample=0;
+        gui_rf_decoder_process(decoder,silence,257,gap,receive_ed_frame,&partition);
+        gui_rf_decode_status_t state;gui_rf_decoder_get_status(decoder,&state);
+        assert(!state.h_locked && !state.v_locked && !state.color_locked && state.frames_decoded==0);
+        assert(partition.frame.frames==0);
+        uint64_t resume=gap+257;
+        process_ed_chunks(decoder,rf,length,resume,true,&partition);
+        check_bars(&partition.frame,.10);
+        assert(partition.frame.first_end_sample>=resume+color.field_start_sample[2]);
+        assert(partition.frame.end_sample<=resume+length+4);
+        printf("%s partition/gap: %d identical frames before gap, 20MSPS end %llu\n",
+            name,reference.frame.frames,(unsigned long long)partition.frame.end_sample);
+        free(rf);
+        color.swap_tracks=0;
+        rf=make_rf_signal_profile(profile,0,true,1.0,-1,TEST_V_NORMAL,&color,&length);
+        gui_rf_decoder_reset_profile(decoder,profile);
+        partition.frame.frames=0;partition.frame.end_sample=0;
+        process_fixture(decoder,rf,length,0,&partition.frame);
+        printf("%s opposite head order: ",name);check_bars(&partition.frame,.10);free(rf);
+
+        /* Physical gray levels expose a wrong 5.4/7.0MHz calibration even
+         * when timing alone locks. No burst must also remove color cleanly. */
+        test_quality_t gray={.pattern=TEST_Q_GRAY,.fields=8,.window_noise_hz=60000.0};
+        rf=make_rf_signal_profile(profile,0,false,1.0,-1,TEST_V_NORMAL,&gray,&length);
+        gui_rf_decoder_reset_profile(decoder,profile);
+        partition.frame.frames=0;partition.frame.end_sample=0;
+        process_fixture(decoder,rf,length,0,&partition.frame);
+        check_quality_gray(&partition.frame,name,0,.035,.015,.06);
+        assert(!partition.frame.status.color_locked);
+        for(int parity=0;parity<2;parity++) {
+            double red=plane_mean(&partition.frame,4,parity,0);
+            assert(fabs(red-plane_mean(&partition.frame,4,parity,1))<.01);
+            assert(fabs(red-plane_mean(&partition.frame,4,parity,2))<.01);
+        }
+        free(rf);
+        /* Switching back must restore VHS RF calibration, not carry the
+         * preceding S-VHS filter coefficients or partial frame state. */
+        gui_rf_profile_t vhs=pal ? GUI_RF_PROFILE_PAL_VHS : GUI_RF_PROFILE_NTSC_VHS;
+        gray.window_noise_hz=0.0;
+        rf=make_rf_signal_profile(vhs,0,true,1.0,-1,TEST_V_NORMAL,&gray,&length);
+        gui_rf_decoder_reset_profile(decoder,vhs);
+        gui_rf_decoder_get_status(decoder,&state);
+        assert(!state.h_locked && !state.v_locked && !state.color_locked && state.frames_decoded==0);
+        partition.frame.frames=0;partition.frame.end_sample=0;
+        process_fixture(decoder,rf,length,0,&partition.frame);
+        check_quality_gray(&partition.frame,pal ? "PAL VHS after S-VHS" : "NTSC VHS after S-VHS",
+            0,.035,.015,.06);
+        assert(partition.frame.status.color_locked);free(rf);
+    }
+    free(reference.frame.rgba);free(partition.frame.rgba);gui_rf_decoder_destroy(decoder);
+    run_svhs_dc_contracts();
+}
+
+/* Physical equal-Y color oracle. RGB is intentionally kept away from both
+ * display clipping rails, so chroma errors cannot hide in clipped channels. */
+static void svhs_expected_color(int parity,bool second,double rgb[3],double yuv[3]) {
+    double u,v;quality_uv_target(parity,second,&u,&v);
+    rgb[0]=display_level(.5)+1.140*v;
+    rgb[1]=display_level(.5)-.395*u-.581*v;
+    rgb[2]=display_level(.5)+2.032*u;
+    for(int c=0;c<3;c++) assert(rgb[c]>.05 && rgb[c]<.95);
+    yuv[0]=.299*rgb[0]+.587*rgb[1]+.114*rgb[2];
+    yuv[1]=(rgb[2]-yuv[0])/2.032;yuv[2]=(rgb[0]-yuv[0])/1.140;
+}
+
+static void svhs_pixel_yuv(const test_frames_t *frame,int x,int y,double out[3]) {
+    const uint8_t *rgb=frame->rgba+((size_t)y*frame->width+x)*4u;
+    out[0]=(.299*rgb[0]+.587*rgb[1]+.114*rgb[2])/255.0;
+    out[1]=(rgb[2]/255.0-out[0])/2.032;
+    out[2]=(rgb[0]/255.0-out[0])/1.140;
+}
+
+static double svhs_crossing(const double *trace,int length,double target,int low,int high) {
+    if(low<0) low=0;
+    if(high>=length-1) high=length-2;
+    for(int x=low;x<=high;x++) if(trace[x]<=target && trace[x+1]>target)
+        return x+(target-trace[x])/(trace[x+1]-trace[x]);
+    return -1.0;
+}
+
+static double svhs_color_metrics(const test_frames_t *frame,bool horizontal,const char *label,int recovery_line) {
+    assert(frame->frames>=3 && frame->status.h_locked && frame->status.v_locked && frame->status.color_locked);
+    int field_height=frame->height/2;
+    double row_square[2][2][2]={{{0}}},row_sum[2][2][2]={{{0}}},rgb_square=0.0;
+    size_t row_counts[2][2]={{0}},rows=0,pixels=0;
+    for(int parity=0;parity<2;parity++) {
+        double sum[2][3]={{0}},expected_sum[2][3]={{0}};
+        size_t counts[2]={0};
+        for(int fy=40;fy<field_height-40;fy++) {
+            double boundary=quality_uv_boundary(parity)*field_height;
+            if(horizontal && fabs(fy-boundary)<8.0) continue;
+            if(recovery_line>=0 && abs(fy-recovery_line)<=4) continue;
+            double row_error[2][2]={{0}};size_t row_pixels[2]={0};
+            for(int region=0;region<2;region++) {
+                int centre=(int)((region ? .75 : .25)*frame->width);
+                bool second=horizontal ? fy>=(int)boundary : region!=0;
+                double expected_rgb[3],expected_yuv[3];
+                svhs_expected_color(parity,second,expected_rgb,expected_yuv);
+                for(int x=centre-8;x<=centre+8;x++) {
+                    int y=fy*2+parity;double actual[3];svhs_pixel_yuv(frame,x,y,actual);
+                    int slot=second ? 1 : 0;
+                    for(int c=0;c<3;c++) { sum[slot][c]+=actual[c];expected_sum[slot][c]+=expected_yuv[c]; }
+                    counts[slot]++;
+                    const uint8_t *rgb=frame->rgba+((size_t)y*frame->width+x)*4u;
+                    for(int c=0;c<3;c++) {
+                        double value=rgb[c]/255.0,error=value-expected_rgb[c];
+                        assert(value>.015 && value<.985);
+                        rgb_square+=error*error;
+                    }
+                    for(int c=0;c<2;c++) row_error[slot][c]+=actual[c+1]-expected_yuv[c+1];
+                    row_pixels[slot]++;pixels++;
+                }
+            }
+            assert(row_pixels[0]+row_pixels[1]==34);
+            for(int region=0;region<2;region++) if(row_pixels[region]) {
+                for(int c=0;c<2;c++) {
+                    double error=row_error[region][c]/row_pixels[region];
+                    row_sum[parity][region][c]+=error;
+                    row_square[parity][region][c]+=error*error;
+                }
+                row_counts[parity][region]++;
+            }
+            rows++;
+        }
+        for(int region=0;region<2;region++) {
+            assert(counts[region]>1000);
+            for(int c=0;c<3;c++) {
+                double error=fabs((sum[region][c]-expected_sum[region][c])/counts[region]);
+                if(error>(c==0 ? .025 : .045))
+                    fprintf(stderr,"%s field%d region%d %c bias %.6f\n",label,parity,region,"YUV"[c],error);
+                assert(error<=(c==0 ? .025 : .045));
+            }
+        }
+        /* Project onto the prescribed UV transition, never a decoder-derived
+         * reference trace. Horizontal traces retain each original field. */
+        double left_rgb[3],left[3],right_rgb[3],right[3];
+        svhs_expected_color(parity,false,left_rgb,left);svhs_expected_color(parity,true,right_rgb,right);
+        double du=right[1]-left[1],dv=right[2]-left[2],norm=du*du+dv*dv;
+        int count=horizontal ? field_height : frame->width;
+        double *trace=calloc((size_t)count,sizeof(*trace));assert(trace);
+        for(int at=0;at<count;at++) {
+            double uv[2]={0};int samples=0;
+            if(horizontal) {
+                for(int x=frame->width/4;x<frame->width*3/4;x++) {
+                    double pixel[3];svhs_pixel_yuv(frame,x,at*2+parity,pixel);
+                    uv[0]+=pixel[1];uv[1]+=pixel[2];samples++;
+                }
+            } else {
+                for(int fy=40;fy<field_height-40;fy++) {
+                    if(recovery_line>=0 && abs(fy-recovery_line)<=4) continue;
+                    double pixel[3];svhs_pixel_yuv(frame,at,fy*2+parity,pixel);
+                    uv[0]+=pixel[1];uv[1]+=pixel[2];samples++;
+                }
+            }
+            trace[at]=((uv[0]/samples-left[1])*du+(uv[1]/samples-left[2])*dv)/norm;
+        }
+        double expected=quality_uv_boundary(parity)*count;
+        int radius=horizontal ? 12 : 64;
+        double x10=svhs_crossing(trace,count,.10,(int)expected-radius,(int)expected+radius);
+        double x50=svhs_crossing(trace,count,.50,(int)expected-radius,(int)expected+radius);
+        double x90=svhs_crossing(trace,count,.90,(int)expected-radius,(int)expected+radius);
+        printf("%s field%d %s edge: expected %.3f centre %.3f width10-90 %.3f\n",
+            label,parity,horizontal ? "horizontal/field-lines" : "vertical/pixels",expected,x50,x90-x10);
+        fflush(stdout);
+        assert(x10>=0 && x50>=0 && x90>=x10);
+        assert(fabs(x50-expected)<=(horizontal ? 3.0 : 32.0));
+        assert(x90-x10<=(horizontal ? 4.0 : 64.0));
+        free(trace);
+    }
+    assert(rows>=280 && pixels==rows*34);
+    double variance=0.0;size_t variance_samples=0;
+    for(int parity=0;parity<2;parity++) for(int region=0;region<2;region++) {
+        size_t count=row_counts[parity][region];assert(count>50);
+        for(int c=0;c<2;c++) {
+            double sum=row_sum[parity][region][c];
+            variance+=fmax(0.0,row_square[parity][region][c]-sum*sum/count);
+            variance_samples+=count;
+        }
+    }
+    double stripe=sqrt(variance/variance_samples),rgb_rms=sqrt(rgb_square/(3.0*pixels));
+    printf("%s physical RGB RMS %.6f; row UV error std %.6f (%zu stable rows)\n",label,rgb_rms,stripe,rows);
+    fflush(stdout);
+    assert(rgb_rms<.12);
+    /* Levels, distinct original fields and edge gates prevent meeting the
+     * stripe limit by desaturating, clipping or smoothing real color edges. */
+    return stripe;
+}
+
+/* Picture UV is prescribed and unchanged by the transport phase jump.
+ * Probe just outside the explicit recovery window as well as far plateaus;
+ * averaging a whole frame must not hide local hue drag near a boundary. */
+static double svhs_phase_recovery_hue(const test_frames_t *frame,int recovery_line,const char *label) {
+    const int offsets[]={-12,-8,-5,5,8,12,-40,40};
+    double maximum=0.0,plateau=0.0;
+    for(int parity=0;parity<2;parity++) for(int region=0;region<2;region++) {
+        double expected_rgb[3],expected[3];svhs_expected_color(parity,region!=0,expected_rgb,expected);
+        int centre=(int)((region ? .75 : .25)*frame->width);
+        for(size_t n=0;n<sizeof(offsets)/sizeof(offsets[0]);n++) {
+            int fy=recovery_line+offsets[n];assert(fy>=0 && fy<frame->height/2);
+            double u=0,v=0;
+            for(int x=centre-8;x<=centre+8;x++) {
+                double pixel[3];svhs_pixel_yuv(frame,x,fy*2+parity,pixel);u+=pixel[1];v+=pixel[2];
+            }
+            double degrees=fabs(atan2(v*expected[1]-u*expected[2],u*expected[1]+v*expected[2]))*180.0/TEST_PI;
+            if(abs(offsets[n])<=12) maximum=fmax(maximum,degrees);
+            else plateau=fmax(plateau,degrees);
+        }
+    }
+    printf("%s known-UV hue error: recovery +/-5/8/12 lines max %.3fdeg; far plateau max %.3fdeg\n",label,maximum,plateau);
+    fflush(stdout);return maximum;
+}
+
+static void check_svhs_no_burst(const test_frames_t *frame,const char *label) {
+    assert(frame->frames>=3 && frame->status.h_locked && frame->status.v_locked && !frame->status.color_locked);
+    for(int parity=0;parity<2;parity++) {
+        double red=plane_mean(frame,2,parity,0),green=plane_mean(frame,2,parity,1),
+            blue=plane_mean(frame,2,parity,2);
+        assert(fabs(red-green)<.01 && fabs(red-blue)<.01 && fabs(red-display_level(.5))<.035);
+    }
+    printf("%s: active color RF without burst stays locked gray (%d original woven frames)\n",label,frame->frames);
+}
+
+/* Few still-valid bursts are weak and phase-corrupt while picture chroma
+ * is unchanged. Their hue is unknowable from that one bad reference, but
+ * rejecting every healthy neighbor must not create huge chroma AGC gain. */
+static void run_svhs_burst_outlier_contracts(void) {
+    const gui_rf_profile_t profiles[]={GUI_RF_PROFILE_PAL_SVHS,GUI_RF_PROFILE_NTSC_SVHS};
+    const int bad_lines[]={101,151,201};
+    gui_rf_decoder_t *decoder=gui_rf_decoder_create_profile(profiles[0]);assert(decoder);
+    test_ed_sequence_t sequence={0};
+    sequence.frame.rgba=malloc((size_t)GUI_RF_FRAME_MAX_WIDTH*GUI_RF_FRAME_MAX_HEIGHT*4u);
+    assert(sequence.frame.rgba);
+    for(size_t system=0;system<sizeof(profiles)/sizeof(profiles[0]);system++) {
+        bool pal=profiles[system]==GUI_RF_PROFILE_PAL_SVHS;
+        test_quality_t quality={.pattern=TEST_Q_UV_VERTICAL,.fields=8,.swap_tracks=1,
+            .sparse_bad_bursts=true,.bad_burst_gain=.14,.bad_burst_phase=TEST_PI/3.0};
+        size_t length;float *rf=make_rf_signal_profile(profiles[system],0,true,1.0,-1,
+            TEST_V_NORMAL,&quality,&length);
+        gui_rf_decoder_reset_profile(decoder,profiles[system]);
+        sequence.frame=(test_frames_t){.rgba=sequence.frame.rgba};
+        const uint64_t origin=UINT64_C(13000000003);
+        process_ed_chunks(decoder,rf,length,origin,true,&sequence);
+        assert(sequence.frame.frames>=3 && sequence.frame.end_sample-origin>=quality.field_start_sample[6]);
+        assert(sequence.frame.status.h_locked && sequence.frame.status.v_locked && sequence.frame.status.color_locked);
+        double maximum_ratio=0.0;size_t clipped=0,pixels=0;
+        for(int parity=0;parity<2;parity++) for(int region=0;region<2;region++) {
+            double expected_rgb[3],expected[3];svhs_expected_color(parity,region!=0,expected_rgb,expected);
+            double target_amplitude=hypot(expected[1],expected[2]);assert(target_amplitude>.1);
+            int centre=(int)((region ? .75 : .25)*sequence.frame.width);
+            for(size_t line=0;line<sizeof(bad_lines)/sizeof(bad_lines[0]);line++) for(int dy=-3;dy<=3;dy++) {
+                int fy=bad_lines[line]-(pal ? 22 : 20)+dy;
+                assert(fy>=0 && fy<sequence.frame.height/2);
+                for(int x=centre-8;x<=centre+8;x++) {
+                    int y=fy*2+parity;double actual[3];svhs_pixel_yuv(&sequence.frame,x,y,actual);
+                    maximum_ratio=fmax(maximum_ratio,hypot(actual[1],actual[2])/target_amplitude);
+                    const uint8_t *rgb=sequence.frame.rgba+((size_t)y*sequence.frame.width+x)*4u;
+                    for(int channel=0;channel<3;channel++) if(rgb[channel]<=2 || rgb[channel]>=253) clipped++;
+                    pixels++;
+                }
+            }
+        }
+        printf("%s sparse bad bursts: source lines101/151/201, gain14%% phase+60deg, activeUV unchanged; peakUV/known target %.4fx, clipped channels %zu/%zu pixels\n",
+            gui_rf_profile_name(profiles[system]),maximum_ratio,clipped,pixels);
+        fflush(stdout);
+        assert(pixels>1000 && clipped==0 && maximum_ratio<=1.8);
+        free(rf);
+    }
+    free(sequence.frame.rgba);gui_rf_decoder_destroy(decoder);
+}
+
+/* Strong but isolated bad burst references contradict the physical PAL
+ * swinging sequence. Picture UV never changes, so both the source row and
+ * its paired neighbors must retain the prescribed direction and amplitude.
+ * Source lines of both parities and both physical head orders are exercised. */
+static void run_svhs_pal_cadence_contracts(void) {
+    const gui_rf_profile_t profile=GUI_RF_PROFILE_PAL_SVHS;
+    const int bad_lines[]={100,151,202};
+    gui_rf_decoder_t *decoder=gui_rf_decoder_create_profile(profile);assert(decoder);
+    test_ed_sequence_t sequence={0};
+    sequence.frame.rgba=malloc((size_t)GUI_RF_FRAME_MAX_WIDTH*GUI_RF_FRAME_MAX_HEIGHT*4u);
+    assert(sequence.frame.rgba);
+    for(int heads=0;heads<2;heads++) {
+        test_quality_t quality={.pattern=TEST_Q_UV_VERTICAL,.fields=8,.swap_tracks=heads,
+            .sparse_bad_bursts=true,.bad_burst_first_line=100,.bad_burst_line_step=51,
+            .bad_burst_gain=1.0,.bad_burst_phase=TEST_PI};
+        size_t length;float *rf=make_rf_signal_profile(profile,0,true,1.0,-1,
+            TEST_V_NORMAL,&quality,&length);
+        gui_rf_decoder_reset_profile(decoder,profile);
+        sequence.frame=(test_frames_t){.rgba=sequence.frame.rgba};
+        const uint64_t origin=UINT64_C(14000000003);
+        process_ed_chunks(decoder,rf,length,origin,true,&sequence);
+        assert(sequence.frame.frames>=3 && sequence.frame.end_sample-origin>=quality.field_start_sample[6]);
+        assert(sequence.frame.status.h_locked && sequence.frame.status.v_locked && sequence.frame.status.color_locked);
+        double maximum_hue=0.0,minimum_ratio=10.0,maximum_ratio=0.0;size_t rows=0;
+        for(int parity=0;parity<2;parity++) for(int region=0;region<2;region++) {
+            double expected_rgb[3],expected[3];svhs_expected_color(parity,region!=0,expected_rgb,expected);
+            double amplitude=hypot(expected[1],expected[2]);assert(amplitude>.1);
+            int centre=(int)((region ? .75 : .25)*sequence.frame.width);
+            for(size_t line=0;line<sizeof(bad_lines)/sizeof(bad_lines[0]);line++) for(int dy=-3;dy<=3;dy++) {
+                int fy=bad_lines[line]-22+dy;assert(fy>=0 && fy<sequence.frame.height/2);
+                double u=0.0,v=0.0;
+                for(int x=centre-8;x<=centre+8;x++) {
+                    double actual[3];svhs_pixel_yuv(&sequence.frame,x,fy*2+parity,actual);
+                    u+=actual[1];v+=actual[2];
+                }
+                u/=17.0;v/=17.0;
+                double hue=fabs(atan2(v*expected[1]-u*expected[2],u*expected[1]+v*expected[2]))*180.0/TEST_PI;
+                double ratio=hypot(u,v)/amplitude;
+                maximum_hue=fmax(maximum_hue,hue);
+                minimum_ratio=fmin(minimum_ratio,ratio);maximum_ratio=fmax(maximum_ratio,ratio);rows++;
+            }
+        }
+        printf("PAL S-VHS head order%d strong contradictory bursts: source lines100/151/202, gain100%% phase+180deg, activeUV unchanged; source/paired +/-3 rows hue max %.3fdeg, known-UV amplitude %.4f..%.4fx (%zu row/region probes)\n",
+            heads,maximum_hue,minimum_ratio,maximum_ratio,rows);
+        fflush(stdout);
+        assert(rows==84 && maximum_hue<=5.0 && minimum_ratio>=.65 && maximum_ratio<=1.35);
+        free(rf);
+    }
+    free(sequence.frame.rgba);gui_rf_decoder_destroy(decoder);
+}
+
+/* Project onto the independently prescribed (dU,dV)=(1,.7) direction.
+ * Averages remain within each original field; equal-Y RGB stays in gamut. */
+static double svhs_detail_trace(const test_frames_t *frame,int parity,int column,int fy,double *y_error) {
+    int centre=(int)((column+.5)*frame->width/5.0);
+    double u=0.0,v=0.0;
+    for(int x=centre-7;x<=centre+7;x++) {
+        double actual[3];svhs_pixel_yuv(frame,x,fy*2+parity,actual);
+        u+=actual[1];v+=actual[2];
+        *y_error=fmax(*y_error,fabs(actual[0]-display_level(.5)));
+        const uint8_t *rgb=frame->rgba+((size_t)(fy*2+parity)*frame->width+x)*4u;
+        for(int c=0;c<3;c++) assert(rgb[c]>5 && rgb[c]<250);
+    }
+    u=u/15.0-(parity ? -.04 : .05);v=v/15.0-(parity ? .05 : .04);
+    return (u+.7*v)/1.49;
+}
+
+static double svhs_detail_average(const double *trace,int first,int last) {
+    double sum=0.0;for(int fy=first;fy<last;fy++) sum+=trace[fy];
+    return sum/(last-first);
+}
+
+static void run_svhs_detail_contracts(void) {
+    const gui_rf_profile_t profiles[]={GUI_RF_PROFILE_PAL_SVHS,GUI_RF_PROFILE_NTSC_SVHS};
+    gui_rf_decoder_t *decoder=gui_rf_decoder_create_profile(profiles[0]);assert(decoder);
+    test_ed_sequence_t sequence={0};
+    sequence.frame.rgba=malloc((size_t)GUI_RF_FRAME_MAX_WIDTH*GUI_RF_FRAME_MAX_HEIGHT*4u);
+    assert(sequence.frame.rgba);
+    for(size_t system=0;system<sizeof(profiles)/sizeof(profiles[0]);system++) for(int heads=0;heads<2;heads++)
+      for(int detail=0;detail<(heads==0 ? 3 : 1);detail++) {
+        double amplitude=detail ? .008 : .025,phase=detail==2 ? TEST_PI*.5 : 0.0;
+        test_quality_t quality={.pattern=TEST_Q_UV_DETAIL,.fields=8,.swap_tracks=heads,
+            .detail_amplitude=amplitude,.detail_phase=phase};
+        size_t length;float *rf=make_rf_signal_profile(profiles[system],0,true,1.0,-1,
+            TEST_V_NORMAL,&quality,&length);
+        gui_rf_decoder_reset_profile(decoder,profiles[system]);
+        sequence.frame=(test_frames_t){.rgba=sequence.frame.rgba};
+        const uint64_t origin=UINT64_C(15000000003);
+        process_ed_chunks(decoder,rf,length,origin,true,&sequence);
+        assert(sequence.frame.frames>=3 && sequence.frame.end_sample-origin>=quality.field_start_sample[6]);
+        assert(sequence.frame.status.h_locked && sequence.frame.status.v_locked && sequence.frame.status.color_locked);
+        for(int parity=0;parity<2;parity++) {
+            double trace[5][GUI_RF_FRAME_MAX_HEIGHT/2]={{0}},y_error=0.0;
+            for(int column=0;column<5;column++) for(int fy=32;fy<208;fy++)
+                trace[column][fy]=svhs_detail_trace(&sequence.frame,parity,column,fy,&y_error);
+            double contrast[2],width[2];
+            for(int edge=0;edge<2;edge++) {
+                double low=svhs_detail_average(trace[edge],56,64);
+                double high=svhs_detail_average(trace[edge],96,104);
+                contrast[edge]=(high-low)/(edge==0 ? .16 : .025);
+                double normalized[GUI_RF_FRAME_MAX_HEIGHT/2]={0};
+                assert(high>low);
+                for(int fy=32;fy<208;fy++) normalized[fy]=(trace[edge][fy]-low)/(high-low);
+                double x10=svhs_crossing(normalized,208,.10,70,90);
+                double x90=svhs_crossing(normalized,208,.90,70,90);
+                width[edge]=x90-x10;
+                assert(x10>=0 && x90>=x10);
+            }
+            double modulation[2];
+            for(int wave=0;wave<2;wave++) {
+                double sine=0.0,cosine=0.0,period=wave==0 ? 16.0 : 8.0;
+                for(int fy=40;fy<200;fy++) {
+                    double phase=2.0*TEST_PI*fy/period;
+                    sine+=trace[wave+2][fy]*sin(phase);cosine+=trace[wave+2][fy]*cos(phase);
+                }
+                modulation[wave]=2.0*hypot(sine,cosine)/(160.0*amplitude);
+            }
+            double glyph=10.0;
+            for(int cap=0;cap<3;cap++) {
+                int start=64+16*cap;
+                double stroke=svhs_detail_average(trace[4],start,start+4);
+                double background=svhs_detail_average(trace[4],start+8,start+12);
+                glyph=fmin(glyph,(stroke-background)/.025);
+            }
+            printf("%s head%d field%d equal-Y detail amp%.3f phase%.0fdeg: strong/weak contrast %.4f/%.4fx widths %.3f/%.3f source-lines; 16/8-line C modulation %.4f/%.4fx; four-line glyph contrast %.4fx; max displayY error %.6f\n",
+                gui_rf_profile_name(profiles[system]),heads,parity,amplitude,phase*180.0/TEST_PI,contrast[0],contrast[1],width[0],width[1],
+                modulation[0],modulation[1],glyph,y_error);
+            fflush(stdout);
+            /* New preservation floors were fixed from the independently
+             * characterized v2 physical chart before testing any NR variant:
+             * approximately10% additional detail loss is the maximum allowed.
+             * The absolute amplitudes still refer to known input UV, not an
+             * image generated by the candidate. Existing gates stay intact. */
+            bool pal=profiles[system]==GUI_RF_PROFILE_PAL_SVHS;
+            assert(contrast[0]>=.98 && contrast[1]>=.95 && contrast[0]<=1.30 && contrast[1]<=1.30);
+            assert(width[0]<=1.0 && width[1]<=4.65);
+            assert(modulation[0]>=(detail ? (pal ? .825 : .795) : (pal ? .84 : .795)) && modulation[0]<=1.25);
+            assert(modulation[1]>=(detail ? (pal ? .415 : .385) : (pal ? .45 : .432)) && modulation[1]<=1.25);
+            assert(glyph>=(pal ? .75 : .71) && glyph<=1.35 && y_error<.012);
+        }
+        free(rf);
+    }
+    free(sequence.frame.rgba);gui_rf_decoder_destroy(decoder);
+}
+
+/* Noise-on test oracle: RF IQ noise is independent of the known picture.
+ * Pixel and row error statistics are kept separate for each original field.
+ * Detail modulation is reported even when it is weaker than the noise. */
+static void run_svhs_cnr_noise_contracts(void) {
+    const gui_rf_profile_t profiles[]={GUI_RF_PROFILE_PAL_SVHS,GUI_RF_PROFILE_NTSC_SVHS};
+    bool strong_edges_ok=true,noise_reduced_ok=true;
+    /* Corresponding frozen-v2 same-seed edge widths plus10%, fixed without
+     * changing any pre-existing clean-edge threshold. */
+    const double width_bound[2][2]={{4.28,2.281},{.94,.82}};
+    gui_rf_decoder_t *decoder=gui_rf_decoder_create_profile(profiles[0]);assert(decoder);
+    test_ed_sequence_t sequence={0};
+    sequence.frame.rgba=malloc((size_t)GUI_RF_FRAME_MAX_WIDTH*GUI_RF_FRAME_MAX_HEIGHT*4u);assert(sequence.frame.rgba);
+    for(size_t system=0;system<sizeof(profiles)/sizeof(profiles[0]);system++) {
+        test_quality_t quality={.pattern=TEST_Q_UV_DETAIL,.fields=8,.swap_tracks=1,.detail_amplitude=.008,
+            .detail_phase=TEST_PI*.5,.chroma_noise_amplitude=.30,.chroma_noise_seed=UINT32_C(0x73676873)};
+        size_t length;float *rf=make_rf_signal_profile(profiles[system],0,true,1.0,-1,TEST_V_NORMAL,&quality,&length);
+        gui_rf_decoder_reset_profile(decoder,profiles[system]);sequence.frame=(test_frames_t){.rgba=sequence.frame.rgba};
+        const uint64_t origin=UINT64_C(16000000003);
+        process_ed_chunks(decoder,rf,length,origin,true,&sequence);
+        assert(sequence.frame.frames>=3 && sequence.frame.end_sample-origin>=quality.field_start_sample[6]);
+        assert(sequence.frame.status.h_locked && sequence.frame.status.v_locked && sequence.frame.status.color_locked);
+        printf("%s physical C-band noise: seed%08x whiteIQ amplitude%.3f, 3x800kHz LP before carrier; all-time RF noise RMS%.6f (FM amplitude.72 unchanged)\n",
+            gui_rf_profile_name(profiles[system]),(unsigned)quality.chroma_noise_seed,quality.chroma_noise_amplitude,quality.generated_c_noise_rms);
+        assert(quality.generated_c_noise_rms>.001 && quality.generated_c_noise_rms<.05);
+        for(int parity=0;parity<2;parity++) {
+            for(int column=0;column<2;column++) {
+                double sum[2]={0},square[2]={0},row_sum[2]={0},row_square[2]={0};size_t pixels=0,rows=0;
+                int centre=(int)((column+.5)*sequence.frame.width/5.0);
+                double expected_u,expected_v;
+                quality_detail_uv(parity,(column+.5)/5.0,150,.008,quality.detail_phase,&expected_u,&expected_v);
+                for(int fy=120;fy<200;fy++) {
+                    double row[2]={0};int count=0;
+                    for(int x=centre-24;x<=centre+24;x++) {
+                        double actual[3];svhs_pixel_yuv(&sequence.frame,x,fy*2+parity,actual);
+                        double error[2]={actual[1]-expected_u,actual[2]-expected_v};
+                        for(int c=0;c<2;c++) {sum[c]+=error[c];square[c]+=error[c]*error[c];row[c]+=error[c];}
+                        pixels++;count++;
+                    }
+                    for(int c=0;c<2;c++) {row[c]/=count;row_sum[c]+=row[c];row_square[c]+=row[c]*row[c];}rows++;
+                }
+                double variance=0.0,row_variance=0.0;
+                for(int c=0;c<2;c++) {
+                    variance+=fmax(0.0,square[c]/pixels-pow(sum[c]/pixels,2));
+                    row_variance+=fmax(0.0,row_square[c]/rows-pow(row_sum[c]/rows,2));
+                    assert(fabs(sum[c]/pixels)<.045);
+                }
+                if(sqrt(variance*.5)>.012 || sqrt(row_variance*.5)>.007) noise_reduced_ok=false;
+                printf("%s noisy field%d flat%d: knownUV bias %.6f/%.6f; pixelUV error std %.6f; rowUV error std %.6f\n",
+                    gui_rf_profile_name(profiles[system]),parity,column,sum[0]/pixels,sum[1]/pixels,sqrt(variance*.5),sqrt(row_variance*.5));
+            }
+            double modulation[2],ignored_y=0.0;
+            for(int wave=0;wave<2;wave++) {
+                double sine=0.0,cosine=0.0,period=wave==0 ? 16.0 : 8.0;
+                for(int fy=40;fy<200;fy++) {
+                    double value=svhs_detail_trace(&sequence.frame,parity,wave+2,fy,&ignored_y);
+                    double phase=2.0*TEST_PI*fy/period;
+                    sine+=value*sin(phase);cosine+=value*cos(phase);
+                }
+                modulation[wave]=2.0*hypot(sine,cosine)/(160*.008);
+            }
+            double trace[GUI_RF_FRAME_MAX_HEIGHT/2]={0};
+            for(int fy=32;fy<208;fy++) trace[fy]=svhs_detail_trace(&sequence.frame,parity,0,fy,&ignored_y);
+            double low=svhs_detail_average(trace,48,64),high=svhs_detail_average(trace,96,112);
+            double contrast=(high-low)/.16;assert(contrast>=.95 && contrast<=1.35);
+            for(int fy=32;fy<208;fy++) trace[fy]=(trace[fy]-low)/(high-low);
+            double x10=svhs_crossing(trace,208,.1,75,85),x50=svhs_crossing(trace,208,.5,75,85),
+                x90=svhs_crossing(trace,208,.9,75,85);
+            printf("%s noisy field%d weakC amp.008: 16/8H modulation %.6f/%.6fx; strong edge contrast %.4fx centre%.3f width%.3fsource-lines; displayY error%.6f\n",
+                gui_rf_profile_name(profiles[system]),parity,modulation[0],modulation[1],contrast,x50,x90-x10,ignored_y);
+            fflush(stdout);
+            if(!(x10>=0 && x50>=0 && x90>=x10 && fabs(x50-80)<=2.0 && x90-x10<=width_bound[system][parity])) strong_edges_ok=false;
+        }
+        /* Identical noise but opposite prescribed weak texture allows a
+         * finite-difference signal response. A single noisy DFT also contains
+         * the random realization at that frequency and is not a clean transfer
+         * measurement. This pairing does not assume candidate linearity. */
+        test_frames_t positive=sequence.frame;
+        size_t bytes=(size_t)positive.width*positive.height*4u;
+        positive.rgba=malloc(bytes);assert(positive.rgba);memcpy(positive.rgba,sequence.frame.rgba,bytes);
+        free(rf);quality.detail_phase+=TEST_PI;
+        rf=make_rf_signal_profile(profiles[system],0,true,1.0,-1,TEST_V_NORMAL,&quality,&length);
+        gui_rf_decoder_reset_profile(decoder,profiles[system]);sequence.frame=(test_frames_t){.rgba=sequence.frame.rgba};
+        process_ed_chunks(decoder,rf,length,origin,true,&sequence);
+        assert(sequence.frame.frames==positive.frames && sequence.frame.end_sample==positive.end_sample);
+        for(int parity=0;parity<2;parity++) {
+            double response[2],signed_response[2],quadrature[2],ignored_y=0.0;
+            for(int wave=0;wave<2;wave++) {
+                double sine=0.0,cosine=0.0,period=wave==0 ? 16.0 : 8.0;
+                for(int fy=40;fy<200;fy++) {
+                    double value=.5*(svhs_detail_trace(&positive,parity,wave+2,fy,&ignored_y)-
+                        svhs_detail_trace(&sequence.frame,parity,wave+2,fy,&ignored_y));
+                    double phase=2.0*TEST_PI*fy/period+TEST_PI*.5;
+                    sine+=value*sin(phase);cosine+=value*cos(phase);
+                }
+                response[wave]=2.0*hypot(sine,cosine)/(160*.008);
+                signed_response[wave]=2.0*sine/(160*.008);quadrature[wave]=2.0*cosine/(160*.008);
+            }
+            printf("%s same-noise opposite-texture field%d: finite-difference 16/8H weakC response %.6f/%.6fx; signed %.6f/%.6f quadrature %.6f/%.6f (inputUV amplitude.008)\n",
+                gui_rf_profile_name(profiles[system]),parity,response[0],response[1],signed_response[0],signed_response[1],quadrature[0],quadrature[1]);
+            fflush(stdout);
+            /* This same-seed physical response must not reverse either
+             * prescribed weak chroma frequency. It catches the rectangular
+             * nine-pair kernel's negative16H lobe; it is not a guarantee for
+             * every possible texture, noise realization or tape. */
+            assert(signed_response[0]>=0.0 && signed_response[1]>=0.0);
+        }
+        fflush(stdout);free(positive.rgba);free(rf);
+    }
+    free(sequence.frame.rgba);gui_rf_decoder_destroy(decoder);
+    assert(strong_edges_ok && noise_reduced_ok);
+}
+
+static void run_svhs_gray_identity_contracts(void) {
+    const gui_rf_profile_t profiles[]={GUI_RF_PROFILE_PAL_SVHS,GUI_RF_PROFILE_NTSC_SVHS};
+    gui_rf_decoder_t *decoder=gui_rf_decoder_create_profile(profiles[0]);assert(decoder);
+    test_ed_sequence_t sequence={0};sequence.frame.rgba=malloc((size_t)GUI_RF_FRAME_MAX_WIDTH*GUI_RF_FRAME_MAX_HEIGHT*4u);assert(sequence.frame.rgba);
+    for(size_t system=0;system<sizeof(profiles)/sizeof(profiles[0]);system++) {
+        test_quality_t quality={.pattern=TEST_Q_GRAY,.fields=8,.swap_tracks=1};
+        size_t length;float *rf=make_rf_signal_profile(profiles[system],0,true,1.0,-1,TEST_V_NORMAL,&quality,&length);
+        gui_rf_decoder_reset_profile(decoder,profiles[system]);sequence.frame=(test_frames_t){.rgba=sequence.frame.rgba};
+        process_ed_chunks(decoder,rf,length,0,true,&sequence);assert(sequence.frame.frames>=3);
+        for(int n=0;n<sequence.frame.frames;n++) printf("%s clean gray identity frame%d end%llu hash%016llx\n",
+            gui_rf_profile_name(profiles[system]),n,(unsigned long long)sequence.ends[n],(unsigned long long)sequence.hashes[n]);
+        free(rf);
+    }
+    free(sequence.frame.rgba);gui_rf_decoder_destroy(decoder);
+}
+
+/* Physical front-end oracle: three simultaneous nonzero physical Y/C
+ * transitions. Existing midtone bars are reused; no expected pixel trace is
+ * generated from a candidate filter. Keep the original fields separate. */
+static void svhs_frontend_midbar_metrics(const test_frames_t *frame,const char *name,int heads,double clock,double jitter) {
+    for(int edge=4;edge<=6;edge++) for(int parity=0;parity<2;parity++) {
+        int centre=frame->width*edge/8,radius=frame->width/32;
+        double old[3]={0},peak_y=0.0,peak_c=0.0,sum_y=0.0,sum_c=0.0,moment_y=0.0,moment_c=0.0;
+        int y_edge=0,c_edge=0;
+        for(int x=centre-radius;x<=centre+radius;x++) {
+            double value[3]={0};int count=0;
+            for(int fy=60;fy<80;fy++) {
+                double pixel[3];svhs_pixel_yuv(frame,x,fy*2+parity,pixel);
+                for(int c=0;c<3;c++) value[c]+=pixel[c];
+                count++;
+            }
+            for(int c=0;c<3;c++) value[c]/=count;
+            if(x>centre-radius) {
+                double dy=fabs(value[0]-old[0]),dc=hypot(value[1]-old[1],value[2]-old[2]);
+                if(dy>peak_y) {peak_y=dy;y_edge=x;}
+                if(dc>peak_c) {peak_c=dc;c_edge=x;}
+                sum_y+=dy;sum_c+=dc;moment_y+=x*dy;moment_c+=x*dc;
+            }
+            memcpy(old,value,sizeof(old));
+        }
+        double centroid=moment_c/sum_c-moment_y/sum_y;
+        printf("FRONTREG %s head%d clock%.3f jitter%.2f field%d edge%d Y%d C%d signed%d centroid%.6f steps%.6f/%.6f\n",
+            name,heads,clock,jitter,parity,edge,y_edge,c_edge,c_edge-y_edge,centroid,peak_y,peak_c);
+        fflush(stdout);
+        /* Reuse the existing physical7px/5px registration limit after
+         * frozen4cb S-VHS characterization passed it. The centroid remains
+         * diagnostic: one5MSPS work sample spans about2.5-3output pixels,
+         * so an uncalibrated extra1output-pixel limit is not a contract. */
+        bool pal=frame->height==576;
+        assert(peak_y>1e-4 && peak_c>1e-4 && abs(c_edge-y_edge)<=(pal ? 7 : 5));
+
+    }
+}
+
+static void svhs_frontend_solve_three(double gram[3][3],double rhs[3],double out[3]) {
+    double a[3][4];
+    for(int r=0;r<3;r++) {for(int c=0;c<3;c++) a[r][c]=gram[r][c];a[r][3]=rhs[r];}
+    for(int c=0;c<3;c++) {
+        int pivot=c;for(int r=c+1;r<3;r++) if(fabs(a[r][c])>fabs(a[pivot][c])) pivot=r;
+        assert(fabs(a[pivot][c])>1e-10);
+        for(int j=c;j<4;j++) {double v=a[c][j];a[c][j]=a[pivot][j];a[pivot][j]=v;}
+        double divisor=a[c][c];for(int j=c;j<4;j++) a[c][j]/=divisor;
+        for(int r=0;r<3;r++) if(r!=c) {double scale=a[r][c];for(int j=c;j<4;j++) a[r][j]-=scale*a[c][j];}
+    }
+    for(int c=0;c<3;c++) out[c]=a[c][3];
+}
+
+static void svhs_frontend_horizontal_metrics(const test_frames_t *frame,bool pal,const char *name,int heads,double frequency) {
+    /* Independent physical active intervals from the RF generator above,
+     * not queried from the decoder or candidate filter. */
+    const double duration=pal ? 52.0 : 53.10555555555556;
+    for(int parity=0;parity<2;parity++) {
+        double gram[3][3]={{0}},rhs[2][3]={{0}},fit[2][3];
+        double ysum=0.0;size_t count=0;
+        for(int x=64;x<frame->width-64;x++) {
+            double phase=2.0*TEST_PI*frequency*duration*1e-6*(x+.5)/frame->width+(parity ? -.71 : .37);
+            double basis[3]={1.0,sin(phase),cos(phase)},uv[2]={0};int rows=0;
+            for(int fy=40;fy<frame->height/2-40;fy++) {
+                double pixel[3];svhs_pixel_yuv(frame,x,fy*2+parity,pixel);
+                const uint8_t *rgb=frame->rgba+((size_t)(fy*2+parity)*frame->width+x)*4u;
+                for(int c=0;c<3;c++) assert(rgb[c]>5 && rgb[c]<250);
+                uv[0]+=pixel[1];uv[1]+=pixel[2];ysum+=pixel[0];count++;rows++;
+            }
+            for(int c=0;c<2;c++) {
+                uv[c]/=rows;
+                for(int j=0;j<3;j++) rhs[c][j]+=basis[j]*uv[c];
+            }
+            for(int j=0;j<3;j++) for(int k=0;k<3;k++) gram[j][k]+=basis[j]*basis[k];
+        }
+        for(int c=0;c<2;c++) svhs_frontend_solve_three(gram,rhs[c],fit[c]);
+        double gain[2],degrees[2];
+        for(int c=0;c<2;c++) {gain[c]=hypot(fit[c][1],fit[c][2])/(c==0 ? .04 : .028);degrees[c]=atan2(fit[c][2],fit[c][1])*180.0/TEST_PI;}
+        printf("FRONTSINE %s head%d frequency%.0f field%d gainU%.6f gainV%.6f phaseU%.6f phaseV%.6f meanU%.6f meanV%.6f meanY%.6f\n",
+            name,heads,frequency,parity,gain[0],gain[1],degrees[0],degrees[1],fit[0][0],fit[1][0],ysum/count);
+        fflush(stdout);
+        /* Frozen before candidate measurements: retain at least90percent
+         * of the smallest4cb modulation, with no arbitrary gain boost.
+         * Known physical zero-phase error may improve; it must not exceed
+         * the frozen4cb worst absolute error plus approximately2degrees. */
+        const double floor_gain[2][2]={{1.022,1.004},{.973,.938}};
+        const double phase_bound[2][2]={{15.6,48.0},{10.5,33.1}};
+        int system=pal ? 0 : 1,band=frequency>200000.0 ? 1 : 0;
+        assert(gain[0]>=floor_gain[system][band] && gain[1]>=floor_gain[system][band]);
+        assert(gain[0]<=1.30 && gain[1]<=1.30);
+        assert(fabs(degrees[0])<=phase_bound[system][band] && fabs(degrees[1])<=phase_bound[system][band]);
+        assert(fabs(fit[0][0]-(parity ? -.04 : .05))<.025 && fabs(fit[1][0]-(parity ? .05 : .04))<.025);
+        assert(fabs(ysum/count-display_level(.5))<.015);
+    }
+}
+
+static void run_svhs_frontend_contracts(void) {
+    const gui_rf_profile_t profiles[]={GUI_RF_PROFILE_PAL_SVHS,GUI_RF_PROFILE_NTSC_SVHS};
+    gui_rf_decoder_t *decoder=gui_rf_decoder_create_profile(profiles[0]);assert(decoder);
+    test_ed_sequence_t sequence={0};sequence.frame.rgba=malloc((size_t)GUI_RF_FRAME_MAX_WIDTH*GUI_RF_FRAME_MAX_HEIGHT*4u);assert(sequence.frame.rgba);
+    for(size_t system=0;system<2;system++) for(int heads=0;heads<2;heads++) {
+        bool pal=system==0;
+        for(int warped=0;warped<(heads ? 2 : 1);warped++) {
+            double clock=warped ? 1.001 : 1.0,jitter=warped ? .08 : 0;
+            test_quality_t quality={.pattern=TEST_Q_MID_BARS,.fields=8,.swap_tracks=heads};
+            size_t length;float *rf=make_rf_signal_profile(profiles[system],jitter,true,clock,-1,TEST_V_NORMAL,&quality,&length);
+            gui_rf_decoder_reset_profile(decoder,profiles[system]);sequence.frame=(test_frames_t){.rgba=sequence.frame.rgba};
+            process_ed_chunks(decoder,rf,length,UINT64_C(16000000003),true,&sequence);
+            assert(sequence.frame.frames>=3 && sequence.frame.status.h_locked && sequence.frame.status.v_locked && sequence.frame.status.color_locked);
+            svhs_frontend_midbar_metrics(&sequence.frame,gui_rf_profile_name(profiles[system]),heads,clock,jitter);free(rf);
+        }
+        const double frequencies[2]={100000.0,300000.0};
+        for(int f=0;f<2;f++) {
+            test_quality_t quality={.pattern=TEST_Q_UV_HORIZONTAL_SINE,.fields=8,.swap_tracks=heads,
+                .c_sine_hz=frequencies[f],.c_sine_amplitude=.04};
+            size_t length;float *rf=make_rf_signal_profile(profiles[system],0,true,1.0,-1,TEST_V_NORMAL,&quality,&length);
+            gui_rf_decoder_reset_profile(decoder,profiles[system]);sequence.frame=(test_frames_t){.rgba=sequence.frame.rgba};
+            process_ed_chunks(decoder,rf,length,UINT64_C(17000000003),true,&sequence);
+            assert(sequence.frame.frames>=3 && sequence.frame.status.h_locked && sequence.frame.status.v_locked && sequence.frame.status.color_locked);
+            svhs_frontend_horizontal_metrics(&sequence.frame,pal,gui_rf_profile_name(profiles[system]),heads,frequencies[f]);free(rf);
+        }
+    }
+    free(sequence.frame.rgba);gui_rf_decoder_destroy(decoder);
+}
+
+static void run_svhs_color_contracts(void) {
+    const gui_rf_profile_t profiles[]={GUI_RF_PROFILE_PAL_SVHS,GUI_RF_PROFILE_NTSC_SVHS};
+    const size_t capacity=(size_t)GUI_RF_FRAME_MAX_WIDTH*GUI_RF_FRAME_MAX_HEIGHT*4u;
+    gui_rf_decoder_t *decoder=gui_rf_decoder_create_profile(profiles[0]);assert(decoder);
+    test_ed_sequence_t sequence={0},partition={0};
+    sequence.frame.rgba=malloc(capacity);partition.frame.rgba=malloc(capacity);
+    assert(sequence.frame.rgba && partition.frame.rgba);
+    for(size_t system=0;system<sizeof(profiles)/sizeof(profiles[0]);system++) {
+        uint64_t continuation=0;
+        for(int horizontal=0;horizontal<2;horizontal++) for(int disturbed=0;disturbed<2;disturbed++) {
+            test_quality_t quality={.pattern=horizontal ? TEST_Q_UV_HORIZONTAL : TEST_Q_UV_VERTICAL,
+                .fields=8,.swap_tracks=1,.burst_noise_seed=UINT32_C(0x13579bdf),
+                .burst_gain_jitter=disturbed ? .28 : 0.0,
+                .burst_phase_jitter=disturbed ? 18.0*TEST_PI/180.0 : 0.0};
+            size_t length;float *rf=make_rf_signal_profile(profiles[system],0,true,1.0,-1,
+                TEST_V_NORMAL,&quality,&length);
+            gui_rf_decoder_reset_profile(decoder,profiles[system]);
+            sequence.frame=(test_frames_t){.rgba=sequence.frame.rgba};
+            const uint64_t origin=UINT64_C(11000000003);
+            process_ed_chunks(decoder,rf,length,origin,false,&sequence);
+            continuation=origin+length;
+            assert(sequence.frame.end_sample-origin>=quality.field_start_sample[6]);
+            char label[160];snprintf(label,sizeof(label),"%s equal-Y %s %s burst",
+                gui_rf_profile_name(profiles[system]),horizontal ? "horizontal bands" : "vertical edges",
+                disturbed ? "jittered" : "nominal");
+            printf("%s: burst-only gain +/-%.1f%%, phase +/-%.1fdeg, seed %08x; active YUV unchanged\n",
+                label,100.0*quality.burst_gain_jitter,quality.burst_phase_jitter*180.0/TEST_PI,
+                (unsigned)quality.burst_noise_seed);
+            double stripe=svhs_color_metrics(&sequence.frame,horizontal!=0,label,-1);
+            assert(stripe<=(disturbed ? .010 : .0045));
+            if(disturbed && !horizontal) {
+                gui_rf_decoder_reset_profile(decoder,profiles[system]);
+                partition.frame=(test_frames_t){.rgba=partition.frame.rgba};
+                process_ed_chunks(decoder,rf,length,origin,true,&partition);
+                assert(partition.frame.frames==sequence.frame.frames);
+                for(int frame=0;frame<sequence.frame.frames;frame++) {
+                    assert(partition.ends[frame]==sequence.ends[frame]);
+                    assert(partition.hashes[frame]==sequence.hashes[frame]);
+                }
+            }
+            free(rf);
+        }
+        const double phase_jumps[]={60.0,30.0};
+        for(size_t phase_case=0;phase_case<sizeof(phase_jumps)/sizeof(phase_jumps[0]);phase_case++) {
+            /* A true channel phase jump rotates burst AND active chroma. Known
+             * picture UV stays fixed; a long stabilizer must not drag the old
+             * channel phase across the boundary. Only four physical source lines
+             * on each side are excluded for the two-line decoder's transient. */
+            bool pal=profiles[system]==GUI_RF_PROFILE_PAL_SVHS;
+            int recovery_line=(pal ? 288 : 240)/2;
+            test_quality_t jump={.pattern=TEST_Q_UV_VERTICAL,.fields=8,.swap_tracks=1,
+                .chroma_jump_line=(pal ? 22 : 20)+recovery_line,.chroma_jump_radians=phase_jumps[phase_case]*TEST_PI/180.0};
+            size_t jump_length;float *jump_rf=make_rf_signal_profile(profiles[system],0,true,1.0,-1,
+                TEST_V_NORMAL,&jump,&jump_length);
+            gui_rf_decoder_reset_profile(decoder,profiles[system]);
+            sequence.frame=(test_frames_t){.rgba=sequence.frame.rgba};
+            const uint64_t jump_origin=UINT64_C(12000000003);
+            process_ed_chunks(decoder,jump_rf,jump_length,jump_origin,false,&sequence);
+            continuation=jump_origin+jump_length;
+            assert(sequence.frame.end_sample-jump_origin>=jump.field_start_sample[6]);
+            char jump_label[120];snprintf(jump_label,sizeof(jump_label),"%s true %.0fdeg channel phase jump",
+                gui_rf_profile_name(profiles[system]),phase_jumps[phase_case]);
+            printf("%s: source line %d; unchanged active UV; +/-4-line recovery window\n",jump_label,jump.chroma_jump_line);
+            double jump_stripe=svhs_color_metrics(&sequence.frame,false,jump_label,recovery_line);
+            double recovery_hue=svhs_phase_recovery_hue(&sequence.frame,recovery_line,jump_label);
+            assert(recovery_hue<=5.0);
+            assert(jump_stripe<=.0045);
+            gui_rf_decoder_reset_profile(decoder,profiles[system]);
+            partition.frame=(test_frames_t){.rgba=partition.frame.rgba};
+            process_ed_chunks(decoder,jump_rf,jump_length,jump_origin,true,&partition);
+            assert(partition.frame.frames==sequence.frame.frames);
+            for(int frame=0;frame<sequence.frame.frames;frame++) {
+                assert(partition.ends[frame]==sequence.ends[frame]);
+                assert(partition.hashes[frame]==sequence.hashes[frame]);
+            }
+            free(jump_rf);
+        }
+        /* Active chroma without burst must not be mistaken for a valid phase
+         * reference, including after a previously locked phase-jump interval. */
+        test_quality_t no_burst={.pattern=TEST_Q_UV_VERTICAL,.fields=8,.swap_tracks=1,.suppress_burst=true};
+        size_t length;float *rf=make_rf_signal_profile(profiles[system],0,true,1.0,-1,
+            TEST_V_NORMAL,&no_burst,&length);
+        /* Exact continuity first: a locked decoder must age out its old
+         * reference instead of keeping color forever from line history. */
+        sequence.frame=(test_frames_t){.rgba=sequence.frame.rgba};
+        process_ed_chunks(decoder,rf,length,continuation,true,&sequence);
+        check_svhs_no_burst(&sequence.frame,"S-VHS continuous burst loss");
+        /* An explicit new segment independently tests reset of histories. */
+        gui_rf_decoder_reset_profile(decoder,profiles[system]);
+        sequence.frame=(test_frames_t){.rgba=sequence.frame.rgba};
+        process_ed_chunks(decoder,rf,length,continuation+length,true,&sequence);
+        check_svhs_no_burst(&sequence.frame,"S-VHS reset without burst");
+        free(rf);
+    }
+    free(sequence.frame.rgba);free(partition.frame.rgba);gui_rf_decoder_destroy(decoder);
+    run_svhs_burst_outlier_contracts();
+    run_svhs_pal_cadence_contracts();
+    run_svhs_detail_contracts();
+    run_svhs_cnr_noise_contracts();
+    run_svhs_gray_identity_contracts();
+    run_svhs_frontend_contracts();
+}
+
+static void svhs_stripe_probe(const test_frames_t *frame, int parity, int row,
+                              int half_width, double uv[2]) {
+    uv[0] = uv[1] = 0;
+    double scale = 1.0/(2*half_width+1);
+    for (int x=frame->width/2-half_width; x<=frame->width/2+half_width; ++x) {
+        double value[3];
+        svhs_pixel_yuv(frame,x,2*row+parity,value);
+        uv[0] += scale*value[1];
+        uv[1] += scale*value[2];
+    }
+}
+
+static double svhs_legal_short_projection(const test_frames_t *frame, int parity, int row) {
+    const double truth_u = -.492*svhs_legal_y;
+    const double truth_v = .877*(svhs_legal_y/(.299+.587)-svhs_legal_y);
+    const double norm = truth_u*truth_u + truth_v*truth_v;
+    const int x0 = frame->width*494/1000, x1 = frame->width*506/1000;
+    double sum = 0.0;
+    for (int x=x0; x<x1; ++x) {
+        double yuv[3];
+        svhs_pixel_yuv(frame,x,2*row+parity,yuv);
+        sum += (truth_u*yuv[1]+truth_v*yuv[2])/norm;
+    }
+    return sum/(x1-x0);
+}
+
+static void run_svhs_stripe_contract(void) {
+    const gui_rf_profile_t profile = GUI_RF_PROFILE_PAL_SVHS;
+    const uint64_t origin = UINT64_C(18000000003);
+    gui_rf_decoder_t *decoder = gui_rf_decoder_create_profile(profile);
+    test_ed_sequence_t sequence = {0};
+    sequence.frame.rgba = malloc((size_t)GUI_RF_FRAME_MAX_WIDTH*GUI_RF_FRAME_MAX_HEIGHT*4u);
+    assert(decoder && sequence.frame.rgba);
+    double background[2][3][2];
+    double healthy[2][9][2];
+    bool passes = true;
+    for (test_stripe_scene_t scene=STRIPE_BACKGROUND; scene<=STRIPE_LEGAL_SHORT; ++scene) {
+        test_quality_t quality = {.pattern=TEST_Q_UV_STRIPES, .fields=8, .stripe_scene=scene,
+            .chroma_noise_amplitude=.30, .chroma_noise_seed=UINT32_C(0x73676873)};
+        size_t length;
+        float *rf = make_rf_signal_profile(profile,0,true,1.0,-1,TEST_V_NORMAL,&quality,&length);
+        gui_rf_decoder_reset_profile(decoder,profile);
+        sequence.frame = (test_frames_t){.rgba=sequence.frame.rgba};
+        process_ed_chunks(decoder,rf,length,origin,true,&sequence);
+        free(rf);
+        assert(sequence.frame.frames>=3 &&
+               sequence.frame.end_sample-origin>=quality.field_start_sample[6]);
+        assert(sequence.frame.status.h_locked && sequence.frame.status.v_locked &&
+               sequence.frame.status.color_locked);
+        for (int parity=0; parity<2; ++parity) {
+            if (scene==STRIPE_LEGAL_SHORT) {
+                int row = svhs_legal_short_row;
+                double reference = 0.0;
+                for (int offset=10; offset<=14; ++offset)
+                    reference += .1*(svhs_legal_short_projection(&sequence.frame,parity,row-offset) +
+                                     svhs_legal_short_projection(&sequence.frame,parity,row+offset));
+                double gain = svhs_legal_short_projection(&sequence.frame,parity,row)-reference;
+                printf("PAL S-VHS field%d legal short 1H gain %.5f\n",parity,gain);
+                passes = passes && gain>=.40;
+                continue;
+            }
+            for (size_t s=0; s<sizeof(svhs_stripes)/sizeof(svhs_stripes[0]); ++s) {
+                double minimum = 1.0;
+                for (int row=0; row<svhs_stripes[s].span; ++row) {
+                    double uv[2];
+                    svhs_stripe_probe(&sequence.frame,parity,svhs_stripes[s].row+row,12,uv);
+                    double projection = (uv[0]+.7*uv[1])/1.49;
+                    if (scene==STRIPE_BACKGROUND) {
+                        background[parity][s][row] = projection;
+                        continue;
+                    }
+                    double gain = (projection-background[parity][s][row])*
+                                  svhs_stripe_polarity(parity)/svhs_stripes[s].amplitude;
+                    minimum = fmin(minimum,gain);
+                }
+                if (scene!=STRIPE_BACKGROUND) {
+                    printf("PAL S-VHS field%d scene%d row%d span%d physical stripe gain %.5f\n",
+                           parity,scene,svhs_stripes[s].row,svhs_stripes[s].span,minimum);
+                    passes = passes && minimum>=svhs_stripes[s].min_gain;
+                }
+            }
+            if (scene==STRIPE_BACKGROUND) continue;
+            double peak = 0.0;
+            for (int row=-4; row<=4; ++row) {
+                double uv[2];
+                svhs_stripe_probe(&sequence.frame,parity,svhs_pulse_row+parity+row,4,uv);
+                double *reference = healthy[parity][row+4];
+                if (scene==STRIPE_CHART) {
+                    memcpy(reference,uv,sizeof(uv));
+                    continue;
+                }
+                peak = fmax(peak,hypot(uv[0]-reference[0],uv[1]-reference[1])/
+                                 hypot(svhs_pulse_u,.7*svhs_pulse_u));
+            }
+            if (scene==STRIPE_CORRUPTED) {
+                printf("PAL S-VHS field%d short RF pulse, normalized C peak %.5f\n",parity,peak);
+                passes = passes && peak<=.25;
+            }
+        }
+    }
+    fflush(stdout);
+    free(sequence.frame.rgba);
+    gui_rf_decoder_destroy(decoder);
+    assert(passes);
+}
+
 int main(int argc, char **argv) {
+    if (argc==2 && strcmp(argv[1],"--svhs-stripe-only")==0) {
+        run_svhs_stripe_contract();
+        return 0;
+    }
+    if(argc==2 && strcmp(argv[1],"--svhs-frontend-only")==0) {run_svhs_frontend_contracts();puts("PAL/NTSC S-VHS physical front-end contracts passed");return 0;}
+    if (argc==2 && strcmp(argv[1],"--svhs-cnr-noise-only")==0) {
+        run_svhs_cnr_noise_contracts();puts("PAL/NTSC S-VHS physical C-band noise contracts passed");return 0;
+    }
+    if (argc==2 && strcmp(argv[1],"--svhs-gray-identity-only")==0) {
+        run_svhs_gray_identity_contracts();return 0;
+    }
+    if (argc==2 && strcmp(argv[1],"--svhs-detail-only")==0) {
+        run_svhs_detail_contracts();puts("PAL/NTSC S-VHS physical chroma detail contracts passed");return 0;
+    }
+    if (argc==2 && strcmp(argv[1],"--svhs-pal-cadence-only")==0) {
+        run_svhs_pal_cadence_contracts();puts("PAL S-VHS physical burst cadence contracts passed");return 0;
+    }
+    if (argc==2 && strcmp(argv[1],"--svhs-burst-outlier-only")==0) {
+        run_svhs_burst_outlier_contracts();puts("PAL/NTSC S-VHS sparse burst amplitude contracts passed");return 0;
+    }
+    if (argc==2 && strcmp(argv[1],"--svhs-color-only")==0) {
+        run_svhs_color_contracts();puts("PAL/NTSC S-VHS physical burst/edge/weave contracts passed");return 0;
+    }
+    if (argc==2 && strcmp(argv[1],"--svhs-only")==0) {
+        run_svhs_contracts();puts("PAL/NTSC S-VHS 20MSPS physical RF contracts passed");return 0;
+    }
     if (argc==2 && strcmp(argv[1],"--superbeta-levels-only")==0) {
         run_superbeta_display_level_contracts();puts("NTSC SuperBeta cached display level contracts passed");return 0;
     }
@@ -2008,7 +3254,7 @@ int main(int argc, char **argv) {
         run_full_frame_contracts();puts("Full-frame geometry and level contracts passed");return 0;
     }
     if (argc!=1 && (argc!=3 || strcmp(argv[1],"--real-ntsc-bars")!=0)) {
-        fprintf(stderr,"usage: %s [--real-ntsc-bars excerpt.s16le] [--full-frame-only] [--ed-beta-only]\n",argv[0]);
+        fprintf(stderr,"usage: %s [--real-ntsc-bars excerpt.s16le] [--full-frame-only] [--ed-beta-only] [--svhs-only] [--svhs-color-only] [--svhs-burst-outlier-only] [--svhs-pal-cadence-only] [--svhs-detail-only] [--svhs-cnr-noise-only] [--svhs-gray-identity-only] [--svhs-frontend-only]\n",argv[0]);
         return 2;
     }
     run_deemphasis_contract();
@@ -2018,6 +3264,8 @@ int main(int argc, char **argv) {
     run_superbeta_acquire_contracts();
     run_superbeta_display_level_contracts();
     run_ed_beta_contracts();
+    run_svhs_contracts();
+    run_svhs_color_contracts();
     run_registration_contract();
     run_quality_contracts();
     run_stop_resume();

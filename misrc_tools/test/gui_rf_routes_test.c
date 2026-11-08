@@ -30,7 +30,7 @@ bool gui_rf_profile_has_hifi(gui_rf_profile_t profile) {
 }
 gui_rf_format_t gui_rf_profile_format(gui_rf_profile_t p) {
     return p==GUI_RF_PROFILE_PAL_VHS || p==GUI_RF_PROFILE_SECAM_VHS ||
-        p==GUI_RF_PROFILE_MESECAM_VHS ? GUI_RF_PAL : GUI_RF_NTSC;
+        p==GUI_RF_PROFILE_MESECAM_VHS || p==GUI_RF_PROFILE_PAL_SVHS ? GUI_RF_PAL : GUI_RF_NTSC;
 }
 gui_rf_preview_worker_t *gui_rf_preview_worker_create_profile(gui_rf_profile_t profile) {
     gui_rf_preview_worker_t *worker=gui_rf_preview_worker_create(gui_rf_profile_format(profile));
@@ -88,7 +88,8 @@ static void test_secam_vhs_routes(bool mesecam,gui_rf_profile_t profile,
         GUI_RF_PROFILE_NTSC_BETAMAX==2 && GUI_RF_PROFILE_NTSC_BETAMAX_HIFI==3 &&
         GUI_RF_PROFILE_NTSC_SUPERBETA==4 && GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI==5 &&
         GUI_RF_PROFILE_SECAM_VHS==6 && GUI_RF_PROFILE_MESECAM_VHS==7 &&
-        GUI_RF_PROFILE_NTSC_ED_BETA==8 && GUI_RF_PROFILE_COUNT==9,
+        GUI_RF_PROFILE_NTSC_ED_BETA==8 && GUI_RF_PROFILE_PAL_SVHS==9 &&
+        GUI_RF_PROFILE_NTSC_SVHS==10 && GUI_RF_PROFILE_COUNT==11,
         "append tape profiles without renumbering existing IDs");
     video_panel_state_t left={0},right={0};
     assert(gui_vhs_fm_init(&left.vhs_fm.decoder));
@@ -103,8 +104,9 @@ static void test_secam_vhs_routes(bool mesecam,gui_rf_profile_t profile,
         .right_view=PANEL_VIEW_WAVEFORM};
     route_app.is_capturing=true;route_app.settings.audio_monitor_playback=true;
     int created=atomic_load(&creates),destroyed=atomic_load(&destroys);
-    gui_vhs_fm_set_format(a,2);gui_vhs_fm_set_format(b,2);
-    gui_vhs_fm_set_mesecam(a,mesecam);gui_vhs_fm_set_mesecam(b,mesecam);
+    const int system = mesecam ? 3 : 2;
+    const int other_system = mesecam ? 2 : 3;
+    gui_vhs_fm_set_format(a,system);gui_vhs_fm_set_format(b,system);
     /* A remembered Beta video preset cannot affect either SECAM VHS recording. */
     gui_vhs_fm_set_beta_preset(a,GUI_BETA_PRESET_ED_BETA);
     assert(gui_vhs_fm_get_profile(a)==profile);
@@ -119,7 +121,7 @@ static void test_secam_vhs_routes(bool mesecam,gui_rf_profile_t profile,
     assert(atomic_load(&creates)==created+2 && a->worker!=b->worker);
     assert(a->worker==secam_worker && ((route_worker_t*)b->worker)->format==GUI_RF_PAL);
     assert(((route_worker_t*)b->worker)->profile==GUI_RF_PROFILE_PAL_VHS);
-    gui_vhs_fm_set_format(b,2);gui_video_update_rf_routes(&route_app);
+    gui_vhs_fm_set_format(b,system);gui_video_update_rf_routes(&route_app);
     assert(a->worker==secam_worker && b->worker==secam_worker);
     assert(atomic_load(&destroys)==destroyed+1);
     int calls=atomic_load(&route_calls),reset_count=atomic_load(&resets);
@@ -130,7 +132,7 @@ static void test_secam_vhs_routes(bool mesecam,gui_rf_profile_t profile,
     gui_video_submit_rf(&route_app,NULL,NULL,0,0,gap,true);
     assert(atomic_load(&resets)==reset_count+2);
     /* Betamax continues to force NTSC even when the prior VHS pick was SECAM. */
-    b->overlay.selected_tape=1;gui_vhs_fm_set_format(b,2);
+    b->overlay.selected_tape=1;gui_vhs_fm_set_format(b,system);
     assert(b->overlay.selected_system==1 && gui_vhs_fm_get_format(b)==VHS_FM_FORMAT_NTSC);
     assert(gui_vhs_fm_get_profile(b)==GUI_RF_PROFILE_NTSC_BETAMAX);
     gui_video_update_rf_routes(&route_app);
@@ -138,17 +140,17 @@ static void test_secam_vhs_routes(bool mesecam,gui_rf_profile_t profile,
     b->overlay.selected_tape=0;gui_vhs_fm_set_format(b,-1);
     assert(gui_vhs_fm_get_profile(b)==GUI_RF_PROFILE_PAL_VHS);
     /* Native SECAM and MESECAM share timing, never their worker identity. */
-    gui_vhs_fm_set_mesecam(b,!mesecam);gui_vhs_fm_set_format(b,2);
+    gui_vhs_fm_set_format(b,other_system);
     gui_video_update_rf_routes(&route_app);
     assert(a->worker==secam_worker && b->worker!=secam_worker);
     assert(((route_worker_t*)b->worker)->format==GUI_RF_PAL);
     assert(((route_worker_t*)b->worker)->profile==
         (mesecam?GUI_RF_PROFILE_SECAM_VHS:GUI_RF_PROFILE_MESECAM_VHS));
-    assert(a->overlay.selected_system==2 && b->overlay.selected_system==2);
+    assert(a->overlay.selected_system==system && b->overlay.selected_system==other_system);
     calls=atomic_load(&route_calls);
     gui_video_submit_rf(&route_app,route_a,NULL,2,0,route_info,true);
     assert(atomic_load(&route_calls)==calls+2);
-    gui_vhs_fm_set_mesecam(b,mesecam);gui_video_update_rf_routes(&route_app);
+    gui_vhs_fm_set_format(b,system);gui_video_update_rf_routes(&route_app);
     assert(b->worker==secam_worker);
     video_detach_rf(a);assert(b->worker==secam_worker);
     video_detach_rf(b);assert(!monitor_source);
@@ -172,7 +174,7 @@ static void test_secam_recording_selector(void) {
     assert(gui_vhs_fm_get_profile(&d)==GUI_RF_PROFILE_SECAM_VHS);
     assert(gui_vhs_fm_get_format(&d)==VHS_FM_FORMAT_SECAM);
     gui_vhs_fm_set_mesecam(&d,true);
-    assert(d.overlay.selected_system==2 && gui_vhs_fm_get_profile(&d)==GUI_RF_PROFILE_MESECAM_VHS);
+    assert(d.overlay.selected_system==3 && gui_vhs_fm_get_profile(&d)==GUI_RF_PROFILE_MESECAM_VHS);
     assert(gui_vhs_fm_get_format(&d)==VHS_FM_FORMAT_MESECAM);
     assert(!strcmp(gui_vhs_fm_get_format_name(&d),"MESECAM"));
     gui_vhs_fm_set_format(&d,0);
@@ -191,15 +193,91 @@ static void test_secam_recording_selector(void) {
         assert(gui_vhs_fm_get_format(&d)==VHS_FM_FORMAT_NTSC);
         assert(gui_vhs_fm_get_profile(&d)==profiles[preset]);
     }
-    d.overlay.selected_tape=0;gui_vhs_fm_set_format(&d,2);
+    d.overlay.selected_tape=0;gui_vhs_fm_set_format(&d,3);
     assert(d.overlay.beta_preset==GUI_BETA_PRESET_ED_BETA &&
         gui_vhs_fm_get_profile(&d)==GUI_RF_PROFILE_MESECAM_VHS);
     gui_vhs_fm_set_mesecam(&d,false);
-    assert(gui_vhs_fm_get_profile(&d)==GUI_RF_PROFILE_SECAM_VHS);
+    assert(d.overlay.selected_system==2 && gui_vhs_fm_get_profile(&d)==GUI_RF_PROFILE_SECAM_VHS);
     assert(gui_vhs_fm_get_format(&d)==VHS_FM_FORMAT_SECAM);
     assert(!strcmp(gui_vhs_fm_get_format_name(&d),"SECAM"));
-    gui_vhs_fm_set_format(&d,3); /* Only three broadcast systems are selectable. */
+    gui_vhs_fm_set_format(&d,4); /* Invalid system selection falls back to PAL. */
     assert(d.overlay.selected_system==0 && gui_vhs_fm_get_profile(&d)==GUI_RF_PROFILE_PAL_VHS);
+}
+static void test_vhs_preset_selector(void) {
+    _Static_assert(GUI_VHS_PRESET_VHS==0 && GUI_VHS_PRESET_SVHS==1 && GUI_VHS_PRESET_COUNT==2,
+                   "VHS and S-VHS are independent manual recording presets");
+    vhs_fm_decoder_t d;
+    assert(gui_vhs_fm_init(&d));
+    assert(d.overlay.vhs_preset==GUI_VHS_PRESET_VHS);
+    assert(!strcmp(gui_vhs_fm_get_vhs_preset_name(&d),"VHS"));
+    gui_vhs_fm_set_vhs_preset(&d,GUI_VHS_PRESET_SVHS);
+    assert(gui_vhs_fm_get_profile(&d)==GUI_RF_PROFILE_PAL_SVHS);
+    assert(d.format==VHS_FM_FORMAT_PAL && !strcmp(gui_vhs_fm_get_vhs_preset_name(&d),"S-VHS"));
+    gui_vhs_fm_set_format(&d,1);
+    assert(gui_vhs_fm_get_profile(&d)==GUI_RF_PROFILE_NTSC_SVHS);
+    assert(d.format==VHS_FM_FORMAT_NTSC);
+    d.overlay.selected_tape=1;
+    gui_vhs_fm_set_beta_preset(&d,GUI_BETA_PRESET_ED_BETA);
+    assert(d.overlay.vhs_preset==GUI_VHS_PRESET_SVHS && gui_vhs_fm_get_profile(&d)==GUI_RF_PROFILE_NTSC_ED_BETA);
+    gui_vhs_fm_set_vhs_preset(&d,GUI_VHS_PRESET_VHS);
+    assert(d.overlay.beta_preset==GUI_BETA_PRESET_ED_BETA && gui_vhs_fm_get_profile(&d)==GUI_RF_PROFILE_NTSC_ED_BETA);
+    gui_vhs_fm_set_vhs_preset(&d,GUI_VHS_PRESET_SVHS);
+    d.overlay.selected_tape=0;
+    assert(gui_vhs_fm_get_profile(&d)==GUI_RF_PROFILE_NTSC_SVHS);
+    for(int mesecam=0;mesecam<2;mesecam++) {
+        gui_vhs_fm_set_mesecam(&d,mesecam!=0);
+        gui_vhs_fm_set_format(&d,mesecam ? 3 : 2);
+        assert(d.overlay.vhs_preset==GUI_VHS_PRESET_VHS);
+        assert(gui_vhs_fm_get_profile(&d)==(mesecam?GUI_RF_PROFILE_MESECAM_VHS:GUI_RF_PROFILE_SECAM_VHS));
+        gui_vhs_fm_set_vhs_preset(&d,GUI_VHS_PRESET_SVHS);
+        assert(d.overlay.selected_system==0 && gui_vhs_fm_get_profile(&d)==GUI_RF_PROFILE_PAL_SVHS);
+        assert(d.format==VHS_FM_FORMAT_PAL && d.overlay.secam_mesecam==(mesecam!=0));
+    }
+    const int invalid[]={-1,GUI_VHS_PRESET_COUNT,999};
+    for(size_t i=0;i<sizeof(invalid)/sizeof(invalid[0]);i++) {
+        gui_vhs_fm_set_vhs_preset(&d,invalid[i]);
+        assert(d.overlay.vhs_preset==GUI_VHS_PRESET_VHS && gui_vhs_fm_get_profile(&d)==GUI_RF_PROFILE_PAL_VHS);
+    }
+    gui_vhs_fm_set_vhs_preset(NULL,GUI_VHS_PRESET_SVHS);
+    assert(!strcmp(gui_vhs_fm_get_vhs_preset_name(NULL),"VHS"));
+}
+static void test_svhs_routes(void) {
+    video_panel_state_t left={0},right={0};
+    assert(gui_vhs_fm_init(&left.vhs_fm.decoder) && gui_vhs_fm_init(&right.vhs_fm.decoder));
+    atomic_init(&left.active_plugin,VIDEO_PLUGIN_VHS_FM);
+    atomic_init(&right.active_plugin,VIDEO_PLUGIN_VHS_FM);
+    vhs_fm_decoder_t *a=&left.vhs_fm.decoder,*b=&right.vhs_fm.decoder;
+    route_app.panel_config_a=(channel_panel_config_t){.left_view=PANEL_VIEW_CVBS,
+        .right_view=PANEL_VIEW_CVBS,.left_state=&left,.right_state=&right,.split=true};
+    route_app.panel_config_b=(channel_panel_config_t){.left_view=PANEL_VIEW_WAVEFORM,.right_view=PANEL_VIEW_WAVEFORM};
+    route_app.is_capturing=true;route_app.settings.audio_monitor_playback=true;
+    int created=atomic_load(&creates),destroyed=atomic_load(&destroys);
+    gui_vhs_fm_set_vhs_preset(a,GUI_VHS_PRESET_SVHS);
+    gui_vhs_fm_set_vhs_preset(b,GUI_VHS_PRESET_SVHS);
+    gui_video_update_rf_routes(&route_app);
+    assert(atomic_load(&creates)==created+1 && a->worker==b->worker);
+    gui_rf_preview_worker_t *pal_svhs=a->worker;
+    assert(((route_worker_t*)pal_svhs)->profile==GUI_RF_PROFILE_PAL_SVHS);
+    assert(((route_worker_t*)pal_svhs)->format==GUI_RF_PAL && !monitor_source && !route_audio_enabled(a));
+    gui_vhs_fm_set_format(b,1);gui_video_update_rf_routes(&route_app);
+    assert(a->worker==pal_svhs && a->worker!=b->worker);
+    assert(((route_worker_t*)b->worker)->profile==GUI_RF_PROFILE_NTSC_SVHS && b->bound_system==GUI_RF_NTSC);
+    gui_vhs_fm_set_vhs_preset(b,GUI_VHS_PRESET_VHS);gui_video_update_rf_routes(&route_app);
+    assert(((route_worker_t*)b->worker)->profile==GUI_RF_PROFILE_NTSC_VHS && a->worker==pal_svhs);
+    gui_vhs_fm_set_format(b,0);gui_vhs_fm_set_vhs_preset(b,GUI_VHS_PRESET_SVHS);
+    gui_video_update_rf_routes(&route_app);
+    assert(a->worker==pal_svhs && b->worker==pal_svhs);
+    b->overlay.selected_tape=1;gui_vhs_fm_set_beta_preset(b,GUI_BETA_PRESET_ED_BETA);
+    gui_video_update_rf_routes(&route_app);
+    assert(b->worker!=pal_svhs && ((route_worker_t*)b->worker)->profile==GUI_RF_PROFILE_NTSC_ED_BETA);
+    b->overlay.selected_tape=0;gui_video_update_rf_routes(&route_app);
+    assert(b->overlay.vhs_preset==GUI_VHS_PRESET_SVHS && b->worker==pal_svhs);
+    int calls=atomic_load(&route_calls);
+    gui_video_submit_rf(&route_app,route_a,NULL,2,0,route_info,true);
+    assert(atomic_load(&route_calls)==calls+1);
+    video_detach_rf(a);video_detach_rf(b);
+    assert(!monitor_source && atomic_load(&creates)-created==atomic_load(&destroys)-destroyed);
+    for(int index=0;index<GUI_RF_PROFILE_COUNT;index++) assert(!atomic_load(&s_rf_routes[0][index]));
 }
 static void test_cached_mesecam_panel(void) {
     video_panel_state_t panel={0};
@@ -219,12 +297,12 @@ static void test_cached_mesecam_panel(void) {
     panel_config_set_left_view(config,PANEL_VIEW_WAVEFORM);
     assert(config->left_cached_state==&panel);
     gui_video_update_rf_routes(&route_app);
-    assert(!d->worker && d->overlay.selected_system==2 && d->overlay.secam_mesecam);
+    assert(!d->worker && d->overlay.selected_system==3 && d->overlay.secam_mesecam);
     panel_config_set_left_view(config,PANEL_VIEW_CVBS);
     assert(config->left_state==&panel);
     gui_video_update_rf_routes(&route_app);
     assert(((route_worker_t*)d->worker)->profile==GUI_RF_PROFILE_MESECAM_VHS);
-    assert(d->overlay.selected_system==2 && d->overlay.secam_mesecam);
+    assert(d->overlay.selected_system==3 && d->overlay.secam_mesecam);
     gui_vhs_fm_set_mesecam(d,false);gui_video_update_rf_routes(&route_app);
     assert(((route_worker_t*)d->worker)->profile==GUI_RF_PROFILE_SECAM_VHS);
     panel_config_cleanup(config);
@@ -577,8 +655,10 @@ int main(void) {
     test_beta_preset_routes();
     test_cached_hifi_panel_routes();
     test_secam_recording_selector();
+    test_vhs_preset_selector();
+    test_svhs_routes();
     test_secam_vhs_routes(false,GUI_RF_PROFILE_SECAM_VHS,VHS_FM_FORMAT_SECAM,"SECAM");
     test_secam_vhs_routes(true,GUI_RF_PROFILE_MESECAM_VHS,VHS_FM_FORMAT_MESECAM,"MESECAM");
     test_cached_mesecam_panel();
-    puts("RF routes: four Beta video presets, independent Audio Mon, SECAM/MESECAM VHS isolation, cached panels, source priority, mute, pressure and concurrent last-release passed");
+    puts("RF routes: VHS/S-VHS and four Beta video presets, independent Audio Mon, SECAM/MESECAM isolation, cached panels, source priority, mute, pressure and concurrent last-release passed");
 }

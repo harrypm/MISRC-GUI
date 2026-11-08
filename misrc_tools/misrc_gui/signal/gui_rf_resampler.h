@@ -14,7 +14,7 @@ gui_rf_resampler_t *gui_rf_resampler_create(uint32_t input_rate_hz);
  * its original 20 MSPS response and fast paths. */
 gui_rf_resampler_t *gui_rf_resampler_create_rate(uint32_t input_rate_hz,
                                                uint32_t output_rate_hz);
-/* ED preview: 20 MSPS with a 9.5 MHz passband. Keeps the ordinary video and
+/* ED Beta / S-VHS preview: 20 MSPS with a 9.5 MHz passband. Keeps ordinary video and
  * Hi-Fi converter response unchanged. Non-native rates require libsoxr. */
 gui_rf_resampler_t *gui_rf_resampler_create_ed_beta(uint32_t input_rate_hz);
 size_t gui_rf_resampler_output_capacity_ed_beta(uint32_t input_rate_hz, size_t input_count);

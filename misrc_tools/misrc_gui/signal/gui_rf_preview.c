@@ -117,7 +117,18 @@ static const rf_profile_t rf_profiles[] = {
     {640,480,20,6,GUI_RF_NTSC_LINE_US,7514285.714285714,6800000.0,
      17857.14285714286,688374.125874126,
      5.3,7.8,GUI_RF_NTSC_ACTIVE_START_US,GUI_RF_NTSC_ACTIVE_END_US,0,0,
-     8050000.0,4200000.0,9500000.0,350000.0,2,4,0,1000000.0,.70710678,true,RF_HYBRID_BLACK_IRE_NTSC,RF_HYBRID_SPAN_IRE_NTSC}
+     8050000.0,4200000.0,9500000.0,350000.0,2,4,0,1000000.0,.70710678,true,RF_HYBRID_BLACK_IRE_NTSC,RF_HYBRID_SPAN_IRE_NTSC},
+    /* S-VHS: 5.4MHz sync / 7.0MHz white, ordinary VHS color-under and
+     * head rotation. IRE calibration and 2.0--8.98MHz RF band follow
+     * vhs-decode's PAL/NTSC S-VHS profiles. The 20MSPS input retains the
+     * high carrier; the shared 5MSPS picture path remains bandwidth-reduced. */
+    {768,576,22,5,GUI_RF_PAL_LINE_US,5880000.0,5400000.0,11200.0,626953.0,
+     5.6,7.85,GUI_RF_PAL_ACTIVE_START_US,GUI_RF_PAL_ACTIVE_END_US,100e-9,400e-9,
+     6200000.0,2000000.0,8980000.0,500000.0,1,2,13.9794,273755.82,.462088186,false,RF_HYBRID_BLACK_IRE_PAL,RF_HYBRID_SPAN_IRE_PAL},
+    {640,480,20,6,GUI_RF_NTSC_LINE_US,5857142.857142857,5400000.0,
+     11428.57142857143,629370.6293706294,
+     5.3,7.8,GUI_RF_NTSC_ACTIVE_START_US,GUI_RF_NTSC_ACTIVE_END_US,120e-9,320e-9,
+     6200000.0,2000000.0,8980000.0,500000.0,1,2,13.9794,273755.82,.462088186,false,RF_HYBRID_BLACK_IRE_NTSC,RF_HYBRID_SPAN_IRE_NTSC}
 };
 
 _Static_assert(sizeof(rf_profiles)/sizeof(rf_profiles[0])==GUI_RF_PROFILE_COUNT,
@@ -133,7 +144,7 @@ uint32_t gui_rf_profile_video_rate_hz(gui_rf_profile_t profile) {
 
 gui_rf_format_t gui_rf_profile_format(gui_rf_profile_t profile) {
     return profile==GUI_RF_PROFILE_PAL_VHS || profile==GUI_RF_PROFILE_SECAM_VHS
-        || profile==GUI_RF_PROFILE_MESECAM_VHS
+        || profile==GUI_RF_PROFILE_MESECAM_VHS || profile==GUI_RF_PROFILE_PAL_SVHS
         ? GUI_RF_PAL : GUI_RF_NTSC;
 }
 
@@ -142,7 +153,8 @@ static bool rf_secam_fm(const gui_rf_decoder_t *d);
 
 const char *gui_rf_profile_name(gui_rf_profile_t profile) {
     static const char *names[]={"PAL VHS SP","NTSC VHS SP","NTSC Betamax","NTSC Beta Hi-Fi",
-        "NTSC SuperBeta","NTSC SuperBeta Hi-Fi","SECAM VHS SP","MESECAM VHS SP","NTSC ED Beta"};
+        "NTSC SuperBeta","NTSC SuperBeta Hi-Fi","SECAM VHS SP","MESECAM VHS SP","NTSC ED Beta",
+        "PAL S-VHS","NTSC S-VHS"};
     return rf_profile_valid(profile) ? names[profile] : "Unknown RF profile";
 }
 
@@ -150,6 +162,16 @@ bool gui_rf_profile_has_hifi(gui_rf_profile_t profile) {
     return profile==GUI_RF_PROFILE_NTSC_BETAMAX_HIFI ||
            profile==GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI || profile==GUI_RF_PROFILE_NTSC_ED_BETA;
 }
+
+typedef struct {
+    float color_rows[3][RF_MAX_LINES][GUI_RF_FRAME_MAX_WIDTH];
+    double nr_pair[3][RF_MAX_LINES/2][(GUI_RF_FRAME_MAX_WIDTH+1)/2];
+    double nr_rows[5][RF_MAX_LINES/2][(GUI_RF_FRAME_MAX_WIDTH+1)/2];
+    double nr_vertical[5][(GUI_RF_FRAME_MAX_WIDTH+1)/2];
+    double nr_derivative[5][(GUI_RF_FRAME_MAX_WIDTH+1)/2];
+    double nr_zero[(GUI_RF_FRAME_MAX_WIDTH+1)/2];
+    bool nr_valid[RF_MAX_LINES/2];
+} rf_svhs_scratch_t;
 
 struct gui_rf_decoder {
     gui_rf_format_t format;
@@ -169,6 +191,8 @@ struct gui_rf_decoder {
 #endif
     double y_cos, y_sin, y_step_cos, y_step_sin;
     double c_cos, c_sin, c_step_cos, c_step_sin, fm_center;
+    float chroma_dc, chroma_dc_alpha;
+    bool chroma_dc_valid;
     float prev_i, prev_q, deemph_x, deemph_y, sync_y;
     float secam_prev_i, secam_prev_q, secam_deemph_x, secam_deemph_y;
     float secam_b0, secam_b1, secam_a1;
@@ -180,9 +204,15 @@ struct gui_rf_decoder {
     double secam_last_field;
     float deemph_b0, deemph_b1, deemph_a1, sync_alpha;
     double luma_delay, chroma_delay, sync_delay, sync_luma_delay, secam_fm_delay;
+    rf_biquad_t svhs_reverse_lp[2];
+    double svhs_reverse_delay;
+    bool svhs_reverse_prepared;
+    int64_t svhs_reverse_first,svhs_reverse_last;
     double luma_wow;
-    bool have_luma_wow, use_ntsc_deemph;
+    bool have_luma_wow, use_shelf_deemph;
     float field_rows[2][3][GUI_RF_FRAME_MAX_WIDTH];
+    rf_svhs_scratch_t *svhs_scratch;
+
     /* One field of native line-sequential C, never the opposite field. */
     float secam_rows[RF_MAX_LINES][GUI_RF_FRAME_MAX_WIDTH];
     double sync_est, blank_est, period;
@@ -265,6 +295,78 @@ static float rf_read(const gui_rf_decoder_t *d, const float *plane, double pos) 
     return a + (b-a)*f;
 }
 
+/* Prepared C occupies the two existing rings used only by MESECAM in
+ * its own mutually exclusive profile. Original ci/cq are never overwritten. */
+static double rf_svhs_c_delay(const gui_rf_decoder_t *d) {
+    return d->chroma_delay-(d->svhs_reverse_prepared ? d->svhs_reverse_delay : 0);
+}
+
+static float rf_svhs_c_read(const gui_rf_decoder_t *d,bool quadrature,double pos) {
+    const float *plane=quadrature ? d->cq : d->ci;
+    if(d->svhs_reverse_prepared) plane=quadrature ? d->mesecam_q : d->mesecam_i;
+    return rf_read(d,plane,pos);
+}
+
+static bool rf_svhs_reverse_prepare(gui_rf_decoder_t *d,const double *lines,
+                                     const double *periods,int rows) {
+    enum { CHUNK=1024, PAD=128 };
+    double shift=d->chroma_delay-d->svhs_reverse_delay-d->sync_delay;
+    /* All quiet/active reads have an offset inside this measured line.
+     * Cover their union plus interpolation margin before publishing the
+     * prepared ring; this does not assume perfectly ordered H anchors. */
+    double minimum=lines[0]+shift,maximum=minimum+periods[0];
+    for(int y=1;y<rows;y++) {
+        minimum=fmin(minimum,lines[y]+shift);
+        maximum=fmax(maximum,lines[y]+periods[y]+shift);
+    }
+    int64_t first=(int64_t)floor(minimum)-16;
+    int64_t last=(int64_t)ceil(maximum)+16;
+    if(first<0 || first<(int64_t)d->low_first || last+PAD>(int64_t)d->low_last || last<=first) return false;
+    int64_t start=first;
+#if GUI_RF_PACKED_IQ
+    /* Each lane owns one chunk's I or Q recursive state. Pair only two
+     * complete chunks; scalar tails retain their exact pad and end point. */
+    for(;start+2*CHUNK<=last;start+=2*CHUNK) {
+        rf_biquad4_t filters[2]={0};
+        for(int s=0;s<2;s++) for(int lane=0;lane<4;lane++) {
+            const rf_biquad_t *f=&d->svhs_reverse_lp[s];
+            filters[s].b0[lane]=f->b0;filters[s].b1[lane]=f->b1;filters[s].b2[lane]=f->b2;
+            filters[s].a1[lane]=f->a1;filters[s].a2[lane]=f->a2;
+        }
+        for(int k=CHUNK+PAD-1;k>=0;k--) {
+            unsigned a=(unsigned)((start+k)&RF_RING_MASK);
+            unsigned b=(unsigned)((start+CHUNK+k)&RF_RING_MASK);
+            __m128 value=_mm_setr_ps(d->ci[a],d->cq[a],d->ci[b],d->cq[b]);
+            value=rf_filter4_sample(&filters[0],value);
+            value=rf_filter4_sample(&filters[1],value);
+            if(k<CHUNK) {
+                float out[4];_mm_storeu_ps(out,value);
+                d->mesecam_i[a]=out[0];d->mesecam_q[a]=out[1];
+                d->mesecam_i[b]=out[2];d->mesecam_q[b]=out[3];
+            }
+        }
+    }
+#endif
+    for(;start<last;start+=CHUNK) {
+        int take=(int)(last-start);if(take>CHUNK) take=CHUNK;
+        rf_biquad_t fi[2]={d->svhs_reverse_lp[0],d->svhs_reverse_lp[1]};
+        rf_biquad_t fq[2]={d->svhs_reverse_lp[0],d->svhs_reverse_lp[1]};
+        /* With the largest pole radius .7955,128samples suppress the
+         * chunk-end initialization below1e-12, beneath float32 precision. */
+        for(int k=take+PAD-1;k>=0;k--) {
+            unsigned at=(unsigned)((start+k)&RF_RING_MASK);
+            float re=d->ci[at],im=d->cq[at];
+            for(int s=0;s<2;s++) {
+                re=rf_filter_sample(&fi[s],re);im=rf_filter_sample(&fq[s],im);
+            }
+            if(k<take) {d->mesecam_i[at]=re;d->mesecam_q[at]=im;}
+        }
+    }
+    d->svhs_reverse_first=first;d->svhs_reverse_last=last;
+    d->svhs_reverse_prepared=true;
+    return true;
+}
+
 static rf_complex_t rf_rotate(rf_complex_t z, double phase) {
     double c = cos(phase), s = sin(phase);
     rf_complex_t r = {z.re*c-z.im*s, z.re*s+z.im*c};
@@ -277,8 +379,10 @@ static rf_complex_t rf_rotate(rf_complex_t z, double phase) {
 static rf_complex_t rf_color_at(const gui_rf_decoder_t *d, double line_start,
                                double line_period, double field_start,
                                int line, double offset) {
+    /* Reference recovery retains the original causal C response. The
+     * backward picture filter must not import future active C into burst. */
     double pos = line_start + offset + d->chroma_delay - d->sync_delay;
-    rf_complex_t z = {rf_read(d, d->ci, pos), rf_read(d, d->cq, pos)};
+    rf_complex_t z = {rf_read(d,d->ci,pos),rf_read(d,d->cq,pos)};
     double nominal = d->p.line_us * 5.0;
     double timing = line_start-field_start-line*nominal
                   + offset*(1.0-nominal/line_period);
@@ -311,6 +415,48 @@ static int rf_compare_double(const void *a, const void *b) {
 static double rf_median(double *values, int count) {
     qsort(values,(size_t)count,sizeof(*values),rf_compare_double);
     return count&1 ? values[count/2] : (values[count/2-1]+values[count/2])*.5;
+}
+
+/* In-place selection for finite S-VHS samples. The selected rank is exact;
+ * the rest of the temporary array is deliberately left unordered. */
+static double rf_svhs_nth(double *values,int count,int rank) {
+    int first=0,last=count-1;
+    while(first<last) {
+        int middle=first+(last-first)/2;
+        double a=values[first],b=values[middle],c=values[last];
+        double pivot=a<b ? (b<c ? b : a<c ? c : a)
+                         : (a<c ? a : b<c ? c : b);
+        int lower=first,at=first,upper=last;
+        /* Three-way partition avoids repeatedly visiting equal populations. */
+        while(at<=upper) {
+            if(values[at]<pivot) {
+                double value=values[at];values[at++]=values[lower];values[lower++]=value;
+            } else if(values[at]>pivot) {
+                double value=values[at];values[at]=values[upper];values[upper--]=value;
+            } else at++;
+        }
+        if(rank<lower) last=lower-1;
+        else if(rank>upper) first=upper+1;
+        else return values[rank];
+    }
+    return values[rank];
+}
+
+static double rf_svhs_median(double *values,int count) {
+    /* The generic comparator treats -0 and +0 as equal. Preserve its exact
+     * chosen zero sign in that degenerate case by retaining the old path. */
+    for(int at=0;at<count;at++) {
+        uint64_t bits;memcpy(&bits,&values[at],sizeof(bits));
+        if(bits==UINT64_C(0x8000000000000000)) return rf_median(values,count);
+    }
+    int middle=count/2;
+    double upper=rf_svhs_nth(values,count,middle);
+    if(count&1) return upper;
+    /* All earlier positions are <= the selected upper middle, so their
+     * maximum is exactly the lower middle, including repeated medians. */
+    double lower=values[0];
+    for(int at=1;at<middle;at++) if(values[at]>lower) lower=values[at];
+    return (lower+upper)*.5;
 }
 
 /* FM frequencies change with physical tape/clock speed, not ADC amplitude.
@@ -943,15 +1089,334 @@ static bool rf_render_secam_field(gui_rf_decoder_t *d, const double *lines,
     return color;
 }
 
+/* Field-local U/V have already had recording-track and PAL burst phase
+ * removed. Preserve the original adjacent-line PAL cancellation, then use
+ * only agreeing neighboring pairs; no luma, opposite field, or temporal
+ * history participates in color averaging. All row storage is decoder-owned. */
+
+/* Quiet C need not be zero: remove a measured phase/line-class template,
+ * then estimate its incoherent residual AFTER the existing pair/2H weights. */
+static double rf_svhs_quiet_noise(double quiet[RF_MAX_LINES][6][2],const bool *valid,
+                                  int rows,int line_first,int active_first,int active_rows) {
+    double reference[4][6][2]={0},values[RF_MAX_LINES];
+    for(int group=0;group<4;group++) for(int k=0;k<6;k++) for(int c=0;c<2;c++) {
+        int count=0;
+        for(int y=group;y<rows;y+=4) if(valid[y] && line_first+y>=active_first && line_first+y<active_first+active_rows)
+            values[count++]=quiet[y][k][c];
+        if(count<8) return 0;
+        reference[group][k][c]=rf_svhs_median(values,count);
+    }
+    for(int y=0;y<rows;y++) if(valid[y]) for(int k=0;k<6;k++) for(int c=0;c<2;c++)
+        quiet[y][k][c]-=reference[y&3][k][c];
+    int count=0;
+    for(int y=2;y+3<rows;y+=2) {
+        bool use=true;
+        for(int k=-2;k<=3;k++) if(!valid[y+k] || line_first+y+k<active_first || line_first+y+k>=active_first+active_rows) use=false;
+        if(!use) continue;
+        double power=0;
+        for(int k=0;k<6;k++) for(int c=0;c<2;c++) {
+            double v=.125*(quiet[y-2][k][c]+quiet[y-1][k][c]+quiet[y+2][k][c]+quiet[y+3][k][c])
+                +.25*(quiet[y][k][c]+quiet[y+1][k][c]);
+            power+=v*v/6;
+        }
+        values[count++]=power;
+    }
+    if(count<32) return 0;
+    qsort(values,(size_t)count,sizeof(*values),rf_compare_double);
+    /* A Wiener variance uses mean power; winsorize the highest decile
+     * rather than underestimating it with the median power. */
+    double ceiling=values[count*9/10],power=0;
+    for(int k=0;k<count;k++) power+=fmin(values[k],ceiling);
+    return power/count;
+}
+
+enum { RF_SVHS_CHROMA_SUPPORT_PIXELS = 16 };
+
+/* A large isolated PAL chroma excursion can dominate the pair average.
+ * Require a near-neutral reference, a much weaker sibling, and low support
+ * for the excursion on every adjacent source line before using the sibling. */
+static void rf_svhs_limit_isolated_chroma(const rf_svhs_scratch_t *scratch, int y, int x,
+                                       const double *pair_u, const double *pair_v,
+                                       const double *pair_y, double severe,
+                                       double *u, double *v) {
+    const double reference_u = .5 * (pair_u[0] + pair_u[2]);
+    const double reference_v = .5 * (pair_v[0] + pair_v[2]);
+    double du = *u - reference_u;
+    double dv = *v - reference_v;
+    double center_distance = du*du + dv*dv;
+    if (center_distance < .16*severe ||
+        reference_u*reference_u + reference_v*reference_v > .10*.10 ||
+        fabs(pair_y[0] - pair_y[1]) > .045 || fabs(pair_y[2] - pair_y[1]) > .045)
+        return;
+
+    double line_u[2], line_v[2], delta_u[2], delta_v[2], distance[2];
+    for (int line=0; line<2; ++line) {
+        int row = y + line;
+        line_u[line] = .5*(scratch->color_rows[1][row][x] + scratch->color_rows[1][row][x+1]);
+        line_v[line] = .5*(scratch->color_rows[2][row][x] + scratch->color_rows[2][row][x+1]);
+        delta_u[line] = line_u[line] - reference_u;
+        delta_v[line] = line_v[line] - reference_v;
+        distance[line] = delta_u[line]*delta_u[line] + delta_v[line]*delta_v[line];
+    }
+    int good = distance[0] <= distance[1] ? 0 : 1;
+    int bad = 1 - good;
+    du = delta_u[bad] - delta_u[good];
+    dv = delta_v[bad] - delta_v[good];
+    if (distance[bad] < severe || distance[good]*9 > distance[bad] ||
+        distance[good] >= center_distance || du*du + dv*dv < severe)
+        return;
+
+    double y_good = .5*(scratch->color_rows[0][y+good][x] + scratch->color_rows[0][y+good][x+1]);
+    if (fabs(y_good - pair_y[1]) > .025)
+        return;
+
+    /* Judge the line before clipping, using the same YUV-to-RGB matrix as
+     * the renderer. Burst AGC can overestimate a real stripe. Reserve a
+     * factor of 1/0.70 for uncertain chroma gain, then 15% RGB headroom. */
+    double y_bad = 2*pair_y[1] - y_good;
+    double checked_u = .70*line_u[bad];
+    double checked_v = .70*line_v[bad];
+    double red = y_bad + 1.140*checked_v;
+    double green = y_bad - .395*checked_u - .581*checked_v;
+    double blue = y_bad + 2.032*checked_u;
+    if (red >= -.15 && red <= 1.15 && green >= -.15 && green <= 1.15 &&
+        blue >= -.15 && blue <= 1.15)
+        return;
+    red = y_good + 1.140*line_v[good];
+    green = y_good - .395*line_u[good] - .581*line_v[good];
+    blue = y_good + 2.032*line_u[good];
+    if (red < 0 || red > 1 || green < 0 || green > 1 || blue < 0 || blue > 1)
+        return;
+
+    /* Checking actual flank lines preserves a coherent stripe even if it
+     * crosses a pair boundary and its color is diluted in the pair mean. */
+    for (int side=0; side<2; ++side) {
+        int first = side ? y+2 : y-2;
+        for (int line=0; line<2; ++line) {
+            int row = first + line;
+            double su = .5*(scratch->color_rows[1][row][x] + scratch->color_rows[1][row][x+1]) - reference_u;
+            double sv = .5*(scratch->color_rows[2][row][x] + scratch->color_rows[2][row][x+1]) - reference_v;
+            if (3*(su*delta_u[bad] + sv*delta_v[bad]) >= distance[bad])
+                return;
+        }
+        int column = side ? x+3 : x-2;
+        double su = scratch->color_rows[1][y+good][column] - line_u[good];
+        double sv = scratch->color_rows[2][y+good][column] - line_v[good];
+        if (su*su + sv*sv > .050*.050 ||
+            fabs(scratch->color_rows[0][y+good][column] - y_good) > .045)
+            return;
+
+        /* Persistent color on the suspect line can be a real thin stripe.
+         * Look roughly one microsecond to each side of this local excursion. */
+        column = x + (side ? RF_SVHS_CHROMA_SUPPORT_PIXELS : -RF_SVHS_CHROMA_SUPPORT_PIXELS);
+        const float *bad_u = scratch->color_rows[1][y+bad];
+        const float *bad_v = scratch->color_rows[2][y+bad];
+        su = .5*(bad_u[column] + bad_u[column+1]) - reference_u;
+        sv = .5*(bad_v[column] + bad_v[column+1]) - reference_v;
+        if (2*(su*delta_u[bad] + sv*delta_v[bad]) >= distance[bad])
+            return;
+    }
+
+    /* Use the sibling chroma for this pair; the field renderer owns Y. */
+    *u = line_u[good];
+    *v = line_v[good];
+}
+
+static void rf_svhs_render_color(gui_rf_decoder_t *d,int rows,int line_first,int parity,
+                                 const bool *valid,bool color,double noise) {
+    rf_svhs_scratch_t *scratch = d->svhs_scratch;
+    const int columns=(d->p.width+1)/2;
+    const int active_end=d->p.active_first+d->p.height/2;
+    int c0=d->full_frame ? (int)ceil(d->p.active_start_us/d->p.line_us*d->p.width*.5) : 0;
+    int c1=d->full_frame ? (int)floor(d->p.active_end_us/d->p.line_us*d->p.width*.5) : columns;
+    /* Ignore residuals below two blue-channel output-code RMS levels. */
+    const bool denoise=color && noise>8.0/(255.0*255.0*2.032*2.032);
+    const bool limit_isolated=denoise && d->format==GUI_RF_PAL;
+    const double severe=fmax(.12*.12,16.0*noise);
+    for(int y=0;y<rows;y+=2) for(int x=0;x<d->p.width;x+=2) {
+        double pair_u[3]={0},pair_v[3]={0},pair_y[3]={0},counts[3]={0};
+        for(int pair=0;pair<3;pair++) {
+            int first=y+2*(pair-1);
+            for(int dy=0;dy<2;dy++) {
+                int other=first+dy;
+                if(other<0 || other>=rows || !valid[other] ||
+                    ((line_first+y>=d->p.active_first)!=(line_first+other>=d->p.active_first))) continue;
+                for(int dx=0;dx<2 && x+dx<d->p.width;dx++) {
+                    pair_y[pair]+=scratch->color_rows[0][other][x+dx];
+                    pair_u[pair]+=scratch->color_rows[1][other][x+dx];
+                    pair_v[pair]+=scratch->color_rows[2][other][x+dx];counts[pair]++;
+                }
+            }
+            if(counts[pair]) { pair_y[pair]/=counts[pair];pair_u[pair]/=counts[pair];pair_v[pair]/=counts[pair]; }
+        }
+        double u=pair_u[1],v=pair_v[1];
+        if(limit_isolated && line_first+y-2>=d->p.active_first && line_first+y+3<active_end &&
+           x-RF_SVHS_CHROMA_SUPPORT_PIXELS>=2*c0 && x+RF_SVHS_CHROMA_SUPPORT_PIXELS+1<2*c1 &&
+           counts[0]==4 && counts[1]==4 && counts[2]==4)
+            rf_svhs_limit_isolated_chroma(scratch,y,x,pair_u,pair_v,pair_y,severe,&u,&v);
+        double su=2*u,sv=2*v,weight=2;
+        if(counts[1]) for(int pair=0;pair<3;pair+=2) if(counts[pair]) {
+            double dy=pair_y[pair]-pair_y[1],du=pair_u[pair]-u,dv=pair_v[pair]-v;
+            double w=fmax(0,1-fabs(dy)/.10)*fmax(0,1-(du*du+dv*dv)/.04);
+            su+=w*pair_u[pair];sv+=w*pair_v[pair];weight+=w;
+        }
+        u=color ? su/weight : 0;v=color ? sv/weight : 0;
+        scratch->nr_pair[0][y/2][x/2]=u;scratch->nr_pair[1][y/2][x/2]=v;
+        scratch->nr_pair[2][y/2][x/2]=pair_y[1];
+        scratch->nr_valid[y/2]=counts[1]>0;
+    }
+    const int pairs=(rows+1)/2;
+    int r0=(d->p.active_first-line_first+1)/2;
+    int r1=(active_end-line_first+1)/2;
+    if(r0<0) r0=0;
+    if(r1>pairs) r1=pairs;
+    /* Horizontal 5-column moments and vertical triangular 9-pair sums keep
+     * a nonnegative-response kernel using constant-cost differences. */
+    if(denoise) {
+        for(int c=0;c<5;c++) {
+            memset(scratch->nr_vertical[c],0,(size_t)columns*sizeof(double));
+            memset(scratch->nr_derivative[c],0,(size_t)columns*sizeof(double));
+        }
+        for(int r=r0;r<r1;r++) if(scratch->nr_valid[r]) {
+            double sums[5]={0};
+            for(int x=c0;x<c1;x++) {
+                if(x==c0) {
+                    for(int at=c0;at<c1 && at<=c0+2;at++) {
+                        double u=scratch->nr_pair[0][r][at],v=scratch->nr_pair[1][r][at],y=scratch->nr_pair[2][r][at];
+                        sums[0]+=u;sums[1]+=v;sums[2]+=u*u+v*v;sums[3]+=y;sums[4]+=y*y;
+                    }
+                } else {
+                    int add=x+2,remove=x-3;
+                    if(add<c1) {
+                        double u=scratch->nr_pair[0][r][add],v=scratch->nr_pair[1][r][add],y=scratch->nr_pair[2][r][add];
+                        sums[0]+=u;sums[1]+=v;sums[2]+=u*u+v*v;sums[3]+=y;sums[4]+=y*y;
+                    }
+                    if(remove>=c0) {
+                        double u=scratch->nr_pair[0][r][remove],v=scratch->nr_pair[1][r][remove],y=scratch->nr_pair[2][r][remove];
+                        sums[0]-=u;sums[1]-=v;sums[2]-=u*u+v*v;sums[3]-=y;sums[4]-=y*y;
+                    }
+                }
+                for(int c=0;c<5;c++) scratch->nr_rows[c][r][x]=sums[c];
+            }
+        }
+    }
+    int valid_rows=0,weighted_rows=0,derivative_rows=0;
+    for(int r=0;r<pairs;r++) {
+        double inverse[6]={0};
+        if(denoise && r>=r0 && r<r1) {
+            if(r==r0) {
+                for(int at=r0;at<r1 && at<=r0+4;at++) if(scratch->nr_valid[at]) {
+                    int w=r0+5-at;weighted_rows+=w;valid_rows++;
+                    for(int c=0;c<5;c++) for(int x=c0;x<c1;x++)
+                        scratch->nr_vertical[c][x]+=w*scratch->nr_rows[c][at][x];
+                }
+                for(int at=r0;at<r1 && at<=r0+5;at++) if(scratch->nr_valid[at]) {
+                    int sign=at==r0 ? -1 : 1;derivative_rows+=sign;
+                    for(int c=0;c<5;c++) for(int x=c0;x<c1;x++)
+                        scratch->nr_derivative[c][x]+=sign*scratch->nr_rows[c][at][x];
+                }
+            } else {
+                int add=r+5,remove=r-5;
+                bool have_add=add<r1 && scratch->nr_valid[add];
+                bool have_center=scratch->nr_valid[r];
+                bool have_remove=remove>=r0 && scratch->nr_valid[remove];
+                weighted_rows+=derivative_rows;
+                derivative_rows+=(int)have_add-2*(int)have_center+(int)have_remove;
+                if(r+4<r1 && scratch->nr_valid[r+4]) valid_rows++;
+                if(have_remove) valid_rows--;
+                for(int c=0;c<5;c++) {
+                    const double *a=have_add ? scratch->nr_rows[c][add] : scratch->nr_zero;
+                    const double *b=have_center ? scratch->nr_rows[c][r] : scratch->nr_zero;
+                    const double *z=have_remove ? scratch->nr_rows[c][remove] : scratch->nr_zero;
+                    for(int x=c0;x<c1;x++) {
+                        double derivative=scratch->nr_derivative[c][x];
+                        scratch->nr_vertical[c][x]+=derivative;
+                        scratch->nr_derivative[c][x]=derivative+a[x]-2*b[x]+z[x];
+                    }
+                }
+            }
+            if(weighted_rows) for(int n=1;n<=5;n++) inverse[n]=1.0/(weighted_rows*n);
+        }
+        for(int x=0;x<columns;x++) {
+        double u=scratch->nr_pair[0][r][x],v=scratch->nr_pair[1][r][x];
+        if(denoise && scratch->nr_valid[r] && r>=r0 && r<r1 && x>=c0 && x<c1) {
+            int left=x-2>c0 ? x-2 : c0,right=x+3<c1 ? x+3 : c1;
+            if(valid_rows*(right-left)>=9) {
+                double inv=inverse[right-left];
+                double mu=scratch->nr_vertical[0][x]*inv,mv=scratch->nr_vertical[1][x]*inv,my=scratch->nr_vertical[3][x]*inv;
+                double variance=fmax(0,scratch->nr_vertical[2][x]*inv-mu*mu-mv*mv);
+                double yvariance=fmax(0,scratch->nr_vertical[4][x]*inv-my*my);
+                if(yvariance<.0009) {
+                    double keep=variance>noise ? 1-noise/variance : 0;
+                    u=mu+keep*(u-mu);v=mv+keep*(v-mv);
+                }
+            }
+        }
+        for(int dy=0;dy<2 && r*2+dy<rows;dy++) for(int dx=0;dx<2 && x*2+dx<d->p.width;dx++) {
+            double luminance=scratch->color_rows[0][r*2+dy][x*2+dx];
+            size_t at=((size_t)((r*2+dy)*2+parity)*d->p.width+x*2+dx)*4u;
+            d->rgba[at]=rf_byte(luminance+1.140*v);
+            d->rgba[at+1]=rf_byte(luminance-.395*u-.581*v);
+            d->rgba[at+2]=rf_byte(luminance+2.032*u);d->rgba[at+3]=255;
+        }
+    }
+}
+}
+
+
+/* Detect sustained channel-phase steps from two short coherent populations,
+ * not a single noisy line-to-line delta. A field-local cut limits only the
+ * phase reference; amplitude stabilization remains independent. */
+static void rf_svhs_phase_cuts(const rf_complex_t *canonical,const double *magnitudes,
+                               const bool *valid,int rows,int line_first,int active_first,
+                               bool *cuts) {
+    double score[RF_MAX_LINES]={0};
+    memset(cuts,0,(size_t)rows*sizeof(*cuts));
+    for(int boundary=1;boundary<rows;boundary++) {
+        rf_complex_t sum[2]={{0,0},{0,0}};int count[2]={0,0};
+        for(int side=0;side<2;side++) for(int k=0;k<8;k++) {
+            int at=side ? boundary+k : boundary-1-k;
+            if(at<0 || at>=rows || !valid[at] ||
+                ((line_first+boundary>=active_first)!=(line_first+at>=active_first))) continue;
+            sum[side].re+=canonical[at].re/magnitudes[at];
+            sum[side].im+=canonical[at].im/magnitudes[at];count[side]++;
+        }
+        if(count[0]<6 || count[1]<6) continue;
+        double coherence0=hypot(sum[0].re,sum[0].im)/count[0];
+        double coherence1=hypot(sum[1].re,sum[1].im)/count[1];
+        if(coherence0<.96 || coherence1<.96) continue;
+        double delta=fabs(atan2(sum[0].re*sum[1].im-sum[0].im*sum[1].re,
+            sum[0].re*sum[1].re+sum[0].im*sum[1].im));
+        double uncertainty=sqrt(fmax(0,2*(1-coherence0)/count[0]+2*(1-coherence1)/count[1]));
+        if(delta>=24.0*RF_PI/180.0 && delta>4*uncertainty) score[boundary]=delta;
+    }
+    for(int boundary=1;boundary<rows;boundary++) if(score[boundary]>0) {
+        bool peak=true;
+        for(int k=-7;k<=7;k++) {
+            int at=boundary+k;
+            if(at>0 && at<rows && (score[at]>score[boundary] ||
+                (score[at]==score[boundary] && at<boundary))) { peak=false;break; }
+        }
+        cuts[boundary]=peak;
+    }
+}
+
 static bool rf_render_field(gui_rf_decoder_t *d, double field_start, int parity,
                             uint64_t end_sample, gui_rf_frame_callback_t callback,
                             void *context) {
+    d->svhs_reverse_prepared=false;
     double lines[RF_MAX_LINES+1], periods[RF_MAX_LINES];
     rf_complex_t burst[RF_MAX_LINES], corrected[RF_MAX_LINES];
     double magnitudes[RF_MAX_LINES], gain[RF_MAX_LINES], luma_wow[RF_MAX_LINES];
     bool valid[RF_MAX_LINES], anchors[RF_MAX_LINES+1];
     int measured_count=0, burst_count=0;
     double nominal = d->p.line_us*5.0;
+    const bool svhs=d->profile==GUI_RF_PROFILE_PAL_SVHS || d->profile==GUI_RF_PROFILE_NTSC_SVHS;
+    rf_svhs_scratch_t *scratch = d->svhs_scratch;
+    rf_complex_t canonical[RF_MAX_LINES];
+    double quiet_c[RF_MAX_LINES][6][2];
+    bool phase_cuts[RF_MAX_LINES];
+    bool phase_reference_valid[RF_MAX_LINES],render_valid[RF_MAX_LINES];
     /* Full mode renders from the field boundary (line 0) so the VBI shows;
      * Active mode crops to the profile's active lines. Unmeasured VBI rows
      * (EQ/broad pulses carry no H anchors) fall back to nominal positions. */
@@ -1003,6 +1468,7 @@ static bool rf_render_field(gui_rf_decoder_t *d, double field_start, int parity,
         periods[y]=rf_clamp(lines[y+1]-lines[y], nominal*.8, nominal*1.2);
     rf_prepare_luma_wow(d,periods,anchors,rows,nominal,luma_wow);
     rf_prepare_display_levels(d);
+    if(svhs) rf_svhs_reverse_prepare(d,lines,periods,rows);
     bool color;
     if(rf_secam_fm(d)) {
         color=rf_render_secam_field(d,lines,periods,luma_wow,rows,line_first,parity,field_start);
@@ -1055,19 +1521,107 @@ static bool rf_render_field(gui_rf_decoder_t *d, double field_start, int parity,
     color = burst_count>rows*3/4 && coherence>(d->format==GUI_RF_PAL ? .40 : .65);
     if (!color) rf_color_loss(d,burst_count<=rows*3/4
         ? "insufficient valid color bursts" : "incoherent tape track/burst phase");
+    /* PAL's swinging burst alternates on every physical line. Infer the
+     * field's actual sequence from valid measured bursts; a single damaged
+     * burst must not reverse the recovered V component for the entire line. */
+    int pal_switch_parity=0;
+    if(svhs && d->format==GUI_RF_PAL) {
+        int votes=0,count=0;
+        for(int y=0;y<rows;y++) if(valid[y]) {
+            rf_complex_t aligned=rf_rotate(corrected[y],-common_phase);
+            int sign=aligned.im>=0 ? 1 : -1;
+            votes+=sign*(y&1 ? -1 : 1);count++;
+        }
+        if(count>rows*3/4 && abs(votes)>count*.75)
+            pal_switch_parity=votes>0 ? 1 : -1;
+    }
+    /* Remove the inferred recording-track rotation and PAL swing before
+     * estimating the local burst reference. Work within this actual field. */
+    if(svhs) for(int y=0;y<rows;y++) {
+        rf_complex_t aligned=rf_rotate(corrected[y],-common_phase);
+        int sign=pal_switch_parity ? pal_switch_parity*(y&1 ? -1 : 1)
+            : d->format==GUI_RF_PAL ? (aligned.im>=0 ? 1 : -1) : 1;
+        int measured=d->format==GUI_RF_PAL ? (aligned.im>=0 ? 1 : -1) : 1;
+        phase_reference_valid[y]=valid[y] && (!pal_switch_parity || measured==sign);
+        render_valid[y]=valid[y];
+        double reference=d->format==GUI_RF_PAL ? (sign>0 ? 3.0*RF_PI/4.0 : -3.0*RF_PI/4.0) : RF_PI;
+        canonical[y]=rf_rotate(corrected[y],-reference);
+    }
+    if(svhs) rf_svhs_phase_cuts(canonical,magnitudes,phase_reference_valid,rows,line_first,
+        d->p.active_first,phase_cuts);
     /* PAL swings its burst about the -U axis. Use neighboring measured burst
      * vectors after the tape rotation is removed, rather than field number. */
     for (int y=0; y<rows; ++y) {
         int line=line_first+y;
         rf_complex_t aligned=rf_rotate(corrected[y], -common_phase);
-        int vswitch = d->format==GUI_RF_PAL ? (aligned.im>=0.0 ? 1 : -1) : 1;
+        int vswitch=pal_switch_parity ? pal_switch_parity*(y&1 ? -1 : 1)
+            : d->format==GUI_RF_PAL ? (aligned.im>=0.0 ? 1 : -1) : 1;
         double reference_phase = d->format==GUI_RF_PAL
             ? (vswitch>0 ? 3.0*RF_PI/4.0 : -3.0*RF_PI/4.0) : RF_PI;
         double phase = reference_phase-atan2(burst[y].im,burst[y].re);
+        bool phase_supported=!svhs || phase_reference_valid[y];
         /* Burst normalization supplies the chroma AGC. Reject weak bursts;
          * suppress color on invalid lines instead of amplifying noise. */
         gain[y]=valid[y] ? (150.0/700.0)/magnitudes[y] : 0.0;
         if (y>0 && valid[y] && valid[y-1]) gain[y]=gain[y]*.75+gain[y-1]*.25;
+        if(svhs && valid[y]) {
+            int phase_first=y>16 ? y-16 : 0,phase_last=y+16<rows ? y+16 : rows-1;
+            for(int at=y;at>phase_first;at--) if(phase_cuts[at]) { phase_first=at;break; }
+            for(int at=y+1;at<=phase_last;at++) if(phase_cuts[at]) { phase_last=at-1;break; }
+            double candidates[33];int count=0;
+            for(int k=-16;k<=16;k++) {
+                int at=y+k;
+                if(at>=0 && at<rows && valid[at] &&
+                    ((line_first+y>=d->p.active_first)==(line_first+at>=d->p.active_first)))
+                    candidates[count++]=magnitudes[at];
+            }
+            if(count>=3) {
+                double median=rf_svhs_median(candidates,count),amplitude=0,amplitude_weight=0,weight=0;
+                rf_complex_t sum={0,0};
+                int phase_anchor=phase_reference_valid[y] ? y : -1;
+                /* Cadence has proved this particular burst inconsistent.
+                 * Select a measured trusted reference in this same segment;
+                 * keep the original 45-degree agreement test unchanged. */
+                for(int distance=1;phase_anchor<0 && distance<=16;distance++) {
+                    for(int side=-1;side<=1;side+=2) {
+                        int at=y+side*distance;
+                        if(at<phase_first || at>phase_last || !phase_reference_valid[at] ||
+                            ((line_first+y>=d->p.active_first)!=(line_first+at>=d->p.active_first)) ||
+                            magnitudes[at]<.5*median || magnitudes[at]>1.7*median) continue;
+                        phase_anchor=at;break;
+                    }
+                }
+                for(int k=-16;k<=16;k++) {
+                    int at=y+k;
+                    if(at<0 || at>=rows || !valid[at] ||
+                        ((line_first+y>=d->p.active_first)!=(line_first+at>=d->p.active_first)) ||
+                        magnitudes[at]<.5*median || magnitudes[at]>1.7*median) continue;
+                    double w=16+1-abs(k);
+                    /* Burst amplitude has its own robust reference. A bad
+                     * center phase must not exclude every healthy amplitude
+                     * and fall back to huge single-line color AGC. */
+                    amplitude+=w*magnitudes[at];amplitude_weight+=w;
+                    /* Phase uses the same robust amplitude candidates, but
+                     * does not cross a detected sustained phase step. Smaller
+                     * unsupported changes retain the bounded smoothing window. */
+                    if(at<phase_first || at>phase_last || !phase_reference_valid[at] || phase_anchor<0) continue;
+                    double agreement=(canonical[at].re*canonical[phase_anchor].re+canonical[at].im*canonical[phase_anchor].im)
+                        /(magnitudes[at]*magnitudes[phase_anchor]);
+                    if(agreement<.70710678) continue;
+                    weight+=w;
+                    sum.re+=w*canonical[at].re/magnitudes[at];
+                    sum.im+=w*canonical[at].im/magnitudes[at];
+                }
+                if(amplitude_weight) gain[y]=(150.0/700.0)/(amplitude/amplitude_weight);
+                if(weight) {
+                    if(hypot(sum.re,sum.im)>.65*weight) {
+                        phase=-atan2(sum.im,sum.re)-track_step*y;
+                        phase_supported=true;
+                    }
+                }
+            }
+        }
+        if(svhs && !phase_supported) { render_valid[y]=false;gain[y]=0; }
         double scale=periods[y]/nominal;
         /* Display levels stay fixed while locked. SuperBeta may calibrate
          * once from a validated multi-line H grid, never individual rows. */
@@ -1083,6 +1637,16 @@ static bool rf_render_field(gui_rf_decoder_t *d, double field_start, int parity,
         double rotate_re=cos(angle), rotate_im=sin(angle);
         double step_angle=carrier_scale*pixel_step*(1.0-nominal/periods[y]);
         double step_re=cos(step_angle), step_im=sin(step_angle);
+        if(scratch && color && render_valid[y]) for(int k=0;k<6;k++) {
+            double offset=(2.5+.2*k)*5.0*scale;
+            double pos=lines[y]+offset+rf_svhs_c_delay(d)-d->sync_delay;
+            rf_complex_t z={rf_svhs_c_read(d,false,pos),rf_svhs_c_read(d,true,pos)};
+            double timing=lines[y]-field_start-(line_first+y)*nominal+offset*(1.0-nominal/periods[y]);
+            z=rf_rotate(z,phase+carrier_scale*timing);
+            quiet_c[y][k][0]=z.re*gain[y];
+            quiet_c[y][k][1]=z.im*gain[y]*vswitch*(d->format==GUI_RF_NTSC ? -1.0 : 1.0);
+        }
+
         const bool active_line=line>=d->p.active_first;
         for (int x=0; x<d->p.width; ++x) {
             double offset=first_offset+x*pixel_step;
@@ -1102,9 +1666,9 @@ static bool rf_render_field(gui_rf_decoder_t *d, double field_start, int parity,
                     : rf_clamp((ire-d->p.hybrid_black_ire)/d->p.hybrid_span_ire,0.0,1.0);
             }
             double u=0.0,v=0.0;
-            if (color && valid[y]) {
-                double pos=lines[y]+offset+d->chroma_delay-d->sync_delay;
-                double re=rf_read(d,d->ci,pos), im=rf_read(d,d->cq,pos);
+            if (color && (svhs ? render_valid[y] : valid[y])) {
+                double pos=lines[y]+offset+rf_svhs_c_delay(d)-d->sync_delay;
+                double re=rf_svhs_c_read(d,false,pos),im=rf_svhs_c_read(d,true,pos);
                 u=(re*rotate_re-im*rotate_im)*gain[y];
                 /* With e^-i(w*t), NTSC color-under U*cos+V*sin yields
                  * U-iV. The .NET path instead multiplies by -cos((fsc+fcc)t),
@@ -1119,9 +1683,21 @@ static bool rf_render_field(gui_rf_decoder_t *d, double field_start, int parity,
             d->field_rows[y&1][0][x]=(float)luminance;
             d->field_rows[y&1][1][x]=(float)u;
             d->field_rows[y&1][2][x]=(float)v;
+            if(scratch) {
+                scratch->color_rows[0][y][x]=(float)luminance;
+                scratch->color_rows[1][y][x]=(float)u;
+                scratch->color_rows[2][y][x]=(float)v;
+            }
         }
-        if (y&1) rf_render_rows(d,y-1,2,parity,color&&valid[y-1],color&&valid[y]);
-        else if (y+1==rows) rf_render_rows(d,y,1,parity,color&&valid[y],false);
+        if(!scratch) {
+            const bool *color_valid = svhs ? render_valid : valid;
+            if (y&1) rf_render_rows(d,y-1,2,parity,color&&color_valid[y-1],color&&color_valid[y]);
+            else if (y+1==rows) rf_render_rows(d,y,1,parity,color&&color_valid[y],false);
+        }
+    }
+    if(scratch) {
+        double noise=color ? rf_svhs_quiet_noise(quiet_c,render_valid,rows,line_first,d->p.active_first,d->p.height/2) : 0;
+        rf_svhs_render_color(d,rows,line_first,parity,render_valid,color,noise);
     }
     }
     /* PAL parity-0 (312 lines) can never write row 624 and NTSC parity-1
@@ -1130,6 +1706,7 @@ static bool rf_render_field(gui_rf_decoder_t *d, double field_start, int parity,
     if (rows*2+parity<frame_height)
         memset(&d->rgba[(size_t)(rows*2+parity)*d->p.width*4u],0,
                (size_t)d->p.width*4u);
+    d->svhs_reverse_prepared=false;
     d->status.fields_decoded++;
     d->status.fields_accepted++;
     d->status.h_locked=true;
@@ -1544,8 +2121,20 @@ void gui_rf_decoder_reset_profile(gui_rf_decoder_t *d, gui_rf_profile_t profile)
     float *storage=d->storage;
     uint8_t *rgba=d->rgba;
     bool full_frame=d->full_frame;
+    bool svhs = profile == GUI_RF_PROFILE_PAL_SVHS || profile == GUI_RF_PROFILE_NTSC_SVHS;
+    rf_svhs_scratch_t *scratch = d->svhs_scratch;
+    /* Each field writes its scratch before reading it. Keep the allocation
+     * across S-VHS resets, and fall back to ordinary color rendering if it
+     * cannot be allocated. Other profiles never retain it. */
+    if (svhs) {
+        if (!scratch) scratch = calloc(1, sizeof(*scratch));
+    } else {
+        free(scratch);
+        scratch = NULL;
+    }
     memset(d,0,sizeof(*d));
     d->storage=storage; d->rgba=rgba;
+    d->svhs_scratch = scratch;
     d->full_frame=full_frame;   /* Display mode survives resets/rebinds. */
     d->luma=storage; d->sync=storage+RF_RING_SIZE;
     d->ci=storage+2u*RF_RING_SIZE; d->cq=storage+3u*RF_RING_SIZE;
@@ -1558,6 +2147,8 @@ void gui_rf_decoder_reset_profile(gui_rf_decoder_t *d, gui_rf_profile_t profile)
     d->p=rf_profiles[profile];
     d->raw_rate=gui_rf_profile_video_rate_hz(profile);
     d->raw_decimation=(unsigned)(d->raw_rate/RF_VIDEO_RATE);
+    if(svhs)
+        d->chroma_dc_alpha=(float)(1.0-exp(-2.0*RF_PI*20000.0/d->raw_rate));
     d->period=d->p.line_us*5.0;
     d->sync_est=d->p.sync_hz; d->blank_est=d->p.blank_hz;
     d->sync_anchor=d->p.sync_hz;d->blank_anchor=d->p.blank_hz;
@@ -1576,6 +2167,12 @@ void gui_rf_decoder_reset_profile(gui_rf_decoder_t *d, gui_rf_profile_t profile)
     }
     d->rf_lp=rf_filter(d->raw_rate,d->p.rf_high,.70710678,false);
     const double qs[2]={.5411961,1.3065630};
+    if(svhs) {
+        for(int n=0;n<2;n++) {
+            d->svhs_reverse_lp[n]=rf_filter(RF_VIDEO_RATE,500000.0,qs[n],false);
+            d->svhs_reverse_delay+=rf_filter_delay(&d->svhs_reverse_lp[n]);
+        }
+    }
     /* ED filters before each reduction: Y at 20/20M, C at 20/20/5/5M.
      * Keep absolute raw-sample phases in process(), and account for each
      * section's actual rate when registering the common 5M picture. */
@@ -1634,10 +2231,10 @@ void gui_rf_decoder_reset_profile(gui_rf_decoder_t *d, gui_rf_profile_t profile)
     d->sync_luma_delay=d->luma_delay;
     d->sync_alpha=(float)exp(-2.0*RF_PI*500000.0/RF_VIDEO_RATE);
     d->sync_delay=d->sync_luma_delay+d->sync_alpha/(1.0-d->sync_alpha);
-    if (d->format==GUI_RF_NTSC && gui_rf_deemph_coefficients(RF_VIDEO_RATE,
+    if ((d->format==GUI_RF_NTSC || profile==GUI_RF_PROFILE_PAL_SVHS) && gui_rf_deemph_coefficients(RF_VIDEO_RATE,
             d->p.shelf_gain,d->p.shelf_mid,d->p.shelf_q,&d->luma_deemph.b0,&d->luma_deemph.b1,&d->luma_deemph.b2,
             &d->luma_deemph.a1,&d->luma_deemph.a2)) {
-        d->use_ntsc_deemph=true;
+        d->use_shelf_deemph=true;
         /* Retain measured display edge registration against legacy sync.
          * The recorded FM is already pre-emphasized: a bare shelf's DC group
          * delay is not the complete recording/decoder/sync path delay. Adding
@@ -1701,6 +2298,7 @@ gui_rf_decoder_t *gui_rf_decoder_create(gui_rf_format_t format) {
 
 void gui_rf_decoder_destroy(gui_rf_decoder_t *d) {
     if (!d) return;
+    free(d->svhs_scratch);
     free(d->storage); free(d->rgba); free(d);
 }
 
@@ -1718,6 +2316,7 @@ void gui_rf_decoder_process(gui_rf_decoder_t *d, const float *samples, size_t co
     }
     d->have_raw=true; d->next_raw=first_sample+count;
     const bool ed=d->profile==GUI_RF_PROFILE_NTSC_ED_BETA;
+    const bool svhs=d->profile==GUI_RF_PROFILE_PAL_SVHS || d->profile==GUI_RF_PROFILE_NTSC_SVHS;
     /* 20M -> 5M uses an absolute four-phase schedule.
      * Derive it once per call so arbitrary block splits retain the same
      * absolute phase without a 64-bit division on every input sample. */
@@ -1735,6 +2334,20 @@ void gui_rf_decoder_process(gui_rf_decoder_t *d, const float *samples, size_t co
         bool picture_tick=ed && ed_phase==0u;
         if(ed && ++ed_phase==4u) ed_phase=0;
         float raw=isfinite(samples[n]) ? samples[n] : 0.0f;
+        float chroma_raw=raw;
+        if(svhs) {
+            /* ADC centering leaves a capture-dependent DC offset. Mixing it
+             * directly moves it to color-under, where the preview LP only
+             * attenuates it by about 16 dB. Burst AGC then amplifies that false
+             * color carrier. A 20 kHz DC tracker rejects it before C mixing;
+             * Y, audio and the recorded RF remain on their original paths. */
+            if(!d->chroma_dc_valid) {
+                d->chroma_dc=raw;
+                d->chroma_dc_valid=true;
+            }
+            d->chroma_dc+=d->chroma_dc_alpha*(raw-d->chroma_dc);
+            chroma_raw-=d->chroma_dc;
+        }
         float band=raw;
         for (int s=0;s<d->p.rf_highpass_sections;++s) band=rf_filter_sample(&d->rf_hp[s],band);
         band=rf_filter_sample(&d->rf_lp,band);
@@ -1749,7 +2362,7 @@ void gui_rf_decoder_process(gui_rf_decoder_t *d, const float *samples, size_t co
 #endif
         {
             yi=(float)(band*d->y_cos); yq=(float)(-band*d->y_sin);
-            ci=(float)(raw*d->c_cos); cq=(float)(-raw*d->c_sin);
+            ci=(float)(chroma_raw*d->c_cos); cq=(float)(-chroma_raw*d->c_sin);
         }
 #if GUI_RF_PACKED_IQ
         if(d->p.beta_rotation || rf_secam_fm(d)) {
@@ -1814,10 +2427,10 @@ void gui_rf_decoder_process(gui_rf_decoder_t *d, const float *samples, size_t co
         }
         double cross=(double)d->prev_i*yq-(double)d->prev_q*yi;
         double dot=(double)d->prev_i*yi+(double)d->prev_q*yq;
-        /* ED uses a full-quadrant bounded approximation; MESECAM keeps
+        /* ED and S-VHS use a full-quadrant bounded approximation; MESECAM keeps
          * its small-angle path. Other profiles retain atan2f. */
         double yphase=d->profile==GUI_RF_PROFILE_MESECAM_VHS
-            ? rf_mesecam_phase(cross,dot) : ed ? gui_rf_preview_phase(cross,dot)
+            ? rf_mesecam_phase(cross,dot) : (ed || svhs) ? gui_rf_preview_phase(cross,dot)
                 : atan2f((float)cross,(float)dot);
         double frequency=d->fm_center+yphase*(RF_VIDEO_RATE/(2.0*RF_PI));
         d->prev_i=yi; d->prev_q=yq;
@@ -1825,7 +2438,7 @@ void gui_rf_decoder_process(gui_rf_decoder_t *d, const float *samples, size_t co
         float x=(float)(frequency-d->fm_center);
         float y=d->deemph_b0*x+d->deemph_b1*d->deemph_x-d->deemph_a1*d->deemph_y;
         d->deemph_x=x; d->deemph_y=y;
-        float luma=d->use_ntsc_deemph ? rf_filter_sample(&d->luma_deemph,x) : y;
+        float luma=d->use_shelf_deemph ? rf_filter_sample(&d->luma_deemph,x) : y;
         y+=(float)d->fm_center;
         /* Beta record emphasis requires its matched inverse shelf for timing too.
          * The VHS legacy plane fragments real Beta EQ/broad pulses, losing

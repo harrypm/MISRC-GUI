@@ -74,12 +74,14 @@ gui_rf_decoder_t *gui_rf_decoder_create(gui_rf_format_t format) {
 void gui_rf_decoder_destroy(gui_rf_decoder_t *d) { free(d); }
 void gui_rf_decoder_set_frame_mode(gui_rf_decoder_t *d, bool full) { (void)d; (void)full; }
 gui_rf_decoder_t *gui_rf_decoder_create_profile(gui_rf_profile_t profile) {
-    gui_rf_decoder_t *d=gui_rf_decoder_create(profile==GUI_RF_PROFILE_PAL_VHS ? GUI_RF_PAL : GUI_RF_NTSC);
+    gui_rf_decoder_t *d=gui_rf_decoder_create(profile==GUI_RF_PROFILE_PAL_VHS ||
+        profile==GUI_RF_PROFILE_PAL_SVHS ? GUI_RF_PAL : GUI_RF_NTSC);
     if(d)d->profile=profile;
     return d;
 }
 void gui_rf_decoder_reset_profile(gui_rf_decoder_t *d, gui_rf_profile_t profile) {
-    gui_rf_decoder_reset(d, profile==GUI_RF_PROFILE_PAL_VHS ? GUI_RF_PAL : GUI_RF_NTSC);
+    gui_rf_decoder_reset(d, profile==GUI_RF_PROFILE_PAL_VHS ||
+        profile==GUI_RF_PROFILE_PAL_SVHS ? GUI_RF_PAL : GUI_RF_NTSC);
     d->profile=profile;
 }
 void gui_rf_decoder_reset(gui_rf_decoder_t *d, gui_rf_format_t format) {
@@ -751,6 +753,73 @@ static void test_superbeta_optional_audio(void) {
     gui_rf_preview_worker_destroy(w);check(gui_rf_preview_worker_set_budget(1),"SuperBeta fixture restores default budget");
 }
 
+/* The wide RF front-end is necessary for S-VHS even though its picture
+ * decoder retains the VHS path. Check the actual worker's converter choice,
+ * clock and profile transitions independently of the physical RF tests. */
+static void test_svhs_frontend(void) {
+    check(gui_rf_preview_worker_set_budget(0),"S-VHS offline budget");
+    const gui_rf_profile_t profiles[]={GUI_RF_PROFILE_PAL_SVHS,GUI_RF_PROFILE_NTSC_SVHS};
+    for(size_t p=0;p<sizeof(profiles)/sizeof(profiles[0]);++p) {
+        gui_rf_preview_worker_t *w=gui_rf_preview_worker_create_profile(profiles[p]);
+        check(w!=NULL,"S-VHS worker creation");if(!w)continue;
+        gui_rf_preview_worker_set_audio_callback(w,audio_test_callback,NULL);
+        unsigned video=atomic_load(&process_calls),audio=atomic_load(&audio_calls);
+        unsigned narrow=atomic_load(&narrow_resample_calls);
+        check(submit_marker(w,16000000u,0,1,false,141) && gui_rf_preview_worker_wait_idle(w,3000),
+            "insufficient S-VHS source rate drains safely");
+        gui_rf_preview_stats_t stats;gui_rf_preview_worker_get_stats(w,&stats);
+        check(strstr(stats.decode.reason,"S-VHS") && strstr(stats.decode.reason,"20 MSPS") &&
+            atomic_load(&process_calls)==video,"S-VHS rejects missing source bandwidth");
+        check(submit_marker(w,20000000u,0,2,true,143) && gui_rf_preview_worker_wait_idle(w,3000),
+            "native 20MSPS S-VHS accepted");
+        check(atomic_load(&latest_first_sample)==0 && atomic_load(&latest_video_count)==32 &&
+            atomic_load(&latest_video_marker)==1143,"native S-VHS uses the wide video stream on the 20M clock");
+        check(submit_marker(w,40000000u,4000,3,true,145) && gui_rf_preview_worker_wait_idle(w,3000),
+            "40MSPS S-VHS accepted");
+        check(atomic_load(&latest_first_sample)==2000 && atomic_load(&latest_video_count)==16 &&
+            atomic_load(&latest_video_marker)==1145,"40MSPS S-VHS is downsampled to wide-passband 20MSPS");
+        check(submit_marker(w,80000000u,8000,4,true,147) && gui_rf_preview_worker_wait_idle(w,3000),
+            "80MSPS S-VHS accepted");
+        check(atomic_load(&latest_first_sample)==2000 && atomic_load(&latest_video_count)==8 &&
+            atomic_load(&latest_video_marker)==1147,"80MSPS S-VHS retains the 20M media clock");
+        check(atomic_load(&audio_calls)==audio && atomic_load(&narrow_resample_calls)==narrow,
+            "S-VHS performs no Beta audio DSP or unnecessary narrow-band conversion");
+        unsigned created=atomic_load(&create_calls);
+        gui_rf_preview_worker_set_profile(w,GUI_RF_PROFILE_PAL_VHS);
+        check(gui_rf_preview_worker_wait_idle(w,3000) &&
+            submit_marker(w,80000000u,8032,4,false,149) && gui_rf_preview_worker_wait_idle(w,3000),
+            "S-VHS to ordinary VHS at unchanged source rate");
+        check(atomic_load(&latest_first_sample)==2008 && atomic_load(&latest_video_marker)==149 &&
+            atomic_load(&create_calls)==created+1,"leaving S-VHS restores the ordinary converter response");
+        created=atomic_load(&create_calls);
+        gui_rf_preview_worker_set_profile(w,profiles[p]);
+        check(gui_rf_preview_worker_wait_idle(w,3000) &&
+            submit_marker(w,80000000u,8064,4,false,151) && gui_rf_preview_worker_wait_idle(w,3000),
+            "ordinary VHS to S-VHS at unchanged source rate");
+        check(atomic_load(&latest_first_sample)==2016 && atomic_load(&latest_video_marker)==1151 &&
+            atomic_load(&create_calls)==created+2,"S-VHS reselects the wide converter despite equal output rates");
+        created=atomic_load(&create_calls);
+        gui_rf_preview_worker_set_profile(w,GUI_RF_PROFILE_NTSC_ED_BETA);
+        check(gui_rf_preview_worker_wait_idle(w,3000) &&
+            submit_marker(w,80000000u,8096,4,false,153) && gui_rf_preview_worker_wait_idle(w,3000),
+            "S-VHS to ED starts the independent Hi-Fi consumer");
+        check(atomic_load(&audio_calls)==audio+1 && atomic_load(&audio_marker)==153 &&
+            atomic_load(&create_calls)==created,"ED reuses the wide converter and decodes current audio");
+        audio=atomic_load(&audio_calls);narrow=atomic_load(&narrow_resample_calls);
+        gui_rf_preview_worker_set_profile(w,profiles[p]);
+        check(gui_rf_preview_worker_wait_idle(w,3000) &&
+            submit_marker(w,80000000u,8128,4,false,155) && gui_rf_preview_worker_wait_idle(w,3000),
+            "ED to S-VHS clears previous Beta audio state");
+        gui_rf_preview_worker_get_stats(w,&stats);
+        check(atomic_load(&latest_first_sample)==2032 && atomic_load(&latest_video_marker)==1155 &&
+            atomic_load(&audio_calls)==audio && atomic_load(&narrow_resample_calls)==narrow &&
+            atomic_load(&create_calls)==created && !stats.audio_active,
+            "S-VHS reuses wide video without stale ED audio or narrow conversion");
+        gui_rf_preview_worker_destroy(w);
+    }
+    check(gui_rf_preview_worker_set_budget(1),"S-VHS restores budget");
+}
+
 static void test_ed_frontends(void) {
     check(gui_rf_preview_worker_set_budget(0),"ED dual-front-end offline budget");
     gui_rf_preview_worker_t *w=gui_rf_preview_worker_create_profile(GUI_RF_PROFILE_NTSC_ED_BETA);
@@ -977,6 +1046,7 @@ int main(void) {
     test_fast_block_handoffs();
     test_parallel_budget();
     test_superbeta_optional_audio();
+    test_svhs_frontend();
     test_ed_frontends();
     test_ed_buffered_frontends(true);test_ed_buffered_frontends(false);
     test_ed_muted_frontend();

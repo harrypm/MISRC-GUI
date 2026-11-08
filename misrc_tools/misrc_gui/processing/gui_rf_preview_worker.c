@@ -105,7 +105,7 @@ struct gui_rf_preview_worker {
     uint32_t source_rate;
     bool stream_valid;
     uint64_t output_sample;      /* Audio and legacy video: public 20 MSPS axis. */
-    uint64_t wide_output_sample; /* EDBeta wide-passband video: independent 20 MSPS cursor. */
+    uint64_t wide_output_sample; /* Wide-passband video: independent 20 MSPS cursor. */
     bool narrow_stream_valid;   /* ED may omit its audio-only converter while muted. */
     uint64_t narrow_audio_generation;
     uint64_t block_enqueue_us;
@@ -386,10 +386,16 @@ static bool rf_reserve_output(float **buffer, size_t *available, size_t capacity
     *buffer = output; *available = capacity;
     return true;
 }
+static bool rf_wideband_profile(gui_rf_profile_t profile) {
+    return profile == GUI_RF_PROFILE_NTSC_ED_BETA ||
+           profile == GUI_RF_PROFILE_PAL_SVHS || profile == GUI_RF_PROFILE_NTSC_SVHS;
+}
 static const char *rf_rate_error(const gui_rf_preview_worker_t *w) {
-    return w->profile == GUI_RF_PROFILE_NTSC_ED_BETA && w->source_rate < GUI_RF_ED_BETA_RATE_HZ
-        ? "Unsupported EDBeta RF rate: requires at least 20 MSPS"
-        : "Unsupported RF rate or resampler unavailable";
+    if (rf_wideband_profile(w->profile) && w->source_rate < GUI_RF_DECODE_RATE_HZ)
+        return w->profile == GUI_RF_PROFILE_NTSC_ED_BETA
+            ? "Unsupported EDBeta RF rate: requires at least 20 MSPS"
+            : "Unsupported S-VHS RF rate: requires at least 20 MSPS";
+    return "Unsupported RF rate or resampler unavailable";
 }
 static bool rf_configure_rate(gui_rf_preview_worker_t *w, uint32_t rate) {
     gui_rf_resampler_destroy(w->resampler);
@@ -397,14 +403,16 @@ static bool rf_configure_rate(gui_rf_preview_worker_t *w, uint32_t rate) {
     w->resampler = w->wide_resampler = NULL;
     w->narrow_stream_valid = false;
     w->source_rate = rate;
-    bool ed_beta = w->profile == GUI_RF_PROFILE_NTSC_ED_BETA;
+    bool wideband = rf_wideband_profile(w->profile);
     if (rate < RF_MIN_RATE || rate > RF_MAX_RATE ||
-        (ed_beta && rate < GUI_RF_ED_BETA_RATE_HZ)) return false;
+        (wideband && rate < GUI_RF_DECODE_RATE_HZ)) return false;
     if (!rf_reserve_output(&w->output, &w->output_capacity,
             gui_rf_resampler_output_capacity(rate, RF_BLOCK_SAMPLES))) return false;
     w->resampler = gui_rf_resampler_create(rate);
     if (!w->resampler) return false;
-    if (ed_beta) {
+    if (wideband) {
+        /* S-VHS also needs the ED converter's wider RF passband: its white
+         * carrier is 7MHz and the useful upper FM sideband reaches 9MHz. */
         if (!rf_reserve_output(&w->wide_output, &w->wide_output_capacity,
                 gui_rf_resampler_output_capacity_ed_beta(rate, RF_BLOCK_SAMPLES))) goto fail;
         w->wide_resampler = gui_rf_resampler_create_ed_beta(rate);
@@ -769,10 +777,10 @@ static int rf_worker_thread(void *context) {
         }
         uint64_t control = atomic_load_explicit(&w->control, memory_order_acquire);
         if (control != w->applied_control) {
-            bool was_ed_beta = w->profile == GUI_RF_PROFILE_NTSC_ED_BETA;
+            bool was_wideband = rf_wideband_profile(w->profile);
             w->profile = (gui_rf_profile_t)atomic_load_explicit(&w->requested_profile, memory_order_relaxed);
             if (gui_rf_profile_has_hifi(w->profile)) (void)rf_audio_start(w);
-            if (w->source_rate && was_ed_beta != (w->profile == GUI_RF_PROFILE_NTSC_ED_BETA))
+            if (w->source_rate && was_wideband != rf_wideband_profile(w->profile))
                 (void)rf_configure_rate(w, w->source_rate);
             /* Publish completion only after reset and audio invalidation. */
             rf_reset_decoder(w, w->source_rate && !w->resampler ? rf_rate_error(w) : "RF preview reset; acquiring");
@@ -867,7 +875,8 @@ static int rf_worker_thread(void *context) {
                 uint64_t audio_generation=atomic_load_explicit(&w->audio_generation,memory_order_acquire);
                 size_t wide_count = 0;
                 bool narrow_needed = !w->wide_resampler ||
-                    atomic_load_explicit(&w->audio_enabled,memory_order_acquire);
+                    (gui_rf_profile_has_hifi(w->profile) &&
+                     atomic_load_explicit(&w->audio_enabled,memory_order_acquire));
                 bool resampled = true;
                 if (narrow_needed) {
                     if (w->wide_resampler && (!w->narrow_stream_valid ||
@@ -883,7 +892,7 @@ static int rf_worker_thread(void *context) {
                     w->narrow_stream_valid = resampled;
                     w->narrow_audio_generation = audio_generation;
                 } else {
-                    /* ED video advances normally; resume audio from fresh RF,
+                    /* Wide video advances normally; resume audio from fresh RF,
                      * rather than pretending its skipped history is contiguous. */
                     w->narrow_stream_valid = false;
                     w->output_sample = rf_scale_sample(w->expected_source_sample,w->source_rate);

@@ -63,6 +63,8 @@ typedef enum {
     GUI_RF_PROFILE_SECAM_VHS,
     GUI_RF_PROFILE_MESECAM_VHS,
     GUI_RF_PROFILE_NTSC_ED_BETA,
+    GUI_RF_PROFILE_PAL_SVHS,
+    GUI_RF_PROFILE_NTSC_SVHS,
     GUI_RF_PROFILE_COUNT
 } gui_rf_profile_t;
 typedef struct gui_rf_decoder gui_rf_decoder_t;
@@ -103,8 +105,8 @@ typedef void (*gui_rf_frame_callback_t)(void *context, const uint8_t *rgba,
 /* Invalid profiles are rejected; reset_profile leaves existing state intact. */
 gui_rf_decoder_t *gui_rf_decoder_create_profile(gui_rf_profile_t profile);
 void gui_rf_decoder_reset_profile(gui_rf_decoder_t *decoder, gui_rf_profile_t profile);
-// RF input rate required by the decoder. All profiles use 20 MSPS; ED uses
-// a separate wide-passband converter before its reduced-rate preview filters.
+// RF input rate required by the decoder. All profiles use 20 MSPS; ED Beta
+// and S-VHS use a wide-passband converter before reduced-rate preview filters.
 uint32_t gui_rf_profile_video_rate_hz(gui_rf_profile_t profile);
 gui_rf_format_t gui_rf_profile_format(gui_rf_profile_t profile);
 const char *gui_rf_profile_name(gui_rf_profile_t profile);

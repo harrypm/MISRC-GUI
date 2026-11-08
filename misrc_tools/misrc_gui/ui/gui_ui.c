@@ -4019,7 +4019,7 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                     }
 
                     // Playback files section
-                    CLAY_TEXT(CLAY_STRING("Playback files (FLAC / drop onto a channel panel):"),
+                    CLAY_TEXT(CLAY_STRING("Playback files (RF / audio; drag and drop):"),
                         CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
 
                     // Player link mode: Synced = one shared transport (legacy

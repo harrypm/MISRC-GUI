@@ -67,6 +67,9 @@ void gui_vhs_fm_set_format(vhs_fm_decoder_t *decoder, int format_select) {
     // SECAM FM is the 2" quad / 1" Type-C domain).
     int system = format_select >= 0 && format_select <= 3 ? format_select : 0;
     decoder->overlay.selected_system = decoder->overlay.selected_tape ? 1 : system;
+    // SECAM/MESECAM recordings currently use ordinary VHS modulation only.
+    if (!decoder->overlay.selected_tape && system >= 2)
+        decoder->overlay.vhs_preset = GUI_VHS_PRESET_VHS;
     decoder->format = gui_vhs_fm_get_format(decoder);
     // The UI route update rebinds this subscriber; other subscribers keep their system.
 }
@@ -85,6 +88,19 @@ void gui_vhs_fm_set_beta_preset(vhs_fm_decoder_t *decoder, int preset) {
     decoder->overlay.beta_preset = preset >= 0 && preset < GUI_BETA_PRESET_COUNT
         ? (gui_beta_preset_t)preset : GUI_BETA_PRESET_BETAMAX;
     // Route updates rebind video only when the recording preset changes.
+}
+void gui_vhs_fm_set_vhs_preset(vhs_fm_decoder_t *decoder, int preset) {
+    if (!decoder) return;
+    decoder->overlay.vhs_preset = preset >= 0 && preset < GUI_VHS_PRESET_COUNT
+        ? (gui_vhs_preset_t)preset : GUI_VHS_PRESET_VHS;
+    // Selecting S-VHS from SECAM or MESECAM moves to PAL.
+    if (!decoder->overlay.selected_tape && decoder->overlay.vhs_preset == GUI_VHS_PRESET_SVHS &&
+        decoder->overlay.selected_system >= 2)
+        decoder->overlay.selected_system = 0;
+    decoder->format = gui_vhs_fm_get_format(decoder);
+}
+const char *gui_vhs_fm_get_vhs_preset_name(const vhs_fm_decoder_t *decoder) {
+    return decoder && decoder->overlay.vhs_preset == GUI_VHS_PRESET_SVHS ? "S-VHS" : "VHS";
 }
 const char *gui_vhs_fm_get_beta_preset_name(const vhs_fm_decoder_t *decoder) {
     if (decoder && decoder->overlay.beta_preset == GUI_BETA_PRESET_ED_BETA) return "ED Beta";
@@ -109,6 +125,8 @@ gui_rf_profile_t gui_vhs_fm_get_profile(const vhs_fm_decoder_t *decoder) {
         return GUI_RF_PROFILE_MESECAM_VHS;
     if (decoder && decoder->overlay.selected_system == 2)
         return GUI_RF_PROFILE_SECAM_VHS;
+    if (decoder && decoder->overlay.vhs_preset == GUI_VHS_PRESET_SVHS)
+        return decoder->overlay.selected_system == 1 ? GUI_RF_PROFILE_NTSC_SVHS : GUI_RF_PROFILE_PAL_SVHS;
     return decoder && decoder->overlay.selected_system == 1 ? GUI_RF_PROFILE_NTSC_VHS : GUI_RF_PROFILE_PAL_VHS;
 }
 void gui_vhs_fm_set_frame_mode(vhs_fm_decoder_t *decoder, int mode_select) {
@@ -124,7 +142,7 @@ vhs_fm_format_t gui_vhs_fm_get_format(vhs_fm_decoder_t *decoder) {
     gui_rf_profile_t profile = gui_vhs_fm_get_profile(decoder);
     return profile == GUI_RF_PROFILE_MESECAM_VHS ? VHS_FM_FORMAT_MESECAM
         : profile == GUI_RF_PROFILE_SECAM_VHS ? VHS_FM_FORMAT_SECAM
-        : profile == GUI_RF_PROFILE_PAL_VHS ? VHS_FM_FORMAT_PAL : VHS_FM_FORMAT_NTSC;
+        : gui_rf_profile_format(profile) == GUI_RF_PAL ? VHS_FM_FORMAT_PAL : VHS_FM_FORMAT_NTSC;
 }
 const char *gui_vhs_fm_get_format_name(vhs_fm_decoder_t *decoder) {
     vhs_fm_format_t format = gui_vhs_fm_get_format(decoder);

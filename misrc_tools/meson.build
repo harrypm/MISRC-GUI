@@ -1096,6 +1096,9 @@ rf_decoder_test = executable('gui_rf_preview_test',
   ['test/gui_rf_preview_test.c', 'misrc_gui/signal/gui_rf_preview.c'],
   dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
 test('gui_rf_preview', rf_decoder_test, timeout: 120)
+test('gui_rf_svhs', rf_decoder_test, args: ['--svhs-only'], timeout: 90)
+test('gui_rf_svhs_color', rf_decoder_test, args: ['--svhs-color-only'], timeout: 90)
+test('gui_rf_svhs_stripe', rf_decoder_test, args: ['--svhs-stripe-only'], timeout: 30)
 rf_secam_test = executable('gui_rf_secam_test',
   ['test/gui_rf_secam_test.c', 'misrc_gui/signal/gui_rf_preview.c'],
   dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
