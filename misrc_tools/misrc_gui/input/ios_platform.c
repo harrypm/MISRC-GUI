@@ -36,9 +36,107 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <fcntl.h>
+#include <sys/mman.h>
+
+#include <mach/mach.h>
+
 #ifndef MISRC_IOS
 #error "ios_platform.c must only be compiled for iOS builds (-DMISRC_IOS)"
 #endif
+
+/* TEMPORARY (allocation probe, 2026-11-08): the ringbuffer's double-mirror
+ * needs a shared backing object. Desktop/sim use memfd/shm_open; the device
+ * sandbox may deny them. Probe every candidate ONCE at library load and
+ * write the results to Documents/rb_probe.txt so the host can pick the
+ * working path. Removed once the ringbuffer allocation is settled. */
+__attribute__((constructor))
+static void ios_rb_probe(void)
+{
+    const char *home = getenv("HOME");
+    if (!home) return;
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/Documents/rb_probe.txt", home);
+    FILE *f = fopen(path, "a");
+    if (!f) return;
+    const size_t SZ = 1 << 20; /* 1 MiB */
+
+    /* 1. plain shm_open (what the memfd shim uses on Apple) */
+    {
+        int fd = shm_open("/misrc-probe", O_RDWR | O_CREAT | O_EXCL, 0600);
+        if (fd >= 0) {
+            int tr = ftruncate(fd, SZ);
+            void *m = mmap(NULL, SZ, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            fprintf(f, "shm_open: fd-ok ftruncate=%d mmap=%s\n", tr,
+                    m == MAP_FAILED ? "FAIL" : "OK");
+            if (m != MAP_FAILED) munmap(m, SZ);
+            close(fd);
+            shm_unlink("/misrc-probe");
+        } else {
+            fprintf(f, "shm_open: FAIL errno=%d\n", errno);
+        }
+    }
+
+    /* 2. MAP_SHARED | MAP_ANONYMOUS (fd = -1) */
+    {
+        void *m = mmap(NULL, SZ, PROT_READ | PROT_WRITE,
+                       MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        fprintf(f, "mmap MAP_SHARED|MAP_ANON: %s\n", m == MAP_FAILED ? "FAIL" : "OK");
+        if (m != MAP_FAILED) munmap(m, SZ);
+    }
+
+    /* 3. mach: vm_allocate + memory entry + two fixed vm_maps (the mirror) */
+    {
+        task_t task = mach_task_self();
+        vm_address_t storage = 0;
+        kern_return_t kr = vm_allocate(task, &storage, SZ, VM_FLAGS_ANYWHERE);
+        if (kr != KERN_SUCCESS) {
+            fprintf(f, "mach-entry: vm_allocate FAIL kr=%d\n", kr);
+        } else {
+            memory_object_size_t esize = SZ;
+            mach_port_t entry = MACH_PORT_NULL;
+            kr = mach_make_memory_entry_64(task, &esize,
+                                           (memory_object_offset_t)storage,
+                                           VM_PROT_READ | VM_PROT_WRITE,
+                                           &entry, MACH_PORT_NULL);
+            if (kr != KERN_SUCCESS) {
+                fprintf(f, "mach-entry: make_entry FAIL kr=%d\n", kr);
+                vm_deallocate(task, storage, SZ);
+            } else {
+                void *reserve = mmap(NULL, 2 * SZ, PROT_NONE,
+                                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                if (reserve == MAP_FAILED) {
+                    fprintf(f, "mach-entry: reserve mmap FAIL\n");
+                } else {
+                    vm_address_t m1 = (vm_address_t)reserve;
+                    kr = vm_map(task, &m1, SZ, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+                                entry, 0, FALSE, VM_PROT_READ | VM_PROT_WRITE,
+                                VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_DEFAULT);
+                    if (kr != KERN_SUCCESS) {
+                        fprintf(f, "mach-entry: vm_map#1 FAIL kr=%d\n", kr);
+                    } else {
+                        vm_address_t m2 = (vm_address_t)reserve + SZ;
+                        kr = vm_map(task, &m2, SZ, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+                                    entry, 0, FALSE, VM_PROT_READ | VM_PROT_WRITE,
+                                    VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_DEFAULT);
+                        /* write through mirror1, read via mirror2 (the mirror test) */
+                        ((volatile int *)reserve)[0] = 0x4D495343;
+                        int back = (m2 != (vm_address_t)reserve)
+                            ? ((volatile int *)m2)[0] : -1;
+                        fprintf(f, "mach-entry: map1=%s map2=%s mirror-read=%s\n",
+                                kr == KERN_SUCCESS ? "OK" : "FAIL",
+                                kr == KERN_SUCCESS ? "OK" : "FAIL",
+                                back == 0x4D495343 ? "SAME-PAGES" : "DIFFERENT");
+                    }
+                    munmap(reserve, 2 * SZ);
+                }
+                mach_port_deallocate(task, entry);
+                vm_deallocate(task, storage, SZ);
+            }
+        }
+    }
+    fclose(f);
+}
 
 static char s_documents_path[1024] = "";
 
