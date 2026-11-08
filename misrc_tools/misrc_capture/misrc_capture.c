@@ -852,7 +852,7 @@ int audio_file_writer(void *ctx)
 			thrd_sleep(&(struct timespec){.tv_nsec=10000000}, NULL);
 		}
 		if (do_exit) {
-			len = audio_ctx->rb->tail - audio_ctx->rb->head;
+			len = rb_fill_level(audio_ctx->rb);
 			if (len == 0) break;
 			buf = rb_read_ptr(audio_ctx->rb, len);
 		}
@@ -930,7 +930,7 @@ int raw_file_writer(void *ctx)
 			thrd_sleep(&(struct timespec){.tv_nsec=10000000}, NULL);
 		}
 		if (do_exit) {
-			len = file_ctx->rb.tail - file_ctx->rb.head;
+			len = rb_fill_level(&file_ctx->rb);
 			if (len == 0) break;
 			buf = rb_read_ptr(&file_ctx->rb, len);
 		}
@@ -1113,7 +1113,7 @@ int flac_file_writer(void *ctx)
 			thrd_sleep(&(struct timespec){.tv_nsec=10000000}, NULL);
 		}
 		if (do_exit) {
-			len = file_ctx->rb.tail - file_ctx->rb.head;
+			len = rb_fill_level(&file_ctx->rb);
 			if (len == 0) break;
 			buf = rb_read_ptr(&file_ctx->rb, len);
 		}

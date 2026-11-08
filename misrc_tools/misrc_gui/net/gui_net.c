@@ -8,6 +8,7 @@
 #include "gui_monitor_transport.h"
 #include "gui_monitor_audio.h"
 #include "gui_monitor_local_save.h"
+#include "../output/gui_record.h"
 #include "../input/gui_playback.h"
 #include "../core/gui_app.h"
 #include "../processing/gui_extract.h"
@@ -23,6 +24,7 @@
 #include <string.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <errno.h>
 
 #ifndef MIRSC_TOOLS_VERSION
@@ -217,6 +219,7 @@ typedef struct {
     net_fanout_sub_t *subs;
     size_t queued_bytes;
     size_t max_bytes;
+    uint64_t capture_id;
     gui_app_t *telemetry_app;
     bool audio_queue;
     int subscribers;
@@ -230,14 +233,29 @@ struct net_fanout_sub {
     size_t off;
     net_fanout_sub_t *next;
     bool overflowed;
+    bool capture_ended;
+    net_chunk_t *capture_tail;
 };
 
-static void net_fanout_init(net_fanout_t *f, gui_app_t *telemetry_app, bool audio_queue) {
+static uint64_t net_next_capture_id(void) {
+    static atomic_uint_fast64_t last;
+    uint_fast64_t now = get_time_ms() << 16;
+    uint_fast64_t previous = atomic_load(&last);
+    uint_fast64_t next;
+    do {
+        next = now > previous ? now : previous + 1;
+    } while (!atomic_compare_exchange_weak(&last, &previous, next));
+    return next;
+}
+
+static void net_fanout_init(net_fanout_t *f, gui_app_t *telemetry_app, bool audio_queue,
+                            uint64_t capture_id) {
     memset(f, 0, sizeof(*f));
     net_mutex_init(&f->mtx);
     net_cond_init(&f->cond);
     f->max_bytes = audio_queue ? GUI_NET_AUDIO_QUEUE_LIMIT_BYTES : GUI_NET_RF_QUEUE_LIMIT_BYTES;
     f->telemetry_app = telemetry_app;
+    f->capture_id = capture_id;
     f->audio_queue = audio_queue;
     f->initialized = true;
 }
@@ -281,6 +299,20 @@ static void net_fanout_shutdown(net_fanout_t *f) {
     net_mutex_unlock(&f->mtx);
 }
 
+/* Let each existing client drain the capture it subscribed to. No new
+ * capture can extend its cursor past this tail, even on a fast restart. */
+static void net_fanout_end_capture(net_fanout_t *f, uint64_t next_capture_id) {
+    net_mutex_lock(&f->mtx);
+    f->capture_id = next_capture_id;
+    for (net_fanout_sub_t *s = f->subs; s; s = s->next) {
+        if (s->capture_ended) continue;
+        s->capture_ended = true;
+        s->capture_tail = s->cur ? f->tail : NULL;
+    }
+    net_cond_broadcast(&f->cond);
+    net_mutex_unlock(&f->mtx);
+}
+
 static void net_fanout_destroy(net_fanout_t *f) {
     if (!f || !f->initialized) return;
     net_mutex_lock(&f->mtx);
@@ -302,10 +334,12 @@ static void net_fanout_destroy(net_fanout_t *f) {
     f->initialized = false;
 }
 
-static void net_fanout_subscribe(net_fanout_t *f, net_fanout_sub_t *s) {
+static uint64_t net_fanout_subscribe(net_fanout_t *f, net_fanout_sub_t *s) {
     memset(s, 0, sizeof(*s));
     net_mutex_lock(&f->mtx);
+    uint64_t capture_id = 0;
     if (!f->shutdown) {
+        capture_id = f->capture_id;
         s->f = f;
         s->next = f->subs;
         f->subs = s;
@@ -313,6 +347,7 @@ static void net_fanout_subscribe(net_fanout_t *f, net_fanout_sub_t *s) {
         /* New clients start from FUTURE data, not an old cached stream. */
     }
     net_mutex_unlock(&f->mtx);
+    return capture_id;
 }
 
 static void net_fanout_unsubscribe(net_fanout_sub_t *s) {
@@ -353,10 +388,11 @@ static void net_fanout_push(net_fanout_t *f, const void *data, size_t len) {
         f->tail = c;
         f->queued_bytes += len;
         for (net_fanout_sub_t *s = f->subs; s; s = s->next) {
-            if (!s->overflowed && !s->cur) s->cur = c;
+            if (!s->overflowed && !s->capture_ended && !s->cur) s->cur = c;
         }
     } else {
         for (net_fanout_sub_t *s = f->subs; s; s = s->next) {
+            if (s->capture_ended && !s->cur) continue;
             if (!s->overflowed) net_fanout_report_drop(f);
             s->overflowed = true;
             s->cur = NULL;
@@ -396,7 +432,7 @@ static ssize_t net_fanout_read(net_fanout_sub_t *s, void *dst, size_t cap, int t
             break;
         }
         if (s->cur && s->off >= s->cur->len) {
-            s->cur = s->cur->next;
+            s->cur = s->cur == s->capture_tail ? NULL : s->cur->next;
             s->off = 0;
             net_fanout_trim_locked(f);
             continue;
@@ -411,7 +447,7 @@ static ssize_t net_fanout_read(net_fanout_sub_t *s, void *dst, size_t cap, int t
             if (cap == 0) break;
             continue;
         }
-        if (timeout_ms <= 0) break;
+        if (s->capture_ended || timeout_ms <= 0) break;
 #ifdef _WIN32
         if (!SleepConditionVariableCS(&f->cond, &f->mtx, (DWORD)timeout_ms)) break;
 #else
@@ -425,8 +461,9 @@ static ssize_t net_fanout_read(net_fanout_sub_t *s, void *dst, size_t cap, int t
         /* Re-check subscriber cursor, overflow and shutdown after wakeup. */
     }
     bool failed = f->shutdown || s->overflowed;
+    bool finished = s->capture_ended && !s->cur && !copied;
     net_mutex_unlock(&f->mtx);
-    return failed ? -1 : (ssize_t)copied;
+    return failed || finished ? -1 : (ssize_t)copied;
 }
 
 /* -------------------------------------------------------------------------
@@ -476,6 +513,7 @@ typedef struct {
     atomic_bool error;
     /* Mirror snapshot (written by worker, read by main poll). */
     atomic_int peer_state;          /* 0 idle, 1 capturing, 2 recording */
+    atomic_bool peer_capture_boundaries; /* The peer closes raw streams at capture stop. */
     atomic_int peer_sample_rate;    /* Hz */
     atomic_int peer_device_count;
     atomic_int peer_selected;
@@ -487,7 +525,12 @@ typedef struct {
     int staged_selected;
     bool staged_dirty;
     /* Ingest control (main thread starts/stops; pump threads run). */
-    atomic_bool ingest_want;        /* worker sets when peer is capturing */
+    atomic_bool ingest_want;        /* worker sets when peer is connected */
+    atomic_bool rf_stream_ended;    /* RF pump waits for main-thread recording handoff */
+    atomic_uint_fast64_t source_boundary;  /* RF and baseband socket generation. */
+    net_mutex_t stream_mtx;                /* Serialize packet publication and revocation. */
+    uint64_t rf_capture_id;                 /* Protected by stream_mtx. */
+    atomic_bool audio_stream_live;          /* Fresh PCM from the active RF generation. */
     atomic_bool ingest_active;      /* main thread sets when ingest running */
     thrd_t rf_pump_thread;
     thrd_t audio_pump_thread;
@@ -515,6 +558,161 @@ typedef struct {
 static net_server_t *s_server = NULL;
 static net_client_t *s_client = NULL;
 
+/* USB callbacks are independent of the HTTP worker count. Publish their
+ * fanout pointer separately so Server teardown can wait for active taps. */
+static _Atomic(net_server_t *) s_server_capture_tap;
+static atomic_uint s_server_capture_readers;
+
+static net_server_t *server_capture_tap_acquire(void) {
+    if (!atomic_load(&s_server_capture_tap)) return NULL;
+    atomic_fetch_add(&s_server_capture_readers, 1u);
+    /* Load again after joining the reader count. The first load was only
+     * a fast check and cannot be used after a concurrent withdrawal. */
+    net_server_t *srv = atomic_load(&s_server_capture_tap);
+    if (!srv) atomic_fetch_sub(&s_server_capture_readers, 1u);
+    return srv;
+}
+
+static void server_capture_tap_release(void) {
+    atomic_fetch_sub(&s_server_capture_readers, 1u);
+}
+
+static void server_capture_tap_withdraw(void) {
+    atomic_store(&s_server_capture_tap, NULL);
+    while (atomic_load(&s_server_capture_readers)) thrd_sleep_ms(1);
+}
+
+#ifdef __ANDROID__
+enum {
+    ANDROID_SERVER_STOP = 1u,
+    ANDROID_SERVER_START = 2u,
+    ANDROID_SERVER_TRANSPORT = ANDROID_SERVER_STOP | ANDROID_SERVER_START,
+    ANDROID_SERVER_MONITOR_DEVICE = 4u,
+    ANDROID_SERVER_DEVICE_SHIFT = 3,
+    ANDROID_SERVER_DEVICE_MASK = 31u,
+    ANDROID_SERVER_CATALOGUE_SHIFT = 8,
+    ANDROID_SERVER_RECORD_ON = 1u,
+    ANDROID_SERVER_RECORD_OFF = 2u
+};
+#define ANDROID_SERVER_TARGETED_START (UINT64_C(1) << 40)
+#define ANDROID_SERVER_DEVICE_SLOT ((uint_fast64_t)ANDROID_SERVER_DEVICE_MASK << ANDROID_SERVER_DEVICE_SHIFT)
+#define ANDROID_SERVER_DEVICE_IDENTITY (ANDROID_SERVER_DEVICE_SLOT | ((uint_fast64_t)UINT32_MAX << ANDROID_SERVER_CATALOGUE_SHIFT))
+_Static_assert(MAX_DEVICES <= ANDROID_SERVER_DEVICE_MASK, "Android device mailbox index capacity");
+/* One atomic snapshot covers transport, requested slot and catalogue
+ * generation. These incoming commands are separate from client output. */
+static atomic_uint_fast64_t s_android_server_control;
+static atomic_bool s_android_rebind_stop;
+static atomic_uint s_android_server_record;
+/* After Device is consumed, the following Start still refers to this
+ * identity even if the catalogue refreshes in the meantime. */
+static bool s_android_start_bound, s_android_start_device_available;
+static device_info_t s_android_start_device;
+#ifdef ENABLE_RTLSDR
+static unsigned s_android_start_rtl_revision;
+#endif
+#endif
+
+#ifdef __ANDROID__
+static void android_cancel_server_start(bool request_stop) {
+    uint_fast64_t old = atomic_load(&s_android_server_control);
+    uint_fast64_t next;
+    do {
+        next = old & ~(ANDROID_SERVER_TARGETED_START | ANDROID_SERVER_START);
+        if ((old & ANDROID_SERVER_TARGETED_START) && !(old & ANDROID_SERVER_MONITOR_DEVICE))
+            next &= ~ANDROID_SERVER_DEVICE_IDENTITY;  /* No explicit Device to retain. */
+        if (request_stop) next |= ANDROID_SERVER_STOP;
+    } while (!atomic_compare_exchange_weak(&s_android_server_control, &old, next));
+}
+
+void gui_net_cancel_pending_server_start(void) {
+    android_cancel_server_start(false);
+}
+#endif
+
+void gui_net_server_request_capture(gui_app_t *app, bool start) {
+#ifdef __ANDROID__
+    (void)app;
+    if (start) atomic_fetch_or(&s_android_server_control, ANDROID_SERVER_START);
+    else android_cancel_server_start(true);
+#else
+    if (start) atomic_store(&app->net_cmd_start, true);
+    else atomic_store(&app->net_cmd_stop, true);
+#endif
+}
+
+#ifdef __ANDROID__
+bool gui_net_server_request_targeted_start(gui_app_t *app, int device_index, uint64_t epoch) {
+    unsigned generation = atomic_load(&app->net_device_catalogue_generation);
+    if (device_index < 0 || device_index >= MAX_DEVICES || (generation & 1u) ||
+        epoch <= UINT32_MAX || !gui_monitor_server_device_epoch_matches(epoch, generation))
+        return false;
+
+    uint_fast64_t target = ((uint_fast64_t)generation << ANDROID_SERVER_CATALOGUE_SHIFT) |
+                           ((uint_fast64_t)(device_index + 1) << ANDROID_SERVER_DEVICE_SHIFT);
+    uint_fast64_t old = atomic_load(&s_android_server_control);
+    uint_fast64_t next;
+    do {
+        /* A Start can follow a matching Device already in the mailbox, but
+         * cannot steal a different selection or queue one on its own. */
+        if ((old & ANDROID_SERVER_DEVICE_SLOT) &&
+            (!(old & (ANDROID_SERVER_MONITOR_DEVICE | ANDROID_SERVER_TARGETED_START)) ||
+             (old & ANDROID_SERVER_DEVICE_IDENTITY) != target))
+            return false;
+        next = old | target | ANDROID_SERVER_TARGETED_START | ANDROID_SERVER_START;
+    } while (!atomic_compare_exchange_weak(&s_android_server_control, &old, next));
+    return true;
+}
+#endif
+
+#ifdef __ANDROID__
+static bool android_server_request_device(gui_app_t *app, int device_index, bool monitor,
+                                          uint64_t observed_epoch, bool bound_route) {
+    unsigned generation = atomic_load(&app->net_device_catalogue_generation);
+    if (device_index < 0 || device_index >= MAX_DEVICES) return false;
+    bool matches = !(generation & 1u) &&
+                   (observed_epoch == GUI_NET_DEVICE_EPOCH_NONE ||
+                    (monitor && gui_monitor_server_device_epoch_matches(observed_epoch, generation)));
+    /* Only older peers may follow a rejected Device with an unbound Start. */
+    if (!matches) {
+        if (bound_route) return false;
+        generation |= 1u;
+    }
+    uint_fast64_t device = (uint_fast64_t)generation << ANDROID_SERVER_CATALOGUE_SHIFT;
+    device |= (uint_fast64_t)(device_index + 1) << ANDROID_SERVER_DEVICE_SHIFT;
+    if (monitor) device |= ANDROID_SERVER_MONITOR_DEVICE;
+    uint_fast64_t old = atomic_load(&s_android_server_control);
+    uint_fast64_t next;
+    do {
+        /* A newer selection cannot inherit another device's targeted Start. */
+        unsigned keep = (old & ANDROID_SERVER_TARGETED_START) ? ANDROID_SERVER_STOP : ANDROID_SERVER_TRANSPORT;
+        next = (old & keep) | device;
+    } while (!atomic_compare_exchange_weak(&s_android_server_control, &old, next));
+    return matches;
+}
+
+bool gui_net_server_request_bound_device(gui_app_t *app, int device_index, uint64_t epoch) {
+    return epoch > UINT32_MAX && epoch != GUI_NET_DEVICE_EPOCH_NONE &&
+           android_server_request_device(app, device_index, true, epoch, true);
+}
+#endif
+
+bool gui_net_server_request_device(gui_app_t *app, int device_index, bool monitor,
+                                   uint64_t observed_epoch) {
+#ifdef __ANDROID__
+    return android_server_request_device(app, device_index, monitor, observed_epoch, false);
+#else
+    (void)observed_epoch;
+    if (monitor) {
+        atomic_store(&app->net_cmd_monitor_device_index, device_index);
+        atomic_store(&app->net_cmd_monitor_select_device, true);
+    } else {
+        atomic_store(&app->net_cmd_device_index, device_index);
+        atomic_store(&app->net_cmd_select_device, true);
+    }
+    return true;
+#endif
+}
+
 /* Global init state. */
 static bool s_globals_init = false;
 
@@ -539,10 +737,19 @@ static atomic_bool s_transition_reenumerate = ATOMIC_VAR_INIT(false);
  * while no worker is running; read once by the worker at start. */
 static int s_transition_prev_mode = GUI_NET_MODE_LOCAL;
 static bool s_transition_force = false;
+#ifdef __ANDROID__
+static int s_deferred_force_mode = -1;  /* Main-thread pending port/host edit. */
+#endif
 
 bool gui_net_transition_busy(void) {
     return atomic_load(&s_transition_running);
 }
+
+#ifdef __ANDROID__
+bool gui_net_capture_controls_locked(const gui_app_t *app) {
+    return gui_net_transition_busy() || atomic_load(&app->net_reenumerate_pending);
+}
+#endif
 
 static int net_transition_normalize_mode(int mode) {
     if (mode == GUI_NET_MODE_MONITOR_SERVER) return GUI_NET_MODE_SERVER;
@@ -567,24 +774,34 @@ static int net_transition_thread(void *arg) {
         applied = want;
         /* Leaving a client mode / returning to Local: the main loop
          * re-enumerates local devices once (app->devices is main-owned). */
-        if (want == GUI_NET_MODE_LOCAL || prev == GUI_NET_MODE_CLIENT ||
-            prev == GUI_NET_MODE_MONITOR_CLIENT) {
+        if (
+#ifndef __ANDROID__
+            want == GUI_NET_MODE_LOCAL ||
+#endif
+            prev == GUI_NET_MODE_CLIENT || prev == GUI_NET_MODE_MONITOR_CLIENT) {
             atomic_store(&s_transition_reenumerate, true);
         }
     }
     bool reenum = atomic_exchange(&s_transition_reenumerate, false);
-    /* Completion flag last (seq_cst): every net_status write above is visible
-     * to the main thread before it resumes touching the net globals. */
-    atomic_store(&s_transition_running, false);
-    if (app && reenum) {
+    if (reenum) {
         /* app->devices is main-thread-owned: only the flag crosses threads. */
         atomic_store(&app->net_reenumerate_pending, true);
     }
+    /* Publish completion after the pending main-thread catalogue handoff. */
+    atomic_store(&s_transition_running, false);
     return 0;
 }
 
 int gui_net_request_apply_mode(gui_app_t *app, int prev_mode, bool force_reapply) {
     if (!app) return -1;
+#ifdef __ANDROID__
+    if (force_reapply && (gui_app_capture_busy() || gui_net_transition_busy())) {
+        s_deferred_force_mode = app->settings.net_mode;
+        gui_net_set_status(app, "Network settings will apply after the current change");
+        return 0;
+    }
+    s_deferred_force_mode = -1;
+#endif
     if (atomic_load(&s_transition_running)) {
         /* Queued, not refused: the click has already written the newest
          * target into settings.net_mode; the running worker chases it. */
@@ -826,7 +1043,7 @@ static void server_build_stats(gui_app_t *app, char *buf, size_t len) {
         "{\"state\":%d,\"sample_rate\":%u,\"total_samples\":%llu,"
         "\"frames\":%u,\"errors\":%u,\"selected_device\":%d,"
         "\"device_count\":%d,\"device_name\":\"%s\",\"device_type\":%d,"
-        "\"audio_frame_bytes\":%d,"
+        "\"audio_frame_bytes\":%d,\"capture_boundaries\":true,"
         "\"rf_fanout_queue_bytes\":%zu,\"audio_fanout_queue_bytes\":%zu,"
         "\"rf_fanout_stream_drops\":%llu,\"audio_fanout_stream_drops\":%llu}",
         state, (unsigned)sr, (unsigned long long)total,
@@ -898,7 +1115,8 @@ static int server_parse_arg(const char *uri_after_path, const char *key, int def
 }
 
 /* Split URI into path + query (in-place in a local copy). */
-static void server_handle_request(gui_app_t *app, net_sock_t fd, const char *method, char *uri) {
+static void server_handle_request(net_server_t *srv, net_sock_t fd, const char *method, char *uri) {
+    gui_app_t *app = srv->app;
     if (0 != strcmp(method, "GET")) {
         net_send_str(fd, "HTTP/1.0 405 Method Not Allowed\r\n\r\n");
         return;
@@ -953,19 +1171,24 @@ static void server_handle_request(gui_app_t *app, net_sock_t fd, const char *met
         return;
     }
     if (strcmp(uri, "/start") == 0) {
-        atomic_store(&app->net_cmd_start, true);
+        gui_net_server_request_capture(app, true);
         net_send_str(fd, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\nstart requested\r\n");
         return;
     }
     if (strcmp(uri, "/stop") == 0) {
-        atomic_store(&app->net_cmd_stop, true);
+        gui_net_server_request_capture(app, false);
         net_send_str(fd, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\nstop requested\r\n");
         return;
     }
     if (strcmp(uri, "/record") == 0) {
         int on = server_parse_arg(query, "on", 1);
+#ifdef __ANDROID__
+        atomic_fetch_or(&s_android_server_record,
+                        on ? ANDROID_SERVER_RECORD_ON : ANDROID_SERVER_RECORD_OFF);
+#else
         if (on) atomic_store(&app->net_cmd_record_on, true);
         else atomic_store(&app->net_cmd_record_off, true);
+#endif
         const char *msg = on ? "record on requested\r\n" : "record off requested\r\n";
         char hdr[128];
         snprintf(hdr, sizeof(hdr), "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\n\r\n", strlen(msg));
@@ -975,18 +1198,28 @@ static void server_handle_request(gui_app_t *app, net_sock_t fd, const char *met
     }
     if (strcmp(uri, "/device") == 0) {
         int n = server_parse_arg(query, NULL, 0);
-        atomic_store(&app->net_cmd_select_device, true);
-        atomic_store(&app->net_cmd_device_index, n);
-        net_send_str(fd, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\ndevice select requested\r\n");
+        if (gui_net_server_request_device(app, n, false, GUI_NET_DEVICE_EPOCH_NONE)) {
+            net_send_str(fd, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\ndevice select requested\r\n");
+        } else {
+            net_send_str(fd, "HTTP/1.0 409 Conflict\r\nContent-Type: text/plain\r\n\r\ndevice list changed\r\n");
+        }
         return;
     }
     if (strcmp(uri, "/rf") == 0 || strcmp(uri, "/baseband") == 0) {
-        net_send_str(fd, "HTTP/1.0 200 OK\r\nContent-Type: application/octet-stream\r\n\r\n");
-        net_fanout_t *f = (uri[1] == 'r') ? &s_server->rf : &s_server->audio;
-        atomic_int *ctr = (uri[1] == 'r') ? &s_server->rf_clients : &s_server->audio_clients;
-        atomic_fetch_add(ctr, 1);
+        net_fanout_t *f = (uri[1] == 'r') ? &srv->rf : &srv->audio;
+        atomic_int *ctr = (uri[1] == 'r') ? &srv->rf_clients : &srv->audio_clients;
         net_fanout_sub_t sub;
-        net_fanout_subscribe(f, &sub);
+        uint64_t capture_id = net_fanout_subscribe(f, &sub);
+        if (!capture_id) return;
+        char header[160];
+        snprintf(header, sizeof(header),
+                 "HTTP/1.0 200 OK\r\nContent-Type: application/octet-stream\r\n"
+                 "X-MISRC-Capture-Id: %" PRIu64 "\r\n\r\n", capture_id);
+        if (net_send_str(fd, header) != 0) {
+            net_fanout_unsubscribe(&sub);
+            return;
+        }
+        atomic_fetch_add(ctr, 1);
         uint8_t buf[64 * 1024];
         for (;;) {
             ssize_t n = net_fanout_read(&sub, buf, sizeof(buf), 1000);
@@ -1062,7 +1295,7 @@ static int server_client_thread(void *arg) {
         net_close(fd);
         goto done;
     }
-    server_handle_request(app, fd, method, uri);
+    server_handle_request(srv, fd, method, uri);
     net_close(fd);
 done:
     atomic_fetch_sub(&srv->active_workers, 1);
@@ -1165,8 +1398,9 @@ static int server_start(gui_app_t *app, uint16_t port) {
     atomic_store(&app->net_rf_server_queue_bytes, 0);
     atomic_store(&app->net_audio_server_stream_drops, 0);
     atomic_store(&app->net_audio_server_queue_bytes, 0);
-    net_fanout_init(&srv->rf, app, false);
-    net_fanout_init(&srv->audio, app, true);
+    uint64_t capture_id = net_next_capture_id();
+    net_fanout_init(&srv->rf, app, false, capture_id);
+    net_fanout_init(&srv->audio, app, true, capture_id);
 
     srv->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (!net_sock_valid(srv->listen_fd)) {
@@ -1204,14 +1438,19 @@ static int server_start(gui_app_t *app, uint16_t port) {
         fprintf(stderr, "[NET] server: beacon thread failed (non-fatal)\n");
     }
     s_server = srv;
+    atomic_store(&s_server_capture_tap, srv);
     app->net_state = srv;
     atomic_store(&app->net_connected, true);
     fprintf(stderr, "[NET] server listening on :%u\n", (unsigned)port);
     return 0;
 }
 
-static void server_stop(net_server_t *srv) {
+static void server_stop(net_server_t *srv, bool rebind) {
+#ifndef __ANDROID__
+    (void)rebind;
+#endif
     if (!srv) return;
+    server_capture_tap_withdraw();
     atomic_store(&srv->stop_flag, true);
     atomic_store(&srv->running, false);
     atomic_store(&srv->beacon_stop, true);
@@ -1244,6 +1483,15 @@ static void server_stop(net_server_t *srv) {
     }
     free(srv);
     s_server = NULL;
+#ifdef __ANDROID__
+    /* No old listener can post after its workers exit. Preserve an accepted
+     * Stop on a port-only rebind because the same local capture remains live. */
+    uint_fast64_t commands = atomic_exchange(&s_android_server_control, 0u);
+    if (rebind && (commands & ANDROID_SERVER_STOP))
+        atomic_store(&s_android_rebind_stop, true);
+    atomic_store(&s_android_server_record, 0u);
+    s_android_start_bound = false;
+#endif
 }
 
 /* -------------------------------------------------------------------------
@@ -1418,6 +1666,15 @@ static bool json_bool(const char *j, const char *key, bool def) {
     return (strncmp(p, "true", 4) == 0);
 }
 
+/* stream_mtx held. Revocation and final ring publication are serialized so
+ * a delayed old PCM packet cannot enter the ring after a new RF epoch. */
+static void client_revoke_streams_locked(net_client_t *cli) {
+    atomic_store(&cli->audio_stream_live, false);
+    atomic_store(&cli->app->net_rf_client_stream_live, false);
+    cli->rf_capture_id = 0;
+    atomic_fetch_add(&cli->source_boundary, 1);
+}
+
 /* Ingest pump thread: connect /rf (or /baseband), read body bytes, re-frame to
  * frame_bytes alignment, write into the buffer manager. Reconnects on any
  * transient stream drop (recv=0/error) with backoff so the feed stays alive
@@ -1433,6 +1690,15 @@ static int client_pump_thread(void *arg) {
     int reconnect_ms = 500;
 
     while (!atomic_load(&cli->pump_stop)) {
+        net_mutex_lock(&cli->stream_mtx);
+        bool ready = pc->is_audio ? atomic_load(&app->net_rf_client_stream_live)
+                                  : !atomic_load(&cli->rf_stream_ended);
+        uint_fast64_t boundary = atomic_load(&cli->source_boundary);
+        net_mutex_unlock(&cli->stream_mtx);
+        if (!ready) {
+            thrd_sleep_ms(5);
+            continue;
+        }
         net_sock_t fd = client_connect(cli->host, cli->port);
         if (!net_sock_valid(fd)) {
             /* Connect failed: backoff and retry (keep trying while the
@@ -1454,7 +1720,8 @@ static int client_pump_thread(void *arg) {
         size_t total = 0;
         int got_headers = 0;
         size_t body_off = 0;
-        while (total < sizeof(hbuf) - 1 && !atomic_load(&cli->pump_stop)) {
+        while (total < sizeof(hbuf) - 1 && !atomic_load(&cli->pump_stop) &&
+               boundary == atomic_load(&cli->source_boundary)) {
 #ifdef _WIN32
             int n = recv(fd, hbuf + total, (int)(sizeof(hbuf) - 1 - total), 0);
             if (n == 0) break;
@@ -1477,32 +1744,51 @@ static int client_pump_thread(void *arg) {
             char *eoh = strstr(hbuf, "\r\n\r\n");
             if (eoh) { got_headers = 1; body_off = (size_t)(eoh + 4 - hbuf); break; }
         }
-        if (!got_headers) {
+        if (!got_headers || (strncmp(hbuf, "HTTP/1.0 200", 12) != 0 &&
+                             strncmp(hbuf, "HTTP/1.1 200", 12) != 0)) {
             net_close(fd);
             thrd_sleep_ms(reconnect_ms);
-            continue;  /* no headers / stream closed: reconnect */
+            continue;  /* no accepted RF/audio stream: reconnect */
         }
         /* Carry over any body bytes already in hbuf. */
         size_t in_have = total - body_off;
         if (in_have > sizeof(inbuf)) in_have = sizeof(inbuf);
         memcpy(inbuf, hbuf + body_off, in_have);
+        hbuf[body_off - 2] = '\0';
+        const char *id_header = strstr(hbuf, "\r\nX-MISRC-Capture-Id: ");
+        uint64_t capture_id = id_header
+            ? (uint64_t)strtoull(id_header + sizeof("\r\nX-MISRC-Capture-Id: ") - 1, NULL, 10)
+            : 0;  // Legacy peers rely on socket generation alone.
 
         // A reconnect loses RF continuity even if the mirrored capture state
         // never became idle. Bind the new stream's first write to a new epoch.
         if (!pc->is_audio) atomic_fetch_add(&app->rf_stream_epoch, 1);
-        if (!pc->is_audio) atomic_store(&app->net_rf_client_stream_live, true);
         fprintf(stderr, "[NET] client pump %s streaming (frame=%d)\n", path, frame);
-        /* Body loop: read until the stream closes, then reconnect. */
-        while (!atomic_load(&cli->pump_stop)) {
-            if (in_have >= sizeof(inbuf)) {
-                size_t aligned = (in_have / frame) * frame;
-                if (aligned == 0) { in_have = 0; continue; }
-                uint8_t *out = (uint8_t *)bufmgr_write_begin(&app->buffers, pc->buf_id, aligned, NULL);
-                if (out) { memcpy(out, inbuf, aligned); bufmgr_write_end(&app->buffers, pc->buf_id, aligned); bufmgr_signal_data(&app->buffers, pc->buf_id); }
-                size_t leftover = in_have - aligned;
-                if (leftover) memmove(inbuf, inbuf + aligned, leftover);
-                in_have = leftover;
-                continue;
+        while (!atomic_load(&cli->pump_stop) && boundary == atomic_load(&cli->source_boundary)) {
+            // Process bytes that came with the HTTP header too, even if the next recv is EOF.
+            size_t aligned = (in_have / frame) * frame;
+            if (aligned) {
+                uint8_t *out = bufmgr_write_begin(&app->buffers, pc->buf_id, aligned, NULL);
+                if (out) memcpy(out, inbuf, aligned);
+                net_mutex_lock(&cli->stream_mtx);
+                bool current = !atomic_load(&cli->pump_stop) &&
+                    boundary == atomic_load(&cli->source_boundary) &&
+                    (!pc->is_audio || capture_id == cli->rf_capture_id);
+                if (current && out) {
+                    bufmgr_write_end(&app->buffers, pc->buf_id, aligned);
+                    bufmgr_signal_data(&app->buffers, pc->buf_id);
+                    if (pc->is_audio) atomic_store(&cli->audio_stream_live, true);
+                    else {
+                        cli->rf_capture_id = capture_id;
+                        atomic_store(&app->net_rf_client_stream_live, true);
+                    }
+                    atomic_store(&app->last_callback_time_ms, get_time_ms());
+                    atomic_store(&app->stream_synced, true);
+                }
+                net_mutex_unlock(&cli->stream_mtx);
+                if (!current) break;
+                in_have -= aligned;
+                if (in_have) memmove(inbuf, inbuf + aligned, in_have);
             }
 #ifdef _WIN32
             int n = recv(fd, (char *)(inbuf + in_have), (int)(sizeof(inbuf) - in_have), 0);
@@ -1522,24 +1808,23 @@ static int client_pump_thread(void *arg) {
             }
             in_have += (size_t)n;
 #endif
-            size_t aligned = (in_have / frame) * frame;
-            if (aligned > 0) {
-                uint8_t *out = (uint8_t *)bufmgr_write_begin(&app->buffers, pc->buf_id, aligned, NULL);
-                if (out) { memcpy(out, inbuf, aligned); bufmgr_write_end(&app->buffers, pc->buf_id, aligned); bufmgr_signal_data(&app->buffers, pc->buf_id); }
-                size_t leftover = in_have - aligned;
-                if (leftover) memmove(inbuf, inbuf + aligned, leftover);
-                in_have = leftover;
-                atomic_store(&app->last_callback_time_ms, get_time_ms());
-                atomic_store(&app->stream_synced, true);
+        }
+        net_mutex_lock(&cli->stream_mtx);
+        bool stopped = atomic_load(&cli->pump_stop);
+        if (pc->is_audio) {
+            if (!stopped) atomic_fetch_add(&app->net_audio_client_interruptions, 1);
+            atomic_store(&cli->audio_stream_live, false);
+        } else {
+            if (boundary == atomic_load(&cli->source_boundary)) client_revoke_streams_locked(cli);
+            if (!stopped) {
+                gui_record_mark_source_loss();
+                atomic_fetch_add(&app->net_rf_client_interruptions, 1);
+                atomic_store(&cli->rf_stream_ended, true);
             }
         }
-        /* Stream ended (recv 0 / error) or pump_stop: close and either reconnect
-         * or exit. */
+        net_mutex_unlock(&cli->stream_mtx);
         net_close(fd);
-        if (!pc->is_audio) atomic_store(&app->net_rf_client_stream_live, false);
-        if (atomic_load(&cli->pump_stop)) break;
-        if (pc->is_audio) atomic_fetch_add(&app->net_audio_client_interruptions, 1);
-        else atomic_fetch_add(&app->net_rf_client_interruptions, 1);
+        if (stopped) break;
         fprintf(stderr, "[NET] client pump %s stream dropped, reconnecting...\n", path);
         thrd_sleep_ms(reconnect_ms);
     }
@@ -1584,6 +1869,7 @@ static void client_start_ingest(gui_app_t *app, net_client_t *cli) {
     app->display_samples_available_b = 0;
 
     /* Treat the network feed as a MISRC-style dual-channel raw stream. */
+    atomic_store(&cli->rf_stream_ended, false);
     app->capture_backend_upstream = false;
     app->capture_has_channel_b = true;
     app->capture_mode_runtime_misrc = app->user_capture_mode_misrc;
@@ -1624,17 +1910,29 @@ static void client_start_ingest(gui_app_t *app, net_client_t *cli) {
     gui_net_set_status(app, "Client ingest running (mirroring server capture)");
 }
 
-/* Main-thread: stop ingest backend. */
+static void client_finish_recording(gui_app_t *app, bool interrupted) {
+    gui_record_cancel_capture_confirmation(app);
+    if (app->is_recording) {
+        if (interrupted) gui_record_mark_source_loss();
+        gui_app_stop_recording(app);
+    }
+}
+
+/* Stop ingest only after its recording has been disarmed. */
 static void client_stop_ingest(gui_app_t *app, net_client_t *cli) {
     if (!atomic_load(&cli->ingest_active)) return;
     fprintf(stderr, "[NET] client: stopping ingest backend\n");
+    net_mutex_lock(&cli->stream_mtx);
     atomic_store(&cli->pump_stop, true);
-    atomic_store(&app->net_rf_client_stream_live, false);
+    client_revoke_streams_locked(cli);
+    net_mutex_unlock(&cli->stream_mtx);
     /* The pump threads will exit when recv returns 0/error or pump_stop is seen.
      * They own their sockets; closing happens inside the thread. Join them. */
     thrd_join(cli->rf_pump_thread, NULL);
     thrd_join(cli->audio_pump_thread, NULL);
 
+    bool interrupted = atomic_exchange(&cli->rf_stream_ended, false);
+    if (app->is_recording) client_finish_recording(app, interrupted);
     app->is_capturing = false;
     if (app->display_thread) gui_display_thread_stop(app->display_thread);
     gui_audio_stop(app);
@@ -1685,6 +1983,8 @@ static int client_worker_thread(void *arg) {
     gui_app_t *app = cli->app;
     int backoff_ms = 500;
     int last_peer_state = -1;
+    int last_peer_rate = 0, last_peer_device = -1;
+    uint64_t last_peer_frames = UINT64_MAX;
     net_client_drop_baseline_t rf_drops = {0};
     net_client_drop_baseline_t audio_drops = {0};
     int miss_streak = 0;  /* consecutive /stats failures; tear down ingest only after several */
@@ -1778,6 +2078,25 @@ static int client_worker_thread(void *arg) {
         atomic_store(&app->net_audio_server_stream_drops,
                      net_client_session_drops(&audio_drops,
                          json_uint64(stats, "audio_fanout_stream_drops", 0)));
+        // Older peers can leave /rf open across a capture change. Use
+        // /stats to rotate the socket. New peers drain their old tail to EOF.
+        bool bounded = json_bool(stats, "capture_boundaries", false);
+        uint64_t frames = json_uint64(stats, "frames", UINT64_MAX);
+        bool restarted = frames != UINT64_MAX && last_peer_frames != UINT64_MAX &&
+            frames < last_peer_frames;
+        bool rate_changed = sr > 0 && last_peer_rate > 0 &&
+            llabs((int64_t)sr - last_peer_rate) > last_peer_rate / 1000;
+        if (!bounded && last_peer_state >= 1 && (st < 1 || restarted || rate_changed ||
+            (sel >= 0 && last_peer_device >= 0 && sel != last_peer_device))) {
+            net_mutex_lock(&cli->stream_mtx);
+            client_revoke_streams_locked(cli);
+            gui_record_mark_source_loss();
+            net_mutex_unlock(&cli->stream_mtx);
+        }
+        last_peer_rate = sr;
+        last_peer_device = sel;
+        last_peer_frames = frames;
+        atomic_store(&cli->peer_capture_boundaries, bounded);
         atomic_store(&cli->peer_state, st);
         atomic_store(&cli->peer_sample_rate, sr);
         atomic_store(&cli->peer_selected, sel);
@@ -2066,6 +2385,7 @@ static int client_start(gui_app_t *app, const char *host, uint16_t port,
     atomic_store(&cli->discovery_stop, false);
     net_mutex_init(&cli->dev_mtx);
     net_mutex_init(&cli->disc_mtx);
+    net_mutex_init(&cli->stream_mtx);
 
     /* An explicit mode change starts a fresh Client UI session. Monitor
      * Client has separate diagnostics and does not use the legacy fanout. */
@@ -2076,6 +2396,7 @@ static int client_start(gui_app_t *app, const char *host, uint16_t port,
         fprintf(stderr, "[NET] client: discovery thread failed\n");
         net_mutex_destroy(&cli->dev_mtx);
         net_mutex_destroy(&cli->disc_mtx);
+        net_mutex_destroy(&cli->stream_mtx);
         free(cli);
         return -1;
     }
@@ -2106,6 +2427,7 @@ static void client_stop(net_client_t *cli) {
     }
     net_mutex_destroy(&cli->dev_mtx);
     net_mutex_destroy(&cli->disc_mtx);
+    net_mutex_destroy(&cli->stream_mtx);
     free(cli);
     s_client = NULL;
 }
@@ -2114,20 +2436,28 @@ static void client_stop(net_client_t *cli) {
  * Public API
  * ------------------------------------------------------------------------- */
 
-void gui_net_stop(gui_app_t *app) {
-    /* A mode transition worker may be mid-apply; join it first so it never
-     * touches freed state afterwards. A FINISHED worker is joined too so its
-     * thread handle is never leaked. */
-    if (atomic_load(&s_transition_running)) {
+#ifndef __ANDROID__
+static
+#endif
+void gui_net_join_transition(void) {
+    /* A finished worker still owns a joinable handle. */
+    if (s_transition_thread_started) {
         thrd_join(s_transition_thread, NULL);
-        atomic_store(&s_transition_running, false);
-    } else if (s_transition_thread_started) {
-        thrd_join(s_transition_thread, NULL);
+        s_transition_thread_started = false;
     }
-    s_transition_thread_started = false;
+}
+
+void gui_net_stop(gui_app_t *app) {
+#ifdef __ANDROID__
+    s_deferred_force_mode = -1;
+#endif
+    gui_net_join_transition();
+#ifdef __ANDROID__
+    atomic_store(&s_android_rebind_stop, false);
+#endif
     gui_monitor_client_stop();
     gui_monitor_server_stop();
-    if (s_server) server_stop(s_server);
+    if (s_server) server_stop(s_server, false);
     if (s_client) client_stop(s_client);
     /* Apply any staged M-Client local-profile/device restore synchronously:
      * at shutdown the per-frame poller that normally consumes it is gone. */
@@ -2146,12 +2476,22 @@ int gui_net_apply_mode(gui_app_t *app) {
     if (want == GUI_NET_MODE_MONITOR_SERVER) {
         app->settings.net_mode = want = GUI_NET_MODE_SERVER;
     }
+    if (want != GUI_NET_MODE_SERVER && gui_monitor_local_save_recording()) {
+        app->settings.net_mode = GUI_NET_MODE_SERVER;
+        gui_net_set_status(app, "Finish Local Save before changing network mode");
+        return -1;
+    }
+    if (s_client && !s_client->monitor_only && app->is_recording) {
+        app->settings.net_mode = GUI_NET_MODE_CLIENT;
+        gui_net_set_status(app, "Stop recording before changing the Client connection");
+        return -1;
+    }
     /* Stop whatever is running if it doesn't match the desired mode. */
     if (s_server && want != GUI_NET_MODE_SERVER) {
         /* Persistent /monitor/video sockets live in HTTP workers. Signal
          * video workers to stop BEFORE server_stop() joins those workers. */
         gui_monitor_server_stop();
-        server_stop(s_server);
+        server_stop(s_server, false);
     }
     if (s_client && !((want == GUI_NET_MODE_CLIENT && !s_client->monitor_only) ||
                       (want == GUI_NET_MODE_MONITOR_CLIENT && s_client->monitor_only))) {
@@ -2180,12 +2520,17 @@ int gui_net_apply_mode(gui_app_t *app) {
         long p = atol(app->settings.net_server_port_str);
         if (p < 1 || p > 65535) { p = (long)app->settings.net_server_port; }
         if (p < 1 || p > 65535) p = 8080;
+        if (s_server && s_server->port != (uint16_t)p &&
+            gui_monitor_local_save_recording()) {
+            gui_net_set_status(app, "Finish Local Save before changing the server port");
+            return -1;
+        }
         app->settings.net_server_port = (uint16_t)p;
         if (s_server) {
             /* Already running: restart only if the listen port changed. */
             if (s_server->port != (uint16_t)p) {
                 gui_monitor_server_stop();
-                server_stop(s_server);
+                server_stop(s_server, true);
                 if (server_start(app, (uint16_t)p) != 0) {
                     gui_net_set_status(app, "Failed to restart network server");
                     return -1;
@@ -2209,7 +2554,7 @@ int gui_net_apply_mode(gui_app_t *app) {
             gui_monitor_server_stop();
         if (!gui_monitor_server_active() &&
             gui_monitor_server_start(app, (uint16_t)p) != 0) {
-            if (s_server) server_stop(s_server);
+            if (s_server) server_stop(s_server, false);
             gui_net_set_status(app, "Failed to enable monitor endpoints");
             return -1;
         }
@@ -2268,16 +2613,31 @@ int gui_net_apply_mode(gui_app_t *app) {
     return 0;
 }
 
+void gui_net_end_capture(gui_app_t *app) {
+    net_server_t *srv = server_capture_tap_acquire();
+    if (!srv) return;
+    if (srv->app == app) {
+        uint64_t capture_id = net_next_capture_id();
+        net_fanout_end_capture(&srv->rf, capture_id);
+        net_fanout_end_capture(&srv->audio, capture_id);
+    }
+    server_capture_tap_release();
+}
+
 void gui_net_tap_rf(gui_app_t *app, const void *data, size_t bytes) {
     (void)app;
-    if (s_server && s_server->rf.initialized) {
-        net_fanout_push(&s_server->rf, data, bytes);
+    net_server_t *srv = server_capture_tap_acquire();
+    if (srv) {
+        net_fanout_push(&srv->rf, data, bytes);
+        server_capture_tap_release();
     }
 }
 
 void gui_net_tap_audio(gui_app_t *app, const void *data, size_t bytes) {
-    if (s_server && s_server->audio.initialized) {
-        net_fanout_push(&s_server->audio, data, bytes);
+    net_server_t *srv = server_capture_tap_acquire();
+    if (srv) {
+        net_fanout_push(&srv->audio, data, bytes);
+        server_capture_tap_release();
     }
     /* Lightweight tap is exclusive to MISRC-M/2 subscribers; never encode
      * or wait inside the capture callback or the legacy /baseband fanout. */
@@ -2285,13 +2645,140 @@ void gui_net_tap_audio(gui_app_t *app, const void *data, size_t bytes) {
         gui_monitor_audio_server_tap(app,data,bytes);
 }
 
+#ifdef __ANDROID__
+static bool android_server_device_present(const device_info_t *device) {
+#ifdef ENABLE_RTLSDR
+    if (device->type == DEVICE_TYPE_RTLSDR) {
+        android_rtlsdr_usb_device_t attached[ANDROID_RTL_USB_MAX_DEVICES];
+        int count = android_rtlsdr_list_usb_devices(attached, ANDROID_RTL_USB_MAX_DEVICES);
+        for (int i = 0; i < count; ++i) {
+            if (attached[i].id == device->index) return true;
+        }
+        return false;
+    }
+#else
+    (void)device;
+#endif
+    return true;
+}
+
+static bool android_server_start_target_matches(const gui_app_t *app) {
+    if (!s_android_start_bound) return true;
+    if (!s_android_start_device_available ||
+        app->selected_device < 0 || app->selected_device >= app->device_count) return false;
+    const device_info_t *current = &app->devices[app->selected_device];
+    const device_info_t *expected = &s_android_start_device;
+#ifdef ENABLE_RTLSDR
+    if (expected->type == DEVICE_TYPE_RTLSDR &&
+        s_android_start_rtl_revision != android_rtlsdr_device_revision()) return false;
+#endif
+    return current->type == expected->type && current->index == expected->index &&
+           strcmp(current->name, expected->name) == 0 &&
+           strcmp(current->serial, expected->serial) == 0 &&
+           android_server_device_present(current);
+}
+
+static void android_poll_server_capture(gui_app_t *app) {
+    uint_fast64_t commands = atomic_load(&s_android_server_control);
+    if (commands & ANDROID_SERVER_STOP) {
+        if (atomic_compare_exchange_strong(&s_android_server_control, &commands,
+                                          commands & ~(uint_fast64_t)ANDROID_SERVER_STOP)) {
+            gui_app_stop_server_capture_async(app);
+        }
+        return;
+    }
+    unsigned device = (commands >> ANDROID_SERVER_DEVICE_SHIFT) & ANDROID_SERVER_DEVICE_MASK;
+    bool monitor = (commands & ANDROID_SERVER_MONITOR_DEVICE) != 0;
+    bool targeted = (commands & ANDROID_SERVER_TARGETED_START) != 0;
+    bool start_only = device && targeted && !monitor;
+    /* Until the stop worker releases the old device, is_capturing can still
+     * describe the source being replaced by an accepted Device switch. */
+    if (gui_app_capture_busy() || gui_playback_is_starting(app)) return;
+    /* A standalone Start on a stable running capture is redundant, even
+     * while recording. Do not leave it pending until capture stops. */
+    if (start_only && app->is_capturing) {
+        atomic_compare_exchange_strong(&s_android_server_control, &commands, 0u);
+        return;
+    }
+
+    if (device) {
+        if (!start_only && (app->is_recording || gui_record_is_finalizing())) return;
+        int index = (int)device - 1;
+        unsigned generation = (unsigned)(commands >> ANDROID_SERVER_CATALOGUE_SHIFT);
+#ifdef ENABLE_RTLSDR
+        unsigned rtl_revision = android_rtlsdr_device_revision();
+#endif
+        bool available = index < app->device_count &&
+                         generation == atomic_load(&app->net_device_catalogue_generation) &&
+                         android_server_device_present(&app->devices[index]);
+        if (start_only)
+            available = available && index == app->selected_device && android_server_start_target_matches(app);
+        uint_fast64_t transport = commands & (ANDROID_SERVER_TRANSPORT | ANDROID_SERVER_TARGETED_START);
+        if (targeted && !available)
+            transport &= ~(ANDROID_SERVER_START | ANDROID_SERVER_TARGETED_START);
+        /* The server owns automatic restart too. A later Stop cancels
+         * this Start, without discarding the requested device. */
+        if (available && monitor && app->is_capturing && index != app->selected_device)
+            transport |= ANDROID_SERVER_START;
+        if (atomic_compare_exchange_strong(&s_android_server_control, &commands, transport)) {
+            /* A rejected standalone Start says nothing about the selected
+             * device. Do not invalidate the binding for other controllers. */
+            if (!start_only || available) {
+                s_android_start_bound = true;
+                s_android_start_device_available = available;
+            }
+            if (!available) {
+                gui_app_set_status(app, "Device list changed. Select the capture device again.");
+            } else {
+                s_android_start_device = app->devices[index];
+#ifdef ENABLE_RTLSDR
+                s_android_start_rtl_revision = rtl_revision;
+#endif
+                if (!start_only && (monitor || !app->is_capturing)) {
+                    gui_app_select_capture_device_async(app, index, monitor, false);
+                }
+            }
+        }
+        return;
+    }
+
+    /* Revalidate after the main loop's hotplug poll, including a request
+     * whose Device arrived before its Start. */
+    if ((commands & ~ANDROID_SERVER_TARGETED_START) == ANDROID_SERVER_START &&
+        atomic_compare_exchange_strong(&s_android_server_control, &commands, 0u)) {
+        if (!android_server_start_target_matches(app)) {
+            /* Keep failed identity bound. Repeated Start must never fall back
+             * to the replacement now occupying the selected slot. */
+            s_android_start_device_available = false;
+            gui_app_set_status(app, "Requested capture device changed. Select it again.");
+        } else if (!app->is_capturing) {
+            gui_app_start_capture_async(app);
+        }
+    }
+}
+#endif
+
 void gui_net_poll_commands(gui_app_t *app) {
     if (!app) return;
     /* Transition worker owns the net globals while it runs; skip the frame. */
+#ifdef __ANDROID__
+    if (gui_net_capture_controls_locked(app)) return;
+    /* The old listener may have accepted Stop even if the replacement bind
+     * failed. Dispatch before polling the replacement listener's commands. */
+    if (atomic_exchange(&s_android_rebind_stop, false) &&
+        app->settings.net_mode == GUI_NET_MODE_SERVER) {
+        gui_app_stop_server_capture_async(app);
+        return;
+    }
+#else
     if (atomic_load(&s_transition_running)) return;
+#endif
     if(gui_monitor_server_active())gui_monitor_server_poll_settings(app);
     /* Server mode: execute queued commands locally on the main thread. */
     if (s_server || gui_monitor_server_active()) {
+#ifdef __ANDROID__
+        android_poll_server_capture(app);
+#else
         if (atomic_exchange(&app->net_cmd_start, false)) {
             if (!app->is_capturing) {
                 fprintf(stderr, "[NET] server: executing /start\n");
@@ -2304,6 +2791,7 @@ void gui_net_poll_commands(gui_app_t *app) {
                 gui_app_stop_capture(app);
             }
         }
+#endif
         /* Distinct command channels preserve each protocol's semantics when
          * both kinds of client are connected to this Server at once. */
         uint64_t monitor_record_id=0;
@@ -2312,6 +2800,7 @@ void gui_net_poll_commands(gui_app_t *app) {
             unsigned result=0; /* 0=success, 1=failed, 2=pending GUI confirmation */
             char reason[384]={0};
             if(monitor_record==3){
+                gui_record_cancel_capture_confirmation(app);
                 if(app->is_recording){
                     fprintf(stderr,"[M-SERVER] executing /monitor/record off\n");
                     gui_app_stop_recording(app);
@@ -2322,6 +2811,9 @@ void gui_net_poll_commands(gui_app_t *app) {
             }else if(app->is_recording){
                 result=1;
                 snprintf(reason,sizeof(reason),"Recording is already running");
+            }else if(gui_record_is_finalizing()){
+                result=1;
+                snprintf(reason,sizeof(reason),"Previous recording is finalizing");
             }else{
                 bool local=monitor_record==2;
                 fprintf(stderr,"[M-SERVER] executing /monitor/record on (local=%d)\n",local);
@@ -2353,7 +2845,12 @@ void gui_net_poll_commands(gui_app_t *app) {
             }
             gui_monitor_server_record_result(monitor_record_id,result,reason);
         }
+#ifdef __ANDROID__
+        unsigned server_record = atomic_exchange(&s_android_server_record, 0u);
+        if (server_record & ANDROID_SERVER_RECORD_ON) {
+#else
         if (atomic_exchange(&app->net_cmd_record_on, false)) {
+#endif
             if (app->is_capturing && !app->is_recording) {
                 fprintf(stderr, "[NET] server: executing /record on\n");
                 int record_rc = gui_app_start_recording(app); /* legacy always records to server */
@@ -2365,15 +2862,22 @@ void gui_net_poll_commands(gui_app_t *app) {
                             app->status_message[0] ? app->status_message : "no status provided");
             }
         }
+#ifdef __ANDROID__
+        if (server_record & ANDROID_SERVER_RECORD_OFF) {
+#else
         if (atomic_exchange(&app->net_cmd_record_off, false)) {
+#endif
+            gui_record_cancel_capture_confirmation(app);
             if (app->is_recording) {
                 fprintf(stderr, "[NET] server: executing /record off\n");
                 gui_app_stop_recording(app);
             }
         }
+#ifndef __ANDROID__
         if (atomic_exchange(&app->net_cmd_monitor_select_device, false)) {
             int n = atomic_exchange(&app->net_cmd_monitor_device_index, -1);
-            if (!app->is_recording && n >= 0 && n < app->device_count) {
+            if (!app->is_recording && n >= 0 && n < app->device_count &&
+                n != app->selected_device) {
                 bool restart = app->is_capturing;
                 if (restart) gui_app_stop_capture(app);
                 app->selected_device = n;
@@ -2392,6 +2896,7 @@ void gui_net_poll_commands(gui_app_t *app) {
                 app->selected_device = n;
             }
         }
+#endif
     }
     /* Client mode: the worker drains the command flags and forwards them; we
      * must NOT execute them locally. Nothing to do here for client. */
@@ -2405,6 +2910,18 @@ void gui_net_poll_mirror(gui_app_t *app) {
      * (possibly driven by the transition worker) defers its app->settings and
      * app->devices writes here, on their owning main thread. */
     (void)gui_monitor_client_take_pending_restore(app);
+#ifdef __ANDROID__
+    /* Keep capture controls locked until this same poll has both restored
+     * the local profile and rebuilt the device catalogue. */
+    if (!gui_app_capture_busy() && atomic_load(&app->net_reenumerate_pending)) {
+        gui_app_enumerate_devices(app);
+        atomic_store(&app->net_reenumerate_pending, false);
+    }
+    if (s_deferred_force_mode == app->settings.net_mode && !gui_app_capture_busy()) {
+        if (gui_net_request_apply_mode(app, s_deferred_force_mode, true) == 0) return;
+        gui_net_set_status(app, "Could not apply deferred network settings");
+    }
+#endif
     if(app->settings.net_mode==GUI_NET_MODE_MONITOR_CLIENT) {
         gui_monitor_client_sync_main(app);
         if(gui_monitor_client_connected()) {
@@ -2442,7 +2959,18 @@ void gui_net_poll_mirror(gui_app_t *app) {
         if (want && !active && atomic_load(&s_client->connected)) {
             client_start_ingest(app, s_client);
         } else if (!want && active) {
+            client_finish_recording(app, true);
             client_stop_ingest(app, s_client);
+        } else if (active && atomic_load(&s_client->rf_stream_ended)) {
+            client_finish_recording(app, true);
+            // Keep both pumps fenced until the RF consumer drops the old
+            // connection's queued tail. WAV uses a fresh start cursor.
+            if (gui_extract_discard_client_rf(app))
+                atomic_store(&s_client->rf_stream_ended, false);
+        } else if (active && app->is_recording &&
+                   !atomic_load(&s_client->peer_capture_boundaries) &&
+                   !gui_net_client_peer_capturing(app)) {
+            client_finish_recording(app, true);
         }
         /* Mirror peer sample rate into app for display. The local capture
          * path updates app->sample_rate from stream metadata every frame;
@@ -2454,9 +2982,12 @@ void gui_net_poll_mirror(gui_app_t *app) {
     }
 }
 
-void gui_net_client_request_start(gui_app_t *app) {
-    if (!app) return;
+bool gui_net_client_request_start(gui_app_t *app) {
+    if (!app) return false;
+    if (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT)
+        return !gui_net_transition_busy() && gui_monitor_client_request_start(app);
     atomic_store(&app->net_cmd_start, true);
+    return true;
 }
 
 void gui_net_client_request_stop(gui_app_t *app) {
@@ -2470,10 +3001,13 @@ void gui_net_client_request_record(gui_app_t *app, bool on) {
     else atomic_store(&app->net_cmd_record_off, true);
 }
 
-void gui_net_client_request_device(gui_app_t *app, int device_index) {
-    if (!app) return;
+bool gui_net_client_request_device(gui_app_t *app, int device_index) {
+    if (!app || gui_net_transition_busy()) return false;
+    if (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT)
+        return gui_monitor_client_request_device(app, device_index);
     atomic_store(&app->net_cmd_device_index, device_index);
     atomic_store(&app->net_cmd_select_device, true);
+    return true;
 }
 
 /* Discovery: return the current count of discovered servers (client mode). */
@@ -2511,12 +3045,17 @@ bool gui_net_get_discovered(int index, char *host, size_t host_cap,
  * the client host/port settings and re-applies mode so the worker reconnects. */
 void gui_net_select_discovered(gui_app_t *app, int index) {
     if (!app || !s_client || atomic_load(&s_transition_running)) return;
+    if (!s_client->monitor_only && app->is_recording) {
+        gui_net_set_status(app, "Finish recording before changing the Client host");
+        return;
+    }
     char host[64] = {0};
     uint16_t port = 0;
     char name[64] = {0};
     if (!gui_net_get_discovered(index, host, sizeof(host), &port, name, sizeof(name))) {
         return;
     }
+    if (!s_client->monitor_only) gui_record_cancel_capture_confirmation(app);
     snprintf(app->settings.net_client_host, sizeof(app->settings.net_client_host), "%s", host);
     app->settings.net_client_port = port;
     snprintf(app->settings.net_client_port_str, sizeof(app->settings.net_client_port_str), "%u", (unsigned)port);
@@ -2548,6 +3087,17 @@ bool gui_net_client_connection_running(const gui_app_t *app) {
         return gui_monitor_client_running();
     if (!s_client) return false;
     return atomic_load(&s_client->worker_started);
+}
+
+bool gui_net_client_wav_ready(const gui_app_t *app) {
+    if (!app || gui_net_transition_busy() || !s_client ||
+        s_client->app != app || s_client->monitor_only) return false;
+    net_client_t *cli = s_client;
+    net_mutex_lock(&cli->stream_mtx);
+    bool ready = atomic_load(&cli->audio_stream_live) &&
+                 atomic_load(&app->net_rf_client_stream_live);
+    net_mutex_unlock(&cli->stream_mtx);
+    return ready;
 }
 
 bool gui_net_client_peer_capturing(const gui_app_t *app) {
@@ -2599,6 +3149,7 @@ void gui_net_client_toggle_connection(gui_app_t *app) {
 
     bool connected_now = atomic_load(&s_client->connected);
     if (connected_now) {
+        gui_record_cancel_capture_confirmation(app);
         client_stop_worker(s_client);
         if (h && h[0]) {
             char msg[128];

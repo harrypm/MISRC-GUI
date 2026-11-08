@@ -3,6 +3,7 @@
 
 #include "../core/gui_app.h"
 #include "../../common/buffer_manager.h"
+#include "../../common/file_utils.h"
 
 // Start audio writer/monitor thread.
 // If no audio outputs are enabled in settings, this is a no-op and returns 0.
@@ -10,6 +11,15 @@ int gui_audio_start(gui_app_t *app, buffer_manager_t *bufmgr);
 
 // Stop audio writer/monitor thread if running.
 void gui_audio_stop(gui_app_t *app);
+/* Record paths are resolved by the caller before publishing a new session. */
+#define GUI_AUDIO_RECORD_OUTPUT_COUNT 7
+#define GUI_AUDIO_RECORD_PATH_MAX (FILE_PATH_MAX + MAX_FILENAME_LEN)
+void gui_audio_begin_recording(const gui_app_t *app,
+    const char paths[GUI_AUDIO_RECORD_OUTPUT_COUNT][GUI_AUDIO_RECORD_PATH_MAX],
+    unsigned overwrite_mask);
+/* Record-only stop keeps the monitor running. Wait from the finalizer. */
+void gui_audio_request_record_stop(const gui_app_t *app);
+bool gui_audio_wait_recording_idle(void);
 
 // True if audio thread is running.
 bool gui_audio_is_running(void);

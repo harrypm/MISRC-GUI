@@ -12,7 +12,10 @@
 static int checks;
 static int failures;
 static const char *test_case;
+enum { TEST_RECORD_READOUT_PX = 18, TEST_MONO_TEXTURE = 2 };
 static float test_font_width = 1;
+static float test_mono_advance = 9.6f;
+static Font test_fonts[2];
 static gui_app_t test_app;
 
 static void expect_true(bool condition, const char *message)
@@ -37,11 +40,11 @@ Font GetFontDefault(void)
 
 Vector2 gui_font_measure_text(Font font, const char *text, float font_size, float spacing)
 {
-    (void)font;
     float width = 0;
     for (size_t i = 0; text[i]; i++) {
         char character = text[i];
-        float advance = character == '1' ? 4 : character == '7' ? 9 :
+        float advance = font.texture.id == TEST_MONO_TEXTURE ? test_mono_advance :
+            character == '1' ? 4 : character == '7' ? 9 :
             character == '+' || character == '-' ? 6 :
             character == ':' || character == ' ' ? 3 :
             character >= 'A' && character <= 'Z' ? 8 : 7;
@@ -79,6 +82,12 @@ static void reset_app(void)
     atomic_init(&test_app.recording_compressed_a, 0);
     atomic_init(&test_app.recording_compressed_b, 0);
     test_font_width = 1;
+    test_mono_advance = 9.6f;
+    test_fonts[0] = GetFontDefault();
+    test_fonts[0].texture.id = 1;
+    test_fonts[1] = test_fonts[0];
+    test_fonts[1].texture.id = TEST_MONO_TEXTURE;
+    test_app.fonts = test_fonts;
     s_ui_scale_percent = 200;
 }
 
@@ -97,6 +106,11 @@ static const uint32_t test_counts[] = {
 static int text_width(const char *text)
 {
     return (int)ceilf(gui_font_measure_text(GetFontDefault(), text, 16, 0).x);
+}
+
+static int record_text_width(const char *text)
+{
+    return (int)ceilf(gui_font_measure_text(test_fonts[1], text, TEST_RECORD_READOUT_PX, 0).x);
 }
 
 static void expect_same_layout(gui_channel_stats_layout_t actual,
@@ -146,11 +160,12 @@ static void check_static_content(gui_channel_stats_layout_t layout,
                 "columns and insets exactly fill the sidebar width");
     expect_true(44 + layout.gap <= layout.view_width,
                 "two existing CXADC DC buttons retain their full width");
-    /* The readout budget uses decimal (SI) GB = UINT64_MAX / 1e9, matching
-     * gui_ui_stats_layout's record_size_max formula. Keep this in sync with
-     * the division in gui_ui.c:gui_ui_stats_layout. */
-    expect_true(text_width("RAW: 18446744073.71 GB") <= layout.width - layout.padding * 2,
-                "the full RAW size readout does not gain another line");
+    /* The approved compact layout reserves one 18 px Space Mono line
+     * for decimal GB readouts through 99,999.99 GB. */
+    expect_true(record_text_width("RAW: 99999.99 GB") <= layout.width - layout.padding * 2,
+                "the RAW size readout near 100 TB fits on one line");
+    expect_true(record_text_width("FLAC: 99999.99 GB") <= layout.width - layout.padding * 2,
+                "the FLAC size readout near 100 TB fits on one line");
     int slot = (layout.view_width - layout.gap) / 2;
     expect_true(text_width("+100%") <= slot && text_width("-100%") <= slot,
                 "both complete full-scale peaks fit independent fixed slots");
@@ -296,11 +311,20 @@ static void test_fractional_font_budget(void)
     test_case = "fractional glyph advances";
     test_font_width = 1.125f;
     gui_channel_stats_layout_t layout = gui_ui_stats_layout(&test_app, true, 1);
-    int slot = (layout.view_width - layout.gap) / 2;
     int numeric_width = layout.label_width + layout.gap + text_width("+777M") * 2 + layout.gap;
-    int record_width = text_width("RAW: 18446744073.71 GB");
-    expect_true(near(layout.width, fmaxf(numeric_width, record_width) + layout.padding * 2),
-                "compact widths retain recording space without rounding counters glyph by glyph");
+    int record_width = record_text_width("FLAC: 99999.99 GB");
+    expect_true(record_width > numeric_width &&
+                near(layout.width, record_width + layout.padding * 2),
+                "compact width uses the approved Space Mono budget without extra reserve");
+
+    /* Let the counters set the width as well, so rounding each glyph up
+     * separately cannot pass hidden underneath the recording reserve. */
+    test_mono_advance = 6.0f;
+    layout = gui_ui_stats_layout(&test_app, true, 1);
+    int slot = (layout.view_width - layout.gap) / 2;
+    expect_true(record_text_width("FLAC: 99999.99 GB") < numeric_width &&
+                near(layout.width, numeric_width + layout.padding * 2),
+                "compact counter width rounds the complete text once");
     check_static_content(layout, true, 1);
     check_counter_formatting(layout);
     check_live_value_invariance(layout, true, 1);
@@ -325,6 +349,9 @@ static void test_fractional_font_budget(void)
 
 int main(void)
 {
+    test_case = "recording readout font size";
+    expect_true(FONT_SIZE_RECORD_READOUT == TEST_RECORD_READOUT_PX,
+                "recording readout remains at the approved 18 px");
     test_static_layout_and_counters();
     test_fractional_font_budget();
     printf("Channel stats layout: %d checks, %d failures\n", checks, failures);

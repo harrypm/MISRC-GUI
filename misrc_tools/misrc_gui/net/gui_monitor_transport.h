@@ -33,6 +33,12 @@ bool gui_monitor_client_take_pending_restore(gui_app_t *app);
 bool gui_monitor_client_running(void);
 bool gui_monitor_client_matches(const char *host, uint16_t port);
 bool gui_monitor_client_connected(void);
+bool gui_monitor_client_request_device(gui_app_t *app, int device_index);
+bool gui_monitor_client_request_start(gui_app_t *app);
+void gui_monitor_client_device_frame_rendered(void);
+#ifdef __ANDROID__
+bool gui_monitor_server_device_epoch_matches(uint64_t observed, unsigned generation);
+#endif
 int gui_monitor_client_peer_state(void);
 uint32_t gui_monitor_client_peer_rate(void);
 uint32_t gui_monitor_client_peer_frames(void);

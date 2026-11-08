@@ -686,8 +686,7 @@ if raylib_dep.found()
     # no separate libpthread; -lpthread fails to link). -ldl is a bionic stub.
     gui_ldflags += ['-lEGL', '-lGLESv2', '-lGLESv3', '-landroid', '-llog', '-lOpenSLES', '-lm', '-ldl']
     sources_gui += 'misrc_capture/simple_capture/simple_capture_android.c'
-    # JNI bridge: MainActivity.nativeSetUsbFd -> android_usb_get_fd() so the
-    # hsdaoh capture path can wrap the Java-granted USB fd with uvc_wrap().
+    # JNI bridge gives each hsdaoh session its own Java-granted USB descriptor.
     sources_gui += 'misrc_gui/input/android_usb_jni.c'
   elif host_system == 'darwin'
     gui_ldflags += ['-Wl,-framework,OpenGL', '-Wl,-framework,Cocoa', '-Wl,-framework,IOKit', '-Wl,-framework,CoreAudio', '-Wl,-framework,CoreVideo']
@@ -838,10 +837,20 @@ if raylib_dep.found()
       # gui_record.c writes through the mls_proxy_* API since bdcbb7a; the
       # CPU-only harnesses link the stdio-passthrough stub (never the networked
       # local-save stack). Same rule as gui_playback_audio_stub.c.
+      record_paths_deps = overlay_test_deps + [flac_dep, dependency('threads')]
+      if soxr_dep.found()
+        record_paths_deps += [soxr_dep]
+      endif
+      if host_system == 'windows'
+        record_paths_deps += [meson.get_compiler('c').find_library('onecore')]
+      endif
       record_paths_test = executable('gui_record_paths_test',
         ['test/gui_record_paths_test.c', 'common/file_utils.c', version_target,
-         'test/monitor_local_save_stub.c'],
-        dependencies: overlay_test_deps + [flac_dep], include_directories: gui_includes,
+         'test/monitor_local_save_stub.c', 'common/flac_writer.c',
+         'misrc_gui/output/gui_record_direct.c',
+         'misrc_gui/net/monitor_local_save_protocol.c',
+         'common/buffer_manager.c', 'common/ringbuffer.c', 'common/rb_event.c'],
+        dependencies: record_paths_deps, include_directories: gui_includes,
         c_args: cflags + ['-fwhole-program'], link_args: ldflags,
         override_options: ['b_lto=true', 'optimization=2'])
       test('gui_record_paths', record_paths_test)
@@ -1184,6 +1193,18 @@ ddd_async_policy_test = executable('gui_ddd_async_policy_test',
   c_args: cflags,
 )
 test('gui_ddd_async_policy', ddd_async_policy_test)
+
+ringbuffer_test_deps = []
+if host_system == 'windows'
+  ringbuffer_test_deps += [meson.get_compiler('c').find_library('onecore')]
+endif
+ringbuffer_wrap_test = executable('ringbuffer_wrap_test',
+  ['test/ringbuffer_wrap_harness.c', 'common/ringbuffer.c'],
+  include_directories: include_directories('common'),
+  dependencies: ringbuffer_test_deps,
+  c_args: cflags,
+)
+test('ringbuffer_wrap', ringbuffer_wrap_test)
 
 # Byte-exact direct RAW record path: the real tap push + writer thread
 # against the real buffer manager/ringbuffer, with an in-memory spill stub

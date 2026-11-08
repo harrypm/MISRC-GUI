@@ -26,6 +26,8 @@ typedef enum {
 // Initialize recording subsystem
 void gui_record_init(void);
 
+/* Wait for recording finalization without resetting capture or writer state. */
+void gui_record_wait_for_finalize(void);
 // Cleanup recording subsystem
 void gui_record_cleanup(void);
 
@@ -41,6 +43,8 @@ int gui_record_start(gui_app_t *app);
 // Check popup result and continue recording if confirmed
 // Call this each frame when gui_record_is_pending() returns true
 void gui_record_check_popup(gui_app_t *app);
+/* Main-thread capture handoff invalidates a pending overwrite confirmation. */
+void gui_record_cancel_capture_confirmation(gui_app_t *app);
 
 // Check if waiting for popup confirmation
 bool gui_record_is_pending(void);
@@ -50,6 +54,8 @@ void gui_record_stop(gui_app_t *app);
 
 // Returns true while record-stop finalization is running in background.
 bool gui_record_is_finalizing(void);
+/* The last completed stop lost data or failed to close/commit an output. */
+bool gui_record_last_stop_failed(void);
 
 // Check if recording is active
 bool gui_record_is_active(void);
@@ -59,19 +65,20 @@ bool gui_record_is_active(void);
 // finalizing icon when capture ends while the write issue persists.
 bool gui_record_has_write_error(void);
 
+// Latch input loss during the active recording so finalization fails.
+void gui_record_mark_source_loss(void);
+/* Capture PCM failure affects recordings that requested a WAV output. */
+void gui_record_mark_audio_source_loss(void);
+
 // Append a timestamped capture/record event to the active session log (if any)
 void gui_record_log_capture_event(gui_app_t *app, const char *level, const char *message,
                                   gui_error_class_t error_class, uint32_t error_count);
 
-// Spillover support for record-path backpressure.
-// Channel: 0 = A, 1 = B.
-bool gui_record_spill_is_forced(int channel);
-// Clear the sticky spill-forced flag for a channel. Call this when the
-// in-memory record ringbuffer write succeeds again, so the capture path
-// returns to direct ringbuffer -> FLAC encoding and the spill temp file
-// can be recycled via the existing drain path. Prevents a single
-// backpressure blip from permanently routing recording through disk.
-void gui_record_spill_clear_forced(int channel);
+// Publish converted int16 samples, keeping newer samples behind older spill.
+bool gui_record_push_converted(gui_app_t *app, int channel, const int16_t *samples,
+                               size_t bytes, uint32_t frame_index,
+                               char *error_msg, size_t error_msg_size);
+
 // Spillover support for record-path backpressure. Byte-generic: `data` may
 // be the extraction thread's int16 sample blocks or the direct RAW path's
 // native device bytes.

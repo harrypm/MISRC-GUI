@@ -13,6 +13,7 @@
 #include "gui_monitor_settings.h"
 #include "gui_monitor_local_save.h"
 #include "../output/gui_record.h"
+#include "gui_net.h"
 #include "../ui/gui_popup.h"
 #include "../../common/buffer_manager.h"
 #include "../../common/file_utils.h"
@@ -23,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <limits.h>
 #include <math.h>
 #include <time.h>
 #ifdef _WIN32
@@ -127,6 +129,13 @@ static struct {
     unsigned result_code; /* 0=started/stopped; 1=failed; 2=awaiting confirmation */
     char detail[256]; /* URL-encoded; safe to embed in a JSON string */
 } g_record_result;
+static void mon_record_reset_locked(gui_app_t *app){
+    atomic_store(&app->net_cmd_monitor_record,0);
+    g_record_result.pending_id=0;
+    g_record_result.completed_id=0;
+    g_record_result.result_code=0;
+    g_record_result.detail[0]=0;
+}
 static atomic_flag g_record_ui_lock=ATOMIC_FLAG_INIT;
 static char g_record_ui_message[512];
 static bool g_record_ui_pending;
@@ -140,6 +149,10 @@ static void mon_record_ui_error(const char *message){
 uint64_t gui_monitor_server_queue_record(gui_app_t *app,int command){
     if(!app || command<1 || command>3)return 0;
     mon_record_lock();
+    if(!atomic_load(&g_server.active) || g_server.app!=app){
+        mon_record_unlock();
+        return 0;
+    }
     uint64_t id=++g_record_result.next_id;
     if(!id)id=++g_record_result.next_id;
     g_record_result.pending_id=id;
@@ -151,6 +164,10 @@ int gui_monitor_server_take_record(gui_app_t *app,uint64_t *request_id){
     if(request_id)*request_id=0;
     if(!app)return 0;
     mon_record_lock();
+    if(!atomic_load(&g_server.active) || g_server.app!=app || !g_record_result.pending_id){
+        mon_record_unlock();
+        return 0;
+    }
     int command=atomic_exchange(&app->net_cmd_monitor_record,0);
     if(command && request_id)*request_id=g_record_result.pending_id;
     if(command)g_record_result.pending_id=0;
@@ -173,9 +190,11 @@ void gui_monitor_server_record_result(uint64_t request_id,unsigned result,const 
         encoded[n]=0;
     }
     mon_record_lock();
-    g_record_result.completed_id=request_id;
-    g_record_result.result_code=result;
-    snprintf(g_record_result.detail,sizeof(g_record_result.detail),"%s",encoded);
+    if(atomic_load(&g_server.active)){
+        g_record_result.completed_id=request_id;
+        g_record_result.result_code=result;
+        snprintf(g_record_result.detail,sizeof(g_record_result.detail),"%s",encoded);
+    }
     mon_record_unlock();
 }
 /* Phase 2I: fully M-only remote recording config and device catalogue.
@@ -202,12 +221,21 @@ static struct {
      * never allow a remote-only index into the legacy Local path. */
     device_info_t local_devices[MAX_DEVICES];
     int local_count,local_selected;
-    bool device_ready,device_seen;
+    uint64_t device_epoch,displayed_device_epoch,requested_device_epoch,requested_start_epoch;
+    int requested_device,displayed_device_count,displayed_selected_device,requested_start_index;
+    bool device_ready,device_seen,device_request_pending,device_click_blocked;
+    bool start_epoch_supported,displayed_start_epoch_supported,start_binding_required,device_explicitly_selected;
+    bool device_bound_supported,displayed_device_bound_supported,requested_device_bound;
+    bool requested_device_is_noop;
+    bool stale_device_click;
 } g_cfg_client;
 static void mon_cfg_disconnect(void){
     cfg_lock();g_cfg_client.received=false;g_cfg_client.initialized=false;
     g_cfg_client.send_pending=false;g_cfg_client.send_sent=false;g_cfg_client.device_ready=false;
-    g_cfg_client.device_seen=false;cfg_unlock();
+    g_cfg_client.device_seen=false;g_cfg_client.device_request_pending=false;
+    g_cfg_client.device_click_blocked=false;g_cfg_client.stale_device_click=false;
+    g_cfg_client.device_explicitly_selected=false;g_cfg_client.start_binding_required=false;
+    g_cfg_client.requested_start_epoch=GUI_NET_DEVICE_EPOCH_NONE;cfg_unlock();
 }
 /* Settings are returned as percent-escaped key=value lines (no arbitrary JSON
  * deserialization or raw structs across different compilers/platforms). */
@@ -348,6 +376,26 @@ static bool mon_cfg_pack(const gui_settings_t *s,char *dst,size_t cap){
     }
     return true;
 }
+#ifdef __ANDROID__
+/* A catalogue generation can repeat after rebind or process restart. Seed a
+ * fresh namespace on every listener start. Keep full tokens above UINT32_MAX
+ * so they are distinct from the previous protocol's 32-bit field. */
+static atomic_uint_fast64_t g_device_epoch_seed;
+static void mon_begin_device_epoch(void){
+    uint64_t random;
+    arc4random_buf(&random,sizeof(random));
+    uint64_t seed=(random & (UINT64_MAX >> 2)) | (UINT64_C(1) << 62);
+    if((uint32_t)seed==(uint32_t)atomic_load(&g_device_epoch_seed))
+        seed^=UINT64_C(1)<<31;
+    atomic_store(&g_device_epoch_seed,seed);
+}
+bool gui_monitor_server_device_epoch_matches(uint64_t observed,unsigned generation){
+    uint64_t seed=atomic_load(&g_device_epoch_seed);
+    if(observed<=UINT32_MAX)return observed==(uint32_t)(seed+generation);
+    return observed==seed+generation;
+}
+#endif
+
 static void mon_cfg_snapshot(gui_app_t *app){
     char settings[MON_SETTINGS_WIRE_CAP]={0},devices[8192]={0};
     if(!mon_cfg_pack(&app->settings,settings,sizeof(settings)))return;
@@ -355,6 +403,13 @@ static void mon_cfg_snapshot(gui_app_t *app){
     int n=snprintf(devices,sizeof(devices),"selected=%d\ncount=%d\n",app->selected_device,app->device_count);
     if(n<0||(size_t)n>=sizeof(devices))return;
     used=(size_t)n;
+#ifdef __ANDROID__
+    uint64_t epoch=atomic_load(&g_device_epoch_seed)+atomic_load(&app->net_device_catalogue_generation);
+    n=snprintf(devices+used,sizeof(devices)-used,"epoch=%" PRIu32 "\nepoch64=%" PRIu64 "\nstart_epoch=1\ndevice_bound=1\n",
+               (uint32_t)epoch,epoch);
+    if(n<0||(size_t)n>=sizeof(devices)-used)return;
+    used+=(size_t)n;
+#endif
     for(int i=0;i<app->device_count&&i<MAX_DEVICES;i++){
         char name[64*3+1],serial[64*3+1];
         if(!mon_url_encode(app->devices[i].name,name,sizeof(name))||
@@ -400,9 +455,24 @@ void gui_monitor_client_sync_main(gui_app_t *app){
     if(g_cfg_client.device_ready){
         int n=g_cfg_client.count;
         if(n>=0&&n<=MAX_DEVICES){
+            /* Clay hit testing has already used the previous drawn layout.
+             * Reject row clicks until the replacement catalogue has rendered. */
+            if(!g_cfg_client.device_seen || n!=app->device_count ||
+               g_cfg_client.displayed_device_epoch!=g_cfg_client.device_epoch ||
+               g_cfg_client.displayed_start_epoch_supported!=g_cfg_client.start_epoch_supported ||
+               g_cfg_client.displayed_device_bound_supported!=g_cfg_client.device_bound_supported ||
+               memcmp(app->devices,g_cfg_client.devices,(size_t)n*sizeof(device_info_t))!=0)
+                g_cfg_client.device_click_blocked=true;
             memcpy(app->devices,g_cfg_client.devices,(size_t)n*sizeof(device_info_t));
             app->device_count=n;
             app->selected_device=g_cfg_client.selected>=0&&g_cfg_client.selected<n?g_cfg_client.selected:-1;
+            g_cfg_client.displayed_device_epoch=g_cfg_client.device_epoch;
+            g_cfg_client.displayed_start_epoch_supported=g_cfg_client.start_epoch_supported;
+            g_cfg_client.displayed_device_bound_supported=g_cfg_client.device_bound_supported;
+            if(g_cfg_client.start_epoch_supported)g_cfg_client.start_binding_required=true;
+            g_cfg_client.displayed_device_count=n;
+            g_cfg_client.displayed_selected_device=app->selected_device;
+            g_cfg_client.device_seen=true;
         }
         g_cfg_client.device_ready=false;
     }
@@ -451,6 +521,32 @@ void gui_monitor_client_sync_main(gui_app_t *app){
     }
 }
 static int mon_get(const char *host,uint16_t port,const char *path,char *dst,size_t cap);
+/* Zero is a valid generation; absence means an older peer. Invalid input
+ * must never fall back to the unversioned request path. */
+static uint64_t mon_parse_device_epoch(const char *text,size_t len,bool full){
+    const uint64_t invalid=UINT64_MAX-1;
+    if(!len||len>20)return invalid;
+    uint64_t value=0;
+    for(size_t i=0;i<len;i++){
+        if(text[i]<'0'||text[i]>'9')return invalid;
+        unsigned digit=(unsigned)(text[i]-'0');
+        if(value>(UINT64_MAX-digit)/10)return invalid;
+        value=value*10+digit;
+    }
+    if(full)return value>UINT32_MAX&&value<invalid?value:invalid;
+    return value<=UINT32_MAX?value:invalid;
+}
+static uint64_t mon_arg_device_epoch(const char *query){
+    uint64_t legacy=GUI_NET_DEVICE_EPOCH_NONE;
+    for(const char *p=query;p&&*p;){
+        size_t len=strcspn(p,"&");
+        if(len>=8&&!strncmp(p,"epoch64=",8))return mon_parse_device_epoch(p+8,len-8,true);
+        if(len>=6&&!strncmp(p,"epoch=",6))legacy=mon_parse_device_epoch(p+6,len-6,false);
+        p=p[len]?p+len+1:NULL;
+    }
+    return legacy;
+}
+
 static void mon_cfg_worker(void){
     char k[MON_SETTINGS_KEY_CAP]={0},v[MON_SETTINGS_VALUE_CAP]={0};bool send=false;
     cfg_lock();
@@ -495,28 +591,44 @@ static void mon_cfg_worker(void){
         char response[8192];
         if(mon_get(g_client.host,g_client.port,"/monitor/devices",response,sizeof(response))==0){
             device_info_t dev[MAX_DEVICES]={0};int count=-1,selected=-1,seen=0;
+            uint64_t epoch=GUI_NET_DEVICE_EPOCH_NONE,epoch64=GUI_NET_DEVICE_EPOCH_NONE;
+            bool start_epoch_supported=false,device_bound_supported=false;
             for(char *line=response;line&&*line;){
                 char *end=strchr(line,'\n');if(end)*end=0;
                 if(!strncmp(line,"selected=",9))selected=atoi(line+9);
                 else if(!strncmp(line,"count=",6))count=atoi(line+6);
+                else if(!strncmp(line,"epoch=",6))epoch=mon_parse_device_epoch(line+6,strlen(line+6),false);
+                else if(!strncmp(line,"epoch64=",8))epoch64=mon_parse_device_epoch(line+8,strlen(line+8),true);
+                else if(!strcmp(line,"start_epoch=1"))start_epoch_supported=true;
+                else if(!strcmp(line,"device_bound=1"))device_bound_supported=true;
                 else if(!strncmp(line,"device=",7)&&seen<MAX_DEVICES){
                     char *p=line+7,*comma=strchr(p,',');if(!comma)goto nextdev;*comma++=0;
                     int type=atoi(p);p=comma;comma=strchr(p,',');if(!comma)goto nextdev;*comma++=0;
-                    int index=atoi(p);p=comma;comma=strchr(p,',');if(!comma)goto nextdev;*comma++=0;
+                    char *index_end=NULL;
+                    errno=0;
+                    long device_id=strtol(p,&index_end,10);
+                    if(errno==ERANGE||index_end==p||*index_end||device_id< -1||device_id>INT_MAX)goto nextdev;
+                    int index=(int)device_id;
+                    p=comma;comma=strchr(p,',');if(!comma)goto nextdev;*comma++=0;
                     /* A device index of -1 is valid for the synthetic Test Signal,
                      * Playback and some OS-backed capture entries. Rejecting
                      * it would invalidate the entire remote catalogue and
                      * leave the M-Client showing its own local device. */
-                    if(type<0||type>100||index<-1||index>MAX_DEVICES)goto nextdev;
+                    if(type<0||type>100)goto nextdev;
                     if(!mon_url_decode(p,strlen(p),dev[seen].name,sizeof(dev[seen].name))||
                        !mon_url_decode(comma,strlen(comma),dev[seen].serial,sizeof(dev[seen].serial)))goto nextdev;
                     dev[seen].type=(device_type_t)type;dev[seen].index=index;seen++;
                 }
                 nextdev:line=end?end+1:NULL;
             }
-            if(count==seen&&count>=0&&count<=MAX_DEVICES){
+            if(epoch64!=GUI_NET_DEVICE_EPOCH_NONE)epoch=epoch64;
+            if(count==seen&&count>=0&&count<=MAX_DEVICES&&epoch!=UINT64_MAX-1&&
+               (!(start_epoch_supported||device_bound_supported)||epoch64!=GUI_NET_DEVICE_EPOCH_NONE)){
                 cfg_lock();memcpy(g_cfg_client.devices,dev,(size_t)seen*sizeof(device_info_t));
-                g_cfg_client.count=seen;g_cfg_client.selected=selected;g_cfg_client.device_ready=true;cfg_unlock();
+                g_cfg_client.count=seen;g_cfg_client.selected=selected;
+                g_cfg_client.start_epoch_supported=start_epoch_supported;
+                g_cfg_client.device_bound_supported=device_bound_supported;
+                g_cfg_client.device_epoch=epoch;g_cfg_client.device_ready=true;cfg_unlock();
             }
         }
     }
@@ -702,13 +814,24 @@ bool gui_monitor_server_handle_request(uintptr_t socket_handle,
         cfg_unlock();
         mon_answer(fd,busy?409:200,"text/plain",busy?"another setting pending\n":"setting queued\n");return false;
     }
+#ifdef __ANDROID__
+    if(strcmp(path,"/monitor/device-bound")==0){
+        int idx=mon_arg(query,"index",-1);
+        if(app->is_recording || !gui_net_server_request_bound_device(app,idx,mon_arg_device_epoch(query))){
+            mon_answer(fd,409,"text/plain","invalid device, list changed, or recording active\n");return false;
+        }
+        mon_answer(fd,200,"text/plain","device queued\n");return false;
+    }
+#endif
     if(strcmp(path,"/monitor/device")==0){
         int idx=mon_arg(query,"index",-1);
-        if(idx<0||idx>=app->device_count||app->is_recording){
-            mon_answer(fd,409,"text/plain","invalid device or recording active\n");return false;
+        if(idx<0||
+#ifndef __ANDROID__
+           idx>=app->device_count||
+#endif
+           app->is_recording || !gui_net_server_request_device(app, idx, true, mon_arg_device_epoch(query))){
+            mon_answer(fd,409,"text/plain","invalid device, list changed, or recording active\n");return false;
         }
-        atomic_store(&app->net_cmd_monitor_device_index,idx);
-        atomic_store(&app->net_cmd_monitor_select_device,true);
         mon_answer(fd,200,"text/plain","device queued\n");return false;
     }
     if(strcmp(path,"/monitor/reset-clips")==0){
@@ -856,12 +979,22 @@ bool gui_monitor_server_handle_request(uintptr_t socket_handle,
             record_result_id,record_result_code,record_result_detail);
         mon_answer(fd,200,"application/json",body);return false;
     }
+#ifdef __ANDROID__
+    /* A separate route fails closed if a peer was replaced by an older
+     * listener between catalogue discovery and Start. */
+    if(strcmp(path,"/monitor/start-bound")==0) {
+        if(!gui_net_server_request_targeted_start(app,mon_arg(query,"index",-1),mon_arg_device_epoch(query))){
+            mon_answer(fd,409,"text/plain","device list changed; select a capture device again\n");return false;
+        }
+        mon_answer(fd,200,"text/plain","start queued\n");return false;
+    }
+#endif
     if(strcmp(path,"/monitor/start")==0) {
-        atomic_store(&app->net_cmd_start,true);
+        gui_net_server_request_capture(app, true);
         mon_answer(fd,200,"text/plain","start queued\n");return false;
     }
     if(strcmp(path,"/monitor/stop")==0) {
-        atomic_store(&app->net_cmd_stop,true);
+        gui_net_server_request_capture(app, false);
         mon_answer(fd,200,"text/plain","stop queued\n");return false;
     }
     if(strcmp(path,"/monitor/record")==0 && query &&
@@ -872,6 +1005,7 @@ bool gui_monitor_server_handle_request(uintptr_t socket_handle,
         }
         uint64_t id=gui_monitor_server_queue_record(app,
                     on ? (!strcmp(query,"on=1&local=1") ? 2 : 1) : 3);
+        if(!id){mon_answer(fd,409,"text/plain","server is stopping\n");return false;}
         char body[80];
         snprintf(body,sizeof(body),"record queued %" PRIu64 "\n",id);
         mon_answer(fd,200,"text/plain",body);return false;
@@ -885,29 +1019,35 @@ int gui_monitor_server_start(gui_app_t *app,uint16_t port) {
     if(!app||!port)return -1;
     if(atomic_load(&g_server.active))
         return g_server.app==app&&g_server.port==port?0:-1;
-    mon_record_lock();
-    g_record_result.pending_id=0;
-    g_record_result.completed_id=0;
-    g_record_result.result_code=0;
-    g_record_result.detail[0]=0;
-    mon_record_unlock();
     gui_monitor_local_save_server_init();
     gui_monitor_audio_server_reset();
     memset(&g_cfg_server,0,sizeof(g_cfg_server));
+#ifdef __ANDROID__
+    mon_begin_device_epoch();
+#endif
     mon_cfg_snapshot(app);
-    g_server.app=app;g_server.port=port;
     fs_lock();g_fs_server.pending_valid=false;
     snprintf(g_fs_server.current,sizeof(g_fs_server.current),"%s",app->settings.output_path);
     fs_unlock();
+    mon_record_lock();
+    mon_record_reset_locked(app);
+    g_server.app=app;g_server.port=port;
     atomic_store(&g_server.active,true);
+    mon_record_unlock();
     if(gui_monitor_video_server_start()!=0)
         fprintf(stderr,"[M-VIDEO] Video startup failed: check server OpenH264 dependency and decoder resources; /monitor/video/status reports state\n");
     fprintf(stderr,"[M-SERVER] Monitor MISRC-M/2 endpoints enabled on shared TCP %u (Zstd-1 preview + control)\n",(unsigned)port);
     return 0;
 }
 void gui_monitor_server_stop(void){
-    if(!atomic_load(&g_server.active))return;
+    mon_record_lock();
+    if(!atomic_load(&g_server.active)){
+        mon_record_unlock();
+        return;
+    }
     atomic_store(&g_server.active,false);
+    mon_record_reset_locked(g_server.app);
+    mon_record_unlock();
     gui_monitor_video_server_stop();
     gui_monitor_audio_server_reset();
     gui_monitor_local_save_server_shutdown();
@@ -1067,8 +1207,12 @@ static void mon_worker_output(void){
 static int mon_client_thread(void *ctx){
     (void)ctx;
     gui_monitor_session_state_t session={0};
+    bool device_refused=false;
     uint64_t expected_record_id=0;
     while(!atomic_load(&g_client.stopping)){
+        char local_save_notice[256];
+        if(gui_monitor_local_save_client_take_notice(local_save_notice,sizeof(local_save_notice)))
+            gui_net_set_status(g_client.app,local_save_notice);
         char response[4096];
         int status_rc=mon_get(g_client.host,g_client.port,"/monitor/status",response,sizeof(response));
         uint64_t status_state=0;
@@ -1192,11 +1336,31 @@ static int mon_client_thread(void *ctx){
             mon_worker_folders();
             mon_cfg_worker();
             gui_app_t *app=g_client.app;
-            if(atomic_exchange(&app->net_cmd_select_device,false)){
-                int idx=atomic_load(&app->net_cmd_device_index);
-                char device_url[96];snprintf(device_url,sizeof(device_url),"/monitor/device?index=%d",idx);
-                if(mon_get(g_client.host,g_client.port,device_url,response,sizeof(response))!=0)
-                    gui_app_set_status(app,"Server device selection refused (stop recording first)");
+            cfg_lock();
+            bool select_device=g_cfg_client.device_request_pending;
+            int idx=g_cfg_client.requested_device;
+            uint64_t epoch=g_cfg_client.requested_device_epoch;
+            bool device_is_noop=g_cfg_client.requested_device_is_noop;
+            bool device_bound=g_cfg_client.requested_device_bound;
+            g_cfg_client.device_request_pending=false;
+            cfg_unlock();
+            if(select_device&&device_is_noop){
+                device_refused=false;
+            }else if(select_device){
+                char device_url[96];
+                /* Never fall back after posting a bound intent. An old
+                 * listener ignores epoch fields on the original route. */
+                if(device_bound)
+                    snprintf(device_url,sizeof(device_url),"/monitor/device-bound?index=%d&epoch64=%" PRIu64,idx,epoch);
+                else if(epoch==GUI_NET_DEVICE_EPOCH_NONE)
+                    snprintf(device_url,sizeof(device_url),"/monitor/device?index=%d",idx);
+                else if(epoch<=UINT32_MAX)
+                    snprintf(device_url,sizeof(device_url),"/monitor/device?index=%d&epoch=%" PRIu32,idx,(uint32_t)epoch);
+                else
+                    snprintf(device_url,sizeof(device_url),"/monitor/device?index=%d&epoch64=%" PRIu64,idx,epoch);
+                device_refused=mon_get(g_client.host,g_client.port,device_url,response,sizeof(response))!=0;
+                if(device_refused)
+                    gui_net_set_status(app,"Server device selection refused. Select the device again.");
             }
             static unsigned output_tick=0;
             if((output_tick++%10)==0)mon_worker_output();
@@ -1211,8 +1375,26 @@ static int mon_client_thread(void *ctx){
                         gui_app_set_status(app,"Server clip reset failed");
                 }
             }
-            if(atomic_exchange(&app->net_cmd_start,false))
-                (void)mon_get(g_client.host,g_client.port,"/monitor/start",response,sizeof(response));
+            cfg_lock();
+            bool start=!g_cfg_client.device_request_pending&&atomic_exchange(&app->net_cmd_start,false);
+            bool stale_device_click=g_cfg_client.stale_device_click;
+            uint64_t start_epoch=g_cfg_client.requested_start_epoch;
+            int start_index=g_cfg_client.requested_start_index;
+            cfg_unlock();
+            if(start){
+                if(device_refused||stale_device_click){
+                    gui_net_set_status(app,"Select a server device again before starting capture");
+                }else if(start_epoch!=GUI_NET_DEVICE_EPOCH_NONE){
+                    char start_url[96];
+                    snprintf(start_url,sizeof(start_url),"/monitor/start-bound?index=%d&epoch64=%" PRIu64,start_index,start_epoch);
+                    if(mon_get(g_client.host,g_client.port,start_url,response,sizeof(response))!=0){
+                        device_refused=true;
+                        gui_net_set_status(app,"Server refused Start. Select the capture device again.");
+                    }
+                }else{
+                    (void)mon_get(g_client.host,g_client.port,"/monitor/start",response,sizeof(response));
+                }
+            }
             if(atomic_exchange(&app->net_cmd_stop,false))
                 (void)mon_get(g_client.host,g_client.port,"/monitor/stop",response,sizeof(response));
             if(atomic_exchange(&app->net_cmd_record_on,false)){
@@ -1264,7 +1446,12 @@ static int mon_client_thread(void *ctx){
             /* Drop commands whose delivery cannot be confirmed. Never silently
              * replay a stale Record/Stop click after network recovery. */
             gui_app_t *app=g_client.app;
-            bool pending=atomic_exchange(&app->net_cmd_start,false);
+            cfg_lock();
+            bool unsent_device=g_cfg_client.device_request_pending;
+            g_cfg_client.device_request_pending=false;
+            cfg_unlock();
+            if(unsent_device)device_refused=true;
+            bool pending=atomic_exchange(&app->net_cmd_start,false)||unsent_device;
             pending=atomic_exchange(&app->net_cmd_stop,false)||pending;
             pending=atomic_exchange(&app->net_cmd_record_on,false)||pending;
             pending=atomic_exchange(&app->net_cmd_record_off,false)||pending;
@@ -1373,6 +1560,54 @@ bool gui_monitor_client_take_pending_restore(gui_app_t *app){
     return true;
 }
 bool gui_monitor_client_connected(void){return atomic_load(&g_client.connected);}
+void gui_monitor_client_device_frame_rendered(void){
+    cfg_lock();
+    g_cfg_client.device_click_blocked=false;
+    cfg_unlock();
+}
+bool gui_monitor_client_request_start(gui_app_t *app){
+    cfg_lock();
+    bool ready=g_cfg_client.device_seen&&!g_cfg_client.device_click_blocked&&!g_cfg_client.stale_device_click;
+    uint64_t epoch=GUI_NET_DEVICE_EPOCH_NONE;
+    int index=-1;
+    if(ready&&g_cfg_client.start_binding_required){
+        /* A prior deliberate choice remains the target even if a reconnect or
+         * hotplug later puts a different source in the selected row. */
+        epoch=g_cfg_client.device_explicitly_selected?g_cfg_client.requested_device_epoch:g_cfg_client.displayed_device_epoch;
+        index=g_cfg_client.device_explicitly_selected?g_cfg_client.requested_device:app->selected_device;
+        ready=g_cfg_client.displayed_start_epoch_supported&&epoch>UINT32_MAX&&
+              epoch!=GUI_NET_DEVICE_EPOCH_NONE&&index>=0&&index<MAX_DEVICES;
+    }
+    if(ready){
+        g_cfg_client.requested_start_epoch=epoch;
+        g_cfg_client.requested_start_index=index;
+        atomic_store(&app->net_cmd_start,true);
+    }
+    cfg_unlock();
+    return ready;
+}
+bool gui_monitor_client_request_device(gui_app_t *app, int device_index){
+    cfg_lock();
+    bool ready=g_cfg_client.device_seen&&!g_cfg_client.device_click_blocked&&
+               device_index>=0&&device_index<g_cfg_client.displayed_device_count;
+    g_cfg_client.stale_device_click=!ready;
+    if(ready){
+        atomic_store(&app->net_cmd_start,false);
+        g_cfg_client.device_explicitly_selected=true;
+        g_cfg_client.start_binding_required=g_cfg_client.displayed_start_epoch_supported;
+        g_cfg_client.requested_device=device_index;
+        g_cfg_client.requested_device_epoch=g_cfg_client.displayed_device_epoch;
+        g_cfg_client.requested_device_bound=g_cfg_client.displayed_device_bound_supported;
+        /* Older desktop peers restart on a same-device request. A fresh
+         * click can confirm their already-running selection locally. */
+        g_cfg_client.requested_device_is_noop=
+            g_cfg_client.displayed_device_epoch==GUI_NET_DEVICE_EPOCH_NONE&&
+            device_index==g_cfg_client.displayed_selected_device&&atomic_load(&g_client.peer_state)>0;
+        g_cfg_client.device_request_pending=true;
+    }
+    cfg_unlock();
+    return ready;
+}
 int gui_monitor_client_peer_state(void){return atomic_load(&g_client.peer_state);}
 uint32_t gui_monitor_client_peer_rate(void){return atomic_load(&g_client.peer_rate);}
 uint32_t gui_monitor_client_peer_frames(void){return atomic_load(&g_client.peer_frames);}
@@ -1426,9 +1661,9 @@ bool gui_monitor_client_preview_error(void){return atomic_load(&g_client.preview
 void gui_monitor_server_poll_settings(gui_app_t *app){
     if(!app||!gui_monitor_server_active())return;
     if(gui_monitor_local_save_recording() && gui_monitor_local_save_failed() && app->is_recording){
-        gui_app_set_status(app,"Local Save failed: client .partial files retained");
+        gui_app_set_status(app,"Local Save failed during recording");
         fprintf(stderr,"[M-LOCAL] Receiver disconnected/disk failure: stopping recording\n");
-        atomic_store(&app->net_cmd_record_off,true);
+        gui_app_stop_recording(app);
     }
     char pending[MON_REMOTE_PATH]={0};bool changed=false;
     fs_lock();

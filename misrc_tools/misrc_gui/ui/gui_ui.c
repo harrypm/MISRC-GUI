@@ -7,6 +7,9 @@
 #include "gui_ui.h"
 #if defined(__ANDROID__)
 #include "../core/gui_android_viewport.h"
+#ifdef ENABLE_RTLSDR
+#include "../input/android_rtlsdr_usb.h"
+#endif
 // Gesture-filtered single taps replace native mouse-press events on Android.
 #define IsMouseButtonPressed(button) gui_android_viewport_click_pressed(button)
 #endif
@@ -33,6 +36,7 @@
 #include "../net/gui_net.h"
 #include "../net/gui_net_queue_limits.h"
 #include "../net/gui_monitor_transport.h"
+#include "../net/gui_monitor_local_save.h"
 #include "../core/gui_updater.h" // Manifest-driven updater: releases page + auto-patch manifest + confirmed self-update
 #include "version.h"
 #include "../visualization/gui_custom_elements.h"
@@ -467,16 +471,6 @@ static bool gui_ui_selected_device_is_playback(const gui_app_t *app)
     return app->devices[app->selected_device].type == DEVICE_TYPE_PLAYBACK;
 }
 
-#if defined(__ANDROID__)
-/* Android Test Signal generates its samples in software. It must not open or
- * request permission for a USB device, including when auto-reconnecting. */
-static bool gui_ui_selected_device_is_simulated(const gui_app_t *app)
-{
-    if (!app) return false;
-    if (app->selected_device < 0 || app->selected_device >= app->device_count) return false;
-    return app->devices[app->selected_device].type == DEVICE_TYPE_SIMULATED;
-}
-#endif
 
 #ifdef ENABLE_DDD
 // DdD is single-channel (channel A only); channel B has no signal source.
@@ -762,14 +756,34 @@ static int gui_ui_net_mode_cycle_next(int cur) {
 // The synchronous gui_net_apply_mode joins network worker threads that can
 // sit in multi-second socket timeouts - running it inline in the click
 // handler is what made switching to Monitor & Remote stall the UI.
-static void gui_ui_net_mode_apply(gui_app_t *app, int next) {
+void gui_ui_net_mode_apply(gui_app_t *app, int next) {
     if (!app) return;
+#ifdef __ANDROID__
+    if (gui_app_capture_busy() || gui_net_capture_controls_locked(app)) {
+        gui_app_set_status(app, "Wait for the current capture or network change to finish");
+        return;
+    }
+    if (next != app->settings.net_mode &&
+        (app->is_recording || gui_record_is_finalizing())) {
+        gui_app_set_status(app, "Stop recording before changing network mode");
+        return;
+    }
+#endif
     if (gui_playback_is_starting(app)) {
         gui_app_set_status(app, "Network mode is locked while playback prepares");
         return;
     }
     int cur = app->settings.net_mode;
     if (cur < GUI_NET_MODE_LOCAL || cur > GUI_NET_MODE_LAST) cur = GUI_NET_MODE_LOCAL;
+    if (next != cur && (gui_monitor_local_save_recording() ||
+        (cur == GUI_NET_MODE_CLIENT && app->is_recording))) {
+        gui_app_set_status(app, "Stop recording before changing network mode");
+        return;
+    }
+#ifdef __ANDROID__
+    if (gui_app_defer_remote_mode(app, next)) return;
+#endif
+    if (next != cur) gui_record_cancel_capture_confirmation(app);
     app->settings.net_mode = next;
     gui_ui_clear_text_edit();
     gui_settings_save(&app->settings);
@@ -787,7 +801,11 @@ static void gui_ui_net_mode_apply(gui_app_t *app, int next) {
         // Worker unavailable (spawn failure): fall back to the synchronous
         // apply so the mode never ends up half-applied.
         (void)gui_net_apply_mode(app);
+#ifdef __ANDROID__
+        if (reenum) atomic_store(&app->net_reenumerate_pending, true);
+#else
         if (reenum) gui_app_enumerate_devices(app);
+#endif
     }
 }
 // Metadata popup state (toolbar scroll badge button)
@@ -2424,6 +2442,9 @@ static bool gui_ui_settings_locked(const gui_app_t *app)
     return app && (app->is_recording ||
         (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT &&
          gui_monitor_client_peer_state() == 2) ||
+#ifdef __ANDROID__
+        gui_app_capture_busy() ||
+#endif
         gui_playback_is_starting((gui_app_t *)app));
 }
 
@@ -7925,18 +7946,10 @@ static bool render_main_panels(gui_app_t *app) {
                               missed);
         format_status_counter(status_errors_display, sizeof(status_errors_display),
                               errors);
-        size_t status_rf_head = atomic_load(&app->buffers.buffers[BUF_CAPTURE_RF].head);
-        size_t status_rf_tail = atomic_load(&app->buffers.buffers[BUF_CAPTURE_RF].tail);
-        size_t status_rf_size = app->buffers.buffers[BUF_CAPTURE_RF].buffer_size;
-        status_rf_pct = status_rf_size > 0
-            ? (int)(((status_rf_tail - status_rf_head) * 100) / status_rf_size) : 0;
+        status_rf_pct = (int)(100.0f * bufmgr_fill_percent(&app->buffers, BUF_CAPTURE_RF));
         if(m_status_valid)status_rf_pct=(int)m_status.rf_fill_pct;
         snprintf(status_rf_buf_display, sizeof(status_rf_buf_display), "%d%%", status_rf_pct);
-        size_t status_aud_head = atomic_load(&app->buffers.buffers[BUF_CAPTURE_AUDIO].head);
-        size_t status_aud_tail = atomic_load(&app->buffers.buffers[BUF_CAPTURE_AUDIO].tail);
-        size_t status_aud_size = app->buffers.buffers[BUF_CAPTURE_AUDIO].buffer_size;
-        status_aud_pct = status_aud_size > 0
-            ? (int)(((status_aud_tail - status_aud_head) * 100) / status_aud_size) : 0;
+        status_aud_pct = (int)(100.0f * bufmgr_fill_percent(&app->buffers, BUF_CAPTURE_AUDIO));
         if(m_status_valid)status_aud_pct=(int)m_status.aud_fill_pct;
         snprintf(status_aud_buf_display, sizeof(status_aud_buf_display), "%d%%", status_aud_pct);
     }
@@ -9011,9 +9024,6 @@ void gui_render_layout(gui_app_t *app) {
 static void gui_ui_poll_android_results(gui_app_t *app)
 {
     extern int android_poll_picker_result(int *out_kind, int *out_ok, char *out_path, size_t out_path_len);
-    extern int android_poll_usb_permission_result(int *out_granted);
-    extern int android_permission_pending(void);
-    extern int android_usb_has_fd(void);
     extern int android_usb_device_present(void);
 
     /* Re-enumerate the device list whenever the Java-reported physical USB
@@ -9023,24 +9033,47 @@ static void gui_ui_poll_android_results(gui_app_t *app)
      * capturing or while a start/stop worker is in flight. */
     static int s_last_usb_present = -1;
     int usb_present_now = android_usb_device_present();
-    if (usb_present_now != s_last_usb_present) {
-        if (!app->is_capturing && !gui_app_capture_busy() && !gui_playback_is_starting(app)) {
+    bool usb_devices_changed = usb_present_now != s_last_usb_present;
+#ifdef ENABLE_RTLSDR
+    static unsigned s_last_rtl_revision;
+    unsigned rtl_revision = android_rtlsdr_device_revision();
+    usb_devices_changed |= rtl_revision != s_last_rtl_revision;
+#endif
+    if (usb_devices_changed &&
+        app->settings.net_mode != GUI_NET_MODE_CLIENT &&
+        app->settings.net_mode != GUI_NET_MODE_MONITOR_CLIENT) {
+        if (!app->is_capturing && !gui_app_capture_busy() &&
+            !gui_net_transition_busy() && !gui_playback_is_starting(app)) {
             int prev_selected_type = -1;
+#ifdef ENABLE_RTLSDR
+            int prev_selected_rtl_id = -1;
+#endif
             if (app->selected_device >= 0 && app->selected_device < app->device_count) {
                 prev_selected_type = (int)app->devices[app->selected_device].type;
+#ifdef ENABLE_RTLSDR
+                if (prev_selected_type == DEVICE_TYPE_RTLSDR) {
+                    prev_selected_rtl_id = app->devices[app->selected_device].index;
+                }
+#endif
             }
             gui_app_enumerate_devices(app);
             /* Keep the user's selection on the same device type if possible
              * (e.g. stay on Test Signal when the MS2130 appears). */
             if (prev_selected_type >= 0) {
                 for (int i = 0; i < app->device_count; i++) {
-                    if ((int)app->devices[i].type == prev_selected_type) {
-                        app->selected_device = i;
-                        break;
-                    }
+                    if ((int)app->devices[i].type != prev_selected_type) continue;
+#ifdef ENABLE_RTLSDR
+                    if (prev_selected_type == DEVICE_TYPE_RTLSDR &&
+                        app->devices[i].index != prev_selected_rtl_id) continue;
+#endif
+                    app->selected_device = i;
+                    break;
                 }
             }
             s_last_usb_present = usb_present_now;
+#ifdef ENABLE_RTLSDR
+            s_last_rtl_revision = rtl_revision;
+#endif
         }
         /* else: retry on a later frame once capture/start/stop settles */
     }
@@ -9087,29 +9120,7 @@ static void gui_ui_poll_android_results(gui_app_t *app)
         }
     }
 
-    /* USB permission result -> complete the connect that the Connect button
-     * (or auto-reconnect) launched asynchronously. Run the (potentially slow)
-     * capture startup on a worker thread so the render loop stays alive. */
-    if (android_permission_pending()) {
-        int granted = 0;
-        if (android_poll_usb_permission_result(&granted)) {
-            if (gui_playback_is_starting(app) ||
-                gui_ui_selected_device_is_simulated(app) ||
-                gui_ui_selected_device_is_playback(app) ||
-                gui_net_is_client(app)) {
-                /* A USB response can arrive after the user has changed
-                 * sources. Never start Test Signal, playback or a network
-                 * client as a side effect of a stale USB permission result. */
-            } else if (granted && android_usb_has_fd()) {
-                gui_app_set_status(app, "USB permission granted, starting capture...");
-                gui_app_start_capture_async(app);
-            } else {
-                gui_app_set_status(app, "USB permission denied or no USB capture device found");
-                app->reconnect_pending = false;
-                app->reconnect_attempts = 0;
-            }
-        }
-    }
+
 }
 #endif
 
@@ -9663,7 +9674,11 @@ void gui_handle_interactions(gui_app_t *app) {
                 // idle by tearing down and re-initializing the buffer manager;
                 // block the change while capturing/recording to avoid disrupting
                 // the live data path.
-                if (app->is_capturing || app->is_recording) {
+                if (app->is_capturing || app->is_recording || gui_record_is_finalizing()
+#ifdef __ANDROID__
+                    || gui_app_capture_busy()
+#endif
+                ) {
                     gui_app_set_status(app, "Stop capture/recording to change memory budget");
                     gui_ui_set_click_consumed();
                     return;
@@ -9700,7 +9715,9 @@ void gui_handle_interactions(gui_app_t *app) {
                 // so the device dropdown reflects the new setting immediately.
                 app->settings.discover_simple_capture = !app->settings.discover_simple_capture;
                 gui_settings_save(&app->settings);
-                gui_app_enumerate_devices(app);
+                if (app->settings.net_mode != GUI_NET_MODE_MONITOR_CLIENT &&
+                    app->settings.net_mode != GUI_NET_MODE_CLIENT)
+                    gui_app_enumerate_devices(app);
                 gui_app_set_status(app, app->settings.discover_simple_capture
                     ? "V4L2 device discovery enabled"
                     : "V4L2 device discovery disabled");
@@ -9821,6 +9838,7 @@ void gui_handle_interactions(gui_app_t *app) {
                     s_active_text_field == UI_TEXT_FIELD_NET_CLIENT_PORT) {
                     gui_ui_clear_text_edit();
                     gui_settings_save(&app->settings);
+                    gui_record_cancel_capture_confirmation(app);
                     (void)gui_net_request_apply_mode(app, app->settings.net_mode, true);
                 }
                 gui_ui_set_click_consumed();
@@ -10168,7 +10186,11 @@ void gui_handle_interactions(gui_app_t *app) {
         // Check connect button
         if (Clay_PointerOver(CLAY_ID("ConnectButton"))) {
             if (gui_playback_is_starting(app)) {
+#ifdef __ANDROID__
+                gui_app_stop_capture_async(app);
+#else
                 gui_app_stop_capture(app);
+#endif
                 gui_ui_set_click_consumed();
                 return;
             }
@@ -10199,6 +10221,10 @@ void gui_handle_interactions(gui_app_t *app) {
 #endif
                 app->reconnect_pending = false;
                 app->reconnect_attempts = 0;
+#ifdef __ANDROID__
+            } else if (gui_app_capture_busy()) {
+                gui_app_set_status(app, "Capture is changing. Please wait");
+#endif
             } else if (gui_ui_selected_device_is_playback(app) && !gui_net_is_client(app)) {
                 // File preparation is asynchronous; the per-frame poll commits it.
                 (void)gui_app_start_capture(app);
@@ -10232,32 +10258,10 @@ void gui_handle_interactions(gui_app_t *app) {
                     } else {
                         gui_app_set_status(app, "Waiting for remote Server connection...");
                     }
-                } else if (gui_ui_selected_device_is_simulated(app)) {
-                    /* Software generator: use the existing non-blocking
-                     * capture worker directly. No USB hardware or Android
-                     * USB permission is needed for Test Signal. */
-                    gui_app_start_capture_async(app);
+                } else {
                     app->reconnect_pending = false;
                     app->reconnect_attempts = 0;
-                } else {
-                    /* Local USB hardware only: async Android permission.
-                     * Never block the render thread on the system dialog. */
-                    extern int android_usb_has_fd(void);
-                    extern int android_request_usb_permission_async(void);
-                    extern int android_permission_pending(void);
-                    extern void android_usb_clear_fd(void);
-                    if (android_usb_has_fd()) {
-                        gui_app_start_capture_async(app);
-                        app->reconnect_pending = false;
-                        app->reconnect_attempts = 0;
-                    } else if (!android_permission_pending()) {
-                        android_usb_clear_fd();
-                        if (android_request_usb_permission_async()) {
-                            gui_app_set_status(app, "Requesting USB permission...");
-                        } else {
-                            gui_app_set_status(app, "USB permission request failed to start");
-                        }
-                    }
+                    gui_app_start_capture_async(app);
                 }
 #else
                 if (gui_app_start_capture(app) == 0) {

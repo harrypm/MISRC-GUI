@@ -2148,29 +2148,28 @@ static void cxadc_abort_audio_capture(cxadc_ctx_t *ctx) { (void)ctx; }
 static void cxadc_close_audio_capture(cxadc_ctx_t *ctx) { (void)ctx; }
 #endif
 
-static int cxadc_audio_capture_thread(void *ctx_ptr)
+static int cxadc_run_audio_capture(cxadc_ctx_t *ctx)
 {
-    cxadc_ctx_t *ctx = (cxadc_ctx_t *)ctx_ptr;
-    if (!ctx || !ctx->app) return -1;
     gui_app_t *app = ctx->app;
 
 #if defined(_WIN32)
     if (!ctx->audio_capture || !ctx->audio_client ||
         ctx->audio_format == CXADC_AUDIO_FMT_NONE || ctx->audio_sample_bytes == 0) {
-        return 0;
+        return -1;
     }
 
     thrd_set_priority(THRD_PRIORITY_ABOVE);
     int dev_channels = ctx->audio_channels;
     if (dev_channels < 1) dev_channels = 1;
     size_t input_frame_bytes = (size_t)dev_channels * ctx->audio_sample_bytes;
+    bool received_audio = false;
 
     while (atomic_load(&ctx->running) && app->is_capturing && !atomic_load(&do_exit)) {
         UINT32 packet_frames = 0;
         HRESULT hr = ctx->audio_capture->lpVtbl->GetNextPacketSize(ctx->audio_capture, &packet_frames);
         if (FAILED(hr)) {
             gui_app_set_status(app, "CXADC WASAPI audio read error");
-            break;
+            return -1;
         }
         if (packet_frames == 0) {
             thrd_sleep_ms(1);
@@ -2187,15 +2186,22 @@ static int cxadc_audio_capture_thread(void *ctx_ptr)
                                                        NULL, NULL);
             if (FAILED(hr)) {
                 gui_app_set_status(app, "CXADC WASAPI GetBuffer error");
-                goto cxadc_wasapi_done;
+                return -1;
             }
 
-            if (data && frames_available > 0 && !(flags & AUDCLNT_BUFFERFLAGS_SILENT)) {
+            const bool silent = (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
+            if (received_audio && (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY))
+                gui_record_mark_audio_source_loss();
+            if (frames_available && !data && !silent)
+                gui_record_mark_audio_source_loss();
+            if (frames_available > 0 && (data || silent)) {
+                received_audio = true;
                 size_t output_bytes = (size_t)frames_available * CXADC_AUDIO_PACKED_FRAME_BYTES;
                 uint8_t *out = (uint8_t *)bufmgr_write_begin(&app->buffers, BUF_CAPTURE_AUDIO,
                                                              output_bytes, NULL);
                 if (out) {
-                    for (UINT32 i = 0; i < frames_available; i++) {
+                    if (silent) memset(out, 0, output_bytes);
+                    for (UINT32 i = 0; !silent && i < frames_available; i++) {
                         const uint8_t *src_frame = data + ((size_t)i * input_frame_bytes);
                         uint8_t *dst_frame = out + ((size_t)i * CXADC_AUDIO_PACKED_FRAME_BYTES);
                         for (int ch = 0; ch < CXADC_AUDIO_CHANNEL_COUNT; ch++) {
@@ -2244,22 +2250,22 @@ static int cxadc_audio_capture_thread(void *ctx_ptr)
                 }
             }
 
-            ctx->audio_capture->lpVtbl->ReleaseBuffer(ctx->audio_capture, frames_available);
-            hr = ctx->audio_capture->lpVtbl->GetNextPacketSize(ctx->audio_capture, &packet_frames);
+            hr = ctx->audio_capture->lpVtbl->ReleaseBuffer(ctx->audio_capture, frames_available);
+            if (SUCCEEDED(hr))
+                hr = ctx->audio_capture->lpVtbl->GetNextPacketSize(ctx->audio_capture, &packet_frames);
             if (FAILED(hr)) {
-                packet_frames = 0;
-                break;
+                gui_app_set_status(app, "CXADC WASAPI audio read error");
+                return -1;
             }
         }
     }
-cxadc_wasapi_done:
     return 0;
 #elif !LIBASOUND_ENABLED
     (void)app;
-    return 0;
+    return -1;
 #else
     if (!ctx->audio_pcm || ctx->audio_format == CXADC_AUDIO_FMT_NONE || ctx->audio_sample_bytes == 0) {
-        return 0;
+        return -1;
     }
 
     thrd_set_priority(THRD_PRIORITY_ABOVE);
@@ -2278,11 +2284,17 @@ cxadc_wasapi_done:
             thrd_sleep_ms(1);
             continue;
         }
+        if (frames < 0 && !atomic_load(&ctx->running)) break;
         if (frames == -EPIPE) {
-            fprintf(stderr, "[CXADC] ALSA underrun (EPIPE) on %s, preparing\n",
+            fprintf(stderr, "[CXADC] ALSA capture overrun (EPIPE) on %s, preparing\n",
                     ctx->audio_device_name);
-            (void)snd_pcm_prepare(ctx->audio_pcm);
-            continue;
+            if (snd_pcm_prepare(ctx->audio_pcm) >= 0) {
+                gui_record_mark_audio_source_loss();
+                continue;
+            }
+            gui_app_set_status(app, "CXADC ALSA audio recovery failed");
+            free(input_buf);
+            return -1;
         }
         if (frames < 0) {
             fprintf(stderr, "[CXADC] ALSA readi error on %s: %s (errno %d)\n",
@@ -2292,11 +2304,13 @@ cxadc_wasapi_done:
                 fprintf(stderr, "[CXADC] ALSA recover failed: %s\n", snd_strerror(rec));
             }
             if (rec >= 0) {
+                gui_record_mark_audio_source_loss();
                 continue;
             }
             fprintf(stderr, "[CXADC] ALSA audio thread exiting after unrecoverable read error\n");
             gui_app_set_status(app, "CXADC ALSA audio read error");
-            break;
+            free(input_buf);
+            return -1;
         }
 
         size_t output_bytes = (size_t)frames * CXADC_AUDIO_PACKED_FRAME_BYTES;
@@ -2347,6 +2361,18 @@ cxadc_wasapi_done:
 #endif
 }
 
+static int cxadc_audio_capture_thread(void *ctx_ptr)
+{
+    cxadc_ctx_t *ctx = ctx_ptr;
+    if (!ctx || !ctx->app) return -1;
+
+    atomic_store(&ctx->app->cxadc_audio_ready, true);
+    int result = cxadc_run_audio_capture(ctx);
+    atomic_store(&ctx->app->cxadc_audio_ready, false);
+    if (result < 0 && atomic_load(&ctx->running)) gui_record_mark_audio_source_loss();
+    return result;
+}
+
 static int cxadc_capture_thread(void *ctx_ptr)
 {
     cxadc_ctx_t *ctx = (cxadc_ctx_t *)ctx_ptr;
@@ -2355,16 +2381,21 @@ static int cxadc_capture_thread(void *ctx_ptr)
     gui_app_t *app = ctx->app;
     thrd_set_priority(THRD_PRIORITY_CRITICAL);
 
-    uint8_t *card_buf_a = (uint8_t *)malloc(CXADC_READ_CHUNK_BYTES);
-    uint8_t *card_buf_b = (uint8_t *)malloc(CXADC_READ_CHUNK_BYTES);
+    // Leave room for one carried byte if a 10-bit read splits a sample.
+    uint8_t *card_buf_a = (uint8_t *)malloc(CXADC_READ_CHUNK_BYTES + 1);
+    uint8_t *card_buf_b = (uint8_t *)malloc(CXADC_READ_CHUNK_BYTES + 1);
     if (!card_buf_a || !card_buf_b) {
         free(card_buf_a);
         free(card_buf_b);
+        gui_record_mark_source_loss();
         gui_app_set_status(app, "CXADC: failed to allocate capture buffers");
         return -1;
     }
-    const int input_bytes_per_sample_a = ctx->tenbit_mode[0] ? 2 : 1;
-    const int input_bytes_per_sample_b = ctx->tenbit_mode[1] ? 2 : 1;
+    uint8_t *const card_buffer[2] = {card_buf_a, card_buf_b};
+    const size_t sample_bytes[2] = {ctx->tenbit_mode[0] ? 2 : 1, ctx->tenbit_mode[1] ? 2 : 1};
+    const int card_count = ctx->card_count > 1 ? 2 : 1;
+    const bool native_rates_differ = card_count > 1 && ctx->card_sample_rate_hz[0] != ctx->card_sample_rate_hz[1];
+    size_t queued[2] = {0, 0};
     uint32_t tap_frame_index = 0;
 #if defined(__APPLE__)
     uint64_t native_last_data=get_time_ms();
@@ -2374,68 +2405,49 @@ static int cxadc_capture_thread(void *ctx_ptr)
     atomic_store(&app->sample_rate, ctx->rf_sample_rate_hz);
 
     while (atomic_load(&ctx->running) && app->is_capturing && !atomic_load(&do_exit)) {
+        size_t direct_bytes[2] = {0, 0};
+        for (int card = 0; card < card_count; ++card) {
+            // With equal sample clocks, keep unmatched samples until the
+            // other card catches up. Unequal clocks feed their native RAW
+            // taps on every read instead of making the faster card wait.
+            if (queued[card] >= sample_bytes[card]) continue;
 #if defined(_WIN32)
-        int read_a = cxadc_read_card(ctx->card_handles[0], card_buf_a, CXADC_READ_CHUNK_BYTES);
+            int count = cxadc_read_card(ctx->card_handles[card], card_buffer[card] + queued[card],
+                                        CXADC_READ_CHUNK_BYTES);
 #else
-        int read_a = cxadc_read_card(ctx->card_fds[0], card_buf_a, CXADC_READ_CHUNK_BYTES);
+            int count = cxadc_read_card(ctx->card_fds[card], card_buffer[card] + queued[card],
+                                        CXADC_READ_CHUNK_BYTES);
 #endif
-        if (read_a < 0) {
+            if (count < 0) {
+                if (!atomic_load(&ctx->running)) goto done;
+                gui_record_mark_source_loss();
 #if defined(__APPLE__)
-            gui_app_set_status(app,gui_cxadc_macos_error());
-            gui_cxadc_macos_mark_failed();
-            atomic_store(&app->dropout_stop_reason,GUI_DROPOUT_DEVICE_ERROR);
-            atomic_store(&app->dropout_stop_requested,true);
-#else
-            gui_app_set_status(app, "CXADC read error on card 0");
-#endif
-            break;
-        }
-        if (read_a == 0) {
-#if defined(__APPLE__)
-            if(get_time_ms()-native_last_data>2000){
-                gui_app_set_status(app,"macOS CXADC stopped delivering samples (device/driver unavailable)");
+                gui_app_set_status(app, gui_cxadc_macos_error());
                 gui_cxadc_macos_mark_failed();
-                atomic_store(&app->dropout_stop_reason,GUI_DROPOUT_CALLBACK_GAP);
-                atomic_store(&app->dropout_stop_requested,true);break;
-            }
-#endif
-            thrd_sleep_ms(1);
-            continue;
-        }
-
-#if defined(__APPLE__)
-        native_last_data=get_time_ms();
-#endif
-        int output_samples = read_a / input_bytes_per_sample_a;
-        if (output_samples <= 0) {
-            thrd_sleep_ms(1);
-            continue;
-        }
-        int read_b = 0;
-        if (ctx->card_count > 1) {
-#if defined(_WIN32)
-            read_b = cxadc_read_card(ctx->card_handles[1], card_buf_b, CXADC_READ_CHUNK_BYTES);
+                atomic_store(&app->dropout_stop_reason, GUI_DROPOUT_DEVICE_ERROR);
+                atomic_store(&app->dropout_stop_requested, true);
 #else
-            read_b = cxadc_read_card(ctx->card_fds[1], card_buf_b, CXADC_READ_CHUNK_BYTES);
+                gui_app_set_status(app, card ? "CXADC read error on card 1" : "CXADC read error on card 0");
 #endif
-            if (read_b < 0) {
-                gui_app_set_status(app, "CXADC read error on card 1");
-                break;
+                goto done;
             }
-            if (read_b == 0) {
-                thrd_sleep_ms(1);
-                continue;
+#if defined(__APPLE__)
+            if (count > 0) native_last_data = get_time_ms();
+            else if (get_time_ms() - native_last_data > 2000) {
+                gui_record_mark_source_loss();
+                gui_app_set_status(app, "macOS CXADC stopped delivering samples (device/driver unavailable)");
+                gui_cxadc_macos_mark_failed();
+                atomic_store(&app->dropout_stop_reason, GUI_DROPOUT_CALLBACK_GAP);
+                atomic_store(&app->dropout_stop_requested, true);
+                goto done;
             }
-            int output_samples_b = read_b / input_bytes_per_sample_b;
-            if (output_samples_b < output_samples) {
-                output_samples = output_samples_b;
-            }
+#endif
+            queued[card] += (size_t)count;
+            direct_bytes[card] = queued[card] - queued[card] % sample_bytes[card];
         }
 
-        // Direct native RAW taps (cards 0/1 -> channels A/B): the exact bytes
-        // just read, before the A/B pairing truncation above (which truncates
-        // both reads to the shorter one and drops card A's data when card B
-        // returns 0). Gated per iteration: both channels' taps are entered
+        // Direct RAW taps write newly read complete samples, independent of
+        // how much can be paired for conversion. Both taps are entered
         // (marked in-flight, so the record-stop handshake's wait-idle covers
         // the whole iteration) and the record decision is latched ONCE, then
         // both chunks are pushed with the same decision — a record start/stop
@@ -2451,13 +2463,13 @@ static int cxadc_capture_thread(void *ctx_ptr)
                 bool a_on = tap_a_ch ? gui_record_tap_iteration_enter(0) : true;
                 bool b_on = tap_b_ch ? gui_record_tap_iteration_enter(1) : true;
                 bool tap_this_iter = a_on && b_on;
-                if (tap_a_ch && tap_this_iter) {
+                if (tap_a_ch && tap_this_iter && direct_bytes[0]) {
                     gui_record_direct_tap_push_latched(0, true, card_buf_a,
-                                                       (size_t)read_a, tap_frame_index);
+                                                       direct_bytes[0], tap_frame_index);
                 }
-                if (tap_b_ch && tap_this_iter) {
+                if (tap_b_ch && tap_this_iter && direct_bytes[1]) {
                     gui_record_direct_tap_push_latched(1, true, card_buf_b,
-                                                       (size_t)read_b, tap_frame_index + 1);
+                                                       direct_bytes[1], tap_frame_index + 1);
                 }
                 if (tap_a_ch) gui_record_tap_iteration_leave(0);
                 if (tap_b_ch) gui_record_tap_iteration_leave(1);
@@ -2465,27 +2477,29 @@ static int cxadc_capture_thread(void *ctx_ptr)
             }
         }
 
-        if (output_samples <= 0) {
+        size_t output_samples = queued[0] / sample_bytes[0];
+        if (card_count > 1 && queued[1] / sample_bytes[1] < output_samples)
+            output_samples = queued[1] / sample_bytes[1];
+        if (!output_samples && !native_rates_differ) {
             thrd_sleep_ms(1);
             continue;
         }
 
-        size_t output_bytes = (size_t)output_samples * sizeof(uint32_t);
-        uint32_t *raw_out = (uint32_t *)bufmgr_write_begin(&app->buffers, BUF_CAPTURE_RF, output_bytes, NULL);
-        if (!raw_out) {
+        size_t output_bytes = output_samples * sizeof(uint32_t);
+        uint32_t *raw_out = output_bytes ? bufmgr_write_begin(&app->buffers, BUF_CAPTURE_RF, output_bytes, NULL) : NULL;
+        if (output_bytes && !raw_out) {
             atomic_fetch_add(&app->rb_drop_count, 1);
 #if defined(__APPLE__)
             gui_cxadc_macos_mark_failed();
             atomic_store(&app->dropout_stop_reason,GUI_DROPOUT_BACKPRESSURE);
             atomic_store(&app->dropout_stop_requested,true);break;
 #endif
-            continue;
         }
 
-        for (int i = 0; i < output_samples; i++) {
+        for (size_t i = 0; raw_out && i < output_samples; i++) {
             int16_t sample_a = 0;
             if (ctx->tenbit_mode[0]) {
-                int idx = i * 2;
+                size_t idx = i * 2;
                 sample_a = cxadc_decode_sample_tenbit(card_buf_a[idx], card_buf_a[idx + 1]);
             } else {
                 sample_a = cxadc_decode_sample_8bit(card_buf_a[i]);
@@ -2493,7 +2507,7 @@ static int cxadc_capture_thread(void *ctx_ptr)
             int16_t sample_b = 0;
             if (ctx->card_count > 1) {
                 if (ctx->tenbit_mode[1]) {
-                    int idx = i * 2;
+                    size_t idx = i * 2;
                     sample_b = cxadc_decode_sample_tenbit(card_buf_b[idx], card_buf_b[idx + 1]);
                 } else {
                     sample_b = cxadc_decode_sample_8bit(card_buf_b[i]);
@@ -2502,6 +2516,18 @@ static int cxadc_capture_thread(void *ctx_ptr)
             raw_out[i] = cxadc_encode_raw_sample(sample_a, sample_b);
         }
 
+        for (int card = 0; card < card_count; ++card) {
+            size_t consumed = output_samples * sample_bytes[card];
+            // Mixed clocks can only be recorded by the native taps. The
+            // legacy packed display consumes the common prefix of the reads.
+            if (native_rates_differ) consumed = direct_bytes[card];
+            queued[card] -= consumed;
+            if (queued[card]) memmove(card_buffer[card], card_buffer[card] + consumed, queued[card]);
+        }
+        if (!raw_out) {
+            if (!output_bytes) thrd_sleep_ms(1);
+            continue;
+        }
         bufmgr_write_end(&app->buffers, BUF_CAPTURE_RF, output_bytes);
         bufmgr_signal_data(&app->buffers, BUF_CAPTURE_RF);
 
@@ -2509,6 +2535,7 @@ static int cxadc_capture_thread(void *ctx_ptr)
         atomic_fetch_add(&app->frame_count, 1);
     }
 
+done:
     free(card_buf_a);
     free(card_buf_b);
     return 0;

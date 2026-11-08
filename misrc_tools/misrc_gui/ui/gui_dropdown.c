@@ -103,23 +103,30 @@ static bool handle_device_dropdown(gui_app_t *app) {
         gui_dropdown_toggle(DROPDOWN_DEVICE, 0);
         clicked = true;
     } else if (gui_dropdown_is_open(DROPDOWN_DEVICE, 0)) {
-        for (int i = 0; i < app->device_count; i++) {
+        bool monitor = app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT;
+        /* A removed remote row may still be hit in the last drawn frame.
+         * Pass its intent through the same stale-selection guard. */
+        int slots = monitor ? MAX_DEVICES : app->device_count;
+        for (int i = 0; i < slots; i++) {
             if (Clay_PointerOver(CLAY_IDI("DeviceOption", i))) {
-                if (i != app->selected_device) {
+                if (i != app->selected_device || monitor) {
                     // Client mode: the dropdown lists the server's (mirrored)
                     // devices. Forward the selection to the server; the client
                     // never opens local hardware. The server's resulting state
                     // is mirrored back via /stats.
-                    if (gui_net_is_client(app)) {
-                        if(app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT &&
-                           gui_monitor_client_peer_state() == 2){
+                    if (monitor || gui_net_is_client(app)) {
+                        if(monitor && gui_monitor_client_peer_state() == 2){
                             gui_net_set_status(app,"Stop Server recording before changing device");
-                        }else{
+                        }else if(gui_net_client_request_device(app, i)){
                             app->selected_device = i;
-                            gui_net_client_request_device(app, i);
                             gui_net_set_status(app, "Requested device change on server");
+                        }else{
+                            gui_net_set_status(app, "Wait for the server device list");
                         }
                     } else {
+#ifdef __ANDROID__
+                        gui_app_select_capture_device_async(app, i, false, true);
+#else
                         // Switch to a different device - stop current and start new
                         bool was_capturing = app->is_capturing;
                         if (was_capturing) {
@@ -132,6 +139,7 @@ static bool handle_device_dropdown(gui_app_t *app) {
                         if (was_capturing) {
                             gui_app_start_capture(app);
                         }
+#endif
                     }
                 }
                 gui_dropdown_close_all();

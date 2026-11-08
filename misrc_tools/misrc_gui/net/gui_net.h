@@ -79,6 +79,11 @@ int gui_net_request_apply_mode(gui_app_t *app, int prev_mode, bool force_reapply
 /* True while an async mode transition (gui_net_request_apply_mode) runs. The
  * main-thread pollers and query helpers early-out while it is set. */
 bool gui_net_transition_busy(void);
+#ifdef __ANDROID__
+/* Local capture must wait for the main thread's device catalogue handoff. */
+bool gui_net_capture_controls_locked(const gui_app_t *app);
+void gui_net_join_transition(void);
+#endif
 
 /* Tear down any active server/client (for gui_app_cleanup and mode switches). */
 void gui_net_stop(gui_app_t *app);
@@ -95,6 +100,7 @@ bool gui_net_is_server(const gui_app_t *app);
 /* Server data tap: called from the capture callback to feed the broadcast fanout
  * so /rf and /baseband clients can stream it. No-op (and cheap) when not in server
  * mode or no clients are connected. Safe to call from the capture thread. */
+void gui_net_end_capture(gui_app_t *app);
 void gui_net_tap_rf(gui_app_t *app, const void *data, size_t bytes);
 void gui_net_tap_audio(gui_app_t *app, const void *data, size_t bytes);
 
@@ -107,13 +113,24 @@ void gui_net_tap_audio(gui_app_t *app, const void *data, size_t bytes);
 void gui_net_poll_commands(gui_app_t *app);
 void gui_net_poll_mirror(gui_app_t *app);
 
+/* Incoming server capture and device requests from either HTTP protocol. */
+void gui_net_server_request_capture(gui_app_t *app, bool start);
+#define GUI_NET_DEVICE_EPOCH_NONE UINT64_MAX
+#ifdef __ANDROID__
+bool gui_net_server_request_targeted_start(gui_app_t *app, int device_index, uint64_t epoch);
+bool gui_net_server_request_bound_device(gui_app_t *app, int device_index, uint64_t epoch);
+void gui_net_cancel_pending_server_start(void);
+#endif
+bool gui_net_server_request_device(gui_app_t *app, int device_index, bool monitor,
+                                   uint64_t observed_epoch);
+
 /* Client control forwarding: set the corresponding net_cmd flag so the client
  * worker thread sends the request to the server. Used by the UI/local control
  * path when running in client mode. */
-void gui_net_client_request_start(gui_app_t *app);
+bool gui_net_client_request_start(gui_app_t *app);
 void gui_net_client_request_stop(gui_app_t *app);
 void gui_net_client_request_record(gui_app_t *app, bool on);
-void gui_net_client_request_device(gui_app_t *app, int device_index);
+bool gui_net_client_request_device(gui_app_t *app, int device_index);
 
 /* Human-readable mode name and a status string for the info-page UI. */
 const char *gui_net_mode_name(int mode);
@@ -141,5 +158,6 @@ void gui_net_client_toggle_connection(gui_app_t *app);
 /* True when client mode is connected and the peer server reports capture/record
  * state active (peer /stats state >= 1). */
 bool gui_net_client_peer_capturing(const gui_app_t *app);
+bool gui_net_client_wav_ready(const gui_app_t *app);
 
 #endif /* GUI_NET_H */

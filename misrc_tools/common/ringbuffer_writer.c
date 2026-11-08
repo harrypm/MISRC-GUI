@@ -48,7 +48,7 @@ size_t rb_writer_run(rb_writer_config_t *config)
             /* No data available - check if we should exit */
             if (should_exit(config)) {
                 /* Drain any remaining partial data before exiting */
-                size_t remaining = config->rb->tail - config->rb->head;
+                size_t remaining = rb_fill_level(config->rb);
                 if (remaining > 0 && remaining < len) {
                     buf = rb_read_ptr(config->rb, remaining);
                     if (buf) {

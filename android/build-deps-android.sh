@@ -18,8 +18,7 @@
 #   DEPS_SRC_DIR     - source/build dir (default: $REPO_ROOT/.deps/src-android-arm64)
 #   JOBS             - parallel build count (default: nproc)
 #
-# Idempotent: a dep is skipped if its installed .pc file already reports the
-# expected version, so reruns are cheap and safe.
+# Idempotent: reuse installed dependencies whose version or build inputs match.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -290,10 +289,7 @@ record "libuvc" "github main @ ${LIBUVC_SHA:-$(git -C "$DEPS_SRC_DIR/libuvc-src"
 
 # ---------------- hsdaoh (vendored) ----------------
 log "=== hsdaoh (vendored third_party/hsdaoh) ==="
-HSDAOH_SHA="$(git -C "$REPO_ROOT/third_party/hsdaoh" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-if [[ -n "$(pc_version hsdaoh)" || -n "$(pc_version libhsdaoh)" ]]; then
-  log "skip (hsdaoh.pc already present)"
-else
+build_android_hsdaoh() {
   rm -rf "$DEPS_SRC_DIR/hsdaoh" "$DEPS_SRC_DIR/hsdaoh-build"
   cp -R "$REPO_ROOT/third_party/hsdaoh" "$DEPS_SRC_DIR/hsdaoh"
   # Android has no librt (clock_gettime is in libc, like macOS). hsdaoh's
@@ -304,22 +300,26 @@ else
     "$DEPS_SRC_DIR/hsdaoh/src/CMakeLists.txt"
   # Android: libusb cannot enumerate/open /dev/bus/usb/* without root, so
   # hsdaoh_open's libusb_get_device_list path fails. Patch _hsdaoh_open_uvc_device
-  # to, on Android, wrap the file descriptor granted by Java UsbManager (stored
-  # via android_usb_jni.c's android_usb_get_fd()) with uvc_wrap() instead of
-  # uvc_find_device()+uvc_open(). uvc_wrap() uses libusb_wrap_sys_device(). We
-  # create a private libusb context with LIBUSB_OPTION_NO_DEVICE_DISCOVERY and
-  # hand it to uvc_init so libusb never touches /dev/bus/usb. If no fd has been
-  # granted yet (permission dialog pending/declined), return LIBUSB_ERROR_ACCESS
-  # so gui_capture surfaces a clear "permission" status.
+  # to, on Android, wrap a native-owned duplicate of the Java grant with
+  # uvc_wrap() instead of uvc_find_device()+uvc_open(). uvc_wrap() uses
+  # libusb_wrap_sys_device(). Apply NO_DEVICE_DISCOVERY before libuvc creates
+  # its libusb context, so it skips enumeration but still runs USB events.
+  # Without a grant, return LIBUSB_ERROR_ACCESS for the permission status.
   #
   # uvc_wrap is exported by libuvc.a but not in its public header, so declare it.
-  HSDAOH_C="$DEPS_SRC_DIR/hsdaoh/src/libhsdaoh.c"
-  python3 - "$HSDAOH_C" <<'PY'
+  local hsdaoh_c="$DEPS_SRC_DIR/hsdaoh/src/libhsdaoh.c"
+  python3 - "$hsdaoh_c" "$DEPS_SRC_DIR/hsdaoh/include/hsdaoh_private.h" <<'PY'
 import sys
-p = sys.argv[1]
+p, private_header = sys.argv[1:]
 s = open(p).read()
-if 'hsdaoh_set_android_usb_fd' in s:
+if 'hsdaoh_set_android_usb_fd_provider' in s:
     sys.exit(0)  # already patched (idempotent)
+
+header = open(private_header).read()
+marker = '\tuvc_device_handle_t *uvc_devh;'
+assert header.count(marker) == 1
+header = header.replace(marker, marker + '\n#if defined(__ANDROID__)\n'
+                        '\tint android_usb_fd;\n#endif', 1)
 
 # (1) Declare externs + uvc_wrap prototype + Android fd-based open helper,
 #     inserted just before _hsdaoh_open_uvc_device. uvc_wrap is exported by
@@ -331,26 +331,27 @@ if 'hsdaoh_set_android_usb_fd' in s:
 #     dropdown — meaning the user can't select it to press connect, and the
 #     permission+fd path is unreachable. On Android, report 1 device ("MS2130")
 #     so it shows in the dropdown; the real VID/PID/open is deferred to the
-#     permission+fd path in hsdaoh_open's android_opened branch.
+#     permission+fd path in hsdaoh_open.
 decl = r'''
 #if defined(__ANDROID__)
 #include <libusb-1.0/libusb.h>
-/* Optional runtime provider from libmisrc_gui.so (android_usb_jni.c). */
-extern int android_usb_get_fd(void) __attribute__((weak));
-/* Explicit fd handoff from JNI to avoid relying on weak-symbol interposition. */
-static int s_android_usb_fd = -1;
-void hsdaoh_set_android_usb_fd(int fd) { s_android_usb_fd = fd; }
-static int hsdaoh_get_android_usb_fd(void)
+#include <stdatomic.h>
+#include <unistd.h>
+
+typedef int (*hsdaoh_android_fd_provider_t)(void);
+static _Atomic(hsdaoh_android_fd_provider_t) s_android_fd_provider;
+
+void hsdaoh_set_android_usb_fd_provider(hsdaoh_android_fd_provider_t provider)
 {
-    if (s_android_usb_fd >= 0) return s_android_usb_fd;
-    if (android_usb_get_fd) return android_usb_get_fd();
-    return -1;
+    atomic_store(&s_android_fd_provider, provider);
 }
+
 extern uvc_error_t uvc_wrap(int sys_dev, uvc_context_t *context, uvc_device_handle_t **devh);
 static uvc_error_t _hsdaoh_open_android_fd(hsdaoh_dev_t *dev)
 {
     uvc_error_t r;
-    int fd = hsdaoh_get_android_usb_fd();
+    hsdaoh_android_fd_provider_t provider = atomic_load(&s_android_fd_provider);
+    int fd = provider ? provider() : -1;
     if (fd < 0)
         return UVC_ERROR_ACCESS;  /* permission not granted yet */
     /* CRITICAL: pass NULL so libuvc creates and OWNS its libusb context.
@@ -364,9 +365,16 @@ static uvc_error_t _hsdaoh_open_android_fd(hsdaoh_dev_t *dev)
      * the root-only /dev/bus/usb enumeration. */
     libusb_set_option(NULL, LIBUSB_OPTION_NO_DEVICE_DISCOVERY);
     r = uvc_init(&dev->uvc_ctx, NULL);
-    if (r < 0) return r;
-    r = uvc_wrap(fd, dev->uvc_ctx, &dev->uvc_devh);
-    if (r < 0) { uvc_exit(dev->uvc_ctx); dev->uvc_ctx = NULL; }
+    if (r >= 0) {
+        r = uvc_wrap(fd, dev->uvc_ctx, &dev->uvc_devh);
+        if (r >= 0) {
+            dev->android_usb_fd = fd;
+            return r;
+        }
+        uvc_exit(dev->uvc_ctx);
+        dev->uvc_ctx = NULL;
+    }
+    close(fd);
     return r;
 }
 #endif
@@ -382,29 +390,60 @@ new = ('int _hsdaoh_open_uvc_device(hsdaoh_dev_t *dev)\n'
        '\n\t/* Initialize UVC context */\n\tr = uvc_init(&dev->uvc_ctx, NULL);')
 s = s.replace(old, new, 1)
 
-# (3) In hsdaoh_open, skip the libusb_get_device_list enumerate on Android
-#     (it fails without root, so the open is never reached). Free the
-#     enumerate-only libusb ctx and jump straight to _hsdaoh_open_uvc_device,
-#     then to the post-open setup (devh/claim/...). Insert an android_opened
-#     label right before dev->devh = uvc_get_libusb_handle(...).
-s = s.replace(
-    '\tdev->dev_lost = 1;\n\n\tcnt = libusb_get_device_list(dev->ctx, &list);',
-    ('\tdev->dev_lost = 1;\n'
-     '#if defined(__ANDROID__)\n'
-     '\t/* No /dev/bus/usb enumerate without root; use the Java-granted fd. */\n'
-     '\tlibusb_exit(dev->ctx);\n'
-     '\tdev->ctx = NULL;\n'
+# (3) Open the owned descriptor directly on Android. Clean up partial opens
+#     and close the descriptor only after libuvc has closed the wrapped handle.
+old = '\tr = libusb_init(&dev->ctx);'
+assert s.count(old) == 1
+s = s.replace(old,
+    ('#if defined(__ANDROID__)\n'
+     '\tdev->android_usb_fd = -1;\n'
+     '\tdev->dev_lost = 1;\n'
      '\tdev->vid = known_devices[0].vid;\n'
      '\tdev->pid = known_devices[0].pid;\n'
      '\tr = _hsdaoh_open_uvc_device(dev);\n'
      '\tif (r < 0) goto err;\n'
-     '\tgoto android_opened;\n'
-     '#endif\n\n'
-     '\tcnt = libusb_get_device_list(dev->ctx, &list);'),
+     '#else\n' + old),
     1)
 s = s.replace(
     '\tdev->devh = uvc_get_libusb_handle(dev->uvc_devh);',
-    'android_opened:\n\tdev->devh = uvc_get_libusb_handle(dev->uvc_devh);',
+    '#endif\n\tdev->devh = uvc_get_libusb_handle(dev->uvc_devh);',
+    1)
+s = s.replace(
+    '\t\tfprintf(stderr, "Failed to get libusb device handle\\n");\n\t\tgoto err;',
+    ('\t\tfprintf(stderr, "Failed to get libusb device handle\\n");\n'
+     '#if defined(__ANDROID__)\n\t\tr = LIBUSB_ERROR_NO_DEVICE;\n#endif\n'
+     '\t\tgoto err;'),
+    1)
+s = s.replace(
+    '\t\tfprintf(stderr, "usb_claim_interface hid error %d\\n", r);\n\t\treturn r;',
+    ('\t\tfprintf(stderr, "usb_claim_interface hid error %d\\n", r);\n'
+     '#if defined(__ANDROID__)\n\t\tgoto err;\n#else\n\t\treturn r;\n#endif'),
+    1)
+s = s.replace(
+    '\tif (hsdaoh_clear_endpoint_halt(dev) < 0)\n\t\tgoto err;',
+    ('#if defined(__ANDROID__)\n'
+     '\tr = hsdaoh_clear_endpoint_halt(dev);\n\tif (r < 0)\n'
+     '#else\n\tif (hsdaoh_clear_endpoint_halt(dev) < 0)\n#endif\n'
+     '\t\tgoto err;'),
+    1)
+s = s.replace(
+    'err:\n\tif (dev)\n\t\tfree(dev);',
+    ('err:\n'
+     '#if defined(__ANDROID__)\n'
+     '\tif (dev->uvc_devh) uvc_close(dev->uvc_devh);\n'
+     '\tif (dev->uvc_ctx) uvc_exit(dev->uvc_ctx);\n'
+     '\tif (dev->android_usb_fd >= 0) close(dev->android_usb_fd);\n'
+     '#endif\n'
+     '\tif (dev)\n\t\tfree(dev);'),
+    1)
+s = s.replace(
+    '\tuvc_close(dev->uvc_devh);\n\tuvc_unref_device(dev->uvc_dev);',
+    ('\tuvc_close(dev->uvc_devh);\n'
+     '#if defined(__ANDROID__)\n'
+     '\tclose(dev->android_usb_fd);\n'
+     '#else\n'
+     '\tuvc_unref_device(dev->uvc_dev);\n'
+     '#endif'),
     1)
 
 # (4) Patch hsdaoh_get_device_count() and hsdaoh_get_device_name() on Android
@@ -435,6 +474,7 @@ s = s.replace(
     1)
 
 open(p, 'w').write(s)
+open(private_header, 'w').write(header)
 PY
   log "patched hsdaoh_open + _hsdaoh_open_uvc_device + get_device_count/name for Android fd-based uvc_wrap"
   # hsdaoh uses pkg_check_modules(flac) + libusb; DEPS_PREFIX is on
@@ -451,8 +491,47 @@ PY
       cp "$PCDIR/libhsdaoh.pc" "$PCDIR/hsdaoh.pc"
     fi
   done
+}
+
+# Hash the actual checkout, including dirty vendored edits. The full build
+# recipe includes the inline Python/Sed patches and CMake configuration.
+HSDAOH_SOURCE_SHA="$(
+  cd "$REPO_ROOT/third_party/hsdaoh"
+  find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum -- | sha256sum | awk '{print $1}'
+)"
+HSDAOH_BUILD_KEY="$(
+  {
+    printf '%s\0' "$HSDAOH_SOURCE_SHA" "$ABI" "$PLATFORM" "$NDK" "$DEPS_PREFIX" \
+      "${CFLAGS:-}" "${CXXFLAGS:-}" "${CPPFLAGS:-}" "${LDFLAGS:-}" \
+      "$PKG_CONFIG_PATH" "$CMAKE_PREFIX_PATH"
+    declare -f build_android_hsdaoh cmake_x
+    sha256sum "$TOOLCHAIN" "$NDK/source.properties" "$SCRIPT_DIR/android-pkg-config"
+    for dep in flac libusb-1.0 libuvc; do
+      printf '%s=%s\n' "$dep" "$(pc_version "$dep")"
+    done
+    for input in "$DEPS_PREFIX"/lib{,64}/{libFLAC,libusb-1.0,libuvc}.a \
+                 "$DEPS_PREFIX"/lib{,64}/pkgconfig/{flac,libusb-1.0,libuvc}.pc; do
+      if [[ -f "$input" ]]; then sha256sum "$input"; fi
+    done
+    for headers in "$DEPS_PREFIX"/include/{FLAC,libusb-1.0,libuvc}; do
+      if [[ -d "$headers" ]]; then
+        printf '%s\n' "$headers"
+        (cd "$headers"; find . -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum --)
+      fi
+    done
+  } | sha256sum | awk '{print $1}'
+)"
+HSDAOH_FD_STAMP="$DEPS_PREFIX/.hsdaoh-owned-android-fd-v1"
+if [[ -f "$HSDAOH_FD_STAMP" && "$(cat "$HSDAOH_FD_STAMP")" == "$HSDAOH_BUILD_KEY" &&
+      -s "$DEPS_PREFIX/lib/libhsdaoh.so" ]] &&
+   [[ -n "$(pc_version hsdaoh)" || -n "$(pc_version libhsdaoh)" ]]; then
+  log "skip (patched hsdaoh already present)"
+else
+  rm -f "$HSDAOH_FD_STAMP"
+  build_android_hsdaoh
+  printf '%s\n' "$HSDAOH_BUILD_KEY" > "$HSDAOH_FD_STAMP"
 fi
-record "hsdaoh" "vendored @ ${HSDAOH_SHA}"
+record "hsdaoh" "vendored source sha256 ${HSDAOH_SOURCE_SHA}; Android build ${HSDAOH_BUILD_KEY}"
 
 # ---------------- raylib 5.5 (PLATFORM=Android, GLES 3.0) ----------------
 log "=== raylib ${RAYLIB_TAG} (PLATFORM=Android) ==="
