@@ -47,6 +47,36 @@ typedef struct {
 
 static gui_android_viewport_state_t s_android_view = { .zoom = 1.0f };
 
+#if defined(MISRC_IOS)
+/* 16:9 letterbox ("video with bars"): the full-resolution UI canvas is
+ * blitted into a centered 16:9 rect so no UI is chopped by the rounded
+ * corners / camera cutout. Bars are the black full-screen clear in
+ * gui_android_viewport_present_canvas(). Touch/zoom math maps through the
+ * letterbox (identity on Android, which keeps the full-screen blit). */
+#define MISRC_IOS_UI_ASPECT (16.0f / 9.0f)
+static void ios_view_fit_rect(int *ox, int *oy, int *cw, int *ch)
+{
+    const int W = GetRenderWidth(), H = GetRenderHeight();
+    if (W <= 0 || H <= 0) {
+        *ox = *oy = 0;
+        *cw = (W > 0) ? W : 1;
+        *ch = (H > 0) ? H : 1;
+        return;
+    }
+    if ((float)W / (float)H > MISRC_IOS_UI_ASPECT) {
+        *ch = H;
+        *cw = (int)roundf((float)H * MISRC_IOS_UI_ASPECT);
+        *oy = 0;
+        *ox = (W - *cw) / 2;
+    } else {
+        *cw = W;
+        *ch = (int)roundf((float)W / MISRC_IOS_UI_ASPECT);
+        *ox = 0;
+        *oy = (H - *ch) / 2;
+    }
+}
+#endif
+
 static float android_view_clamp(float x, float lo, float hi)
 {
     return fmaxf(lo, fminf(hi, x));
@@ -92,7 +122,20 @@ void gui_android_viewport_update(void)
     if (n >= 2) {
         const Vector2 a = GetTouchPosition(0);
         const Vector2 b = GetTouchPosition(1);
-        const Vector2 mid = { (a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f };
+        Vector2 mid = { (a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f };
+#if defined(MISRC_IOS)
+        /* Focus point is in UI-canvas coordinates; convert from raw screen
+         * through the letterbox (identity when no bars on that axis). */
+        {
+            int ox, oy, cw, ch;
+            ios_view_fit_rect(&ox, &oy, &cw, &ch);
+            const int W = GetRenderWidth(), H = GetRenderHeight();
+            if (cw > 0 && ch > 0 && W > 0 && H > 0) {
+                mid.x = (mid.x - (float)ox) * ((float)W / (float)cw);
+                mid.y = (mid.y - (float)oy) * ((float)H / (float)ch);
+            }
+        }
+#endif
         const float distance = hypotf(a.x - b.x, a.y - b.y);
         v->queued_tap = false; // A gesture never becomes an accidental click.
         if (!v->multi_active || v->last_contacts < 2 || distance <= 12.0f) {
@@ -164,8 +207,23 @@ void gui_android_viewport_update(void)
     android_view_limit_translation();
     // raylib's GetMousePosition() becomes the *unzoomed* virtual coordinate,
     // so Clay hit testing and normal UI pointer math still agree with drawing.
+#if defined(MISRC_IOS)
+    {
+        int ox, oy, cw, ch;
+        ios_view_fit_rect(&ox, &oy, &cw, &ch);
+        const int W = GetRenderWidth(), H = GetRenderHeight();
+        const float sx = (cw > 0 && W > 0) ? (float)W / (float)cw : 1.0f;
+        const float sy = (ch > 0 && H > 0) ? (float)H / (float)ch : 1.0f;
+        /* screen px r -> canvas px ((r-ox)*W/cw - pan)/zoom:
+         * offset = -(ox + pan*cw/W), scale = W/(cw*zoom). */
+        SetMouseOffset((int)roundf(-(ox + v->x * ((float)cw / (float)(W > 0 ? W : 1)))),
+                       (int)roundf(-(oy + v->y * ((float)ch / (float)(H > 0 ? H : 1)))));
+        SetMouseScale(sx / v->zoom, sy / v->zoom);
+    }
+#else
     SetMouseOffset((int)roundf(-v->x), (int)roundf(-v->y));
     SetMouseScale(1.0f / v->zoom, 1.0f / v->zoom);
+#endif
 }
 
 bool gui_android_viewport_block_controls(void)
@@ -184,8 +242,22 @@ Vector2 gui_android_viewport_pointer(void)
 {
     const gui_android_viewport_state_t *v = &s_android_view;
     if (!v->click_pulse) return GetMousePosition();
+#if defined(MISRC_IOS)
+    {
+        /* click_screen is RAW screen px; map through the letterbox into
+         * UI-canvas coordinates (identity on Android). */
+        int ox, oy, cw, ch;
+        ios_view_fit_rect(&ox, &oy, &cw, &ch);
+        const int W = GetRenderWidth(), H = GetRenderHeight();
+        const float sx = (cw > 0 && W > 0) ? (float)W / (float)cw : 1.0f;
+        const float sy = (ch > 0 && H > 0) ? (float)H / (float)ch : 1.0f;
+        return (Vector2){ ((v->click_screen.x - (float)ox) * sx - v->x) / v->zoom,
+                          ((v->click_screen.y - (float)oy) * sy - v->y) / v->zoom };
+    }
+#else
     return (Vector2){ (v->click_screen.x - v->x) / v->zoom,
                       (v->click_screen.y - v->y) / v->zoom };
+#endif
 }
 
 /* Draw the *elements* at the final pinch zoom instead of magnifying a
@@ -243,10 +315,21 @@ void gui_android_viewport_present_canvas(bool active)
                               -(float)v->canvas_height };
     /* Already drawn at pinch zoom; present at native pixel size. Scaling
      * the finished canvas again would reintroduce blurred text. */
+#if defined(MISRC_IOS)
+    /* 16:9 "video with bars": the canvas is blitted into the centered fit
+     * rect; the full-screen clear above leaves the bars. */
+    {
+        int ox, oy, cw, ch;
+        ios_view_fit_rect(&ox, &oy, &cw, &ch);
+        const Rectangle dest = { (float)ox, (float)oy, (float)cw, (float)ch };
+        DrawTexturePro(v->canvas.texture, source, dest, (Vector2){0, 0}, 0, WHITE);
+    }
+#else
     const Rectangle dest = { 0, 0,
                              (float)v->canvas_width,
                              (float)v->canvas_height };
     DrawTexturePro(v->canvas.texture, source, dest, (Vector2){0, 0}, 0, WHITE);
+#endif
 }
 
 
