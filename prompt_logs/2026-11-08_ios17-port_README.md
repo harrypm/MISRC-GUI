@@ -188,9 +188,19 @@ by pixel analysis (screenshot14.png: 487KB, 67k background px, 8.7k UI px
 across y≈600–1900) + luminance map showing the panel grid. Visual
 sign-off by Harry still pending (rule: real-world confirmation).
 
+ICON (resolved, user-approved 2026-11-08 ~08:44, commit a76964a): source
+is a 500x500 window+stand artwork with transparent corners + drop shadow.
+Final treatment (ios/make_icons.py, pure-python PNG codec): complete
+original art alpha-flattened over WHITE, scaled to 80% of the icon,
+centered — matching the Android APK's legacy-launcher look (it ships the
+raw icon and the launcher masks it small on a light bg). Earlier attempts
+(crop-to-square letterbox over interior color) read as "mangled" and were
+reverted. NOTE: this simulator caches icons across installs — an uninstall
++ reinstall + device reboot is required to see icon changes.
+
 Also fixed en route: /opt/homebrew pollution incident (openh264 meson
-default prefix) — remediated with brew reinstall; icons (transparency +
-centering) still TODO; device slice not yet built.
+default prefix) — remediated with brew reinstall. Device slice not yet
+built.
 
 ## Output artifacts (this session)
 
