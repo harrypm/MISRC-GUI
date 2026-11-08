@@ -8,12 +8,10 @@ validation rejects alpha in icons), and the shadow makes a straight resize
 look bottom-heavy/off-center. iOS applies its OWN rounded-corner mask, so
 the correct treatment is:
 
-  1. locate the square artwork (the bright frame border), excluding the
-     drop shadow,
-  2. crop to that square, keeping a tiny margin so the frame is not cut,
-  3. flatten over the artwork's own interior background color (so the
-     rounded corners of the art blend into an opaque square),
-  4. downscale (box filter) to each target size with alpha forced to 255.
+  1. keep the COMPLETE original composition (window + stand + shadow),
+  2. composite its alpha out over an opaque background (default: white,
+     the surface the art is designed for),
+  3. downscale (box filter) to each target size — no alpha channel.
 
 Pure Python (no PIL): ships its own PNG decode/encode. Output sizes are the
 four icons referenced by ios/Info.plist (CFBundleIconFiles):
@@ -21,6 +19,13 @@ four icons referenced by ios/Info.plist (CFBundleIconFiles):
   AppIcon76x76@2x~ipad.png (152), AppIcon83.5x83.5@2x~ipad.png (167).
 
 Usage: make_icons.py <source.png> <output_dir> [--bg auto|R,G,B] [--margin N]
+
+Default (--bg auto): faithful mode — the COMPLETE original artwork
+(window + stand + soft shadow, already centered on its square canvas) is
+flattened over WHITE, matching how the art is presented in the project
+README. iOS renders transparent icon pixels as black, so the alpha is
+composited out; no cropping, no letterboxing. The earlier crop-to-square
+attempt (window only, interior-color bands) read as "mangled" — retired.
 """
 import os
 import sys
@@ -183,88 +188,26 @@ def main():
     print('source: %dx%d' % (w, h))
     os.makedirs(out_dir, exist_ok=True)
 
-    # --- locate the square artwork via full-width alpha coverage ---
-    # The icon art is a rounded square spanning nearly the full canvas
-    # width; the desktop-style base/shine elements BELOW it are narrower.
-    # Rows of the square have ~full opaque coverage; rows below do not.
-    # (A luminance-based frame detection fails here: the interior contains
-    # bright scope-trace art of its own.)
-    rowcount = [0] * h
-    for yy in range(h):
-        c = 0
-        for xx in range(w):
-            if rgba[(yy * w + xx) * 4 + 3] > 200:
-                c += 1
-        rowcount[yy] = c
-    peak = max(rowcount)
-    wide = 0.8 * peak
-    # longest contiguous run of wide rows = the square's vertical extent
-    best_len = 0
-    best_top = 0
-    run_start = None
-    for yy in range(h):
-        if rowcount[yy] >= wide:
-            if run_start is None:
-                run_start = yy
-        else:
-            if run_start is not None:
-                if yy - run_start > best_len:
-                    best_len = yy - run_start
-                    best_top = run_start
-                run_start = None
-    if run_start is not None and h - run_start > best_len:
-        best_len = h - run_start
-        best_top = run_start
-    if best_len < h // 4:
-        raise SystemExit('no full-width square region found in icon')
-    sq_top = best_top
-    sq_bottom = best_top + best_len - 1
-    # horizontal extent: columns well-covered within the square rows
-    colcount = [0] * w
-    for xx in range(w):
-        c = 0
-        for yy in range(sq_top, sq_bottom + 1):
-            if rgba[(yy * w + xx) * 4 + 3] > 200:
-                c += 1
-        colcount[xx] = c
-    sq_height = sq_bottom - sq_top + 1
-    cols_wide = [xx for xx in range(w) if colcount[xx] >= 0.8 * sq_height]
-    if not cols_wide:
-        raise SystemExit('no full-height column range found in icon')
-    sq_left = cols_wide[0]
-    sq_right = cols_wide[-1]
-    print('square (alpha coverage): x %d..%d  y %d..%d' %
-          (sq_left, sq_right, sq_top, sq_bottom))
-
-    # --- art region: the detected square artwork, flattened over an opaque
-    # background (the art's rounded corners blend into its own interior
-    # color; the below-square base/shine elements are EXCLUDED). ---
-    aw = sq_right - sq_left + 1
-    ah = sq_bottom - sq_top + 1
-    print('art region: %dx%d' % (aw, ah))
-
-    # background color: average of the opaque interior of the art region
+    # Background: default WHITE (the artwork — window, stand and soft
+    # shadow — is designed for a light surface; that is how the README
+    # presents it). --bg R,G,B overrides.
     if bg == 'auto':
-        rs = gs = bs = n = 0
-        for yy in range(sq_top + ah // 6, sq_top + 5 * ah // 6, 3):
-            for xx in range(sq_left + aw // 6, sq_left + 5 * aw // 6, 3):
-                o = (yy * w + xx) * 4
-                if rgba[o + 3] > 200:
-                    rs += rgba[o]
-                    gs += rgba[o + 1]
-                    bs += rgba[o + 2]
-                    n += 1
-        bgc = (rs // n, gs // n, bs // n) if n else (0, 0, 0)
+        bgc = (255, 255, 255)
     else:
         bgc = tuple(int(v) for v in bg.split(','))
     print('background: %s' % (bgc,))
 
-    artflat = bytearray(aw * ah * 4)
-    for yy in range(ah):
-        for xx in range(aw):
-            so = ((sq_top + yy) * w + (sq_left + xx)) * 4
+    # Faithful mode: flatten the COMPLETE source composition over the
+    # background (alpha composited out -> opaque icon; iOS renders
+    # transparent icon pixels as black, which is what broke the corners).
+    # No crop, no letterbox: the art is already composed on its square
+    # canvas and centered.
+    artflat = bytearray(w * h * 4)
+    for yy in range(h):
+        for xx in range(w):
+            so = (yy * w + xx) * 4
             a = rgba[so + 3]
-            d = (yy * aw + xx) * 4
+            d = (yy * w + xx) * 4
             if a == 255:
                 artflat[d:d + 4] = rgba[so:so + 4]
             elif a == 0:
@@ -277,39 +220,29 @@ def main():
                 artflat[d + 2] = (rgba[so + 2] * a + bgc[2] * ia + 127) // 255
                 artflat[d + 3] = 255
 
-    # --- emit the four sizes: opaque square, art scale-to-FIT centered ---
-    # (the artwork is a wide rounded-rect, so a square crop would cut the
-    # frame; fit the WHOLE art with a uniform margin of background color)
     sizes = [
         ('AppIcon60x60@2x.png', 120),
         ('AppIcon60x60@3x.png', 180),
         ('AppIcon76x76@2x~ipad.png', 152),
         ('AppIcon83.5x83.5@2x~ipad.png', 167),
     ]
-    padfrac = margin / 100.0  # margin px of source scale -> fraction knob
-    inner = 1.0 - 2 * (padfrac if padfrac > 0 else 0.07)
     for name, size in sizes:
-        w2 = max(1, round(size * inner * aw / max(aw, ah)))
-        h2 = max(1, round(size * inner * ah / max(aw, ah)))
-        scaled = box_downscale_rgba(artflat, aw, ah, w2, h2)
-        ox = (size - w2) // 2
-        oy = (size - h2) // 2
+        scaled = box_downscale_rgba(artflat, w, h, size, size)
         rgb = bytearray(size * size * 3)
-        # background fill
         for p in range(size * size):
+            o = p * 4
             d = p * 3
-            rgb[d:d + 3] = bgc
-        # paste the scaled art (already opaque)
-        for yy in range(h2):
-            for xx in range(w2):
-                so = (yy * w2 + xx) * 4
-                d = ((oy + yy) * size + (ox + xx)) * 3
-                rgb[d] = scaled[so]
-                rgb[d + 1] = scaled[so + 1]
-                rgb[d + 2] = scaled[so + 2]
+            if scaled[o + 3] == 255:
+                rgb[d:d + 3] = scaled[o:o + 3]
+            else:
+                a = scaled[o + 3]
+                ia = 255 - a
+                rgb[d] = (scaled[o] * a + bgc[0] * ia + 127) // 255
+                rgb[d + 1] = (scaled[o + 1] * a + bgc[1] * ia + 127) // 255
+                rgb[d + 2] = (scaled[o + 2] * a + bgc[2] * ia + 127) // 255
         encode_png_rgb('%s/%s' % (out_dir, name), size, size, rgb)
-        print('wrote %s/%s (%dx%d, opaque, art %dx%d centered)' %
-              (out_dir, name, size, size, w2, h2))
+        print('wrote %s/%s (%dx%d, opaque, full original art on white)' %
+              (out_dir, name, size, size))
 
 
 if __name__ == '__main__':
