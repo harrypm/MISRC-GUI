@@ -107,8 +107,12 @@ void gui_ios_view_layout_size(int *w, int *h)
 static void ios_view_input_log(const char *what, float a_x, float a_y,
                                float b_x, float b_y, int touches, int mdown)
 {
-    const char *home = getenv("HOME");
-    if (!home) return;
+    /* Documents/ (not HOME root): on device only the app container is
+     * retrievable over devicectl, and Documents is proven writable (the
+     * settings file lives there). */
+    extern const char *ios_get_storage_path(void);
+    const char *home = ios_get_storage_path();
+    if (!home || !*home) return;
     char path[1024];
     snprintf(path, sizeof(path), "%s/misrc_input.log", home);
     FILE *f = fopen(path, "a");
@@ -173,6 +177,37 @@ void gui_android_viewport_update(void)
     v->click_pulse = false;
     v->block_controls = (n != 0);
 #if defined(MISRC_IOS)
+    /* SDL on iOS DEVICE intermittently reports a finger at exactly (0,0)
+     * mid-touch (verified via misrc_input.log: positions flicker between
+     * the real point and (0,0) while the finger is down). Consequences:
+     * the (0,0)-jump exceeds the drag threshold so EVERY tap is rejected
+     * as a drag, and the pinch midpoint jumps to (0,0) so the zoom
+     * re-anchors at a wild focus (position never holds). Fix: track the
+     * last real position per touch index and HOLD it while SDL reports
+     * the phantom (0,0). The sim (synthesized mouse events) never sees
+     * this, which is why it only reproduces on hardware. */
+#define MISRC_TOUCH_SLOTS 8
+    static Vector2 s_last_touch[MISRC_TOUCH_SLOTS];
+    static bool s_touch_valid[MISRC_TOUCH_SLOTS];
+    {
+        const int nmax = (n < MISRC_TOUCH_SLOTS) ? n : MISRC_TOUCH_SLOTS;
+        for (int i = 0; i < nmax; i++) {
+            Vector2 p = GetTouchPosition(i);
+            if (p.x == 0.0f && p.y == 0.0f && s_touch_valid[i]) {
+                /* phantom (0,0): hold the last real position */
+            } else {
+                s_last_touch[i] = p;
+                s_touch_valid[i] = true;
+            }
+        }
+        for (int i = n; i < MISRC_TOUCH_SLOTS; i++) s_touch_valid[i] = false;
+    }
+#define TOUCH_POS(i_) (((i_) < n && (i_) < MISRC_TOUCH_SLOTS && s_touch_valid[i_]) \
+                       ? s_last_touch[(i_)] : GetTouchPosition(i_))
+#else
+#define TOUCH_POS(i_) GetTouchPosition(i_)
+#endif
+#if defined(MISRC_IOS)
     /* TEMPORARY: per-frame input watcher — logs when touches or mouse
      * activity exist (plus a 1/45-frame heartbeat) so the host can see
      * exactly what SDL delivers. */
@@ -194,8 +229,8 @@ void gui_android_viewport_update(void)
 #endif
 
     if (n >= 2) {
-        const Vector2 a = GetTouchPosition(0);
-        const Vector2 b = GetTouchPosition(1);
+        const Vector2 a = TOUCH_POS(0);
+        const Vector2 b = TOUCH_POS(1);
         Vector2 mid = { (a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f };
 #if defined(MISRC_IOS)
         /* Focus point in CANVAS px: touch positions are POINTS (SDL
@@ -232,7 +267,7 @@ void gui_android_viewport_update(void)
         v->single_active = false;
         v->multi_active = true;
     } else if (n == 1) {
-        const Vector2 p = GetTouchPosition(0);
+        const Vector2 p = TOUCH_POS(0);
         if (v->multi_active) {
             // Consume the leftover finger until ALL fingers have lifted.
             v->single_active = false;
@@ -265,18 +300,24 @@ void gui_android_viewport_update(void)
          * (user report 2026-11-08: slow touch reaction). Pinch-in already
          * resets the zoom (clamped to 1.0), so the double-tap gesture is
          * redundant here; drop it and fire the click at once. */
-        if (v->last_contacts == 1 && v->single_active &&
-            !v->single_drag && !v->multi_active) {
-            v->click_screen = v->previous;
-            v->click_pulse = true;
-            {
-                int ox, oy, cw, ch;
-                ios_view_fit_rect(&ox, &oy, &cw, &ch);
-                const float dpi = ios_view_dpi();
-                ios_view_input_log("TAP", v->click_screen.x, v->click_screen.y,
-                                   (v->click_screen.x * dpi - (float)ox - v->x) / v->zoom,
-                                   (v->click_screen.y * dpi - (float)oy - v->y) / v->zoom,
-                                   0, 0);
+        if (v->last_contacts == 1 && v->single_active) {
+            /* Log WHY a tap did not fire (device touch debugging). */
+            if (v->single_drag)
+                ios_view_input_log("TAP-REJECT-DRAG", v->previous.x, v->previous.y, 0, 0, 0, 0);
+            else if (v->multi_active)
+                ios_view_input_log("TAP-REJECT-MULTI", v->previous.x, v->previous.y, 0, 0, 0, 0);
+            else {
+                v->click_screen = v->previous;
+                v->click_pulse = true;
+                {
+                    int ox, oy, cw, ch;
+                    ios_view_fit_rect(&ox, &oy, &cw, &ch);
+                    const float dpi = ios_view_dpi();
+                    ios_view_input_log("TAP", v->click_screen.x, v->click_screen.y,
+                                       (v->click_screen.x * dpi - (float)ox - v->x) / v->zoom,
+                                       (v->click_screen.y * dpi - (float)oy - v->y) / v->zoom,
+                                       0, 0);
+                }
             }
         }
         v->queued_tap = false;
