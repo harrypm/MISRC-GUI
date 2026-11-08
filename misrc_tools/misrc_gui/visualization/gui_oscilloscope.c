@@ -548,10 +548,14 @@ void draw_channel_grid(float x, float y, float width, float height,
 
     float center_y = y + height / 2;
 
-    // Text measurements return physical pixels; bounds are logical (physical / scale).
-    // Scale text widths to logical so layout math is consistent at all UI zoom levels.
-    float text_scale = gui_ui_get_scale_factor();
-    float to_logical_w = 1.0f / text_scale;
+    // Text measurement contract: gui_text_measure returns the width at the
+    // given fontSize in the SAME space the text is drawn (logical layout px
+    // under the Clay rlScalef) - both scale together through the render
+    // transform. The old 1/scale division assumed physical measurements and
+    // shrank every label/button while the text stayed full-size, so at UI
+    // scales >100% the text overflowed its buttons (iOS 200% report
+    // 2026-11-08; desktop at >100% had the same latent bug).
+    float to_logical_w = 1.0f;
 
     // Channel label width (used to place the time/div label beside it).
     int ch_label_w = (int)(gui_text_measure(label, FONT_SIZE_OSC_LABEL) * to_logical_w);
@@ -1676,16 +1680,13 @@ static void waveform_render_overlay(void *state_ptr, Rectangle bounds) {
     float trig_btn_y = render_btn_y;
     Vector2 mouse = gui_ui_get_mouse_position();
 
-    // Text measurements return physical pixels; bounds are logical.
-    // Scale to logical for consistent layout at all UI zoom levels.
-    float text_scale = gui_ui_get_scale_factor();
-    float to_logical_w = 1.0f / text_scale;
+    // Text measurement contract: gui_text_measure is in the draw space
+    // (logical px; see the grid-render note above) - no conversion.
+    float to_logical_w = 1.0f;
     #define TEXT_W(t, fs) ((int)(gui_text_measure(t, fs) * to_logical_w))
 
     // Reserve the widest label plus arrow/padding, not just the current value.
     // Both dropdowns keep the same width when the selection changes.
-    // 98px is the physical-pixel floor; scale to logical so it stays
-    // the same visual size at all UI zoom levels.
     float button_width = 98.0f * to_logical_w;
     for (int i = 0; i < WAVEFORM_MODE_COUNT; i++) {
         button_width = fmaxf(button_width,
@@ -2581,14 +2582,12 @@ static void waveform_render(void *state_ptr, gui_app_t *app, int channel,
     {
         if (waveform_test_mode_active(app) &&
             !gui_chrome_hide_hidden(&state->chrome_hide)) {
-            // Text measurements return physical pixels; the panel bounds
-            // and every hit rect on this row are LOGICAL units (the row-1
-            // overlay group's contract - see waveform_render_overlay).
-            // Convert the measurements and the fixed pixel floors to
-            // logical so the generator row scales correctly at every UI
-            // zoom level (user report 2026-11-03: the buttons did not
-            // scale with the UI zoom).
-            const float to_logical_w = 1.0f / gui_ui_get_scale_factor();
+            // Text measurement contract: gui_text_measure is in the draw
+            // space (logical px; see the grid-render note above) - the
+            // buttons scale with the UI zoom through the render transform
+            // without any conversion (the 1/scale division shrank buttons
+            // under full-size text -> overlapping controls at >100%).
+            const float to_logical_w = 1.0f;
             const float btn_h = 18.0f;
             const float row_y = bounds.y + 8.0f + btn_h + 6.0f;
             const float x_right = bounds.x + bounds.width - 8.0f;
@@ -2692,7 +2691,9 @@ static void waveform_render(void *state_ptr, gui_app_t *app, int channel,
     {
         if (waveform_playback_res_visible(app) &&
             !gui_chrome_hide_hidden(&state->chrome_hide)) {
-            const float to_logical_w = 1.0f / gui_ui_get_scale_factor();
+            // Text measurement contract: logical px, no conversion (see the
+            // generator-row note above).
+            const float to_logical_w = 1.0f;
             const float btn_h = 18.0f;
             const float row_y = bounds.y + 8.0f + btn_h + 6.0f;
             const float x_right = bounds.x + bounds.width - 8.0f;

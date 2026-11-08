@@ -796,8 +796,9 @@ static void spectro_vtable_render(void *state_ptr, gui_app_t *app, int channel,
         static const char *pal_names[2] = { "Phosphor", "Heat" };
         float btn_h = 18;
         float pad = 8;
-        float text_scale = gui_ui_get_scale_factor();
-        float to_logical_w = 1.0f / text_scale;
+        // Text measurement contract: gui_text_measure is in the draw space
+        // (logical px) - no 1/scale conversion (same fix as gui_oscilloscope).
+        float to_logical_w = 1.0f;
         float btn_w = 0;
         for (int i = 0; i < 2; i++) {
             float w = (float)((int)(gui_text_measure(pal_names[i], FONT_SIZE_DROPDOWN_OPT) * to_logical_w)) + 26;
