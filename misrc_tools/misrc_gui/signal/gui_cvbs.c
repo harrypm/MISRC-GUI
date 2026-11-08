@@ -5718,14 +5718,12 @@ static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *ap
         return;
     }
 
-    // Text measurements return physical pixels; the panel bounds and every
-    // hit rect below are LOGICAL units (the UI render-scale transform
-    // scales rects while the font keeps its fixed physical size - the same
-    // contract as the waveform overlay group). Convert the measurements and
-    // the fixed pixel floors to logical so this overlay scales correctly at
-    // every UI zoom level (user report 2026-11-03: the new signal-generator
-    // controls did not scale with the UI zoom).
-    const float to_logical_w = 1.0f / gui_ui_get_scale_factor();
+    // Text measurement contract: gui_text_measure is in the draw space
+    // (logical px under the Clay rlScalef) — no 1/scale conversion. The old
+    // division shrank every button under full-size text, so the right-aligned
+    // rows overflowed the panel's right edge and clipped (iOS 200% report
+    // 2026-11-08; same fix as the oscilloscope/spectrogram overlay rows).
+    const float to_logical_w = 1.0f;
     const float btn_h = 18.0f;
     const char *label = "Decoder: RF Preview";
     float text_w = (float)gui_text_measure(label, FONT_SIZE_DROPDOWN_OPT) * to_logical_w;

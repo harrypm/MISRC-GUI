@@ -225,25 +225,17 @@ void gui_vhs_fm_render_frame(vhs_fm_decoder_t *decoder, float x, float y,
         decoder->display_window_frames = decoder->displayed_frames;
     }
     // --- Stats readout (selectable view, UI-scale-aware metrics) ---
-    // Panel bounds are LOGICAL units; gui_text_* font sizes are PHYSICAL
-    // pixels drawn under the global UI render-scale transform (Clay applies
-    // rlScalef(ui_scale) around all custom panel drawing). The font therefore
-    // stays a FIXED physical size — the transform scales it with UI zoom,
-    // exactly like the overlay buttons (multiplying by ui_scale here would
-    // double-scale and rendered wrong at any zoom other than 100%). The
-    // LOGICAL line height derives from that fixed font. Measured widths are
-    // physical pixels, so compare them against the logical budget * scale.
-    // Layout is bottom-stacked: the reason line owns the lowest slot and the
-    // stats lines stack directly above it — no gap, no overlap, every view.
-    // Long lines truncate with "..." instead of vanishing on narrow panels.
-    // A double-click on the panel (gui_cvbs.c) hides ALL overlay chrome —
-    // buttons, stats and the reason line — for a clean video preview.
-    float ui_scale = gui_ui_get_scale_factor();
-    if (!(ui_scale > 0.05f)) ui_scale = 1.0f;
+    // Text measurement contract (same fix as the oscilloscope/cvbs overlay
+    // rows, 2026-11-08): gui_text_measure/gui_text_draw work in the DRAW
+    // space — logical layout px, scaled to physical by the Clay rlScalef.
+    // The old code assumed PHYSICAL measurements: the line height was
+    // divided by ui_scale (lines crushed together at >100%) and the width
+    // budget multiplied by ui_scale (long lines drawn past the panel edge
+    // and clipped — iOS 200% report). Both are plain logical now.
     const int font_px = FONT_SIZE_DROPDOWN_OPT;               // 16: matches overlay buttons
-    const float line_h = ((float)font_px + 6.0f) / ui_scale;   // logical line height
+    const float line_h = (float)font_px + 6.0f;                // logical line height
     const float pad = 8.0f;
-    const float max_w_px = (width - pad * 2.0f) * ui_scale;    // physical text budget
+    const float max_w_px = width - pad * 2.0f;                 // logical text budget
 
     char line[224];
     int stats_view = decoder->overlay.stats_view;
