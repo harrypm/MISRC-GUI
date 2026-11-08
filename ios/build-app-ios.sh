@@ -107,13 +107,13 @@ sed -e "s|<string>1.0.0</string>|<string>$VERSION_CLEAN</string>|" \
     -e "s|<string>1</string>|<string>$BUILD_NUM</string>|" \
     "$SCRIPT_DIR/Info.plist" > "$APP/Info.plist"
 
-# Icons from the repo icon (sips ships with macOS).
+# Icons: opaque + centered via ios/make_icons.py. The source art is a
+# rounded square with a drop shadow and transparent corners; raw sips
+# resizes produced transparent (black on iOS) corners and off-center art
+# (see 2026-11-08 icon fix notes in the prompt log).
 ICON_SRC="$REPO_ROOT/assets/Icons/MISRC_Icon.png"
 if [[ -f "$ICON_SRC" ]]; then
-  sips -z 120 120 "$ICON_SRC" --out "$APP/AppIcon60x60@2x.png" >/dev/null
-  sips -z 180 180 "$ICON_SRC" --out "$APP/AppIcon60x60@3x.png" >/dev/null
-  sips -z 152 152 "$ICON_SRC" --out "$APP/AppIcon76x76@2x~ipad.png" >/dev/null
-  sips -z 167 167 "$ICON_SRC" --out "$APP/AppIcon83.5x83.5@2x~ipad.png" >/dev/null
+  python3 "$SCRIPT_DIR/make_icons.py" "$ICON_SRC" "$APP"
 else
   log "WARNING: $ICON_SRC missing — app will use the default icon"
 fi
