@@ -221,8 +221,23 @@ phantom reports. Settings modal: touch-scrollable body + clipped
 output-path text (ea7ce1b) + compact spacing (0dc74ef) + 150% default
 scale so the whole modal fits like desktop (7acba0e).
 
+BUFFER ALLOCATION on device (resolved, user-confirmed "its now working
+on real hardware fine" 2026-11-08 ~14:46, commit 9f5fd18): the iOS
+sandbox DENIES POSIX shm (probe: shm_open FAIL errno=1) so the
+ringbuffer's memfd double-mirror could never allocate on device
+("failed to start extraction" on Test Gen; net-mode apply failed the
+same way). Fix path: vm_allocate the backing + a 2x region, then
+vm_remap the backing into both halves (copy=FALSE = shared pages).
+Two dead ends documented: mach_make_memory_entry_64 works at probe
+size (1MB) but FAILS at 512MB on device (rb_init code=3,
+misrc_rb.log); plain MAP_SHARED|MAP_ANON works but cannot be aliased.
+The vm_remap path is PROVEN on hardware: Test Gen + net cycle + touch
+all work on the iPhone 14. rb_init failure instrumentation
+(RB_LOG_FAIL -> Documents/misrc_rb.log) still compiled in.
+
 Still open: temporary debug logging to strip (ios_gl_debug_dump,
-ios_view_input_log + watcher), network-mode validation, CI/docs.
+ios_view_input_log + watcher, RB_LOG_FAIL, rb_probe), network-mode
+validation vs a desktop server, CI/docs.
 
 ## Output artifacts (this session)
 
