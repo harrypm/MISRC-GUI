@@ -207,12 +207,22 @@ the layout below the 640x360 minimum). Raylib iOS patches now also fix
 the drawable size at init AND in the SIZE_CHANGED handler
 (SDL_GL_GetDrawableSize; the stock code renders 1x into a 3x framebuffer).
 
-Also fixed en route: /opt/homebrew pollution incident (openh264 meson
-default prefix) — remediated with brew reinstall. Device slice built +
-installed on Harry's iPhone 14 (devicectl; landscape lock, sysconf
-core count, FLAC popup suppressed on iOS). OPEN: click-through of UI
-elements/sub-menus still being verified; temporary GL + input debug
-logging still compiled in (ios_gl_debug_dump + ios_view_input_log).
+TOUCH INTERACTION (resolved, user-confirmed "buttons now click"
+2026-11-08 ~13:37, commits 7e73cbb + f35aa5c): (1) taps dispatched
+IMMEDIATELY on finger lift on iOS — the Android pipeline's 300ms
+double-tap-wait was a dead wait on every click (pinch-in already
+resets zoom, so double-tap is redundant on iOS); (2) THE device bug:
+SDL on iOS hardware intermittently reports a finger at exactly (0,0)
+MID-TOUCH (misrc_input.log evidence) — the jump exceeded the drag
+threshold so every tap was rejected as a drag (53 REJECT-DRAGs in one
+session), and pinch midpoints snapped to (0,0) so zoom never held.
+Fix: per-touch-slot last-real-position tracking holds through the
+phantom reports. Settings modal: touch-scrollable body + clipped
+output-path text (ea7ce1b) + compact spacing (0dc74ef) + 150% default
+scale so the whole modal fits like desktop (7acba0e).
+
+Still open: temporary debug logging to strip (ios_gl_debug_dump,
+ios_view_input_log + watcher), network-mode validation, CI/docs.
 
 ## Output artifacts (this session)
 
