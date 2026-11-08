@@ -33,12 +33,6 @@ typedef struct {
 #ifdef _WIN32
 	uint8_t      *_buffer2;
 #endif
-#if defined(__APPLE__) && !defined(_WIN32)
-	/* iOS: the backing is a vm_allocate region (no memfd/shm in the iOS
-	 * sandbox); the entry is mapped twice for the mirror. rb_close needs
-	 * the storage address to vm_deallocate it. */
-	void         *_storage;
-#endif
 	size_t        buffer_size;
 	int           fd;
 	atomic_size_t head;
