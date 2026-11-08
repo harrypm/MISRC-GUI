@@ -1735,7 +1735,9 @@ int main(int argc, char **argv) {
         Vector2 mouse_pos = gui_ui_get_mouse_position();
         Clay_SetPointerState((Clay_Vector2){ mouse_pos.x, mouse_pos.y },
 #if defined(__ANDROID__) || defined(MISRC_IOS)
-                             gui_android_viewport_click_pressed(MOUSE_LEFT_BUTTON));
+                             gui_android_viewport_click_pressed(MOUSE_LEFT_BUTTON) ||
+                             IsMouseButtonDown(MOUSE_LEFT_BUTTON) ||
+                             GetTouchPointCount() > 0);
 #else
                              IsMouseButtonDown(MOUSE_LEFT_BUTTON));
 #endif

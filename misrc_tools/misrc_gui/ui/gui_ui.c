@@ -3579,7 +3579,9 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
             .childGap = 8
         }
     }) {
-        // Editable path box (click to edit)
+        // Editable path box (click to edit). Long paths CLIP inside the box
+        // (same as MonitorLocalSavePathBox) instead of spilling past the
+        // modal edge (iOS container paths are very long).
         CLAY(CLAY_ID("OutputPathBox"), {
             .layout = {
                 .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(32) },
@@ -3587,7 +3589,8 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                 .padding = { 10, 10, 0, 0 }
             },
             .backgroundColor = to_clay_color((Color){25, 25, 30, 255}),
-            .cornerRadius = CLAY_CORNER_RADIUS(4)
+            .cornerRadius = CLAY_CORNER_RADIUS(4),
+            .clip = { .horizontal = true }
         }) {
             if (gui_ui_is_text_field_active(UI_TEXT_FIELD_OUTPUT_PATH)) {
                 gui_ui_render_active_text(UI_TEXT_FIELD_OUTPUT_PATH, app->settings.output_path, FONT_SIZE_NORMAL, 0, COLOR_TEXT);
