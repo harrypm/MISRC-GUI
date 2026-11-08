@@ -527,6 +527,8 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     settings->resample_gain_b = 0.0f;     // No gain
 #ifdef ENABLE_DDD
     settings->ddd_decimation = DDD_DECIMATION_FULL_RATE;
+    settings->ddd_use_winusb = false;
+    settings->ddd_libusb_raw_io = false;
 #endif
     
     // FLAC defaults
@@ -757,6 +759,8 @@ void gui_settings_save(const gui_settings_t *settings) {
     fprintf(f, "  \"resample_gain_b\": %.1f,\n", settings->resample_gain_b);
 #ifdef ENABLE_DDD
     fprintf(f, "  \"ddd_decimation\": %u,\n", (unsigned)settings->ddd_decimation);
+    fprintf(f, "  \"ddd_use_winusb\": %s,\n", settings->ddd_use_winusb ? "true" : "false");
+    fprintf(f, "  \"ddd_libusb_raw_io\": %s,\n", settings->ddd_libusb_raw_io ? "true" : "false");
 #endif
     fprintf(f, "  \"use_flac\": %s,\n", settings->use_flac ? "true" : "false");
     fprintf(f, "  \"flac_12bit\": %s,\n", settings->flac_12bit ? "true" : "false");
@@ -1303,6 +1307,12 @@ void gui_settings_load(gui_settings_t *settings) {
         if (ddd_decimation_is_supported(factor)) {
             settings->ddd_decimation = factor;
         }
+    }
+    if ((value = find_value(content, "ddd_use_winusb")) != NULL) {
+        settings->ddd_use_winusb = (strcmp(value, "true") == 0);
+    }
+    if ((value = find_value(content, "ddd_libusb_raw_io")) != NULL) {
+        settings->ddd_libusb_raw_io = (strcmp(value, "true") == 0);
     }
 #endif
 

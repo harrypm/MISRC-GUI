@@ -16,6 +16,8 @@
 #include <stdint.h>
 #include <stdatomic.h>
 
+#include "../../common/ddd_protocol.h"
+
 struct libusb_context;
 struct libusb_device_handle;
 struct libusb_transfer;
@@ -215,6 +217,11 @@ typedef gui_ddd_async_consume_result_t (*gui_ddd_async_consume_fn)(
     const uint8_t *data,
     size_t size);
 
+typedef bool (*gui_ddd_async_failed_tail_fn)(
+    void *context,
+    const uint8_t *data,
+    size_t size);
+
 typedef void (*gui_ddd_async_telemetry_fn)(
     void *context,
     const uint8_t *data,
@@ -241,19 +248,52 @@ typedef enum {
     GUI_DDD_ASYNC_RESULT_DRAIN_TIMEOUT,
     GUI_DDD_ASYNC_RESULT_ORDER_FAILURE,
     GUI_DDD_ASYNC_RESULT_CONSUMER_FAILURE,
+    GUI_DDD_ASYNC_RESULT_RAW_IO_UNAVAILABLE,
 } gui_ddd_async_result_code_t;
+
+/* Bulk queue and FIFO polling state at the first error, before teardown can
+ * replace useful counts with cancellation callbacks. */
+typedef struct {
+    bool valid;
+    uint64_t time_ms;
+    size_t in_flight;
+    size_t ready_transfers;
+    uint64_t next_consume_id;
+    uint64_t next_submit_id;
+    uint64_t completed_transfers;
+    uint64_t consumed_transfers;
+    uint64_t telemetry_readings;
+    unsigned telemetry_failures;
+    bool telemetry_in_flight;
+} gui_ddd_async_failure_snapshot_t;
+
+/* A periodic control read submitted before the fault may still complete while
+ * the queue is being reaped. The two host timestamps bound its observation. */
+typedef struct {
+    bool valid;
+    uint64_t submitted_ms;
+    uint64_t completed_ms;
+    ddd_fifo_telemetry_t telemetry;
+} gui_ddd_async_fifo_completion_t;
 
 typedef struct {
     gui_ddd_async_result_code_t code;
     int libusb_error;
+    /* Both are -1 when there was no bulk completion for this failure. */
     int transfer_status;
     int actual_length;
     uint64_t submission_id;
+    gui_ddd_async_failure_snapshot_t failure;
+    gui_ddd_async_fifo_completion_t fifo_completion_after_fault;
     uint64_t completed_transfers;
     uint64_t consumed_transfers;
     uint64_t telemetry_readings;
     unsigned telemetry_failures;
     bool ready_signalled;
+    bool libusb_raw_io_enabled;
+    const char *libusb_raw_io_stage; /* Static failure-stage name, or NULL. */
+    int libusb_raw_io_packet_size;
+    int libusb_raw_io_max_transfer_size;
     bool transfers_unreaped;
     size_t unreaped_transfers;
     size_t active_callbacks;
@@ -264,16 +304,24 @@ typedef struct {
     struct libusb_context *usb_context;
     struct libusb_device_handle *device_handle;
     uint8_t endpoint;
+    /* Windows libusb only. A requested policy must apply before any I/O. */
+    bool libusb_raw_io;
     atomic_bool *capture_running;
     atomic_bool *transfer_ready;
     atomic_bool *startup_failed;
     gui_ddd_async_consume_fn consume;
     void *consume_context;
+    /* Optional inspection of contiguous completed blocks after a consumer
+     * failure. Uses consume_context and returns false when enough is seen.
+     * With a nonzero wait, (NULL, 0) asks whether to wait for more blocks. */
+    gui_ddd_async_failed_tail_fn inspect_failed_tail;
+    uint64_t failure_tail_wait_ms; /* Zero cancels immediately. */
     /* Optional DdD FIFO instrument. It is driven by the same event thread as
      * the RF queue; no second event handler or synchronous control transfer is
      * introduced while capture is active. */
     gui_ddd_async_telemetry_fn telemetry;
     void *telemetry_context;
+    uint64_t telemetry_interval_ms; /* Zero selects the normal interval. */
     gui_ddd_async_event_pump_fn event_pump_override;
     void *event_pump_context;
     gui_ddd_async_now_ms_fn now_ms_override;
@@ -296,6 +344,7 @@ static inline void gui_ddd_async_detach_external_context(
     config->startup_failed = NULL;
     config->consume = NULL;
     config->consume_context = NULL;
+    config->inspect_failed_tail = NULL;
     config->telemetry = NULL;
     config->telemetry_context = NULL;
     config->event_pump_override = NULL;
@@ -353,5 +402,6 @@ bool gui_ddd_async_orphan_abandon(gui_ddd_async_orphan_t *orphan);
 bool gui_ddd_async_global_quarantine_active(void);
 
 const char *gui_ddd_async_result_name(gui_ddd_async_result_code_t code);
+const char *gui_ddd_async_transfer_status_name(int status);
 
 #endif /* GUI_DDD_ASYNC_H */

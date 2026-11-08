@@ -2482,6 +2482,20 @@ static bool gui_ui_settings_locked(const gui_app_t *app)
         gui_playback_is_starting((gui_app_t *)app));
 }
 
+#if defined(ENABLE_DDD) && defined(ENABLE_DDD_WINUSB)
+static bool gui_ui_ddd_usb_backend_visible(const gui_app_t *app)
+{
+    return gui_ui_selected_device_is_ddd_v1(app) &&
+        app->settings.net_mode != GUI_NET_MODE_CLIENT &&
+        app->settings.net_mode != GUI_NET_MODE_MONITOR_CLIENT;
+}
+
+static bool gui_ui_ddd_usb_backend_locked(const gui_app_t *app)
+{
+    return app->is_capturing || app->is_recording || gui_record_is_finalizing();
+}
+#endif
+
 // One-time per-session low-rate warning: pops a dismissible info dialog
 // only when the resample cycle lands on the 14.3 MSPS stock 10-bit CXADC
 // rate. 5/10 MSPS are intentional SW-resample targets for HiFi audio-only
@@ -4082,6 +4096,49 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                         }
                     }
 
+#if defined(ENABLE_DDD) && defined(ENABLE_DDD_WINUSB)
+                    if (gui_ui_ddd_usb_backend_visible(app)) {
+                        bool locked = gui_ui_ddd_usb_backend_locked(app);
+                        Color button_bg = locked ? ui_disabled_color(COLOR_BUTTON) : COLOR_BUTTON;
+                        Color text_fg = locked ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT;
+                        CLAY(CLAY_ID("DddUsbBackendRow"), {
+                            .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) },
+                                .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 }
+                        }) {
+                            CLAY(CLAY_ID("DddUsbBackendToggle"), {
+                                .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) },
+                                    .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } },
+                                .backgroundColor = to_clay_color(button_bg), .cornerRadius = CLAY_CORNER_RADIUS(4)
+                            }) {
+                                CLAY_TEXT(app->settings.ddd_use_winusb ? CLAY_STRING("WinUSB") : CLAY_STRING("libusb"),
+                                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(text_fg) }));
+                            }
+                            CLAY_TEXT(CLAY_STRING("DdD USB backend"),
+                                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(text_fg) }));
+                        }
+                        if (!app->settings.ddd_use_winusb) {
+                            Color raw_io_bg = locked ? button_bg :
+                                (app->settings.ddd_libusb_raw_io ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON);
+                            CLAY(CLAY_ID("DddLibusbRawIoRow"), {
+                                .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) },
+                                    .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                                    .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 }
+                            }) {
+                                CLAY(CLAY_ID("DddLibusbRawIoToggle"), {
+                                    .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) },
+                                        .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } },
+                                    .backgroundColor = to_clay_color(raw_io_bg), .cornerRadius = CLAY_CORNER_RADIUS(4)
+                                }) {
+                                    CLAY_TEXT(app->settings.ddd_libusb_raw_io ? CLAY_STRING("ON") : CLAY_STRING("OFF"),
+                                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(text_fg) }));
+                                }
+                                CLAY_TEXT(CLAY_STRING("libusb RAW_IO"),
+                                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(text_fg) }));
+                            }
+                        }
+                    } else
+#endif
                     CLAY(CLAY_ID("ToggleRowResampleB"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
                         Color resample_b_toggle_bg = settings_b_controls_disabled
                             ? ui_disabled_color(COLOR_BUTTON)
@@ -10907,6 +10964,34 @@ void gui_handle_interactions(gui_app_t *app) {
                 gui_ui_begin_text_edit(app, UI_TEXT_FIELD_FLAC_AFFINITY, CLAY_ID("FlacAffinityListField"), 8.0f, 8.0f);
                 gui_ui_set_click_consumed();
             }
+#if defined(ENABLE_DDD) && defined(ENABLE_DDD_WINUSB)
+            if (gui_ui_ddd_usb_backend_visible(app) &&
+                Clay_PointerOver(CLAY_ID("DddUsbBackendToggle"))) {
+                if (gui_ui_ddd_usb_backend_locked(app)) {
+                    gui_app_set_status(app, "Disconnect DdD before changing the USB backend");
+                } else {
+                    app->settings.ddd_use_winusb = !app->settings.ddd_use_winusb;
+                    gui_settings_save(&app->settings);
+                    gui_app_set_status(app, app->settings.ddd_use_winusb
+                        ? "DdD USB backend set to WinUSB" : "DdD USB backend set to libusb");
+                }
+                gui_ui_set_click_consumed();
+                return;
+            }
+            if (gui_ui_ddd_usb_backend_visible(app) && !app->settings.ddd_use_winusb &&
+                Clay_PointerOver(CLAY_ID("DddLibusbRawIoToggle"))) {
+                if (gui_ui_ddd_usb_backend_locked(app)) {
+                    gui_app_set_status(app, "Disconnect DdD before changing libusb RAW_IO");
+                } else {
+                    app->settings.ddd_libusb_raw_io = !app->settings.ddd_libusb_raw_io;
+                    gui_settings_save(&app->settings);
+                    gui_app_set_status(app, app->settings.ddd_libusb_raw_io
+                        ? "DdD libusb RAW_IO set to ON" : "DdD libusb RAW_IO set to OFF");
+                }
+                gui_ui_set_click_consumed();
+                return;
+            }
+#endif
             if (!settings_ddd_v1_mode &&
                 Clay_PointerOver(CLAY_ID("ToggleResampleA"))) {
                 bool enable = !app->settings.enable_resample_a;

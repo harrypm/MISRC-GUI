@@ -260,6 +260,8 @@ typedef struct {
     float resample_gain_b;                     // dB
 #ifdef ENABLE_DDD
     uint8_t ddd_decimation;                    // Firmware 3.1 only: 1=40, 2=20 MSPS
+    bool ddd_use_winusb;                        // Windows DdD v1 USB transport preference
+    bool ddd_libusb_raw_io;                     // Windows DdD v1 libusb RAW_IO preference
 #endif
 
     // FLAC compression

@@ -598,6 +598,88 @@ static bool test_sequence_learning_guards(void)
     return true;
 }
 
+static bool test_sequence_failure_history(void)
+{
+    const uint32_t length = DDD_SEQUENCE_SAMPLES_PER_MARKER;
+    const uint16_t fault[] = {2u << 10, 1u << 10, 1u << 10};
+    const uint16_t following[] = {1u << 10, 2u << 10, 3u << 10, 4u << 10};
+    const uint64_t fault_index = 37u + 2u * length - 1u;
+    ddd_sequence_validator_t sequence;
+
+    CHECK(prime_sequence(&sequence, length));
+    CHECK(feed_sequence_run(&sequence, 1, length - 2u) == DDD_VALIDATION_OK);
+    CHECK(ddd_sequence_validator_feed(&sequence, fault, 3) ==
+          DDD_VALIDATION_MISMATCH);
+    CHECK(sequence.failure_phase == DDD_SEQUENCE_RUNNING);
+    CHECK(sequence.error_sample_index == fault_index);
+    CHECK(sequence.expected_marker == 1 && sequence.actual_marker == 2);
+    CHECK(sequence.before_count == 3 && sequence.after_count == 2);
+    CHECK(sequence.before[0].marker == 62 && sequence.before[0].sample_count == 37);
+    CHECK(!sequence.before[0].start_observed && sequence.before[0].end_observed);
+    CHECK(sequence.before[1].marker == 0 && sequence.before[1].sample_count == length);
+    CHECK(sequence.before[1].start_sample_index == 37);
+    CHECK(sequence.before[1].start_observed && sequence.before[1].end_observed);
+    CHECK(sequence.before[2].marker == 1 && sequence.before[2].sample_count == length - 1);
+    CHECK(sequence.before[2].start_sample_index == 37u + length);
+    CHECK(sequence.before[2].start_observed && sequence.before[2].end_observed);
+    CHECK(sequence.after[0].marker == 2 && sequence.after[0].sample_count == 1);
+    CHECK(sequence.after[0].start_sample_index == fault_index);
+    CHECK(sequence.after[0].start_observed && sequence.after[0].end_observed);
+    CHECK(sequence.after[1].marker == 1 && sequence.after[1].sample_count == 2);
+    CHECK(sequence.after[1].start_observed && !sequence.after[1].end_observed);
+
+    CHECK(!ddd_sequence_validator_extend_failure_history(&sequence, following, 4));
+    CHECK(sequence.after_count == 4);
+    CHECK(sequence.after[1].sample_count == 3 && sequence.after[1].end_observed);
+    CHECK(sequence.after[2].marker == 2 && sequence.after[2].sample_count == 1);
+    CHECK(sequence.after[3].marker == 3 && sequence.after[3].sample_count == 1);
+    CHECK(sequence.after[3].end_observed);
+    CHECK(!ddd_sequence_validator_extend_failure_history(&sequence, following, 4));
+    CHECK(ddd_sequence_validator_feed(&sequence, fault, 3) == DDD_VALIDATION_MISMATCH);
+    CHECK(sequence.after_count == 4 && sequence.samples_seen == fault_index);
+    CHECK(sequence.error_sample_index == fault_index && sequence.samples_per_marker == length);
+    return true;
+}
+
+static bool test_sequence_failure_history_bounds(void)
+{
+    const uint32_t length = DDD_SEQUENCE_LEGACY_SAMPLES_PER_MARKER;
+    const uint16_t oversized[] = {6u << 10, 6u << 10, 7u << 10};
+    uint16_t reserved[1024];
+    ddd_sequence_validator_t sequence;
+
+    CHECK(prime_sequence(&sequence, length));
+    CHECK(feed_sequence_run(&sequence, 1, length - 1u) == DDD_VALIDATION_OK);
+    for (uint8_t marker = 2; marker <= 6; ++marker) {
+        CHECK(feed_sequence_run(&sequence, marker, length) == DDD_VALIDATION_OK);
+    }
+    CHECK(ddd_sequence_validator_feed(&sequence, oversized, 3) == DDD_VALIDATION_MISMATCH);
+    CHECK(sequence.before_count == DDD_SEQUENCE_HISTORY_RUNS);
+    CHECK(sequence.before[0].marker == 3 && sequence.before[0].sample_count == length);
+    CHECK(sequence.before[0].start_observed && sequence.before[0].end_observed);
+    CHECK(sequence.before[3].marker == 6 && sequence.before[3].sample_count == length);
+    CHECK(sequence.before[3].start_observed && !sequence.before[3].end_observed);
+    CHECK(sequence.after[0].marker == 6 && sequence.after[0].sample_count == 2);
+    CHECK(!sequence.after[0].start_observed && sequence.after[0].end_observed);
+    CHECK(sequence.after[1].marker == 7 && !sequence.after[1].end_observed);
+
+    ddd_sequence_validator_init(&sequence);
+    for (size_t i = 0; i < 1024u; ++i) reserved[i] = (uint16_t)(63u << 10);
+    CHECK(ddd_sequence_validator_feed(&sequence, reserved, 1) == DDD_VALIDATION_MISMATCH);
+    CHECK(sequence.failure_phase == DDD_SEQUENCE_SYNCHRONIZING);
+    CHECK(sequence.samples_per_marker == 0 && sequence.before_count == 0);
+    for (uint32_t i = 1; i < DDD_SEQUENCE_HISTORY_AFTER_MAX; i += 1024u) {
+        CHECK(ddd_sequence_validator_extend_failure_history(&sequence, reserved, 1024u) ==
+              (i + 1024u < DDD_SEQUENCE_HISTORY_AFTER_MAX));
+    }
+    CHECK(sequence.after_count == 1 && sequence.after[0].marker == 63);
+    CHECK(sequence.after[0].sample_count == DDD_SEQUENCE_HISTORY_AFTER_MAX);
+    CHECK(!sequence.after[0].start_observed && !sequence.after[0].end_observed);
+    CHECK(!ddd_sequence_validator_extend_failure_history(&sequence, oversized, 3));
+    CHECK(sequence.samples_seen == 0 && sequence.error_sample_index == 0);
+    return true;
+}
+
 static bool test_validators(void)
 {
     ddd_sequence_validator_t sequence;
@@ -660,6 +742,8 @@ int main(void)
         !test_sequence_wire_lengths() ||
         !test_sequence_fault_detection(65536u) ||
         !test_sequence_fault_detection(65535u) ||
+        !test_sequence_failure_history() ||
+        !test_sequence_failure_history_bounds() ||
         !test_sequence_learning_guards()) {
         return 1;
     }
