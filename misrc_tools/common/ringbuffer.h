@@ -24,6 +24,27 @@
 #ifndef RINGBUFFER_H
 #define RINGBUFFER_H
 
+/* TEMPORARY (iOS alloc diagnosis 2026-11-08): rb_init failure logging to
+ * the app's Documents dir; pulled over devicectl. */
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+#include <stdio.h>
+#include <stdlib.h>
+#define RB_LOG_FAIL(code_, sz_) do { \
+    const char *h_ = getenv("HOME"); \
+    if (h_) { \
+        char p_[1024]; \
+        snprintf(p_, sizeof(p_), "%s/Documents/misrc_rb.log", h_); \
+        FILE *f_ = fopen(p_, "a"); \
+        if (f_) { fprintf(f_, "rb_init FAIL code=%d size=%zu (%.1f MB)\n", \
+                          (code_), (size_t)(sz_), (double)(sz_)/1048576.0); \
+                  fclose(f_); } \
+    } \
+} while(0)
+#endif
+#endif
+
 #include <stddef.h>
 #include <stdint.h>
 #include <stdatomic.h>

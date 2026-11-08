@@ -101,62 +101,60 @@ int rb_init(ringbuffer_t *rb, char *name, size_t size) {
 		page_size = 4096;
 	}
 	if(size % (size_t)page_size != 0) {
+		RB_LOG_FAIL(1, size);
 		return 1;
 	}
 
 #if defined(RB_IOS_MACH_ENTRY)
-	/* iOS path: vm_allocate the real storage, wrap it in a Mach memory
-	 * entry, and map that entry twice into a reserved 2x range — the
-	 * mirror trick without POSIX shm. */
+	/* iOS path: vm_allocate the backing, then vm_remap it twice into a
+	 * 2x mirror region (copy=FALSE -> the mappings SHARE the same pages,
+	 * identical semantics to the memfd double-map). A Mach memory entry
+	 * worked at probe size but mach_make_memory_entry_64 FAILS at 512MB
+	 * on device (rb_init code=3, size=536870912 - misrc_rb.log), so the
+	 * entry is not used. */
 	task_t task = mach_task_self();
 	vm_address_t storage = 0;
 	kern_return_t kr = vm_allocate(task, &storage, size, VM_FLAGS_ANYWHERE);
 	if(kr != KERN_SUCCESS) {
+		RB_LOG_FAIL(2, size);
 		return 2;
 	}
-	memory_object_size_t entry_size = size;
-	mach_port_t entry = MACH_PORT_NULL;
-	kr = mach_make_memory_entry_64(task, &entry_size, (memory_object_offset_t)storage,
-	                               VM_PROT_READ | VM_PROT_WRITE, &entry, MACH_PORT_NULL);
-	if(kr != KERN_SUCCESS || entry_size != size) {
-		vm_deallocate(task, storage, size);
-		return 3;
-	}
-	void *reserve = mmap(NULL, 2 * size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	if(reserve == MAP_FAILED) {
-		mach_port_deallocate(task, entry);
+	vm_address_t mirror = 0;
+	kr = vm_allocate(task, &mirror, 2 * size, VM_FLAGS_ANYWHERE);
+	if(kr != KERN_SUCCESS) {
+		RB_LOG_FAIL(4, size);
 		vm_deallocate(task, storage, size);
 		return 4;
 	}
-	vm_address_t mirror1 = (vm_address_t)reserve;
-	kr = vm_map(task, &mirror1, size, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
-	            entry, 0, FALSE, VM_PROT_READ | VM_PROT_WRITE,
-	            VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_DEFAULT);
+	vm_prot_t cur_prot = VM_PROT_READ | VM_PROT_WRITE;
+	vm_prot_t max_prot = cur_prot;
+	vm_address_t m1 = mirror;
+	kr = vm_remap(task, &m1, size, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+	              task, storage, FALSE, &cur_prot, &max_prot,
+	              VM_INHERIT_DEFAULT);
 	if(kr != KERN_SUCCESS) {
-		munmap(reserve, 2 * size);
-		mach_port_deallocate(task, entry);
+		RB_LOG_FAIL(5, size);
+		vm_deallocate(task, mirror, 2 * size);
 		vm_deallocate(task, storage, size);
 		return 5;
 	}
-	vm_address_t mirror2 = (vm_address_t)reserve + size;
-	kr = vm_map(task, &mirror2, size, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
-	            entry, 0, FALSE, VM_PROT_READ | VM_PROT_WRITE,
-	            VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_DEFAULT);
+	vm_address_t m2 = mirror + size;
+	kr = vm_remap(task, &m2, size, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+	              task, storage, FALSE, &cur_prot, &max_prot,
+	              VM_INHERIT_DEFAULT);
 	if(kr != KERN_SUCCESS) {
-		munmap(reserve, size);
-		munmap((char *)reserve + size, size);
-		mach_port_deallocate(task, entry);
+		RB_LOG_FAIL(6, size);
+		vm_deallocate(task, mirror, 2 * size);
 		vm_deallocate(task, storage, size);
 		return 6;
 	}
-	/* The two mappings hold the pages; the entry handle is not needed. */
-	mach_port_deallocate(task, entry);
-	rb->buffer = (uint8_t *)reserve;
+	rb->buffer = (uint8_t *)mirror;
 	rb->_storage = (void *)(uintptr_t)storage;
 	rb->fd = -1;
 #else
 	// Make an anonymous file and set its size
 	if((rb->fd = memfd_create(name, 0)) == -1) {
+		RB_LOG_FAIL(2, size);
 		return 2;
 	}
 
