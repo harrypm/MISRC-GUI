@@ -1024,18 +1024,14 @@ int main(int argc, char **argv) {
     // so automated tests can launch the GUI with a pre-written config.
     gui_settings_set_override_path(config_path);
     gui_settings_load(&app.settings);
-#if defined(__ANDROID__)
-    // Render the existing UI without layout zoom on Android. The touch
-    // viewport scales the whole frame, including its outer borders.
+#if defined(__ANDROID__) || defined(MISRC_IOS)
+    // Render the existing UI without layout zoom on touch platforms. The
+    // touch viewport scales the whole frame, including its outer borders.
+    // (A phone-scale bump to 150% was tried and REVERTED: it shrank the
+    // Clay layout below the app's own 640x360 minimum and squished the UI
+    // into oblivion. The Android model is the contract: 100% scale, layout
+    // == the letterbox/canvas rect 1:1, and PINCH-ZOOM for reading detail.)
     app.settings.ui_scale_percent = GUI_UI_SCALE_DEFAULT_PERCENT;
-#elif defined(MISRC_IOS)
-    /* Phone UI: the letterbox layout is ~716pt wide vs the desktop's
-     * 1425px, so absolute-px controls render visually tiny. Scale the
-     * layout up 150% (elements 1.5x bigger, layout width shrinks
-     * accordingly - the same knob as the desktop Ctrl+wheel UI scale). */
-    if (app.settings.ui_scale_percent == GUI_UI_SCALE_DEFAULT_PERCENT) {
-        app.settings.ui_scale_percent = 150;
-    }
 #endif
     gui_ui_set_scale_percent(app.settings.ui_scale_percent);
     // --gen-system / --gen-format launch overrides (hard rule
