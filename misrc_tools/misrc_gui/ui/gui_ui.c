@@ -3391,7 +3391,17 @@ static void render_settings_panel(gui_app_t *app) {
         .backgroundColor = (Clay_Color){0, 0, 0, 140}
     }) {}
 
-    // Panel
+    // Panel. iOS phone layouts are ~585-603px tall at 200% UI scale (vs the
+    // desktop's ~710) — the full desktop spacing pushes the modal ~90px past
+    // the fold, so iOS compacts the section gaps/padding (same rows, same
+    // controls, Harry-approved 2026-11-08 "fix the settings menu").
+#ifdef MISRC_IOS
+    int settings_pad = 12;
+    int settings_gap = 8;
+#else
+    int settings_pad = 16;
+    int settings_gap = 12;
+#endif
     CLAY(CLAY_ID("SettingsPanel"), {
         .layout = {
             .sizing = {
@@ -3399,8 +3409,8 @@ static void render_settings_panel(gui_app_t *app) {
                 CLAY_SIZING_FIT(.min = settings_min_height, .max = settings_max_height)
             },
             .layoutDirection = CLAY_TOP_TO_BOTTOM,
-            .padding = { 16, 16, 16, 16 },
-            .childGap = 12
+            .padding = { settings_pad, settings_pad, settings_pad, settings_pad },
+            .childGap = settings_gap
         },
         .floating = {
             .attachTo = CLAY_ATTACH_TO_ROOT,
@@ -3618,11 +3628,16 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
 
 
         // Scrollable settings body
+#ifdef MISRC_IOS
+        int settings_body_gap = 6;
+#else
+        int settings_body_gap = 10;
+#endif
         CLAY(CLAY_ID("SettingsScroll"), {
             .layout = {
                 .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) },
                 .layoutDirection = CLAY_TOP_TO_BOTTOM,
-                .childGap = 10
+                .childGap = settings_body_gap
             },
             .clip = {
                 .vertical = true,
