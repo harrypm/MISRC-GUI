@@ -1986,15 +1986,6 @@ int main(int argc, char **argv) {
 
         // Render
         BeginDrawing();
-#if defined(MISRC_IOS)
-        /* RENDER BISECT step A (2026-11-08): touch canvas ON, Clay render
-         * still OFF. Isolates the canvas path. */
-        const bool android_canvas_active = gui_android_viewport_begin_canvas();
-        ClearBackground(COLOR_BG);
-        DrawRectangle(80, 80, 600, 300, MAROON);
-        DrawText("MISRC iOS CANVAS BISECT", 40, 40, 28, RAYWHITE);
-        DrawFPS(40, 500);
-#else
 #if defined(__ANDROID__) || defined(MISRC_IOS)
         const bool android_canvas_active = gui_android_viewport_begin_canvas();
 #endif
@@ -2002,7 +1993,6 @@ int main(int argc, char **argv) {
 
         // Render Clay UI (custom elements are handled via CLAY_RENDER_COMMAND_TYPE_CUSTOM)
         Clay_Raylib_Render(render_commands, fonts);
-#endif
 
         // Draw FPS in debug mode
         #ifdef DEBUG

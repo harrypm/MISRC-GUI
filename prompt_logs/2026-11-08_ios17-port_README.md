@@ -156,6 +156,42 @@
     layout/canvas presentation issue under investigation. User asked to
     visually confirm on the open Simulator window.
 
+## BLACK-SCREEN ROOT CAUSES (found + fixed 2026-11-08 ~07:45)
+
+Two independent raylib-on-iOS bugs, both desktop-GL assumptions breaking
+under iOS/EAGL (both patched idempotently in ios/build-deps-ios.sh):
+
+1. **FBO-0 restore**: under GRAPHICS_API_OPENGL_ES3 rlgl.h also defines
+   ES2 + RLGL_RENDER_TEXTURES_HINT, so EndTextureMode→rlDisableFramebuffer
+   binds framebuffer 0 — INVALID on iOS (SDL's UIKit view owns the window
+   FBO, observed id 1). Everything after the first RT pass drew into the
+   void. Fix: capture the real window FBO at SDL_GL_CreateContext and
+   restore it at every "return to default" site.
+2. **viewRenderbuffer unbind**: rlgl.h rebinds renderbuffer 0 after
+   creating an RT's depth RBO. SDL2/UIKit presents via
+   `[context presentRenderbuffer:GL_RENDERBUFFER]` and its own comment
+   says rebinding viewRenderbuffer is the app's job — binding 0 kills all
+   presentation even though the GL framebuffer contains correct content
+   (proven by in-app glReadPixels probes: fb had the UI, screen black).
+   Fix: capture GL_RENDERBUFFER_BINDING too and restore alongside the FBO.
+
+Supporting findings: Apple clang 17 keeps the macOS triple with only
+-isysroot (so __IPHONEOS__ is NEVER defined — patches must use
+TargetConditionals' TARGET_OS_IPHONE); raylib windows need
+FLAG_FULLSCREEN_MODE on iOS; the macOS osascript elevation path must be
+gated off iOS (on the SIMULATOR it spawns host osascript successfully and
+exits SDL_main instantly).
+
+Verified state at save point: full GUI (toolbar + Clay UI + panels +
+bottom bar) renders on the iPhone 17 Pro simulator (iOS 26.2), confirmed
+by pixel analysis (screenshot14.png: 487KB, 67k background px, 8.7k UI px
+across y≈600–1900) + luminance map showing the panel grid. Visual
+sign-off by Harry still pending (rule: real-world confirmation).
+
+Also fixed en route: /opt/homebrew pollution incident (openh264 meson
+default prefix) — remediated with brew reinstall; icons (transparency +
+centering) still TODO; device slice not yet built.
+
 ## Output artifacts (this session)
 
 - `prompt_logs/2026-11-08_ios17-port_README.md` (this file)

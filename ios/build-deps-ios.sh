@@ -593,6 +593,73 @@ else:
     open(p, 'w').write(s)
     print('[ios-deps] rcore_desktop_sdl.c: window-FBO capture patch applied')
 PY
+    # (4) THE SECOND HALF of the black-screen root cause: rlgl.h rebinds
+    #     renderbuffer 0 after creating an RT's depth renderbuffer (line
+    #     ~3416). On iOS, SDL2's UIKit swap does `[context
+    #     presentRenderbuffer:GL_RENDERBUFFER]` — its OWN comment: "Code
+    #     that binds something else is responsible for rebinding
+    #     viewRenderbuffer". Binding 0 unbinds SDL's view renderbuffer, so
+    #     every subsequent present shows nothing (black). Capture SDL's
+    #     renderbuffer at context creation and restore it alongside the FBO.
+    python3 - "$RAYLIB_SRC/src/rlgl.h" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+if 'RLGL_DEFAULT_RB' in s:
+    print('[ios-deps] rlgl.h viewRenderbuffer patch already applied')
+else:
+    if 'RLGL_DEFAULT_FB' not in s:
+        sys.exit('rlgl.h FBO patch missing - run order broken?')
+    # add the renderbuffer static + macro right after the FBO static block
+    fb_block = '''#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+    #define RLGL_DEFAULT_FB RLGL_DefaultFramebuffer
+    static unsigned int RLGL_DefaultFramebuffer = 0;
+#else
+    #define RLGL_DEFAULT_FB 0
+#endif'''
+    rb_block = fb_block + '''
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+    /* SDL/UIKit presents the GL_RENDERBUFFER binding; raylib rebinds 0 after
+     * RT depth-RBO creation, which unbinds SDL's view renderbuffer. */
+    #define RLGL_DEFAULT_RB RLGL_DefaultRenderbuffer
+    static unsigned int RLGL_DefaultRenderbuffer = 0;
+#else
+    #define RLGL_DEFAULT_RB 0
+#endif'''
+    if fb_block not in s:
+        sys.exit('rlgl.h FBO static block not found')
+    s = s.replace(fb_block, rb_block, 1)
+    n1 = s.count('glBindRenderbuffer(GL_RENDERBUFFER, 0);')
+    s = s.replace('glBindRenderbuffer(GL_RENDERBUFFER, 0);',
+                  'glBindRenderbuffer(GL_RENDERBUFFER, RLGL_DEFAULT_RB);')
+    # defensive: also restore the RB whenever we restore the default FBO
+    old_disable = 'glBindFramebuffer(GL_FRAMEBUFFER, RLGL_DEFAULT_FB);'
+    new_disable = ('glBindFramebuffer(GL_FRAMEBUFFER, RLGL_DEFAULT_FB);\n'
+                   '    glBindRenderbuffer(GL_RENDERBUFFER, RLGL_DEFAULT_RB);')
+    n2 = s.count(old_disable)
+    s = s.replace(old_disable, new_disable)
+    open(p, 'w').write(s)
+    print('[ios-deps] rlgl.h: viewRenderbuffer patch applied (%d RB-zero sites, %d FBO-restore sites extended)' % (n1, n2))
+PY
+    python3 - "$RAYLIB_SRC/src/platforms/rcore_desktop_sdl.c" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = 'RLGL_DefaultRenderbuffer = (unsigned int)defaultRB;'
+if marker in s:
+    print('[ios-deps] rcore_desktop_sdl.c viewRenderbuffer capture already applied')
+else:
+    anchor = 'RLGL_DefaultFramebuffer = (unsigned int)defaultFBO;'
+    if anchor not in s:
+        sys.exit('rcore_desktop_sdl.c FBO capture anchor not found')
+    add = anchor + '''
+        GLint defaultRB = 0;
+        glGetIntegerv(GL_RENDERBUFFER_BINDING, &defaultRB);
+        RLGL_DefaultRenderbuffer = (unsigned int)defaultRB;
+        TRACELOG(LOG_INFO, "GL: [iOS] view renderbuffer id: %u", (unsigned)defaultRB);'''
+    open(p, 'w').write(s.replace(anchor, add, 1))
+    print('[ios-deps] rcore_desktop_sdl.c: viewRenderbuffer capture added')
+PY
     cmake -S "$RAYLIB_SRC" -B "$DEPS_SRC_DIR/raylib-build-$SDK" \
       -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN_FILE" \
       -DPLATFORM=SDL \
