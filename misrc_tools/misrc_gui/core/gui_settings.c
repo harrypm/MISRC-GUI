@@ -610,7 +610,14 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     settings->show_core_pinning_in_settings = false;
     // Max total buffer RAM budget (1-16 GB). Default 4 GB mirrors the older
     // code's ~4 GB target. Clamped on load; applied at buffer-manager init.
+#if defined(MISRC_IOS)
+    /* Phone stock: 1 GB buffer budget (the phone's RAM is shared with the
+     * OS + video decoder stacks; the desktop 4 GB default would over-commit
+     * and invite jetsam kills). User-tunable in Settings. */
+    settings->memory_budget_gb = 1;
+#else
     settings->memory_budget_gb = 4;
+#endif
     settings->update_last_check_unix_s = 0;
     settings->update_last_release_tag[0] = '\0';
     settings->update_available_cached = false;

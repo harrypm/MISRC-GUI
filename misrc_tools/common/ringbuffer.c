@@ -31,6 +31,18 @@
 #ifndef MAP_ANONYMOUS
 #define MAP_ANONYMOUS MAP_ANON
 #endif
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+#include <mach/mach.h>
+/* iOS: no memfd_create/shm_open in the app sandbox (POSIX shared memory
+ * is unavailable), so the double-mirror ringbuffer needs a different
+ * backing: a Mach memory entry over an anonymous vm_allocate region.
+ * The entry maps the SAME pages at both mirror addresses — identical
+ * semantics to the memfd double-map, entirely in-RAM. */
+#define RB_IOS_MACH_ENTRY 1
+#endif
+#endif
 #endif
 #include "ringbuffer.h"
 #include <string.h>
@@ -92,6 +104,57 @@ int rb_init(ringbuffer_t *rb, char *name, size_t size) {
 		return 1;
 	}
 
+#if defined(RB_IOS_MACH_ENTRY)
+	/* iOS path: vm_allocate the real storage, wrap it in a Mach memory
+	 * entry, and map that entry twice into a reserved 2x range — the
+	 * mirror trick without POSIX shm. */
+	task_t task = mach_task_self();
+	vm_address_t storage = 0;
+	kern_return_t kr = vm_allocate(task, &storage, size, VM_FLAGS_ANYWHERE);
+	if(kr != KERN_SUCCESS) {
+		return 2;
+	}
+	memory_object_size_t entry_size = size;
+	mach_port_t entry = MACH_PORT_NULL;
+	kr = mach_make_memory_entry_64(task, &entry_size, (memory_object_offset_t)storage,
+	                               VM_PROT_READ | VM_PROT_WRITE, &entry, MACH_PORT_NULL);
+	if(kr != KERN_SUCCESS || entry_size != size) {
+		vm_deallocate(task, storage, size);
+		return 3;
+	}
+	void *reserve = mmap(NULL, 2 * size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if(reserve == MAP_FAILED) {
+		mach_port_deallocate(task, entry);
+		vm_deallocate(task, storage, size);
+		return 4;
+	}
+	vm_address_t mirror1 = (vm_address_t)reserve;
+	kr = vm_map(task, &mirror1, size, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+	            entry, 0, FALSE, VM_PROT_READ | VM_PROT_WRITE,
+	            VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_DEFAULT);
+	if(kr != KERN_SUCCESS) {
+		munmap(reserve, 2 * size);
+		mach_port_deallocate(task, entry);
+		vm_deallocate(task, storage, size);
+		return 5;
+	}
+	vm_address_t mirror2 = (vm_address_t)reserve + size;
+	kr = vm_map(task, &mirror2, size, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+	            entry, 0, FALSE, VM_PROT_READ | VM_PROT_WRITE,
+	            VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_DEFAULT);
+	if(kr != KERN_SUCCESS) {
+		munmap(reserve, size);
+		munmap((char *)reserve + size, size);
+		mach_port_deallocate(task, entry);
+		vm_deallocate(task, storage, size);
+		return 6;
+	}
+	/* The two mappings hold the pages; the entry handle is not needed. */
+	mach_port_deallocate(task, entry);
+	rb->buffer = (uint8_t *)reserve;
+	rb->_storage = (void *)(uintptr_t)storage;
+	rb->fd = -1;
+#else
 	// Make an anonymous file and set its size
 	if((rb->fd = memfd_create(name, 0)) == -1) {
 		return 2;
@@ -115,7 +178,8 @@ int rb_init(ringbuffer_t *rb, char *name, size_t size) {
 	if(mmap(rb->buffer + size, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, rb->fd, 0) == MAP_FAILED)  {
 		return 6;
 	}
-#endif
+#endif /* RB_IOS_MACH_ENTRY */
+#endif /* _WIN32 */
 
 	// Initialize our buffer indices
 	rb->buffer_size = size;
@@ -210,7 +274,15 @@ void rb_close(ringbuffer_t *rb) {
 #else
 	munmap(rb->buffer, rb->buffer_size);
 	munmap(rb->buffer+rb->buffer_size, rb->buffer_size);
-#if defined(__APPLE__)
+#if defined(RB_IOS_MACH_ENTRY)
+	/* Release the vm_allocate storage (the two mirror mappings are gone;
+	 * without this the backing pages would leak). */
+	if(rb->_storage) {
+		vm_deallocate(mach_task_self(),
+		              (vm_address_t)(uintptr_t)rb->_storage, rb->buffer_size);
+		rb->_storage = NULL;
+	}
+#elif defined(__APPLE__)
     close(rb->fd); /* release anonymous backing object after both mappings */
     rb->fd = -1;
 #endif
