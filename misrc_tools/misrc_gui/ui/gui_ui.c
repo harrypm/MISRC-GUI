@@ -9820,6 +9820,13 @@ void gui_handle_interactions(gui_app_t *app) {
                 s_net_mode_press_armed = true;
                 s_net_mode_hold_fired = false;
                 s_net_mode_press_time = GetTime();
+#if defined(MISRC_IOS)
+                extern void ios_view_input_log_net(const char *what, float x, float y);
+                {
+                    Vector2 p = gui_ui_get_mouse_position();
+                    ios_view_input_log_net("NET-ARM", p.x, p.y);
+                }
+#endif
                 gui_ui_set_click_consumed();
                 return;
             }
@@ -11220,6 +11227,38 @@ void gui_handle_interactions(gui_app_t *app) {
     if (s_net_mode_press_armed) {
         bool over_toggle = s_version_info_window_open &&
             Clay_PointerOver(CLAY_ID("VersionInfoNetModeToggle"));
+#if defined(MISRC_IOS)
+        /* Touch: IsMouseButtonDown is ALWAYS false (SDL finger events do
+         * not set the mouse button state), so the desktop release check
+         * would resolve the quick-click one frame after arming regardless
+         * of hold time. Resolve on the FINGER state instead: quick click
+         * when the finger is up, hold-menu when the finger stays down on
+         * the toggle for 450ms. */
+        bool touch_down = GetTouchPointCount() > 0;
+        if (!touch_down) {
+            bool quick_click = !s_net_mode_hold_fired && over_toggle;
+            s_net_mode_press_armed = false;
+            s_net_mode_hold_fired = false;
+            {
+                extern void ios_view_input_log_net(const char *what, float x, float y);
+                Vector2 p = gui_ui_get_mouse_position();
+                ios_view_input_log_net(quick_click ? "NET-QUICK-CLICK" : "NET-RESOLVE-NO-OVER",
+                                       p.x, p.y);
+            }
+            if (quick_click) {
+                gui_ui_net_mode_apply(app, gui_ui_net_mode_cycle_next(app->settings.net_mode));
+            }
+        } else if (!s_net_mode_hold_fired && over_toggle &&
+                   (GetTime() - s_net_mode_press_time) >= 0.45) {
+            s_net_mode_hold_fired = true;
+            s_net_mode_menu_open = true;
+            gui_dropdown_close_all();
+            {
+                extern void ios_view_input_log_net(const char *what, float x, float y);
+                ios_view_input_log_net("NET-HOLD-MENU", 0, 0);
+            }
+        }
+#else
         if (!IsMouseButtonDown(MOUSE_LEFT_BUTTON)) {
             bool quick_click = !s_net_mode_hold_fired && over_toggle;
             s_net_mode_press_armed = false;
@@ -11233,5 +11272,6 @@ void gui_handle_interactions(gui_app_t *app) {
             s_net_mode_menu_open = true;
             gui_dropdown_close_all();
         }
+#endif
     }
 }

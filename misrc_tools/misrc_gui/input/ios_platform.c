@@ -98,6 +98,20 @@ int ios_open_url(const char *url)
     return SDL_OpenURL(url) == 0;
 }
 
+/* TEMPORARY (net-mode trace): append a line to the Documents input log
+ * from the UI layer. Removed with the rest of the debug logging. */
+void ios_view_input_log_net(const char *what, float x, float y)
+{
+    const char *docs = ios_get_storage_path();
+    if (!docs || !*docs) return;
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/misrc_input.log", docs);
+    FILE *f = fopen(path, "a");
+    if (!f) return;
+    fprintf(f, "%s at=(%.1f,%.1f)\n", what, x, y);
+    fclose(f);
+}
+
 /* CPU core detection for the info panel / FLAC thread defaults (the CLI
  * lib's get_num_cores is not linked on iOS; sysconf does the same job). */
 uint32_t get_num_cores(void)
