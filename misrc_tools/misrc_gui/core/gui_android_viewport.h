@@ -327,8 +327,12 @@ Vector2 gui_android_viewport_pointer(void)
     if (!v->click_pulse) return GetMousePosition();
 #if defined(MISRC_IOS)
     {
-        /* click_screen is RAW screen px; 1:1 letterbox: subtract the rect
-         * origin and pan, divide by zoom (identity on Android). */
+        /* click_screen comes from SDL touch/mouse events in WINDOW POINT
+         * space (UpdateTouchPointsSDL scales by screen.width/height which
+         * are points; SDL mouse coords are window points). The 1:1 blit
+         * maps points->points, so mapping = subtract the letterbox origin
+         * and pan, divide by zoom. NO dpi division here (verified: the
+         * dpi-dividing revision landed taps at 1/3 coordinates). */
         int ox, oy, cw, ch;
         ios_view_fit_rect(&ox, &oy, &cw, &ch);
         return (Vector2){ (v->click_screen.x - (float)ox - v->x) / v->zoom,
