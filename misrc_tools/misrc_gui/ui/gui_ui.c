@@ -1549,22 +1549,6 @@ static char stat_rec_flac[2][32];
 static char stat_rec_ratio[2][24];
 static char stat_rec_duration[2][24];
 
-// Snapshot of what is visible in each channel's recording card. The UI
-// renders live values, while the existing info popup shows a click-time
-// snapshot. Keep this out of gui_app_t: no recording or network state changes.
-typedef struct {
-    bool visible;
-    bool recording;
-    bool buffer_known;
-    bool local_save;
-    unsigned buffer_fill_pct;
-    uint64_t write_waits;
-    uint64_t dropped_blocks;
-    uint64_t send_queue_bytes;
-    uint64_t send_queue_capacity;
-} gui_record_details_view_t;
-static gui_record_details_view_t s_record_details_view[2];
-
 // Playback file display buffers
 static char playback_file_a_display[64];
 static char playback_file_b_display[64];
@@ -6402,8 +6386,13 @@ static void render_toolbar(gui_app_t *app, bool ddd_compact_labels) {
 
 // Fixed width for labels to ensure alignment
 #define LABEL_WIDTH 50
-// Recording values keep a readable size; show fewer items in the narrow sidebar.
-#define FONT_SIZE_RECORD_READOUT 16
+// Recording stat rows (Dur/RAW/FLAC/Ratio) use Space Mono at a user-fixed
+// 18px (harrypm, 2026-11-08: 1.1x the original v1.2.6 16px readout — 1.3x
+// proved too large), drawn from the same bilinear-filtered 64px atlas so it
+// stays antialiased. gui_ui_stats_layout must reserve width with this exact
+// size/font. HARD UX rule: dev/gui_ux_change_approval_rules.md — this value
+// only changes on a direct user instruction.
+#define FONT_SIZE_RECORD_READOUT 18
 
 typedef struct {
     uint32_t clip_pos, clip_neg;
@@ -6462,12 +6451,13 @@ static gui_channel_stats_layout_t gui_ui_stats_layout(gui_app_t *app,
     // Also keep both existing 22px CXADC DC buttons intact.
     if (44 + gap > view_width) view_width = 44 + gap;
     float width = label_width + gap + view_width + padding * 2;
-    // Preserve room for the full RAW size readout in Space Mono, even at
-    // UINT64_MAX, without letting live recording bytes change the width.
-    char record_size_max[32];
-    snprintf(record_size_max, sizeof(record_size_max), "RAW: %.2f GB",
-             (double)UINT64_MAX / 1000000000.0);
-    int record_width = gui_ui_measure_text_width(app, record_size_max, FONT_SIZE_STATS, 0);
+    // Preserve room for the size readouts in Space Mono up to a realistic
+    // ~100 TB bound (harrypm 2026-11-08: don't push dead space for the
+    // UINT64_MAX sample). Static sample, so live recording bytes still
+    // never change the width; the FLAC row (with its label) is the longest
+    // of the restored rows.
+    int record_width = gui_ui_measure_text_width(app, "FLAC: 99999.99 GB",
+                                                 FONT_SIZE_RECORD_READOUT, 1);
     width = fmaxf(width, record_width + padding * 2);
     if (!compact) width = fmaxf(width, ceilf(185 * gui_ui_stats_width_scale(s_ui_scale_percent)));
     view_width = (int)width - label_width - gap - padding * 2;
@@ -6691,7 +6681,6 @@ static void render_channel_stats(gui_app_t *app, int channel,
             bool show_record_stats = remote_active
                 ? (remote_ch_enabled && (remote_recording || raw_bytes>0 || comp_bytes>0 || m_record->elapsed_ms>0))
                 : (app->is_capturing && (app->is_recording || raw_bytes > 0 || comp_bytes > 0 || app->last_recording_duration_s > 0.0));
-            if (!show_record_stats) s_record_details_view[channel].visible = false;
             if (show_record_stats) {
                 double shown_duration = m_record ? (double)m_record->elapsed_ms/1000.0
                     : (app->is_recording ? (GetTime() - app->recording_start_time) : app->last_recording_duration_s);
@@ -6724,144 +6713,32 @@ static void render_channel_stats(gui_app_t *app, int channel,
                     buf_rec_flac[0] = '\0';
                     buf_rec_ratio[0] = '\0';
                 }
-                // Detailed stats live behind a single button; do not crowd the
-                // narrow sidebar with waits, drops and per-buffer percentages.
-                gui_record_details_view_t *detail = &s_record_details_view[channel];
-                memset(detail, 0, sizeof(*detail));
-                detail->visible = true;
-                detail->recording = remote_active ? remote_recording : app->is_recording;
-                detail->local_save = m_record && m_record->local_save;
-                if (m_record) {
-                    detail->buffer_known = true;
-                    detail->buffer_fill_pct = m_record->rec_fill_pct[channel];
-                    detail->write_waits = m_record->rec_waits[channel];
-                    detail->dropped_blocks = m_record->rec_drops[channel];
-                    if (channel == 0 && m_record->local_save) {
-                        detail->send_queue_bytes = m_record->send_queue_bytes;
-                        detail->send_queue_capacity = m_record->send_queue_capacity;
-                    }
-                } else {
-                    buffer_id_t id = channel == 0 ? BUF_RECORD_A : BUF_RECORD_B;
-                    if (app->buffers.manager_initialized && app->buffers.initialized[id]) {
-                        buffer_stats_t bstats;
-                        bufmgr_get_stats(&app->buffers, id, &bstats);
-                        float fill = bufmgr_fill_percent(&app->buffers, id);
-                        if (fill < 0.0f) fill = 0.0f;
-                        if (fill > 1.0f) fill = 1.0f;
-                        detail->buffer_known = true;
-                        detail->buffer_fill_pct = (unsigned)roundf(fill * 100.0f);
-                        detail->write_waits = atomic_load(&bstats.write_waits);
-                        detail->dropped_blocks = atomic_load(&bstats.write_drops);
-                    }
+                // v1.2.6 compact readout restored (HARD UX rule:
+                // dev/gui_ux_change_approval_rules.md — no UX/layout changes
+                // without direct sign-off from harrypm). Plain Space Mono
+                // rows in the channel colour; gui_ui_stats_layout reserves
+                // the sidebar width for this exact font/size.
+                CLAY(CLAY_IDI("RecDurationRow", channel), { .layout = STAT_ROW_LAYOUT }) {
+                    CLAY_TEXT(make_string(buf_rec_duration),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_RECORD_READOUT, .fontId = 1, .textColor = to_clay_color(channel_value_color) }));
                 }
-                const char *buffer_health = "Buffer info";
-                Color buffer_health_color = COLOR_TEXT_DIM;
-                if (detail->buffer_known) {
-                    if (detail->dropped_blocks > 0) {
-                        buffer_health = "Data lost!";
-                        buffer_health_color = COLOR_CLIP_RED;
-                    } else if (detail->buffer_fill_pct >= 75 || detail->write_waits > 0) {
-                        buffer_health = "Buffer high";
-                        buffer_health_color = COLOR_METER_YELLOW;
-                    } else {
-                        buffer_health = "Buffer OK";
-                        buffer_health_color = COLOR_SYNC_GREEN;
-                    }
-                }
-
-                // Keep recording state and duration together in the narrow
-                // sidebar. Use a short inactive label so the 18px clock fits.
-                CLAY(CLAY_IDI("RecordingStateRow", channel), {
-                    .layout = {
-                        .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) },
-                        .layoutDirection = CLAY_LEFT_TO_RIGHT,
-                        .childGap = 4,
-                        .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }
-                    }
-                }) {
-                    CLAY(CLAY_IDI("RecordingStateDot", channel), {
-                        .layout = { .sizing = { CLAY_SIZING_FIXED(7), CLAY_SIZING_FIXED(7) } },
-                        .backgroundColor = to_clay_color(detail->recording ? COLOR_SYNC_GREEN : COLOR_TEXT_DIM),
-                        .cornerRadius = CLAY_CORNER_RADIUS(8)
-                    }) {}
-                    CLAY_TEXT(detail->recording ? CLAY_STRING("Recording") : CLAY_STRING("Last rec"),
-                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 0,
-                            .textColor = to_clay_color(COLOR_TEXT_DIM),
-                            .wrapMode = CLAY_TEXT_WRAP_NONE }));
-                    CLAY_TEXT(make_string(buf_rec_duration + 5),
-                        CLAY_TEXT_CONFIG({ .fontSize = 18, .fontId = 0,
-                            .wrapMode = CLAY_TEXT_WRAP_NONE,
-                            .textColor = to_clay_color(COLOR_TEXT) }));
-                }
-                // Full-width rows keep values readable inside the narrow
-                // channel sidebar. Two equal-sized columns forced the labels
-                // and compression readout to use tiny text.
                 if (!quarter_scale_layout) {
                     CLAY(CLAY_IDI("RecRawRow", channel), { .layout = STAT_ROW_LAYOUT }) {
-                        CLAY(CLAY_IDI("RecRawLabel", channel), {
-                            .layout = { .sizing = { CLAY_SIZING_FIXED(52), CLAY_SIZING_FIT(0) } }
-                        }) {
-                            CLAY_TEXT(CLAY_STRING("RAW:"), CLAY_TEXT_CONFIG({
-                                .fontSize = FONT_SIZE_STATS, .fontId = 0,
-                                .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-                        }
-                        CLAY_TEXT(make_string(buf_rec_raw + 5), CLAY_TEXT_CONFIG({
-                            .fontSize = 18, .fontId = 0, .wrapMode = CLAY_TEXT_WRAP_NONE,
-                            .textColor = to_clay_color(COLOR_TEXT) }));
+                        CLAY_TEXT(make_string(buf_rec_raw),
+                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_RECORD_READOUT, .fontId = 1, .textColor = to_clay_color(channel_value_color) }));
                     }
-                    if (buf_rec_flac[0]) {
-                        CLAY(CLAY_IDI("RecFlacRow", channel), { .layout = STAT_ROW_LAYOUT }) {
-                            CLAY(CLAY_IDI("RecFlacLabel", channel), {
-                                .layout = { .sizing = { CLAY_SIZING_FIXED(52), CLAY_SIZING_FIT(0) } }
-                            }) {
-                                CLAY_TEXT(CLAY_STRING("FLAC:"), CLAY_TEXT_CONFIG({
-                                    .fontSize = FONT_SIZE_STATS, .fontId = 0,
-                                    .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-                            }
-                            CLAY_TEXT(make_string(buf_rec_flac + 6), CLAY_TEXT_CONFIG({
-                                .fontSize = 18, .fontId = 0, .wrapMode = CLAY_TEXT_WRAP_NONE,
-                                .textColor = to_clay_color(COLOR_TEXT) }));
-                        }
+                }
+                if (buf_rec_flac[0]) {
+                    CLAY(CLAY_IDI("RecFlacRow", channel), { .layout = STAT_ROW_LAYOUT }) {
+                        CLAY_TEXT(make_string(buf_rec_flac),
+                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_RECORD_READOUT, .fontId = 1, .textColor = to_clay_color(channel_value_color) }));
                     }
                 }
                 if (buf_rec_ratio[0]) {
-                    CLAY(CLAY_IDI("RecRatioRow", channel), {
-                        .layout = {
-                            .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) },
-                            .layoutDirection = CLAY_LEFT_TO_RIGHT,
-                            .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
-                            .childGap = 6
-                        }
-                    }) {
-                        CLAY_TEXT(CLAY_STRING("Compression"), CLAY_TEXT_CONFIG({
-                            .fontSize = FONT_SIZE_STATS, .fontId = 0,
-                            .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-                        CLAY_TEXT(make_string(buf_rec_ratio + 7), CLAY_TEXT_CONFIG({
-                            .fontSize = 18, .fontId = 0, .wrapMode = CLAY_TEXT_WRAP_NONE,
-                            .textColor = to_clay_color(COLOR_SYNC_GREEN) }));
+                    CLAY(CLAY_IDI("RecRatioRow", channel), { .layout = STAT_ROW_LAYOUT }) {
+                        CLAY_TEXT(make_string(buf_rec_ratio),
+                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_RECORD_READOUT, .fontId = 1, .textColor = to_clay_color(channel_value_color) }));
                     }
-                }
-                CLAY(CLAY_IDI("RecordingDetailsButton", channel), {
-                    .layout = {
-                        .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(24) },
-                        .layoutDirection = CLAY_LEFT_TO_RIGHT,
-                        .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
-                        .childGap = 4,
-                        .padding = { 4, 4, 0, 0 }
-                    },
-                    .backgroundColor = to_clay_color(COLOR_BUTTON),
-                    .cornerRadius = CLAY_CORNER_RADIUS(3)
-                }) {
-                    // Use the same size/font as the Split and Waveform controls.
-                    // Keep warning labels short so both captions fit this narrow button.
-                    CLAY_TEXT(make_string(buffer_health), CLAY_TEXT_CONFIG({
-                        .fontSize = FONT_SIZE_DROPDOWN_OPT, .fontId = 0,
-                        .textColor = to_clay_color(buffer_health_color),
-                        .wrapMode = CLAY_TEXT_WRAP_NONE }));
-                    CLAY_TEXT(CLAY_STRING("Details >"), CLAY_TEXT_CONFIG({
-                        .fontSize = FONT_SIZE_DROPDOWN_OPT, .fontId = 0,
-                        .textColor = to_clay_color(COLOR_TEXT),
-                        .wrapMode = CLAY_TEXT_WRAP_NONE }));
                 }
             }
         }
@@ -10194,42 +10071,6 @@ void gui_handle_interactions(gui_app_t *app) {
             return;
         }
         for (int channel = 0; channel < 2; channel++) {
-            if (s_record_details_view[channel].visible &&
-                Clay_PointerOver(CLAY_IDI("RecordingDetailsButton", channel))) {
-                const gui_record_details_view_t *detail = &s_record_details_view[channel];
-                char message[480];
-                char buffer_section[200];
-                if (detail->buffer_known) {
-                    snprintf(buffer_section, sizeof(buffer_section),
-                             "Record buffer %c: %u%%\nWrite waits: %" PRIu64
-                             "\nDropped blocks: %" PRIu64,
-                             channel == 0 ? 'A' : 'B', detail->buffer_fill_pct,
-                             detail->write_waits, detail->dropped_blocks);
-                } else {
-                    snprintf(buffer_section, sizeof(buffer_section),
-                             "Record buffer: unavailable");
-                }
-                char send_section[96] = "";
-                if (detail->local_save && channel == 0 && detail->send_queue_capacity > 0) {
-                    snprintf(send_section, sizeof(send_section),
-                             "\nLocal Save queue: %.1f / %.1f MiB",
-                             (double)detail->send_queue_bytes / 1048576.0,
-                             (double)detail->send_queue_capacity / 1048576.0);
-                }
-                snprintf(message, sizeof(message),
-                         "%s\n%s\n%s%s%s%s%s\n\n%s%s",
-                         detail->recording ? "Recording in progress" : "Last recording",
-                         stat_rec_duration[channel], stat_rec_raw[channel],
-                         stat_rec_flac[channel][0] ? "\n" : "",
-                         stat_rec_flac[channel],
-                         stat_rec_ratio[channel][0] ? "\n" : "",
-                         stat_rec_ratio[channel], buffer_section, send_section);
-                gui_dropdown_close_all();
-                gui_ui_clear_text_edit();
-                gui_popup_info("Recording details (snapshot)", message);
-                gui_ui_set_click_consumed();
-                return;
-            }
             if (Clay_PointerOver(CLAY_IDI("StatClip", channel))) {
                 char details[160];
                 uint_fast32_t positive = channel == 0 ? atomic_load(&app->clip_count_a_pos)

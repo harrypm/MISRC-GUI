@@ -5,8 +5,9 @@ mode="${1:---all}"
 case "$mode" in
   --codec) modules=(openh264 opus) ;;
   --all) modules=(openh264 opus fftw3f flac libusb-1.0 soxr libuvc libzstd) ;;
+  --system) modules=(fftw3f flac libusb-1.0 soxr libuvc libzstd) ;;
   --gui) modules=(openh264 opus fftw3f flac libusb-1.0 soxr libuvc libzstd hsdaoh raylib) ;;
-  *) echo "[build-deps-check] ERROR: Usage: $0 [--codec|--all|--gui]" >&2; exit 2 ;;
+  *) echo "[build-deps-check] ERROR: Usage: $0 [--codec|--system|--all|--gui]" >&2; exit 2 ;;
 esac
 
 pc="${PKG_CONFIG:-pkg-config}"
@@ -52,7 +53,8 @@ if (("${#missing[@]}" > 0)); then
     printf '\n' >&2
   fi
   if [[ "$mode" == --gui ]]; then
-    echo "[build-deps-check] hsdaoh/raylib: build vendored deps with scripts/build-deps-unix.sh" >&2
+    echo "[build-deps-check] hsdaoh/raylib (and opus/openh264 when absent from the system):" >&2
+    echo "[build-deps-check]   build vendored deps with scripts/build-deps-unix.sh (run via scripts/build-local.sh)" >&2
   fi
   echo "[build-deps-check] Build aborted before compilation." >&2
   exit 1

@@ -578,6 +578,24 @@ if raylib_dep.found()
       endif
     elif host_system == 'android'
       gui_deps += [meson.get_compiler('c').find_library('c++', required: true)]
+    elif host_system == 'linux' or host_system == 'darwin'
+      # The vendored in-repo openh264 (third_party/openh264, built by
+      # scripts/build-deps-unix.sh) is a STATIC archive, so the link needs
+      # the C++ runtime (undefined __vmi_class_type_info vtable otherwise).
+      # Detect static-ness from the .pc libdir: a static install ships
+      # libopenh264.a next to openh264.pc; shared distro builds (CI's
+      # libopenh264-dev) do not, and stay C-only. libc++ on macOS,
+      # libstdc++ on Linux.
+      fs = import('fs')
+      openh264_libdir = openh264_dep.get_variable(pkgconfig: 'libdir', default_value: '')
+      openh264_is_static = openh264_libdir != '' and fs.is_file(join_paths(openh264_libdir, 'libopenh264.a'))
+      if openh264_is_static
+        if host_system == 'darwin'
+          gui_deps += [meson.get_compiler('c').find_library('c++', required: true)]
+        else
+          gui_deps += [meson.get_compiler('c').find_library('stdc++', required: true)]
+        endif
+      endif
     endif
     message('MISRC monitor H.264 video codec enabled')
     openh264_define = '-DMISRC_HAVE_OPENH264=1'

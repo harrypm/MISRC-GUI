@@ -29,3 +29,6 @@ __pycache__/
 # with a build timestamp + the host NDK path. Never commit it for the same
 # reason: regenerating it on CI dirties the tree and tags the version -dirty.
 /android/deps-versions.txt
+
+# Local restore-point zips (large; never commit)
+/restore_points/

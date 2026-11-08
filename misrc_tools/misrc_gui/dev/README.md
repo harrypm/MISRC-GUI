@@ -36,6 +36,9 @@ Use lowercase with underscores:
 | `gui_output_verification_rules.md` | HARD rule: headless verification must read what the GUI displays (render-path conversion contracts) |
 | `gui_uniform_border_rules.md` | HARD rule: visible Clay containers derive width from content (uniform borders) — AudioLevelBars incident |
 | `gui_signal_default_rules.md` | HARD rule: mode-scoped default configs — device defaults (test-gen triggers etc.) never leak across modes; user picks never overwritten |
+| `gui_ux_change_approval_rules.md` | HARD rule: no UX/GUI layout changes of any kind without direct sign-off from harrypm (Harry Munday) |
+| `readme_hands_off_rules.md` | HARD rule: root `README.md` is hands-off — no edits of any kind without a direct instruction from harrypm |
+| `self_contained_deps_rules.md` | HARD rule: all build deps self-contained from committed pinned `third_party/` trees; no build-time downloads; dep changes only via human-approved commits |
 
 ### When starting a new prompt
 

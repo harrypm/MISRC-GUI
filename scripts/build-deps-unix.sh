@@ -5,8 +5,13 @@
 # fftw3f/flac/libusb-1.0/soxr/libuvc come from the system package manager
 # (apt libuvc-dev/libfftw3-dev/libflac-dev/libsoxr-dev/libusb-1.0-0-dev on
 # Debian/Ubuntu, `brew install fftw flac libusb libuvc libsoxr` on macOS) -- the
-# same versions CI installs -- so only hsdaoh + raylib are built vendored.
-#
+# same versions CI installs. Everything else the GUI hard-requires is built
+# VENDORED from committed, pinned sources in third_party/ into
+# .deps/install (2026-11-08: opus and openh264 joined hsdaoh + raylib after
+# the Monitor codecs became hard GUI deps). No build-time downloads: the
+# trees live in the repository and change only through reviewed,
+# human-approved commits (HARD rule:
+# misrc_tools/misrc_gui/dev/self_contained_deps_rules.md).
 # Idempotent: skips work whose stamp matches the current inputs, so repeated runs
 # or new terminal sessions reuse .deps/install until an input changes.
 #
@@ -19,6 +24,8 @@ REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 DEPS_PREFIX="${DEPS_PREFIX:-$REPO_ROOT/.deps/install}"
 HSDAOH_SOURCE_DIR="${HSDAOH_SOURCE_DIR:-$REPO_ROOT/third_party/hsdaoh}"
 RAYLIB_TAG="${RAYLIB_TAG:-5.5}"
+OPUS_TAG="${OPUS_TAG:-v1.5.2}"
+OPENH264_TAG="${OPENH264_TAG:-v2.6.0}"  # same pin as android/build-openh264-android.sh
 
 log()  { printf '[build-deps-unix] %s\n' "$*"; }
 fail() { printf '[build-deps-unix] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -51,7 +58,9 @@ require_tools cmake pkg-config cc git
 # validating libraries. Check BEFORE invoking CMake or reusing the stamp.
 export PKG_CONFIG="${PKG_CONFIG:-pkg-config}"
 export PKG_CONFIG_PATH="$DEPS_PREFIX/lib/pkgconfig:$DEPS_PREFIX/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
-bash "$SCRIPT_DIR/check-build-deps.sh" --all
+# System modules only: opus/openh264 are vendored below when the system dev
+# packages are missing, so they must not abort the deps run before that.
+bash "$SCRIPT_DIR/check-build-deps.sh" --system
 
 # --- Stamp: rebuild only when inputs change ---------------------------------
 stamp_file="$DEPS_PREFIX/.build-stamp"
@@ -68,6 +77,8 @@ compute_stamp() {
     for m in fftw3f flac libusb-1.0 soxr libuvc libzstd openh264 opus; do
       printf '%s=%s\n' "$m" "$(pkg-config --modversion "$m" 2>/dev/null || echo missing)"
     done
+    echo "opus_tag=$OPUS_TAG"
+    echo "openh264_tag=$OPENH264_TAG"
   } | sha256sum | awk '{print $1}'
 }
 
@@ -124,6 +135,32 @@ fi
 cmake -S "$REPO_ROOT/.deps/raylib" -B "$REPO_ROOT/.deps/raylib/build" "${RAY_CMAKE_ARGS[@]}"
 cmake --build "$REPO_ROOT/.deps/raylib/build" --parallel
 cmake --install "$REPO_ROOT/.deps/raylib/build"
+
+# --- opus (static, vendored in-repo: third_party/opus) ----------------------
+# Monitor/Remote Audio Mon streams 48 kHz / 10 ms Opus mono (hard GUI dep).
+# Built from the committed, pinned tree (see third_party/opus/VENDOR.md):
+# no build-time downloads. The vendored prefix is FIRST in PKG_CONFIG_PATH,
+# so this build wins over any system copy.
+rm -rf "$REPO_ROOT/.deps/opus"
+cp -R "$REPO_ROOT/third_party/opus" "$REPO_ROOT/.deps/opus"
+cmake -S "$REPO_ROOT/.deps/opus" -B "$REPO_ROOT/.deps/opus/build" \
+  -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+  -DOPUS_BUILD_SHARED_LIBRARY=OFF -DOPUS_BUILD_PROGRAMS=OFF \
+  -DCMAKE_INSTALL_PREFIX="$DEPS_PREFIX"
+cmake --build "$REPO_ROOT/.deps/opus/build" --parallel
+cmake --install "$REPO_ROOT/.deps/opus/build"
+
+# --- openh264 (static, vendored in-repo: third_party/openh264) --------------
+# OpenH264 is mandatory for the Monitor Client's video feature. Built from
+# the committed, pinned tree (see third_party/openh264/VENDOR.md; same pin
+# as android/build-openh264-android.sh). Upstream ships meson.build.
+rm -rf "$REPO_ROOT/.deps/openh264"
+cp -R "$REPO_ROOT/third_party/openh264" "$REPO_ROOT/.deps/openh264"
+meson setup "$REPO_ROOT/.deps/openh264/build" "$REPO_ROOT/.deps/openh264" \
+  --prefix "$DEPS_PREFIX" --libdir lib --buildtype release \
+  --default-library static
+meson compile -C "$REPO_ROOT/.deps/openh264/build"
+meson install -C "$REPO_ROOT/.deps/openh264/build"
 
 # --- sanity -----------------------------------------------------------------
 export PKG_CONFIG_PATH="$DEPS_PREFIX/lib/pkgconfig:$DEPS_PREFIX/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"

@@ -72,10 +72,16 @@ python3 "$GUARD_SCRIPT" --static-only || fail "CI guard tests failed (see output
 # deps prefix and hides system modules like fftw3f/libusb/alsa/soxr.
 # Override with MISRC_PKG_CONFIG if a different native pkg-config is needed.
 export PKG_CONFIG="${MISRC_PKG_CONFIG:-pkg-config}"
-# Detect the H.264 dependency before building vendored deps or touching a
-# pre-existing build directory. Missing OpenH264 must never yield a GUI that
-# silently falls back to a black video preview.
-bash "$SCRIPT_DIR/check-build-deps.sh" --codec
+# Codec preflight (openh264/opus) runs AFTER the deps-ensure step below:
+# build-deps-unix.sh builds both from the committed, pinned third_party/
+# trees (no downloads), so a local build is self-contained from the repo —
+# no libopus-dev/libopenh264-dev sudo install needed. Only a caller-
+# provided prebuilt prefix (MISRC_DEPS_PREFIX) cannot gain vendored codecs,
+# so that path keeps the hard early gate — missing OpenH264 must never
+# yield a GUI that silently falls back to a black video preview.
+if [[ -n "${MISRC_DEPS_PREFIX:-}" ]]; then
+  bash "$SCRIPT_DIR/check-build-deps.sh" --codec
+fi
 
 # Locate a vendored deps prefix that provides hsdaoh.pc.
 DEPS_PREFIX=""
@@ -93,13 +99,26 @@ done
 # linux-appimage/macos CI deps blocks and self-skips via a stamp when inputs
 # are unchanged, so new terminals reuse until an input changes (local == CI).
 # Skip only when the caller points at a prebuilt prefix via MISRC_DEPS_PREFIX.
+deps_prefix_has_codecs() {
+  local candidate="$1"
+  PKG_CONFIG_PATH="$candidate/lib/pkgconfig:$candidate/lib64/pkgconfig:${PKG_CONFIG_PATH:-}" \
+    "$PKG_CONFIG" --exists opus openh264
+}
+deps_script="$SCRIPT_DIR/build-deps-unix.sh"
+if [[ ! -f "$deps_script" ]]; then
+  fail "Deps build script not found: $deps_script"
+fi
 if [[ -z "$DEPS_PREFIX" && -z "${MISRC_DEPS_PREFIX:-}" ]]; then
-  deps_script="$SCRIPT_DIR/build-deps-unix.sh"
-  if [[ ! -f "$deps_script" ]]; then
-    fail "Deps build script not found: $deps_script"
-  fi
   log "Ensuring local deps via $deps_script (skips instantly if already built)"
   bash "$deps_script"
+elif [[ -n "$DEPS_PREFIX" && -z "${MISRC_DEPS_PREFIX:-}" ]] && ! deps_prefix_has_codecs "$DEPS_PREFIX"; then
+  # The located prefix predates the vendored opus/openh264 hard deps.
+  # Build INTO it (offline, from the committed third_party/ trees) rather
+  # than failing on distro dev packages the user may not be able to install.
+  log "Located deps prefix lacks vendored opus/openh264; topping it up"
+  DEPS_PREFIX="$DEPS_PREFIX" bash "$deps_script"
+fi
+if [[ -z "${MISRC_DEPS_PREFIX:-}" ]]; then
   # Re-detect the deps prefix after the build.
   for candidate in "$REPO_ROOT/.deps/install" "$REPO_ROOT/.deps/install-appimage-local"; do
     for pcdir in "$candidate/lib/pkgconfig" "$candidate/lib64/pkgconfig"; do
@@ -110,6 +129,9 @@ if [[ -z "$DEPS_PREFIX" && -z "${MISRC_DEPS_PREFIX:-}" ]]; then
   done
   if [[ -z "$DEPS_PREFIX" ]]; then
     fail "Deps build reported success but hsdaoh.pc still not found under .deps/install."
+  fi
+  if ! deps_prefix_has_codecs "$DEPS_PREFIX"; then
+    fail "Deps build reported success but vendored opus/openh264 are still missing from $DEPS_PREFIX."
   fi
 fi
 
