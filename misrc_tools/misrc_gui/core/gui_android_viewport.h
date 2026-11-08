@@ -258,6 +258,32 @@ void gui_android_viewport_update(void)
             v->previous = p;
         }
     } else {
+#if defined(MISRC_IOS)
+        /* iOS: dispatch the tap IMMEDIATELY on finger lift. The Android
+         * pipeline holds every tap 0.30s to distinguish a double-tap
+         * (zoom reset) — on iOS that is a 300ms dead wait on EVERY click
+         * (user report 2026-11-08: slow touch reaction). Pinch-in already
+         * resets the zoom (clamped to 1.0), so the double-tap gesture is
+         * redundant here; drop it and fire the click at once. */
+        if (v->last_contacts == 1 && v->single_active &&
+            !v->single_drag && !v->multi_active) {
+            v->click_screen = v->previous;
+            v->click_pulse = true;
+            {
+                int ox, oy, cw, ch;
+                ios_view_fit_rect(&ox, &oy, &cw, &ch);
+                const float dpi = ios_view_dpi();
+                ios_view_input_log("TAP", v->click_screen.x, v->click_screen.y,
+                                   (v->click_screen.x * dpi - (float)ox - v->x) / v->zoom,
+                                   (v->click_screen.y * dpi - (float)oy - v->y) / v->zoom,
+                                   0, 0);
+            }
+        }
+        v->queued_tap = false;
+        v->single_active = false;
+        v->single_drag = false;
+        v->multi_active = false;
+#else
         if (v->last_contacts == 1 && v->single_active &&
             !v->single_drag && !v->multi_active) {
             if (v->queued_tap &&
@@ -280,18 +306,8 @@ void gui_android_viewport_update(void)
             v->click_screen = v->queued_screen;
             v->click_pulse = true;
             v->queued_tap = false;
-#if defined(MISRC_IOS)
-            {
-                int ox, oy, cw, ch;
-                ios_view_fit_rect(&ox, &oy, &cw, &ch);
-                const float dpi = ios_view_dpi();
-                ios_view_input_log("TAP", v->click_screen.x, v->click_screen.y,
-                                   (v->click_screen.x * dpi - (float)ox - v->x) / v->zoom,
-                                   (v->click_screen.y * dpi - (float)oy - v->y) / v->zoom,
-                                   0, 0);
-            }
-#endif
         }
+#endif
     }
     v->last_contacts = n;
     android_view_limit_translation();
