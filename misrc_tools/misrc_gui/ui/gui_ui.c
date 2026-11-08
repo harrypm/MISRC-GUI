@@ -11236,13 +11236,18 @@ void gui_handle_interactions(gui_app_t *app) {
          * the toggle for 450ms. */
         bool touch_down = GetTouchPointCount() > 0;
         if (!touch_down) {
-            bool quick_click = !s_net_mode_hold_fired && over_toggle;
+            /* NO live over_toggle re-check at resolve: the finger is up, the
+             * live pointer is meaningless on device (no mouse events), and
+             * the ARM gate already verified the position at tap time
+             * (NET-ARM logs proved the resolve-frame pointer reads garbage
+             * -> every quick-click was dropped as NO-OVER). */
+            bool quick_click = !s_net_mode_hold_fired;
             s_net_mode_press_armed = false;
             s_net_mode_hold_fired = false;
             {
                 extern void ios_view_input_log_net(const char *what, float x, float y);
                 Vector2 p = gui_ui_get_mouse_position();
-                ios_view_input_log_net(quick_click ? "NET-QUICK-CLICK" : "NET-RESOLVE-NO-OVER",
+                ios_view_input_log_net(quick_click ? "NET-QUICK-CLICK" : "NET-RESOLVE",
                                        p.x, p.y);
             }
             if (quick_click) {

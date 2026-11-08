@@ -193,6 +193,10 @@ void gui_android_viewport_update(void)
         const int nmax = (n < MISRC_TOUCH_SLOTS) ? n : MISRC_TOUCH_SLOTS;
         for (int i = 0; i < nmax; i++) {
             Vector2 p = GetTouchPosition(i);
+            /* A NEW touch's first report is often (0,0) on device; holding
+             * the last real position ACROSS touches (no per-lift reset)
+             * keeps the gesture start stable — a real (0,0) touch lands in
+             * the bar area where no controls live, so holding is safe. */
             if (p.x == 0.0f && p.y == 0.0f && s_touch_valid[i]) {
                 /* phantom (0,0): hold the last real position */
             } else {
@@ -200,9 +204,7 @@ void gui_android_viewport_update(void)
                 s_touch_valid[i] = true;
             }
         }
-        for (int i = n; i < MISRC_TOUCH_SLOTS; i++) s_touch_valid[i] = false;
-    }
-#define TOUCH_POS(i_) (((i_) < n && (i_) < MISRC_TOUCH_SLOTS && s_touch_valid[i_]) \
+#define TOUCH_POS(i_) (((i_) < n && (i_) < MISRC_TOUCH_SLOTS) \
                        ? s_last_touch[(i_)] : GetTouchPosition(i_))
 #else
 #define TOUCH_POS(i_) GetTouchPosition(i_)
