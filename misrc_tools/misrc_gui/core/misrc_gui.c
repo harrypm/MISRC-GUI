@@ -1029,15 +1029,15 @@ int main(int argc, char **argv) {
     // viewport scales the whole frame, including its outer borders.
     app.settings.ui_scale_percent = GUI_UI_SCALE_DEFAULT_PERCENT;
 #elif defined(MISRC_IOS)
-    /* Android-model layout (canvas == layout, 1:1 physical), but iOS
-     * screens are physically much smaller than desktop monitors, so
-     * stock absolute-px elements read small. A 200% default (only when
-     * the setting is untouched) doubles element size; the layout stays
-     * ~1194x603 px — above the 640x360 minimum (the failed 150%-on-
-     * points attempt squashed ONLY because that layout was 498px wide).
-     * Still user-tunable via the scale HUD. */
+    /* Android-model layout (canvas == layout, 1:1 physical). 150% is the
+     * phone sweet spot: elements 1.5x (physically larger than Android's
+     * 100%-of-a-2208px-canvas), layout ~1432x780 — and the SETTINGS modal
+     * (~610-660px of content) fits FULLY VISIBLE like the desktop. At
+     * 200% the layout is ~585px tall and the settings content cannot fit
+     * (verified: the modal pins at max height, body scrolls). Users can
+     * still pick 200% via the scale HUD; settings then scrolls. */
     if (app.settings.ui_scale_percent == GUI_UI_SCALE_DEFAULT_PERCENT) {
-        app.settings.ui_scale_percent = 200;
+        app.settings.ui_scale_percent = 150;
     }
 #endif
     gui_ui_set_scale_percent(app.settings.ui_scale_percent);
