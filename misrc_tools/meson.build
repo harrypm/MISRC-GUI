@@ -433,9 +433,13 @@ endif
 
 rf_preview_sources = [
   'misrc_gui/signal/gui_rf_preview.c',
+  'misrc_gui/signal/gui_ld_rf_demod.c',
 ]
 rf_audio_sources = [
   'misrc_gui/signal/gui_vhs_hifi.c',
+  'misrc_gui/signal/gui_ld_rf_analog.c',
+  'misrc_gui/signal/gui_ld_rf_digital.c',
+  'misrc_gui/signal/gui_ld_efm_frontend.c',
 ]
 
 # GUI application (requires raylib)
