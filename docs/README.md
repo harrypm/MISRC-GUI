@@ -12,6 +12,7 @@ enforces this layout.
 | Document | Description |
 |---|---|
 | [DECODER_MODES.md](DECODER_MODES.md) | Every decoder mode (Video panel decoders, RF Preview tape profiles, CVBS modes, Demod modes, monitor video codecs) and the state of each |
+| [RTL-SDR.md](RTL-SDR.md) | Compatible USB dongles, I/Q capture setup and VHS Hi-Fi preview |
 | [MONITOR_MODES.md](MONITOR_MODES.md) | Unified Server / Monitor & Remote network modes, endpoints and Local Save |
 | [MONITOR_VIDEO_CODECS.md](MONITOR_VIDEO_CODECS.md) | Monitor video codec negotiation (H.264/AV1/VP9/HEVC) and per-platform build requirements |
 | [MONITOR_VIDEO_STAGE1.md](MONITOR_VIDEO_STAGE1.md) | Monitor video stage 1: MVD1 wire framing and RGB-to-I420 conversion |
