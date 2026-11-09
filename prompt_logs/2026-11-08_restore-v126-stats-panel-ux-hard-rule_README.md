@@ -186,6 +186,28 @@ Follow-up: "make a contributing md which references the rules".
 - Rebuild: `scripts/build-local.sh` green (guards + compile + link + smoke
   test). PENDING user visual confirmation.
 
+## Round 8 (2026-11-08 ~05:08): commit + push + v1.2.7 release replaced
+
+- User: "commit, push, nuke the v1.2.7 release, but copy my description over
+  dont nuke that" / "I want to replace it".
+- Saved the release body (2958 B) to /tmp/v127-release-body.md before
+  deletion; `restore_points/` added to .gitignore (578 MB zip must never be
+  committed).
+- Commit 52317c5 (UI restore + HARD rules + vendored deps, 1396 files).
+  First push FAILED CI: the 'shell script Git executable modes' guard
+  rejected 14 vendored .sh files at 100644. Fixed with git update-index
+  --chmod=+x on all tracked .sh (commit b5a3cf5). Re-pushed: run
+  42449788253 GREEN (per ci_guard rule 6 the push was not 'done' until
+  verified).
+- Deleted release v1.2.7 + tag (--cleanup-tag), re-tagged b5a3cf5 as
+  v1.2.7, pushed: release run 42450386059 GREEN, published fresh assets
+  (6 platform builds built from the new code).
+- Restored the user's original description via `gh release edit
+  --notes-file` + title 'MISRC GUI v1.2.7'.
+- NOTE (inherent to same-tag replacement): clients already running v1.2.7
+  see the same version string, so the auto-updater will not offer them the
+  rebuilt assets; only fresh downloads get the new build.
+
 ## HARD rules now in force
 
 - `misrc_tools/misrc_gui/dev/gui_ux_change_approval_rules.md` — no UX
