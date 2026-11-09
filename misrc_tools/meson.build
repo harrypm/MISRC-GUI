@@ -737,6 +737,11 @@ if raylib_dep.found()
     # NOTE: no -lpthread on Android — bionic's libc provides pthread (there is
     # no separate libpthread; -lpthread fails to link). -ldl is a bionic stub.
     gui_ldflags += ['-lEGL', '-lGLESv2', '-lGLESv3', '-landroid', '-llog', '-lOpenSLES', '-lm', '-ldl']
+    if ld_dts_enabled
+      # The AArch64 NEON FFT directly addresses tables in static libavutil.
+      # Keep those symbols local to the NativeActivity shared library.
+      gui_ldflags += ['-Wl,--exclude-libs,libavutil.a']
+    endif
     sources_gui += 'misrc_capture/simple_capture/simple_capture_android.c'
     # JNI bridge gives each hsdaoh session its own Java-granted USB descriptor.
     sources_gui += 'misrc_gui/input/android_usb_jni.c'
