@@ -3023,6 +3023,49 @@ def check_cxadc_sync_start_contract(repo_root: Path) -> int:
     return 0
 
 
+def check_docs_layout_contract(repo_root: Path) -> int:
+    """HARD rule (misrc_tools/misrc_gui/dev/docs_folder_rules.md):
+    user-facing sub-docs live in docs/.
+
+    The repository root may keep only the primary entry documents
+    (README/CONTRIBUTING/INSTALLATION/TECHNICAL/UPDATE/LICENSE*). Any other
+    loose .md file in the root belongs in docs/, which must exist together
+    with its README.md index. Dev notes/prompt logs are governed by their own
+    rule and live under misrc_tools/misrc_gui/dev/ (prompt_logs/ holds
+    in-session logs as a tracked folder, not loose root files).
+    """
+    allowed = {
+        "README.md",
+        "CONTRIBUTING.md",
+        "INSTALLATION.md",
+        "TECHNICAL.md",
+        "UPDATE.md",
+    }
+    loose = []
+    for entry in sorted(repo_root.iterdir()):
+        if not entry.is_file() or entry.suffix.lower() != ".md":
+            continue
+        if entry.name in allowed or entry.name.startswith("LICENSE"):
+            continue
+        loose.append(entry.name)
+    if loose:
+        return fail(
+            "Documentation lives in docs/ (HARD rule, "
+            "misrc_tools/misrc_gui/dev/docs_folder_rules.md): move loose root "
+            "sub-doc(s) into docs/ and index them in docs/README.md: "
+            + ", ".join(loose)
+        )
+    docs_dir = repo_root / "docs"
+    if not docs_dir.is_dir():
+        return fail(
+            "docs/ folder is missing: user-facing sub-documents must live in "
+            "docs/ (HARD rule, misrc_tools/misrc_gui/dev/docs_folder_rules.md)"
+        )
+    if not (docs_dir / "README.md").is_file():
+        return fail("docs/README.md index is missing (docs folder HARD rule)")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="MISRC CI guard tests")
     parser.add_argument(
@@ -3103,6 +3146,7 @@ def main() -> int:
         ("CXADC rate probe contract", lambda: check_cxadc_rate_probe_contract(repo_root)),
         ("audio record alignment contract", lambda: check_audio_record_alignment_contract(repo_root)),
         ("CXADC synchronized start contract", lambda: check_cxadc_sync_start_contract(repo_root)),
+        ("docs folder layout contract", lambda: check_docs_layout_contract(repo_root)),
     ]
     if not args.static_only:
         checks.insert(7, ("AppRun runtime behavior", lambda: check_apprun_runtime_behavior(repo_root, icon_path)))

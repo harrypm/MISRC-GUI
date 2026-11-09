@@ -48,6 +48,17 @@ from harrypm. Agents never download or sudo-install deps to unblock a build —
 report and stop. Details:
 `misrc_tools/misrc_gui/dev/self_contained_deps_rules.md`
 
+## HARD RULE 3 — Documentation lives in `docs/`
+
+Every user-facing sub-document lives in `docs/`. The repository root keeps
+only the primary entry documents (`README.md`, `CONTRIBUTING.md`,
+`INSTALLATION.md`, `TECHNICAL.md`, `UPDATE.md`, `LICENSE*`). Topic guides,
+per-feature docs, integration guides and mode/state references go in `docs/`
+in the same change that creates them, with a row added to `docs/README.md`.
+A static CI guard (`check_docs_layout_contract`) rejects loose root `.md`
+files outside the allowlist. Details:
+`misrc_tools/misrc_gui/dev/docs_folder_rules.md`
+
 ## Other HARD rules (read before the relevant kind of change)
 
 All live in `misrc_tools/misrc_gui/dev/` (index: `misrc_tools/misrc_gui/dev/README.md`):
@@ -68,7 +79,8 @@ All live in `misrc_tools/misrc_gui/dev/` (index: `misrc_tools/misrc_gui/dev/READ
 
 All dev notes, prompt logs and lock-step tracking documents live in
 `misrc_tools/misrc_gui/dev/` — never loose `.md` files in the repository root
-(root is for user-facing docs only). Session prompt logs use
+(the root is for the primary entry documents only; user-facing sub-docs go in
+`docs/`, per HARD RULE 3). Session prompt logs use
 `prompt_<feature>_<readme|bug>.md` naming; see that folder's `README.md`.
 
 When a change is confirmed working by the user, preserve a restore point
