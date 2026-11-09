@@ -2461,26 +2461,28 @@ def check_raw_direct_passthrough_contract(repo_root: Path) -> int:
         if snippet not in text:
             return fail(f"Direct RAW passthrough contract missing {label}: {snippet}")
 
-    # Tap placement: the lockstep tap gate must sit AFTER the A/B reads and
-    # pairing truncation (the pushed bytes are the exact card reads, never
-    # the paired/truncated samples) and BEFORE the display-ring write, with
-    # the per-iteration ordering: enter both channels' taps, latch the
-    # decision once, push both chunks with the same decision, then leave.
+    # Tap placement: latch once after the reads and push the newly completed
+    # native samples before pairing can hold or consume them. Enter both
+    # channels' taps before either push and leave only after both pushes.
     # A record start/stop handshake landing between the per-channel pushes
     # then cannot split the channels by one chunk.
-    gate_enter_a = cxadc_c.find("gui_record_tap_iteration_enter(0)")
-    gate_latch = cxadc_c.find("bool tap_this_iter = a_on && b_on;")
-    tap_a = cxadc_c.find("gui_record_direct_tap_push_latched(0, true, card_buf_a")
-    tap_b = cxadc_c.find("gui_record_direct_tap_push_latched(1, true, card_buf_b")
-    gate_leave_a = cxadc_c.find("gui_record_tap_iteration_leave(0)")
-    truncation = cxadc_c.find("output_samples_b < output_samples")
-    display_write = cxadc_c.find("bufmgr_write_begin(&app->buffers, BUF_CAPTURE_RF")
-    if min(gate_enter_a, gate_latch, tap_a, tap_b, gate_leave_a, truncation, display_write) < 0:
+    worker = func_body_from(cxadc_c, "static int cxadc_capture_thread(void *ctx_ptr)")
+    ordered = [worker.find(snippet) for snippet in (
+        "direct_bytes[card] = queued[card] - queued[card] % sample_bytes[card]",
+        "gui_record_tap_iteration_enter(0)",
+        "gui_record_tap_iteration_enter(1)",
+        "bool tap_this_iter = a_on && b_on;",
+        "gui_record_direct_tap_push_latched(0, true, card_buf_a",
+        "gui_record_direct_tap_push_latched(1, true, card_buf_b",
+        "gui_record_tap_iteration_leave(0)",
+        "gui_record_tap_iteration_leave(1)",
+        "size_t output_samples = queued[0] / sample_bytes[0]",
+        "bufmgr_write_begin(&app->buffers, BUF_CAPTURE_RF",
+    )]
+    if min(ordered) < 0:
         return fail("Direct RAW tap gate placement anchors not found in gui_cxadc.c")
-    if not (truncation < gate_enter_a < gate_latch < tap_a < tap_b < gate_leave_a):
-        return fail("Direct RAW tap gate must sit after the A/B pairing, latching the decision once before both latched pushes")
-    if not (gate_leave_a < display_write):
-        return fail("Direct RAW tap gate must complete before the display-ring write")
+    if ordered != sorted(ordered):
+        return fail("Direct RAW tap must latch once after the reads and publish both native chunks before RF pairing")
 
     # Producer handshake: mark in-flight, THEN read enabled.
     push_body = func_body_from(direct_c, "gui_record_direct_push_result_t gui_record_direct_push")
@@ -2528,15 +2530,22 @@ def check_raw_direct_passthrough_contract(repo_root: Path) -> int:
         if snippet not in set_rec_body:
             return fail(f"gui_extract_set_recording must carry the direct mask: {snippet}")
 
-    # Stop handshake: taps disabled and idle BEFORE is_recording clears.
+    # UI closes producer admission without joining. The finalizer waits for
+    # accepted pushes and the RF tail before publishing writer drain.
     stop_body = func_body_from(record_c, "void gui_record_stop(gui_app_t *app)")
+    finalizer = func_body_from(record_c, "static void gui_record_finalize_stop_sync")
     tap_disable_pos = stop_body.find("gui_record_direct_tap_disable")
-    tap_idle_pos = stop_body.find("gui_record_direct_tap_wait_idle")
+    extract_stop_pos = stop_body.find("gui_extract_request_record_stop")
     is_recording_pos = stop_body.find("app->is_recording = false;")
-    if min(tap_disable_pos, tap_idle_pos, is_recording_pos) < 0:
-        return fail("Direct RAW stop handshake anchors not found in gui_record_stop")
-    if not (tap_disable_pos < tap_idle_pos < is_recording_pos):
-        return fail("gui_record_stop must disable+idle the taps before clearing is_recording")
+    tap_idle_pos = finalizer.find("gui_record_direct_tap_wait_idle")
+    extract_idle_pos = finalizer.find("gui_extract_wait_recording_idle")
+    drain_pos = finalizer.find("atomic_store(&s_record_writer_draining, true)")
+    if min(tap_disable_pos, extract_stop_pos, is_recording_pos,
+           tap_idle_pos, extract_idle_pos, drain_pos) < 0:
+        return fail("Direct RAW stop handshake anchors not found")
+    if not (tap_disable_pos < is_recording_pos and extract_stop_pos < is_recording_pos and
+            tap_idle_pos < drain_pos and extract_idle_pos < drain_pos):
+        return fail("Record stop must disarm producers and wait in the finalizer before writer drain")
 
     # Start order: writers, then taps, then extraction recording (skip mask).
     start_writer = record_c.find("gui_record_direct_writer_thread")
@@ -2905,25 +2914,20 @@ def check_ui_scale_integration_contract(repo_root: Path, gui_c_path: Path,
 
 
 def check_audio_record_alignment_contract(repo_root: Path) -> int:
-    """Static contract for the F1 record-alignment transitions in the
-    audio thread: transitions detected at the top of the loop (bounded by
-    the 2 ms read timeout, so within ~2-4 ms of the record button), a
-    discard-to-now of buffered pre-record audio at record START at the
-    576 B producer granularity, and a flush-to-now of buffered tail audio
-    at record STOP (the old semantics wrote up to one full ~350 ms block
-    of pre-record audio at record START)."""
+    """Start discards through its producer cursor; Stop flushes through its own."""
     audio_c = read_text(repo_root / "misrc_tools/misrc_gui/output/gui_audio.c")
     buffer_manager_c = read_text(repo_root / "misrc_tools/common/buffer_manager.c")
 
     required_snippets = [
-        (audio_c, "#define AUDIO_SYNC_CHUNK_BYTES 576", "producer-granularity sync chunk (48 frames x 12 B)"),
-        (audio_c, "static uint64_t audio_discard_ring_to_now(", "discard-to-now helper"),
-        (audio_c, "static uint64_t audio_flush_ring_to_files(", "flush-to-now helper"),
+        (audio_c, "static uint64_t audio_discard_ring_to_start(", "discard to the producer cursor captured at Start"),
+        (audio_c, "static uint64_t audio_flush_ring_to_files(", "flush to the producer cursor captured at Stop"),
+        (audio_c, "s_audio_record_start_tail = atomic_load_explicit(", "latched Start cursor"),
+        (audio_c, "s_audio_record_stop_tail = atomic_load_explicit(", "latched Stop cursor"),
         (audio_c, "static void audio_write_recorded_block(", "shared block-write helper"),
-        (audio_c, "BUF_CAPTURE_AUDIO,\n                                    AUDIO_SYNC_CHUNK_BYTES, 0)", "sync helpers use no-wait full chunks"),
+        (audio_c, "bufmgr_read_begin(a->bufmgr, BUF_CAPTURE_AUDIO, take, 0)", "no-wait reads at the recorded boundaries"),
         (audio_c, "[AUDIO] Record start aligned", "start-alignment log line"),
         (audio_c, "[AUDIO] Record stop aligned", "stop-alignment log line"),
-        (audio_c, "bool was_recording = (a->f_4ch != NULL)", "pre-opened-files recording init"),
+        (audio_c, "file_open_utf8(s_audio_record_paths[i]", "recording opens latched WAV output paths"),
         (audio_c, "bufmgr_read_begin(a->bufmgr, BUF_CAPTURE_AUDIO, len, 2);", "2 ms read timeout keeps the transition observation at ~2-4 ms"),
         (buffer_manager_c, "if (timeout_ms == 0) return NULL;", "timeout-0 read returns only full available chunks"),
     ]
@@ -2933,21 +2937,19 @@ def check_audio_record_alignment_contract(repo_root: Path) -> int:
 
     # The transition handler must sit at the TOP of the audio loop, before
     # the main full-block read, so transitions are observed within the
-    # 10 ms read-timeout spin instead of only at the next full ~350 ms block.
+    # short read-timeout spin instead of only at the next full block.
     thread_body = func_body_from(audio_c, "static int audio_thread_main(void *ctx)")
     loop_pos = thread_body.find("while (1) {")
-    transition_pos = thread_body.find("bool rec_now = a->app && a->app->is_recording;")
+    transition_pos = thread_body.find("int record_state = atomic_load(&s_audio_record_state);")
     read_pos = thread_body.find("bufmgr_read_begin(a->bufmgr, BUF_CAPTURE_AUDIO, len, 2);")
     if min(loop_pos, transition_pos, read_pos) < 0:
         return fail("Audio record alignment anchors not found in audio_thread_main")
     if not (loop_pos < transition_pos < read_pos):
         return fail("Audio record transition handler must sit at the top of the audio loop, before the main full-block read")
 
-    # START discards, STOP flushes: both through the producer-granularity
-    # chunk (12,288 B = one clockgen capture-thread write) and both before
-    # the main full-block read path runs.
-    start_discard_pos = thread_body.find("audio_discard_ring_to_now(a);", transition_pos)
-    stop_flush_pos = thread_body.find("audio_flush_ring_to_files(a);", transition_pos)
+    # Start and Stop process their captured cursors before the full-block read.
+    start_discard_pos = thread_body.find("audio_discard_ring_to_start(a);", transition_pos)
+    stop_flush_pos = thread_body.find("audio_flush_ring_to_files(a)", transition_pos)
     if start_discard_pos < 0 or stop_flush_pos < 0:
         return fail("Audio record transitions must call the discard/flush helpers")
     if not (start_discard_pos < read_pos and stop_flush_pos < read_pos):

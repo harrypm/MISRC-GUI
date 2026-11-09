@@ -108,17 +108,9 @@ deps_script="$SCRIPT_DIR/build-deps-unix.sh"
 if [[ ! -f "$deps_script" ]]; then
   fail "Deps build script not found: $deps_script"
 fi
-if [[ -z "$DEPS_PREFIX" && -z "${MISRC_DEPS_PREFIX:-}" ]]; then
-  log "Ensuring local deps via $deps_script (skips instantly if already built)"
-  bash "$deps_script"
-elif [[ -n "$DEPS_PREFIX" && -z "${MISRC_DEPS_PREFIX:-}" ]] && ! deps_prefix_has_codecs "$DEPS_PREFIX"; then
-  # The located prefix predates the vendored opus/openh264 hard deps.
-  # Build INTO it (offline, from the committed third_party/ trees) rather
-  # than failing on distro dev packages the user may not be able to install.
-  log "Located deps prefix lacks vendored opus/openh264; topping it up"
-  DEPS_PREFIX="$DEPS_PREFIX" bash "$deps_script"
-fi
 if [[ -z "${MISRC_DEPS_PREFIX:-}" ]]; then
+  log "Ensuring local deps via $deps_script (skips when the input stamp matches)"
+  DEPS_PREFIX="${DEPS_PREFIX:-$REPO_ROOT/.deps/install}" bash "$deps_script"
   # Re-detect the deps prefix after the build.
   for candidate in "$REPO_ROOT/.deps/install" "$REPO_ROOT/.deps/install-appimage-local"; do
     for pcdir in "$candidate/lib/pkgconfig" "$candidate/lib64/pkgconfig"; do

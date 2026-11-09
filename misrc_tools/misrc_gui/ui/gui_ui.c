@@ -7,6 +7,9 @@
 #include "gui_ui.h"
 #if defined(__ANDROID__)
 #include "../core/gui_android_viewport.h"
+#ifdef ENABLE_RTLSDR
+#include "../input/android_rtlsdr_usb.h"
+#endif
 // Gesture-filtered single taps replace native mouse-press events on Android.
 #define IsMouseButtonPressed(button) gui_android_viewport_click_pressed(button)
 #endif
@@ -33,6 +36,7 @@
 #include "../net/gui_net.h"
 #include "../net/gui_net_queue_limits.h"
 #include "../net/gui_monitor_transport.h"
+#include "../net/gui_monitor_local_save.h"
 #include "../core/gui_updater.h" // Manifest-driven updater: releases page + auto-patch manifest + confirmed self-update
 #include "version.h"
 #include "../visualization/gui_custom_elements.h"
@@ -467,16 +471,6 @@ static bool gui_ui_selected_device_is_playback(const gui_app_t *app)
     return app->devices[app->selected_device].type == DEVICE_TYPE_PLAYBACK;
 }
 
-#if defined(__ANDROID__)
-/* Android Test Signal generates its samples in software. It must not open or
- * request permission for a USB device, including when auto-reconnecting. */
-static bool gui_ui_selected_device_is_simulated(const gui_app_t *app)
-{
-    if (!app) return false;
-    if (app->selected_device < 0 || app->selected_device >= app->device_count) return false;
-    return app->devices[app->selected_device].type == DEVICE_TYPE_SIMULATED;
-}
-#endif
 
 #ifdef ENABLE_DDD
 // DdD is single-channel (channel A only); channel B has no signal source.
@@ -696,7 +690,8 @@ typedef enum {
     UI_TEXT_FIELD_INGEST_OPERATOR,
     UI_TEXT_FIELD_INGEST_LOCATION,
     UI_TEXT_FIELD_INGEST_NOTES,
-    UI_TEXT_FIELD_RTLSDR_FREQ,         // RTL-SDR center frequency (Hz, digits only)
+    UI_TEXT_FIELD_RTLSDR_FREQ,
+    UI_TEXT_FIELD_RTLSDR_RATE,
     UI_TEXT_FIELD_NET_SERVER_PORT,      // Network server port (digits only)
     UI_TEXT_FIELD_NET_CLIENT_HOST,      // Network client server host (IP/hostname)
     UI_TEXT_FIELD_NET_CLIENT_PORT,      // Network client server port (digits only)
@@ -726,9 +721,42 @@ static double s_active_text_last_click_time = -1.0;
 static Clay_ElementId s_active_text_last_click_element_id = { 0 };
 static double s_active_text_backspace_repeat_at = 0.0;
 
-// RTL-SDR frequency text field mirrors settings.rtlsdr_freq_hz (a uint64).
-// Synced in render_settings_panel: format Hz->str when not editing, parse str->Hz when editing.
-static char s_rtlsdr_freq_str[32] = {0};
+#ifdef ENABLE_RTLSDR
+#define DROPDOWN_RTLSDR_PRESET "RtlsdrPreset"
+
+typedef struct {
+    uint32_t value;
+    const char *label;
+} sdr_preset_t;
+
+static const sdr_preset_t s_rtlsdr_frequency_presets[] = {
+    {1500000, "1.500 MHz (NTSC Hi-Fi)"},
+    {1600000, "1.600 MHz (PAL Hi-Fi)"},
+    {100000000, "100 MHz (FM example)"},
+    {1090000000, "1090 MHz (ADS-B)"}
+};
+static const sdr_preset_t s_rtlsdr_rate_presets[] = {
+    {250000, "0.250 MSPS"},
+    {1024000, "1.024 MSPS"},
+    {1200000, "1.200 MSPS"},
+    {1536000, "1.536 MSPS"},
+    {2000000, "2.000 MSPS"},
+    {2048000, "2.048 MSPS"},
+    {2400000, "2.400 MSPS"}
+};
+
+static const struct {
+    ui_text_field_t field;
+    const sdr_preset_t *presets;
+    int count;
+} s_rtlsdr_fields[] = {
+    {UI_TEXT_FIELD_RTLSDR_FREQ, s_rtlsdr_frequency_presets,
+     sizeof(s_rtlsdr_frequency_presets) / sizeof(s_rtlsdr_frequency_presets[0])},
+    {UI_TEXT_FIELD_RTLSDR_RATE, s_rtlsdr_rate_presets,
+     sizeof(s_rtlsdr_rate_presets) / sizeof(s_rtlsdr_rate_presets[0])}
+};
+static char s_rtlsdr_draft[32];
+#endif
 
 // Record-limit popup state (toolbar clock button)
 static bool s_record_limit_window_open = false;
@@ -762,14 +790,34 @@ static int gui_ui_net_mode_cycle_next(int cur) {
 // The synchronous gui_net_apply_mode joins network worker threads that can
 // sit in multi-second socket timeouts - running it inline in the click
 // handler is what made switching to Monitor & Remote stall the UI.
-static void gui_ui_net_mode_apply(gui_app_t *app, int next) {
+void gui_ui_net_mode_apply(gui_app_t *app, int next) {
     if (!app) return;
+#ifdef __ANDROID__
+    if (gui_app_capture_busy() || gui_net_capture_controls_locked(app)) {
+        gui_app_set_status(app, "Wait for the current capture or network change to finish");
+        return;
+    }
+    if (next != app->settings.net_mode &&
+        (app->is_recording || gui_record_is_finalizing())) {
+        gui_app_set_status(app, "Stop recording before changing network mode");
+        return;
+    }
+#endif
     if (gui_playback_is_starting(app)) {
         gui_app_set_status(app, "Network mode is locked while playback prepares");
         return;
     }
     int cur = app->settings.net_mode;
     if (cur < GUI_NET_MODE_LOCAL || cur > GUI_NET_MODE_LAST) cur = GUI_NET_MODE_LOCAL;
+    if (next != cur && (gui_monitor_local_save_recording() ||
+        (cur == GUI_NET_MODE_CLIENT && app->is_recording))) {
+        gui_app_set_status(app, "Stop recording before changing network mode");
+        return;
+    }
+#ifdef __ANDROID__
+    if (gui_app_defer_remote_mode(app, next)) return;
+#endif
+    if (next != cur) gui_record_cancel_capture_confirmation(app);
     app->settings.net_mode = next;
     gui_ui_clear_text_edit();
     gui_settings_save(&app->settings);
@@ -787,7 +835,11 @@ static void gui_ui_net_mode_apply(gui_app_t *app, int next) {
         // Worker unavailable (spawn failure): fall back to the synchronous
         // apply so the mode never ends up half-applied.
         (void)gui_net_apply_mode(app);
+#ifdef __ANDROID__
+        if (reenum) atomic_store(&app->net_reenumerate_pending, true);
+#else
         if (reenum) gui_app_enumerate_devices(app);
+#endif
     }
 }
 // Metadata popup state (toolbar scroll badge button)
@@ -2424,8 +2476,25 @@ static bool gui_ui_settings_locked(const gui_app_t *app)
     return app && (app->is_recording ||
         (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT &&
          gui_monitor_client_peer_state() == 2) ||
+#ifdef __ANDROID__
+        gui_app_capture_busy() ||
+#endif
         gui_playback_is_starting((gui_app_t *)app));
 }
+
+#if defined(ENABLE_DDD) && defined(ENABLE_DDD_WINUSB)
+static bool gui_ui_ddd_usb_backend_visible(const gui_app_t *app)
+{
+    return gui_ui_selected_device_is_ddd_v1(app) &&
+        app->settings.net_mode != GUI_NET_MODE_CLIENT &&
+        app->settings.net_mode != GUI_NET_MODE_MONITOR_CLIENT;
+}
+
+static bool gui_ui_ddd_usb_backend_locked(const gui_app_t *app)
+{
+    return app->is_capturing || app->is_recording || gui_record_is_finalizing();
+}
+#endif
 
 // One-time per-session low-rate warning: pops a dismissible info dialog
 // only when the resample cycle lands on the 14.3 MSPS stock 10-bit CXADC
@@ -2561,6 +2630,13 @@ static bool gui_ui_text_field_get_buffer(gui_app_t *app, ui_text_field_t field, 
             *dst = app->settings.ingest_notes;
             *cap = sizeof(app->settings.ingest_notes);
             return true;
+#ifdef ENABLE_RTLSDR
+        case UI_TEXT_FIELD_RTLSDR_FREQ:
+        case UI_TEXT_FIELD_RTLSDR_RATE:
+            *dst = s_rtlsdr_draft;
+            *cap = sizeof(s_rtlsdr_draft);
+            return true;
+#endif
         case UI_TEXT_FIELD_NET_SERVER_PORT:
             *dst = app->settings.net_server_port_str;
             *cap = sizeof(app->settings.net_server_port_str);
@@ -2632,7 +2708,8 @@ static bool gui_ui_text_field_can_edit(gui_app_t *app, ui_text_field_t field)
         case UI_TEXT_FIELD_AUDIO_LABEL_3:
         case UI_TEXT_FIELD_AUDIO_LABEL_4:
             return app->settings.auto_names_enabled;
-        case UI_TEXT_FIELD_RTLSDR_FREQ: {
+        case UI_TEXT_FIELD_RTLSDR_FREQ:
+        case UI_TEXT_FIELD_RTLSDR_RATE: {
 #ifdef ENABLE_RTLSDR
             return gui_ui_selected_device_is_sdr(app);
 #else
@@ -2670,13 +2747,8 @@ static bool gui_ui_text_field_char_allowed(ui_text_field_t field, int ch)
         // Keep these permissive for ingest entry, but still block JSON-breaking quote chars.
         return (ch >= 32 && ch < 127 && ch != '\"');
     }
-    if (field == UI_TEXT_FIELD_RTLSDR_FREQ) {
-        // Frequency in Hz: digits only (parsed to uint64 on commit).
-        return (ch >= '0' && ch <= '9');
-    }
-    if (field == UI_TEXT_FIELD_NET_SERVER_PORT ||
-        field == UI_TEXT_FIELD_NET_CLIENT_PORT) {
-        // TCP port: digits only.
+    if (field == UI_TEXT_FIELD_RTLSDR_FREQ || field == UI_TEXT_FIELD_RTLSDR_RATE ||
+        field == UI_TEXT_FIELD_NET_SERVER_PORT || field == UI_TEXT_FIELD_NET_CLIENT_PORT) {
         return (ch >= '0' && ch <= '9');
     }
     if (field == UI_TEXT_FIELD_NET_CLIENT_HOST) {
@@ -2716,6 +2788,8 @@ static void gui_ui_text_field_font(ui_text_field_t field, int *font_size, int *f
         case UI_TEXT_FIELD_AUDIO_LABEL_4:
         case UI_TEXT_FIELD_LEVEL_AUTOSTOP_LEVEL:
         case UI_TEXT_FIELD_LEVEL_AUTOSTOP_DURATION:
+        case UI_TEXT_FIELD_RTLSDR_FREQ:
+        case UI_TEXT_FIELD_RTLSDR_RATE:
         case UI_TEXT_FIELD_INGEST_PROJECT:
         case UI_TEXT_FIELD_INGEST_TAPE_ID:
         case UI_TEXT_FIELD_INGEST_TAPE_FORMAT:
@@ -2882,11 +2956,12 @@ static bool gui_ui_text_insert_filtered(ui_text_field_t field, char *dst, size_t
     if (!filtered) return false;
     size_t count = 0;
     bool valid = true;
-    bool path_field = field == UI_TEXT_FIELD_OUTPUT_BASE_NAME ||
-                      field == UI_TEXT_FIELD_OUTPUT_PATH ||
-                      field == UI_TEXT_FIELD_MONITOR_LOCAL_SAVE_PATH ||
-                      field == UI_TEXT_FIELD_MONITOR_SERVER_BROWSER_PATH ||
-                      (field >= UI_TEXT_FIELD_RF_TAG_A && field <= UI_TEXT_FIELD_AUDIO_LABEL_4);
+    bool strict_paste = field == UI_TEXT_FIELD_OUTPUT_BASE_NAME ||
+                        field == UI_TEXT_FIELD_OUTPUT_PATH ||
+                        field == UI_TEXT_FIELD_MONITOR_LOCAL_SAVE_PATH ||
+                        field == UI_TEXT_FIELD_MONITOR_SERVER_BROWSER_PATH ||
+                        (field >= UI_TEXT_FIELD_RF_TAG_A && field <= UI_TEXT_FIELD_AUDIO_LABEL_4) ||
+                        field == UI_TEXT_FIELD_RTLSDR_FREQ || field == UI_TEXT_FIELD_RTLSDR_RATE;
     for (const char *p = src; *p; ) {
         int size = 0;
         int ch = GetCodepointNext(p, &size);
@@ -2897,7 +2972,7 @@ static bool gui_ui_text_insert_filtered(ui_text_field_t field, char *dst, size_t
             break;
         }
         if (!gui_ui_text_field_char_allowed(field, ch)) {
-            if (path_field) { valid = false; break; }
+            if (strict_paste) { valid = false; break; }
             p += size;
             continue;
         }
@@ -3114,6 +3189,34 @@ static bool gui_ui_text_delete(char *dst, int *cursor)
     return gui_text_replace(dst, len + 1, cursor, *cursor, gui_text_next(dst, *cursor), NULL, 0);
 }
 
+#ifdef ENABLE_RTLSDR
+static void gui_ui_apply_rtlsdr_value(gui_app_t *app, ui_text_field_t field, uint32_t value)
+{
+    if (field == UI_TEXT_FIELD_RTLSDR_FREQ) app->settings.rtlsdr_freq_hz = value;
+    else app->settings.rtlsdr_sample_rate_hz = value;
+    gui_settings_save(&app->settings);
+    if (app->is_capturing)
+        gui_app_set_status(app, "SDR setting saved. Reconnect to apply.");
+}
+
+static bool gui_ui_commit_rtlsdr_value(gui_app_t *app, ui_text_field_t field, const char *draft)
+{
+    const bool rate = field == UI_TEXT_FIELD_RTLSDR_RATE;
+    const bool digits_only = draft[0] && !draft[strspn(draft, "0123456789")];
+    unsigned long long value = digits_only ? strtoull(draft, NULL, 10) : 0;
+    const bool rate_supported = (value >= 225001 && value <= 300000) ||
+                                (value >= 900001 && value <= 3200000);
+    if (value == 0 || value > UINT32_MAX || (rate && !rate_supported)) {
+        gui_app_set_status(app, rate
+            ? "Enter a sample rate in S/s (225001-300000 or 900001-3200000)"
+            : "Enter a frequency in Hz (1-4294967295)");
+        return false;
+    }
+    gui_ui_apply_rtlsdr_value(app, field, (uint32_t)value);
+    return true;
+}
+#endif
+
 static void gui_ui_handle_active_text_edit(gui_app_t *app)
 {
     if (s_active_text_field == UI_TEXT_FIELD_NONE) return;
@@ -3127,13 +3230,12 @@ static void gui_ui_handle_active_text_edit(gui_app_t *app)
     }
     gui_ui_text_clamp_state(dst);
 
-    // RTL-SDR frequency text field mirrors settings.rtlsdr_freq_hz (a uint64).
-    // Sync string -> uint64 here so every gui_settings_save() below commits the
-    // current value (including on Enter/Esc). Non-digits parse to 0 and are ignored.
-    if (s_active_text_field == UI_TEXT_FIELD_RTLSDR_FREQ && s_rtlsdr_freq_str[0]) {
-        unsigned long long parsed = strtoull(s_rtlsdr_freq_str, NULL, 10);
-        if (parsed > 0) app->settings.rtlsdr_freq_hz = (uint64_t)parsed;
-    }
+#ifdef ENABLE_RTLSDR
+    const bool sdr_edit = s_active_text_field == UI_TEXT_FIELD_RTLSDR_FREQ ||
+                          s_active_text_field == UI_TEXT_FIELD_RTLSDR_RATE;
+#else
+    const bool sdr_edit = false;
+#endif
     // Level-autostop level text field: clamp the edited 0.X into 0.1-0.8 on commit.
     // The live string is allowed to be partial while typing; final clamping happens
     // here so the saved value is always in range.
@@ -3221,6 +3323,13 @@ static void gui_ui_handle_active_text_edit(gui_app_t *app)
         }
         if (finish_edit_requested) {
             gui_ui_text_clamp_state(dst);
+#ifdef ENABLE_RTLSDR
+            if (sdr_edit) {
+                if (gui_ui_commit_rtlsdr_value(app, s_active_text_field, dst))
+                    gui_ui_clear_text_edit();
+                return;
+            }
+#endif
             gui_settings_save(&app->settings);
             gui_ui_clear_text_edit();
             return;
@@ -3276,11 +3385,18 @@ static void gui_ui_handle_active_text_edit(gui_app_t *app)
     }
 
     gui_ui_text_clamp_state(dst);
-    if (changed && s_active_text_field != UI_TEXT_FIELD_MONITOR_SERVER_BROWSER_PATH) {
+    if (changed && !sdr_edit && s_active_text_field != UI_TEXT_FIELD_MONITOR_SERVER_BROWSER_PATH) {
         gui_settings_save(&app->settings);
     }
 
     if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER) || IsKeyPressed(KEY_ESCAPE)) {
+#ifdef ENABLE_RTLSDR
+        if (sdr_edit) {
+            if (IsKeyPressed(KEY_ESCAPE) || gui_ui_commit_rtlsdr_value(app, s_active_text_field, dst))
+                gui_ui_clear_text_edit();
+            return;
+        }
+#endif
         if(s_active_text_field==UI_TEXT_FIELD_MONITOR_SERVER_BROWSER_PATH){
             if(!IsKeyPressed(KEY_ESCAPE)){
                 s_monitor_folder_page=0;
@@ -3300,6 +3416,143 @@ static CustomLayoutElement s_settings_icon_element;
 static CustomLayoutElement s_record_limit_icon_element;
 static CustomLayoutElement s_version_icon_element;
 static CustomLayoutElement s_metadata_icon_element;
+
+#ifdef ENABLE_RTLSDR
+static Clay_ElementDeclaration gui_ui_channel_menu(Clay_ElementId button_id, int width, int option_count);
+
+static uint64_t gui_ui_rtlsdr_value(const gui_app_t *app, ui_text_field_t field)
+{
+    return field == UI_TEXT_FIELD_RTLSDR_FREQ ? app->settings.rtlsdr_freq_hz
+                                            : app->settings.rtlsdr_sample_rate_hz;
+}
+
+static void render_rtlsdr_setting(const gui_app_t *app, int index)
+{
+    const ui_text_field_t field = s_rtlsdr_fields[index].field;
+    const bool frequency = field == UI_TEXT_FIELD_RTLSDR_FREQ;
+    const bool editing = gui_ui_is_text_field_active(field);
+    const bool menu_open = gui_dropdown_is_open(DROPDOWN_RTLSDR_PRESET, index);
+    const sdr_preset_t *presets = s_rtlsdr_fields[index].presets;
+    const int count = s_rtlsdr_fields[index].count;
+    const uint64_t value = gui_ui_rtlsdr_value(app, field);
+    const Clay_ElementId button_id = CLAY_IDI("RtlsdrSettingValue", index);
+    static char display[2][32];
+
+    const char *label = frequency ? "Frequency (Hz)" : editing ? "Sample rate (S/s)" : "Sample rate";
+    const char *value_text = display[index];
+    snprintf(display[index], sizeof(display[index]), frequency ? "%" PRIu64 : "%" PRIu64 " S/s", value);
+    if (!frequency) {
+        for (int i = 0; i < count; ++i)
+            if (presets[i].value == value) value_text = presets[i].label;
+    }
+
+    CLAY(CLAY_IDI("RtlsdrSettingRow", index), {
+        .layout = {
+            .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) },
+            .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
+            .childGap = 10
+        }
+    }) {
+        CLAY_TEXT(make_string(label), CLAY_TEXT_CONFIG({
+            .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT)
+        }));
+        CLAY(button_id, {
+            .layout = {
+                .sizing = { CLAY_SIZING_FIXED(136), CLAY_SIZING_FIXED(28) },
+                .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER },
+                .padding = { 8, 8, 0, 0 },
+                .childGap = 6
+            },
+            .backgroundColor = to_clay_color(editing || menu_open ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON),
+            .cornerRadius = CLAY_CORNER_RADIUS(4)
+        }) {
+            if (editing) {
+                gui_ui_render_active_text(field, s_rtlsdr_draft, FONT_SIZE_STATS, 1, COLOR_TEXT);
+            } else {
+                CLAY_TEXT(make_string(value_text), CLAY_TEXT_CONFIG({
+                    .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT)
+                }));
+                CLAY_TEXT(CLAY_STRING("v"), CLAY_TEXT_CONFIG({
+                    .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM)
+                }));
+            }
+        }
+    }
+
+    if (menu_open) {
+        Clay_ElementDeclaration menu = gui_ui_channel_menu(button_id, 224, count + 1);
+        menu.floating.zIndex = 1;
+        CLAY(CLAY_ID("RtlsdrPresetOptions"), menu) {
+            for (int i = 0; i <= count; ++i) {
+                const Clay_ElementId id = CLAY_IDI("RtlsdrPresetOption", i);
+                const bool selected = i < count && presets[i].value == value;
+                CLAY(id, {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(20) },
+                        .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
+                        .padding = { 8, 8, 0, 0 }
+                    },
+                    .backgroundColor = to_clay_color(gui_dropdown_option_color(selected, Clay_PointerOver(id)))
+                }) {
+                    CLAY_TEXT(make_string(i < count ? presets[i].label : "Custom..."), CLAY_TEXT_CONFIG({
+                        .fontSize = FONT_SIZE_DROPDOWN_OPT, .textColor = to_clay_color(COLOR_TEXT)
+                    }));
+                }
+            }
+        }
+    }
+}
+
+static bool gui_ui_handle_rtlsdr_setting_click(gui_app_t *app)
+{
+    if (!app->settings_panel_open || gui_ui_settings_locked(app) || !gui_ui_selected_device_is_sdr(app))
+        return false;
+
+    const bool editing = s_active_text_field == UI_TEXT_FIELD_RTLSDR_FREQ ||
+                         s_active_text_field == UI_TEXT_FIELD_RTLSDR_RATE;
+    if (editing && !Clay_PointerOver(s_active_text_element_id)) {
+        if (!gui_ui_commit_rtlsdr_value(app, s_active_text_field, s_rtlsdr_draft))
+            return true;
+        gui_ui_clear_text_edit();
+    }
+
+    for (int index = 0; index < 2; ++index) {
+        const Clay_ElementId id = CLAY_IDI("RtlsdrSettingValue", index);
+        const ui_text_field_t field = s_rtlsdr_fields[index].field;
+        if (gui_dropdown_is_open(DROPDOWN_RTLSDR_PRESET, index)) {
+            const int count = s_rtlsdr_fields[index].count;
+            for (int i = 0; i <= count; ++i) {
+                if (!Clay_PointerOver(CLAY_IDI("RtlsdrPresetOption", i))) continue;
+                gui_dropdown_close_all();
+                if (i == count) {
+                    snprintf(s_rtlsdr_draft, sizeof(s_rtlsdr_draft), "%" PRIu64,
+                             gui_ui_rtlsdr_value(app, field));
+                    gui_ui_begin_text_edit(app, field, id, 8.0f, 8.0f);
+                    s_active_text_selection_anchor = 0;
+                    s_active_text_cursor = (int)strlen(s_rtlsdr_draft);
+                    s_active_text_drag_selecting = false;
+                } else {
+                    gui_ui_apply_rtlsdr_value(app, field, s_rtlsdr_fields[index].presets[i].value);
+                }
+                return true;
+            }
+        }
+        if (Clay_PointerOver(id)) {
+            if (gui_ui_is_text_field_active(field)) {
+                gui_ui_begin_text_edit(app, field, id, 8.0f, 8.0f);
+            } else {
+                gui_ui_clear_text_edit();
+                gui_dropdown_toggle(DROPDOWN_RTLSDR_PRESET, index);
+            }
+            return true;
+        }
+    }
+    if (gui_dropdown_is_open(DROPDOWN_RTLSDR_PRESET, 0) ||
+        gui_dropdown_is_open(DROPDOWN_RTLSDR_PRESET, 1))
+        gui_dropdown_close_all();
+    return false;
+}
+#endif
 
 // Render settings panel (floating modal)
 static void render_settings_panel(gui_app_t *app) {
@@ -3602,40 +3855,10 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                     // helper-like rows
 #ifdef ENABLE_RTLSDR
                     if (gui_ui_selected_device_is_sdr(app)) {
-                        // Display sync: when not editing, format uint64 -> string.
-                        if (s_active_text_field != UI_TEXT_FIELD_RTLSDR_FREQ) {
-                            snprintf(s_rtlsdr_freq_str, sizeof(s_rtlsdr_freq_str), "%llu",
-                                     (unsigned long long)app->settings.rtlsdr_freq_hz);
-                        }
-
                         CLAY_TEXT(CLAY_STRING("SDR:"),
                             CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-
-                        // Frequency (Hz) row
-                        CLAY(CLAY_ID("RtlsdrFreqRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
-                            CLAY_TEXT(CLAY_STRING("Frequency (Hz):"),
-                                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-                            CLAY(CLAY_ID("RtlsdrFreqField"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER }, .padding = { 8, 8, 0, 0 } }, .backgroundColor = to_clay_color((Color){25,25,30,255}), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                                if (gui_ui_is_text_field_active(UI_TEXT_FIELD_RTLSDR_FREQ)) {
-                                    gui_ui_render_active_text(UI_TEXT_FIELD_RTLSDR_FREQ, s_rtlsdr_freq_str, FONT_SIZE_STATS, 1, COLOR_TEXT);
-                                } else {
-                                    CLAY_TEXT(make_string(s_rtlsdr_freq_str), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
-                                }
-                            }
-                            CLAY(CLAY_ID("RtlsdrFreqHint"), { .layout = { .sizing = { CLAY_SIZING_FIXED(90), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER } } }) {
-                                CLAY_TEXT(CLAY_STRING("(click to edit)"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-                            }
-                        }
-
-                        // Sample rate row (cycle box)
-                        CLAY(CLAY_ID("RtlsdrSampleRateRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
-                            CLAY_TEXT(CLAY_STRING("Sample rate:"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
-                            char sr_buf[24];
-                            snprintf(sr_buf, sizeof(sr_buf), "%.2f MSPS", (double)app->settings.rtlsdr_sample_rate_hz / 1.0e6);
-                            CLAY(CLAY_ID("RtlsdrSampleRateBox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                                CLAY_TEXT(make_string(sr_buf), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
-                            }
-                        }
+                        render_rtlsdr_setting(app, 0);
+                        render_rtlsdr_setting(app, 1);
 
                         // Gain mode toggle row
                         CLAY(CLAY_ID("RtlsdrGainModeRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
@@ -3649,7 +3872,7 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                         // Gain stepper row
                         CLAY(CLAY_ID("RtlsdrGainRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
                             CLAY(CLAY_ID("RtlsdrGainMinus"), { .layout = { .sizing = { CLAY_SIZING_FIXED(28), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) { CLAY_TEXT(CLAY_STRING("-"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) })); }
-                            char gain_buf[24];
+                            static char gain_buf[24];
                             snprintf(gain_buf, sizeof(gain_buf), "Gain: %.1f dB", (double)app->settings.rtlsdr_gain_tenths_db / 10.0);
                             CLAY(CLAY_ID("RtlsdrGainValue"), { .layout = { .sizing = { CLAY_SIZING_FIXED(140), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER }, .padding = { 8, 8, 0, 0 } }, .backgroundColor = to_clay_color((Color){25,25,30,255}), .cornerRadius = CLAY_CORNER_RADIUS(4) }) { CLAY_TEXT(make_string(gain_buf), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) })); }
                             CLAY(CLAY_ID("RtlsdrGainPlus"), { .layout = { .sizing = { CLAY_SIZING_FIXED(28), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) { CLAY_TEXT(CLAY_STRING("+"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) })); }
@@ -3873,6 +4096,49 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                         }
                     }
 
+#if defined(ENABLE_DDD) && defined(ENABLE_DDD_WINUSB)
+                    if (gui_ui_ddd_usb_backend_visible(app)) {
+                        bool locked = gui_ui_ddd_usb_backend_locked(app);
+                        Color button_bg = locked ? ui_disabled_color(COLOR_BUTTON) : COLOR_BUTTON;
+                        Color text_fg = locked ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT;
+                        CLAY(CLAY_ID("DddUsbBackendRow"), {
+                            .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) },
+                                .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 }
+                        }) {
+                            CLAY(CLAY_ID("DddUsbBackendToggle"), {
+                                .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) },
+                                    .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } },
+                                .backgroundColor = to_clay_color(button_bg), .cornerRadius = CLAY_CORNER_RADIUS(4)
+                            }) {
+                                CLAY_TEXT(app->settings.ddd_use_winusb ? CLAY_STRING("WinUSB") : CLAY_STRING("libusb"),
+                                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(text_fg) }));
+                            }
+                            CLAY_TEXT(CLAY_STRING("DdD USB backend"),
+                                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(text_fg) }));
+                        }
+                        if (!app->settings.ddd_use_winusb) {
+                            Color raw_io_bg = locked ? button_bg :
+                                (app->settings.ddd_libusb_raw_io ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON);
+                            CLAY(CLAY_ID("DddLibusbRawIoRow"), {
+                                .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) },
+                                    .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                                    .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 }
+                            }) {
+                                CLAY(CLAY_ID("DddLibusbRawIoToggle"), {
+                                    .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) },
+                                        .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } },
+                                    .backgroundColor = to_clay_color(raw_io_bg), .cornerRadius = CLAY_CORNER_RADIUS(4)
+                                }) {
+                                    CLAY_TEXT(app->settings.ddd_libusb_raw_io ? CLAY_STRING("ON") : CLAY_STRING("OFF"),
+                                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(text_fg) }));
+                                }
+                                CLAY_TEXT(CLAY_STRING("libusb RAW_IO"),
+                                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(text_fg) }));
+                            }
+                        }
+                    } else
+#endif
                     CLAY(CLAY_ID("ToggleRowResampleB"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
                         Color resample_b_toggle_bg = settings_b_controls_disabled
                             ? ui_disabled_color(COLOR_BUTTON)
@@ -3998,7 +4264,7 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                     }
 
                     // Playback files section
-                    CLAY_TEXT(CLAY_STRING("Playback files (FLAC / drop onto a channel panel):"),
+                    CLAY_TEXT(CLAY_STRING("Playback files (RF / audio; drag and drop):"),
                         CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
 
                     // Player link mode: Synced = one shared transport (legacy
@@ -7925,18 +8191,10 @@ static bool render_main_panels(gui_app_t *app) {
                               missed);
         format_status_counter(status_errors_display, sizeof(status_errors_display),
                               errors);
-        size_t status_rf_head = atomic_load(&app->buffers.buffers[BUF_CAPTURE_RF].head);
-        size_t status_rf_tail = atomic_load(&app->buffers.buffers[BUF_CAPTURE_RF].tail);
-        size_t status_rf_size = app->buffers.buffers[BUF_CAPTURE_RF].buffer_size;
-        status_rf_pct = status_rf_size > 0
-            ? (int)(((status_rf_tail - status_rf_head) * 100) / status_rf_size) : 0;
+        status_rf_pct = (int)(100.0f * bufmgr_fill_percent(&app->buffers, BUF_CAPTURE_RF));
         if(m_status_valid)status_rf_pct=(int)m_status.rf_fill_pct;
         snprintf(status_rf_buf_display, sizeof(status_rf_buf_display), "%d%%", status_rf_pct);
-        size_t status_aud_head = atomic_load(&app->buffers.buffers[BUF_CAPTURE_AUDIO].head);
-        size_t status_aud_tail = atomic_load(&app->buffers.buffers[BUF_CAPTURE_AUDIO].tail);
-        size_t status_aud_size = app->buffers.buffers[BUF_CAPTURE_AUDIO].buffer_size;
-        status_aud_pct = status_aud_size > 0
-            ? (int)(((status_aud_tail - status_aud_head) * 100) / status_aud_size) : 0;
+        status_aud_pct = (int)(100.0f * bufmgr_fill_percent(&app->buffers, BUF_CAPTURE_AUDIO));
         if(m_status_valid)status_aud_pct=(int)m_status.aud_fill_pct;
         snprintf(status_aud_buf_display, sizeof(status_aud_buf_display), "%d%%", status_aud_pct);
     }
@@ -9011,9 +9269,6 @@ void gui_render_layout(gui_app_t *app) {
 static void gui_ui_poll_android_results(gui_app_t *app)
 {
     extern int android_poll_picker_result(int *out_kind, int *out_ok, char *out_path, size_t out_path_len);
-    extern int android_poll_usb_permission_result(int *out_granted);
-    extern int android_permission_pending(void);
-    extern int android_usb_has_fd(void);
     extern int android_usb_device_present(void);
 
     /* Re-enumerate the device list whenever the Java-reported physical USB
@@ -9023,24 +9278,47 @@ static void gui_ui_poll_android_results(gui_app_t *app)
      * capturing or while a start/stop worker is in flight. */
     static int s_last_usb_present = -1;
     int usb_present_now = android_usb_device_present();
-    if (usb_present_now != s_last_usb_present) {
-        if (!app->is_capturing && !gui_app_capture_busy() && !gui_playback_is_starting(app)) {
+    bool usb_devices_changed = usb_present_now != s_last_usb_present;
+#ifdef ENABLE_RTLSDR
+    static unsigned s_last_rtl_revision;
+    unsigned rtl_revision = android_rtlsdr_device_revision();
+    usb_devices_changed |= rtl_revision != s_last_rtl_revision;
+#endif
+    if (usb_devices_changed &&
+        app->settings.net_mode != GUI_NET_MODE_CLIENT &&
+        app->settings.net_mode != GUI_NET_MODE_MONITOR_CLIENT) {
+        if (!app->is_capturing && !gui_app_capture_busy() &&
+            !gui_net_transition_busy() && !gui_playback_is_starting(app)) {
             int prev_selected_type = -1;
+#ifdef ENABLE_RTLSDR
+            int prev_selected_rtl_id = -1;
+#endif
             if (app->selected_device >= 0 && app->selected_device < app->device_count) {
                 prev_selected_type = (int)app->devices[app->selected_device].type;
+#ifdef ENABLE_RTLSDR
+                if (prev_selected_type == DEVICE_TYPE_RTLSDR) {
+                    prev_selected_rtl_id = app->devices[app->selected_device].index;
+                }
+#endif
             }
             gui_app_enumerate_devices(app);
             /* Keep the user's selection on the same device type if possible
              * (e.g. stay on Test Signal when the MS2130 appears). */
             if (prev_selected_type >= 0) {
                 for (int i = 0; i < app->device_count; i++) {
-                    if ((int)app->devices[i].type == prev_selected_type) {
-                        app->selected_device = i;
-                        break;
-                    }
+                    if ((int)app->devices[i].type != prev_selected_type) continue;
+#ifdef ENABLE_RTLSDR
+                    if (prev_selected_type == DEVICE_TYPE_RTLSDR &&
+                        app->devices[i].index != prev_selected_rtl_id) continue;
+#endif
+                    app->selected_device = i;
+                    break;
                 }
             }
             s_last_usb_present = usb_present_now;
+#ifdef ENABLE_RTLSDR
+            s_last_rtl_revision = rtl_revision;
+#endif
         }
         /* else: retry on a later frame once capture/start/stop settles */
     }
@@ -9087,29 +9365,7 @@ static void gui_ui_poll_android_results(gui_app_t *app)
         }
     }
 
-    /* USB permission result -> complete the connect that the Connect button
-     * (or auto-reconnect) launched asynchronously. Run the (potentially slow)
-     * capture startup on a worker thread so the render loop stays alive. */
-    if (android_permission_pending()) {
-        int granted = 0;
-        if (android_poll_usb_permission_result(&granted)) {
-            if (gui_playback_is_starting(app) ||
-                gui_ui_selected_device_is_simulated(app) ||
-                gui_ui_selected_device_is_playback(app) ||
-                gui_net_is_client(app)) {
-                /* A USB response can arrive after the user has changed
-                 * sources. Never start Test Signal, playback or a network
-                 * client as a side effect of a stale USB permission result. */
-            } else if (granted && android_usb_has_fd()) {
-                gui_app_set_status(app, "USB permission granted, starting capture...");
-                gui_app_start_capture_async(app);
-            } else {
-                gui_app_set_status(app, "USB permission denied or no USB capture device found");
-                app->reconnect_pending = false;
-                app->reconnect_attempts = 0;
-            }
-        }
-    }
+
 }
 #endif
 
@@ -9254,6 +9510,13 @@ void gui_handle_interactions(gui_app_t *app) {
         (s_active_text_field == UI_TEXT_FIELD_NET_SERVER_PORT ||
          s_active_text_field == UI_TEXT_FIELD_NET_CLIENT_HOST ||
          s_active_text_field == UI_TEXT_FIELD_NET_CLIENT_PORT);
+#ifdef ENABLE_RTLSDR
+    if ((gui_dropdown_is_open(DROPDOWN_RTLSDR_PRESET, 0) ||
+         gui_dropdown_is_open(DROPDOWN_RTLSDR_PRESET, 1)) &&
+        (IsKeyPressed(KEY_ESCAPE) || !app->settings_panel_open || gui_ui_settings_locked(app) ||
+         !gui_ui_selected_device_is_sdr(app)))
+        gui_dropdown_close_all();
+#endif
     if (las_text_field_active && s_record_limit_window_open) {
         gui_ui_handle_active_text_edit(app);
     } else if (net_text_field_active && s_version_info_window_open &&
@@ -9663,7 +9926,11 @@ void gui_handle_interactions(gui_app_t *app) {
                 // idle by tearing down and re-initializing the buffer manager;
                 // block the change while capturing/recording to avoid disrupting
                 // the live data path.
-                if (app->is_capturing || app->is_recording) {
+                if (app->is_capturing || app->is_recording || gui_record_is_finalizing()
+#ifdef __ANDROID__
+                    || gui_app_capture_busy()
+#endif
+                ) {
                     gui_app_set_status(app, "Stop capture/recording to change memory budget");
                     gui_ui_set_click_consumed();
                     return;
@@ -9700,7 +9967,9 @@ void gui_handle_interactions(gui_app_t *app) {
                 // so the device dropdown reflects the new setting immediately.
                 app->settings.discover_simple_capture = !app->settings.discover_simple_capture;
                 gui_settings_save(&app->settings);
-                gui_app_enumerate_devices(app);
+                if (app->settings.net_mode != GUI_NET_MODE_MONITOR_CLIENT &&
+                    app->settings.net_mode != GUI_NET_MODE_CLIENT)
+                    gui_app_enumerate_devices(app);
                 gui_app_set_status(app, app->settings.discover_simple_capture
                     ? "V4L2 device discovery enabled"
                     : "V4L2 device discovery disabled");
@@ -9821,6 +10090,7 @@ void gui_handle_interactions(gui_app_t *app) {
                     s_active_text_field == UI_TEXT_FIELD_NET_CLIENT_PORT) {
                     gui_ui_clear_text_edit();
                     gui_settings_save(&app->settings);
+                    gui_record_cancel_capture_confirmation(app);
                     (void)gui_net_request_apply_mode(app, app->settings.net_mode, true);
                 }
                 gui_ui_set_click_consumed();
@@ -10168,7 +10438,11 @@ void gui_handle_interactions(gui_app_t *app) {
         // Check connect button
         if (Clay_PointerOver(CLAY_ID("ConnectButton"))) {
             if (gui_playback_is_starting(app)) {
+#ifdef __ANDROID__
+                gui_app_stop_capture_async(app);
+#else
                 gui_app_stop_capture(app);
+#endif
                 gui_ui_set_click_consumed();
                 return;
             }
@@ -10199,6 +10473,10 @@ void gui_handle_interactions(gui_app_t *app) {
 #endif
                 app->reconnect_pending = false;
                 app->reconnect_attempts = 0;
+#ifdef __ANDROID__
+            } else if (gui_app_capture_busy()) {
+                gui_app_set_status(app, "Capture is changing. Please wait");
+#endif
             } else if (gui_ui_selected_device_is_playback(app) && !gui_net_is_client(app)) {
                 // File preparation is asynchronous; the per-frame poll commits it.
                 (void)gui_app_start_capture(app);
@@ -10232,32 +10510,10 @@ void gui_handle_interactions(gui_app_t *app) {
                     } else {
                         gui_app_set_status(app, "Waiting for remote Server connection...");
                     }
-                } else if (gui_ui_selected_device_is_simulated(app)) {
-                    /* Software generator: use the existing non-blocking
-                     * capture worker directly. No USB hardware or Android
-                     * USB permission is needed for Test Signal. */
-                    gui_app_start_capture_async(app);
+                } else {
                     app->reconnect_pending = false;
                     app->reconnect_attempts = 0;
-                } else {
-                    /* Local USB hardware only: async Android permission.
-                     * Never block the render thread on the system dialog. */
-                    extern int android_usb_has_fd(void);
-                    extern int android_request_usb_permission_async(void);
-                    extern int android_permission_pending(void);
-                    extern void android_usb_clear_fd(void);
-                    if (android_usb_has_fd()) {
-                        gui_app_start_capture_async(app);
-                        app->reconnect_pending = false;
-                        app->reconnect_attempts = 0;
-                    } else if (!android_permission_pending()) {
-                        android_usb_clear_fd();
-                        if (android_request_usb_permission_async()) {
-                            gui_app_set_status(app, "Requesting USB permission...");
-                        } else {
-                            gui_app_set_status(app, "USB permission request failed to start");
-                        }
-                    }
+                    gui_app_start_capture_async(app);
                 }
 #else
                 if (gui_app_start_capture(app) == 0) {
@@ -10319,6 +10575,12 @@ void gui_handle_interactions(gui_app_t *app) {
             return;
         }
 
+#ifdef ENABLE_RTLSDR
+        if (gui_ui_handle_rtlsdr_setting_click(app)) {
+            gui_ui_set_click_consumed();
+            return;
+        }
+#endif
         if (app->settings_panel_open &&
             (Clay_PointerOver(CLAY_ID("SettingsBackdrop")) || Clay_PointerOver(CLAY_ID("SettingsCloseButton")))) {
             app->settings_panel_open = false;
@@ -10431,6 +10693,7 @@ void gui_handle_interactions(gui_app_t *app) {
         // Check settings button
         if (Clay_PointerOver(CLAY_ID("SettingsButton"))) {
             app->settings_panel_open = !app->settings_panel_open;
+            gui_dropdown_close_all();
             gui_ui_clear_text_edit();
             gui_settings_save(&app->settings);
         }
@@ -10701,6 +10964,34 @@ void gui_handle_interactions(gui_app_t *app) {
                 gui_ui_begin_text_edit(app, UI_TEXT_FIELD_FLAC_AFFINITY, CLAY_ID("FlacAffinityListField"), 8.0f, 8.0f);
                 gui_ui_set_click_consumed();
             }
+#if defined(ENABLE_DDD) && defined(ENABLE_DDD_WINUSB)
+            if (gui_ui_ddd_usb_backend_visible(app) &&
+                Clay_PointerOver(CLAY_ID("DddUsbBackendToggle"))) {
+                if (gui_ui_ddd_usb_backend_locked(app)) {
+                    gui_app_set_status(app, "Disconnect DdD before changing the USB backend");
+                } else {
+                    app->settings.ddd_use_winusb = !app->settings.ddd_use_winusb;
+                    gui_settings_save(&app->settings);
+                    gui_app_set_status(app, app->settings.ddd_use_winusb
+                        ? "DdD USB backend set to WinUSB" : "DdD USB backend set to libusb");
+                }
+                gui_ui_set_click_consumed();
+                return;
+            }
+            if (gui_ui_ddd_usb_backend_visible(app) && !app->settings.ddd_use_winusb &&
+                Clay_PointerOver(CLAY_ID("DddLibusbRawIoToggle"))) {
+                if (gui_ui_ddd_usb_backend_locked(app)) {
+                    gui_app_set_status(app, "Disconnect DdD before changing libusb RAW_IO");
+                } else {
+                    app->settings.ddd_libusb_raw_io = !app->settings.ddd_libusb_raw_io;
+                    gui_settings_save(&app->settings);
+                    gui_app_set_status(app, app->settings.ddd_libusb_raw_io
+                        ? "DdD libusb RAW_IO set to ON" : "DdD libusb RAW_IO set to OFF");
+                }
+                gui_ui_set_click_consumed();
+                return;
+            }
+#endif
             if (!settings_ddd_v1_mode &&
                 Clay_PointerOver(CLAY_ID("ToggleResampleA"))) {
                 bool enable = !app->settings.enable_resample_a;
@@ -10790,24 +11081,6 @@ void gui_handle_interactions(gui_app_t *app) {
             // SDR controls (shown for any SDR backend; today only RTL-SDR).
 #ifdef ENABLE_RTLSDR
             if (gui_ui_selected_device_is_sdr(app)) {
-                if (Clay_PointerOver(CLAY_ID("RtlsdrFreqField")) && !gui_ui_click_consumed()) {
-                    gui_ui_begin_text_edit(app, UI_TEXT_FIELD_RTLSDR_FREQ, CLAY_ID("RtlsdrFreqField"), 8.0f, 8.0f);
-                    gui_ui_set_click_consumed();
-                }
-                if (Clay_PointerOver(CLAY_ID("RtlsdrSampleRateBox"))) {
-                    // Cycle through known-stable RTL sample rates (Hz).
-                    static const uint32_t rtlsdr_rates[] = { 250000, 1024000, 1200000, 1536000, 2048000, 2400000 };
-                    static const int n = (int)(sizeof(rtlsdr_rates)/sizeof(rtlsdr_rates[0]));
-                    uint32_t cur = app->settings.rtlsdr_sample_rate_hz;
-                    int idx = 0;
-                    for (int i = 0; i < n; i++) { if (rtlsdr_rates[i] == cur) { idx = i; break; } }
-                    app->settings.rtlsdr_sample_rate_hz = rtlsdr_rates[(idx + 1) % n];
-                    gui_settings_save(&app->settings);
-                    char msg[80];
-                    snprintf(msg, sizeof(msg), "SDR sample rate set to %.2f MSPS (applies on next capture start)",
-                             (double)app->settings.rtlsdr_sample_rate_hz / 1.0e6);
-                    gui_app_set_status(app, msg);
-                }
                 if (Clay_PointerOver(CLAY_ID("RtlsdrGainModeToggle"))) {
                     // 0=auto,1=manual
                     app->settings.rtlsdr_gain_mode = app->settings.rtlsdr_gain_mode ? 0 : 1;

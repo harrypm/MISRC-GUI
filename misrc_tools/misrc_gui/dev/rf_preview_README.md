@@ -1,6 +1,6 @@
 # Tape RF preview
 
-The RF Preview panel provides PAL/NTSC/SECAM VHS SP (native or MESECAM),
+The RF Preview panel provides PAL/NTSC/SECAM VHS SP (native or MESECAM), PAL/NTSC S-VHS,
 NTSC Betamax, ordinary NTSC SuperBeta and NTSC-J ED Beta video-RF preview. It weaves two original fields into alternating
 rows, without deinterlacing, field duplication or motion interpolation.
 Output is RGBA at 768x576 PAL or 640x480 NTSC, displayed at 4:3. Nominal
@@ -9,10 +9,13 @@ output rates are 25 and 29.97 fps.
 ## Operation
 
 1. Open a Video panel for the desired RF channel.
-2. Cycle Decoder to **RF Preview**, choose **Tape: VHS** or **Tape: Betamax**,
-   and select PAL, NTSC or SECAM. Under SECAM VHS, the **MESECAM** switch
-   defaults to **Off** for native frequency-divided recording; **On** selects
-   the heterodyne recording method. Betamax currently
+2. Cycle Decoder to **RF Preview** and choose **Format: VHS** or
+   **Format: Betamax**. In VHS mode, **System** cycles through PAL, NTSC,
+   SECAM and MESECAM. Choose **System: SECAM** for native frequency-divided
+   recording or **System: MESECAM** for heterodyne recording.
+   Cycle **Preset** between **VHS** (default) and **S-VHS**. S-VHS supports
+   manual PAL/NTSC selection. Selecting SECAM or MESECAM restores the VHS
+   preset. Selecting S-VHS from either system switches to PAL. Betamax currently
    supports NTSC only. Cycle **Preset** through **Betamax** (default),
    **Betamax Hi-Fi**, **SuperBeta** and **ED Beta** to select the video recording profile.
    **Audio Mon** independently controls Hi-Fi listening for Betamax Hi-Fi,
@@ -52,18 +55,23 @@ limits distinct from [native SECAM](secam_vhs_preview_README.md).
 
 ## Sample rates and continuity
 
-The decoder processes RF internally at 20 MSPS:
+The decoder processes RF internally at 20 MSPS. Ordinary VHS, Betamax and
+SuperBeta use these conversion paths:
 
 | Physical input | Conversion |
 | --- | --- |
 | 20 MHz | No rate conversion |
 | 40 MHz | Stateful halfband FIR, 2:1 |
 | 80 MHz | Two stateful halfband FIR stages, 4:1 |
-| Other 16..160 MHz | libsoxr HQ, when available |
+| Other 16..200 MHz | libsoxr HQ, when available |
 
-Without libsoxr, only 20/40/80 MHz are supported. Unsupported rates fail
-explicitly. Rate support does not establish usable signal bandwidth or
-picture quality for every device.
+Without libsoxr, these ordinary profiles support only 20/40/80 MHz.
+S-VHS and ED Beta require at least 20 MSPS input. Native 20 MSPS bypasses
+rate conversion; higher rates, including 40/80 MSPS, use their dedicated
+libsoxr converter with a 9.5 MHz passband and 10 MHz stopband. The S-VHS
+picture/sync path then works at 5 MSPS. Capture RF retains its original
+physical rate. Unsupported rates fail explicitly. Rate support does not
+establish usable signal bandwidth or picture quality for every device.
 
 Every input block carries its physical rate, absolute sample position,
 epoch and discontinuity flag. Rate changes, seeks, looping, channel mapping
@@ -126,17 +134,20 @@ when tape playback returns, without reconnecting or changing PAL/NTSC. Sample
 positions, DSP filters, diagnostic totals and the capture session stay intact.
 
 Luma uses fixed profile levels with bounded, slow timing correction rather
-than noisy per-line black/gain normalization. NTSC VHS display deemphasis is
-independent of its sync plane; Beta synchronization uses its matched shelf.
-Chroma averaging uses neighbors from the same
-field and retains the original luma rows.
+than noisy per-line black/gain normalization. NTSC VHS and PAL/NTSC S-VHS
+display deemphasis is independent of the sync plane; Beta synchronization
+uses its matched shelf. S-VHS also stabilizes burst phase/gain and gates
+neighboring color pairs at luma or chroma boundaries. Chroma averaging uses
+neighbors from the same field and retains the original luma rows.
 
 The input-rate separation, field assembly and color-under concepts were
 informed by vhs-decode-dotnet. The halfband coefficients originate from its
 `VHSDecode.Core/Rf/HalfRateSampleLoader.cs`; source attribution is retained in
 `gui_rf_resampler.c`. This preview does not implement the complete offline
 .NET TBC/color pipeline or promise output equivalence. VHS LP/EP,
-S-VHS, PAL Betamax, dropout repair and advanced comb filtering are not implemented.
+PAL Betamax, dropout repair and advanced comb filtering are not implemented.
+The S-VHS preview omits its additional linear/nonlinear sub-deemphasis and
+full RF equalization.
 
 ## Capture protection
 
@@ -218,6 +229,7 @@ Windows executables have `.exe`:
 ```sh
 build/gui_rf_preview_file input.s16le 20000000 ntsc output.ppm --realtime
 build/gui_rf_preview_file input.s16le 40000000 pal output.ppm --max
+build/gui_rf_preview_file input.s16le 40000000 pal-svhs output.ppm --max
 build/gui_rf_preview_file input.s16le 40000000 ntsc-beta-hifi output.ppm --max output.wav 6
 build/gui_rf_preview_file input.s16le 40000000 ntsc-beta-hifi output.ppm --realtime output.wav 32 1.5
 build/gui_rf_preview_record_load input.s16le 20000000 ntsc output-prefix 60 on 1 4 1.0

@@ -221,6 +221,20 @@ bool gui_playback_get_link_separate(gui_app_t *app);
 // channel: 0=A, 1=B. In Synced mode these drive the shared transport.
 void gui_playback_toggle_pause_channel(gui_app_t *app, int channel);
 bool gui_playback_is_channel_paused(gui_app_t *app, int channel);
+typedef enum {
+    PLAYBACK_RF_END_NONE,
+    PLAYBACK_RF_END_PENDING,
+    PLAYBACK_RF_END_READY
+} playback_rf_end_t;
+// Natural EOF and visible/monitored LD loops. READY means the final RF input was forwarded.
+// token identifies this endpoint for ACK, and may be NULL when only polling state.
+playback_rf_end_t gui_playback_get_channel_rf_end(gui_app_t *app, int channel, uint64_t *token);
+// GUI monitor route, -1 when no LD file is audible.
+void gui_playback_set_ld_audio_channel(gui_app_t *app, int channel);
+// Bits 0 and 1 select channels with a visible LD decoder.
+void gui_playback_set_ld_video_channels(gui_app_t *app, unsigned channels);
+// Acknowledge after video and any selected audio have drained.
+void gui_playback_finish_ld_tail(gui_app_t *app, int channel, uint64_t token);
 void gui_playback_set_channel_loop(gui_app_t *app, int channel, bool loop);
 bool gui_playback_get_channel_loop(gui_app_t *app, int channel);
 

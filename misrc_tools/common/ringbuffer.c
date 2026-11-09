@@ -33,10 +33,12 @@
 #endif
 #endif
 #include "ringbuffer.h"
+#include <stdbool.h>
 #include <string.h>
 
 
 int rb_init(ringbuffer_t *rb, char *name, size_t size) {
+	if (size == 0 || size > SIZE_MAX / 2) return 1;
 
 #ifdef _WIN32
 
@@ -124,81 +126,79 @@ int rb_init(ringbuffer_t *rb, char *name, size_t size) {
 	return 0;
 }
 
+/*
+ * Cursors each wrap independently at twice the capacity. The extra phase
+ * distinguishes full from empty and keeps offsets correct for any capacity.
+ */
+static size_t rb_distance(const ringbuffer_t *rb, size_t head, size_t tail) {
+	return tail >= head ? tail - head : rb->buffer_size * 2 - (head - tail);
+}
+
+static size_t rb_offset(const ringbuffer_t *rb, size_t cursor) {
+	return cursor >= rb->buffer_size ? cursor - rb->buffer_size : cursor;
+}
+
+static size_t rb_advance(const ringbuffer_t *rb, size_t cursor, size_t size) {
+	size_t to_wrap = rb->buffer_size * 2 - cursor;
+	return size >= to_wrap ? size - to_wrap : cursor + size;
+}
+
+static bool rb_can_write(const ringbuffer_t *rb, size_t tail, size_t size) {
+	size_t head = atomic_load_explicit(&rb->head, memory_order_acquire);
+	size_t used = rb_distance(rb, head, tail);
+	return used <= rb->buffer_size && size <= rb->buffer_size - used;
+}
+
+static bool rb_can_read(const ringbuffer_t *rb, size_t head, size_t size) {
+	size_t tail = atomic_load_explicit(&rb->tail, memory_order_acquire);
+	size_t used = rb_distance(rb, head, tail);
+	return used <= rb->buffer_size && size <= used;
+}
+
 int rb_put(ringbuffer_t *rb, void *data, size_t size) {
-	size_t head = atomic_load(&rb->head);
-	size_t tail = atomic_load(&rb->tail);
-	size_t map_size = rb->buffer_size * 2;
-	if(tail < head) {
-		return 1;
-	}
-	if(rb->buffer_size - (tail - head) < size) {
-		return 1;
-	}
-	if(tail >= map_size || size > (map_size - tail)) {
-		return 1;
-	}
-	memcpy(&rb->buffer[tail], data, size);
-	rb->tail += size;
+	size_t tail = atomic_load_explicit(&rb->tail, memory_order_relaxed);
+	if (!rb_can_write(rb, tail, size)) return 1;
+	memcpy(rb->buffer + rb_offset(rb, tail), data, size);
+	atomic_store_explicit(&rb->tail, rb_advance(rb, tail, size), memory_order_release);
 	return 0;
 }
 
 void* rb_write_ptr(ringbuffer_t *rb, size_t size) {
-	size_t head = atomic_load(&rb->head);
-	size_t tail = atomic_load(&rb->tail);
-	size_t map_size = rb->buffer_size * 2;
-	if(tail < head) {
-		return NULL;
-	}
-	if(rb->buffer_size - (tail - head) < size) {
-		return NULL;
-	}
-	if(tail >= map_size || size > (map_size - tail)) {
-		return NULL;
-	}
-	return &rb->buffer[tail];
+	size_t tail = atomic_load_explicit(&rb->tail, memory_order_relaxed);
+	if (!rb_can_write(rb, tail, size)) return NULL;
+	return rb->buffer + rb_offset(rb, tail);
 }
 
 int rb_write_finished(ringbuffer_t *rb, size_t size) {
-	size_t head = atomic_load(&rb->head);
-	size_t tail = atomic_load(&rb->tail);
-	size_t map_size = rb->buffer_size * 2;
-	if(tail < head) {
-		return 1;
-	}
-	if(rb->buffer_size - (tail - head) < size) {
-		return 1;
-	}
-	if(tail >= map_size || size > (map_size - tail)) {
-		return 1;
-	}
-	rb->tail += size;
+	size_t tail = atomic_load_explicit(&rb->tail, memory_order_relaxed);
+	if (!rb_can_write(rb, tail, size)) return 1;
+	atomic_store_explicit(&rb->tail, rb_advance(rb, tail, size), memory_order_release);
 	return 0;
 }
 
 void* rb_read_ptr(ringbuffer_t *rb, size_t size) {
-	size_t head = atomic_load(&rb->head);
-	size_t tail = atomic_load(&rb->tail);
-	size_t map_size = rb->buffer_size * 2;
-	if(tail < head){
-		return NULL;
-	}
-	if(tail - head < size){
-		return NULL;
-	}
-	if(head >= map_size || size > (map_size - head)) {
-		return NULL;
-	}
-	return &rb->buffer[head];
+	size_t head = atomic_load_explicit(&rb->head, memory_order_relaxed);
+	if (!rb_can_read(rb, head, size)) return NULL;
+	return rb->buffer + rb_offset(rb, head);
 }
 
 int rb_read_finished(ringbuffer_t *rb, size_t size) {
-	if(rb->tail - rb->head < size){
-		return 1;
-	}
-	rb->head += size;
-	if(rb->head >= rb->buffer_size) {
-		rb->head -= rb->buffer_size;
-		rb->tail -= rb->buffer_size;
+	size_t head = atomic_load_explicit(&rb->head, memory_order_relaxed);
+	if (!rb_can_read(rb, head, size)) return 1;
+	atomic_store_explicit(&rb->head, rb_advance(rb, head, size), memory_order_release);
+	return 0;
+}
+
+size_t rb_fill_level(const ringbuffer_t *rb) {
+	/* A third-party observer can sample while both cursors are moving.
+	 * Retry briefly if the consumer moved during the snapshot. */
+	for (int attempt = 0; attempt < 3; attempt++) {
+		size_t head = atomic_load_explicit(&rb->head, memory_order_acquire);
+		size_t tail = atomic_load_explicit(&rb->tail, memory_order_acquire);
+		if (head == atomic_load_explicit(&rb->head, memory_order_acquire)) {
+			size_t used = rb_distance(rb, head, tail);
+			if (used <= rb->buffer_size) return used;
+		}
 	}
 	return 0;
 }

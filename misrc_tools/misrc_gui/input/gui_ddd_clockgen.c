@@ -16,6 +16,7 @@
 
 #include "../core/gui_app.h"
 #include "../net/gui_monitor_audio.h"
+#include "../output/gui_record.h"
 #include "../../common/buffer_manager.h"
 #include "../../common/threading.h"
 
@@ -338,6 +339,7 @@ static int ddd_cg_audio_capture_thread(void *ctx_ptr)
     const size_t input_buffer_bytes = (size_t)DDD_CLOCKGEN_READ_FRAMES * input_frame_bytes;
     uint8_t *input_buf = (uint8_t *)malloc(input_buffer_bytes);
     if (!input_buf) {
+        gui_record_mark_audio_source_loss();
         gui_app_set_status(app, "DdD Clockgen: failed to allocate ALSA audio buffer");
         return -1;
     }
@@ -348,11 +350,13 @@ static int ddd_cg_audio_capture_thread(void *ctx_ptr)
             thrd_sleep_ms(1);
             continue;
         }
-        if (frames == -EPIPE) {
-            (void)snd_pcm_prepare(ctx->pcm);
-            continue;
-        }
         if (frames < 0) {
+            if (!atomic_load(&ctx->running)) break;
+            gui_record_mark_audio_source_loss();
+            if (frames == -EPIPE) {
+                (void)snd_pcm_prepare(ctx->pcm);
+                continue;
+            }
             int rec = snd_pcm_recover(ctx->pcm, (int)frames, 1);
             if (rec >= 0) {
                 continue;

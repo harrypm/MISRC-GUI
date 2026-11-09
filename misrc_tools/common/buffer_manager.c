@@ -577,10 +577,7 @@ rb_event_t *bufmgr_get_space_event(buffer_manager_t *mgr, buffer_id_t id) {
 size_t bufmgr_fill_level(buffer_manager_t *mgr, buffer_id_t id) {
     if (!mgr || id >= BUF_COUNT || !mgr->initialized[id]) return 0;
 
-    ringbuffer_t *rb = &mgr->buffers[id];
-    size_t head = atomic_load(&rb->head);
-    size_t tail = atomic_load(&rb->tail);
-    return tail - head;
+    return rb_fill_level(&mgr->buffers[id]);
 }
 
 float bufmgr_fill_percent(buffer_manager_t *mgr, buffer_id_t id) {

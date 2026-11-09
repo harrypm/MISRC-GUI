@@ -48,11 +48,19 @@ pwsh -File scripts/build-local.ps1
 scripts/build-local.sh
 ```
 
-Both entry points auto-build the vendored dependencies (see below) on first run and reuse them afterward, so a single command produces a working binary with no manual deps step.
+Both entry points prepare the source dependencies on first run and reuse them afterward.
+
+The desktop build scripts compile RTL-SDR into the dependency prefix. Release
+CI also builds RTL-SDR for its desktop and Android targets. Meson prepares
+liba52 when building the RF preview targets. These two dependencies use pinned
+upstream archives, verified with SHA-256 before the repository patches are
+applied. The first build needs network access or a populated archive cache.
+The default cache is `.deps/downloads`. Set `MISRC_DEP_CACHE` to use another
+cache directory.
 
 ## Vendored deps caching model (local == CI)
 
-hsdaoh, libuvc, and raylib are not available as system packages on all platforms, so they are built from source into `.deps/install` (mirroring the CI `windows-exe` / `linux-appimage` / `macos-app-build` deps blocks). The deps build is stamp-gated: a content-addressed hash of the hsdaoh source tree + raylib tag + libuvc ref + system dep versions is stored in `.deps/install/.build-stamp`; the build skips instantly when the stamp matches, so new terminals and CI runs reuse until an input changes.
+hsdaoh, libuvc, and raylib are not available as system packages on all platforms, so they are built from source into `.deps/install` (mirroring the CI `windows-exe` / `linux-appimage` / `macos-app-build` deps blocks). The local dependency scripts store a hash of their inputs in `.deps/install/.build-stamp`. It includes the hsdaoh sources, raylib and libuvc versions, installed dependency versions, and the RTL-SDR source pin and patch. A matching stamp allows the prefix to be reused.
 
 - **Windows**: `scripts/build-local.ps1` auto-invokes `scripts/build-deps-windows.sh` (via MSYS2 UCRT64) on first run or when inputs change. No manual deps step needed.
 - **Linux/macOS**: `scripts/build-local.sh` auto-invokes `scripts/build-deps-unix.sh` on first run or when inputs change.

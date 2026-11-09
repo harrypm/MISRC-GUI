@@ -52,7 +52,7 @@ static inline double rf_display_level(double y01) {
 #define RF_HYBRID_SPAN_IRE_NTSC  (197.680)
 
 typedef enum { GUI_RF_PAL = 0, GUI_RF_NTSC = 1 } gui_rf_format_t;
-/* Tape modulation profiles are independent of PAL/NTSC field geometry. */
+/* RF modulation profiles are independent of PAL/NTSC field geometry. */
 typedef enum {
     GUI_RF_PROFILE_PAL_VHS = 0,
     GUI_RF_PROFILE_NTSC_VHS,
@@ -63,8 +63,18 @@ typedef enum {
     GUI_RF_PROFILE_SECAM_VHS,
     GUI_RF_PROFILE_MESECAM_VHS,
     GUI_RF_PROFILE_NTSC_ED_BETA,
+    GUI_RF_PROFILE_PAL_SVHS,
+    GUI_RF_PROFILE_NTSC_SVHS,
+    GUI_RF_PROFILE_PAL_LASERDISC,
+    GUI_RF_PROFILE_NTSC_LASERDISC,
+    GUI_RF_PROFILE_NTSC_VHS_HIFI,
+    GUI_RF_PROFILE_PAL_VHS_HIFI,
     GUI_RF_PROFILE_COUNT
 } gui_rf_profile_t;
+
+static inline bool gui_rf_profile_is_audio_only(gui_rf_profile_t profile) {
+    return profile == GUI_RF_PROFILE_NTSC_VHS_HIFI || profile == GUI_RF_PROFILE_PAL_VHS_HIFI;
+}
 typedef struct gui_rf_decoder gui_rf_decoder_t;
 
 typedef struct {
@@ -103,8 +113,8 @@ typedef void (*gui_rf_frame_callback_t)(void *context, const uint8_t *rgba,
 /* Invalid profiles are rejected; reset_profile leaves existing state intact. */
 gui_rf_decoder_t *gui_rf_decoder_create_profile(gui_rf_profile_t profile);
 void gui_rf_decoder_reset_profile(gui_rf_decoder_t *decoder, gui_rf_profile_t profile);
-// RF input rate required by the decoder. All profiles use 20 MSPS; ED uses
-// a separate wide-passband converter before its reduced-rate preview filters.
+// RF input rate required by the decoder. All profiles use 20 MSPS; ED Beta
+// and S-VHS use a wide-passband converter before reduced-rate preview filters.
 uint32_t gui_rf_profile_video_rate_hz(gui_rf_profile_t profile);
 gui_rf_format_t gui_rf_profile_format(gui_rf_profile_t profile);
 const char *gui_rf_profile_name(gui_rf_profile_t profile);

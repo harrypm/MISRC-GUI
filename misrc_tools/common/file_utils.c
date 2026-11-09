@@ -5,6 +5,7 @@
 #include "file_utils.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -57,6 +58,8 @@ FILE *file_open_utf8(const char *filename, const char *mode)
         errno = EINVAL;
         return NULL;
     }
+    bool exclusive_binary = strcmp(mode, "wbx") == 0;
+    bool exclusive_text = strcmp(mode, "wx") == 0;
 #if defined(_WIN32) || defined(_WIN64)
     wchar_t *wide = file_wide_path(filename);
     wchar_t wide_mode[16];
@@ -66,12 +69,37 @@ FILE *file_open_utf8(const char *filename, const char *mode)
         free(wide); errno = EINVAL; return NULL;
     }
     for (size_t i = 0; i <= n; i++) wide_mode[i] = (unsigned char)mode[i];
-    FILE *file = _wfopen(wide, wide_mode);
+    FILE *file;
+    if (exclusive_binary || exclusive_text) {
+        // Use an atomic exclusive create even on older Windows CRTs that
+        // do not support the C11 "x" modifier in _wfopen.
+        int flags = _O_WRONLY | _O_CREAT | _O_EXCL | (exclusive_binary ? _O_BINARY : _O_TEXT);
+        int fd = _wopen(wide, flags, _S_IREAD | _S_IWRITE);
+        file = fd >= 0 ? _fdopen(fd, exclusive_binary ? "wb" : "w") : NULL;
+        if (fd >= 0 && !file) {
+            int error = errno;
+            _close(fd);
+            errno = error;
+        }
+    } else {
+        file = _wfopen(wide, wide_mode);
+    }
     int saved_errno = errno;
     free(wide);
     errno = saved_errno;
     return file;
 #else
+    if (exclusive_binary || exclusive_text) {
+        int fd = open(filename, O_WRONLY | O_CREAT | O_EXCL, 0666);
+        if (fd < 0) return NULL;
+        FILE *file = fdopen(fd, exclusive_binary ? "wb" : "w");
+        if (!file) {
+            int error = errno;
+            close(fd);
+            errno = error;
+        }
+        return file;
+    }
     return fopen(filename, mode);
 #endif
 }

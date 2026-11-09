@@ -1,9 +1,10 @@
 /*
  * Private VHS monitor filter design. GPL-3.0, as the containing project.
  *
- * NTSC parameter/profile and inverse high-shelf construction ported from
+ * VHS/S-VHS parameter/profile and inverse high-shelf construction ported from
  * machcnz/vhs-decode-dotnet, VHSDecode.Core/Dsp/IirFilterDesign.cs:873-933
- * and Formats/format-params.snapshot.json (NTSC VHS SP deemph_gain/mid/q).
+ * and Formats/format-params.snapshot.json (NTSC VHS and PAL/NTSC S-VHS
+ * deemph_gain/mid/q).
  * The upstream Shelf is the parameterized RBJ second-order high shelf;
  * VideoDeEmphasisShelf swaps numerator and denominator before normalization.
  *
@@ -11,7 +12,8 @@
  * it preserves DC, the physical midpoint and both shelf plateaus; bilinear
  * warping and phase differ from a design evaluated at 20MHz or 40MHz. There
  * is no extra rate multiplier, brightness gain, or zero-phase processing.
- * PAL keeps its existing filter; do not use this NTSC profile for PAL.
+ * Ordinary PAL VHS keeps its existing filter. PAL S-VHS uses its matched
+ * display shelf while retaining the legacy PAL sync filter.
  */
 #ifndef GUI_RF_PREVIEW_FILTERS_H
 #define GUI_RF_PREVIEW_FILTERS_H

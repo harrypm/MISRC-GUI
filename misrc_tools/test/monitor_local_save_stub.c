@@ -51,6 +51,9 @@ int gui_monitor_local_save_send(unsigned type, unsigned id, uint64_t offset,
     (void)type; (void)id; (void)offset; (void)data; (void)bytes;
     return -1;
 }
+bool gui_monitor_local_save_commit_unconfirmed(void) {
+    return false;
+}
 bool gui_monitor_local_save_end(bool commit) {
     (void)commit;
     return false;

@@ -253,6 +253,22 @@ bool gui_rf_resampler_process(gui_rf_resampler_t *resampler,
 #endif
 }
 
+bool gui_rf_resampler_finish(gui_rf_resampler_t *resampler, float *output,
+                             size_t output_capacity, size_t *output_count) {
+    if (!output_count) return false;
+    *output_count = 0;
+    if (!resampler || !output || !output_capacity) return false;
+    if (resampler->factor) return true;
+#if LIBSOXR_ENABLED
+    if (!resampler->soxr || resampler->failed) return false;
+    resampler->failed = soxr_process(resampler->soxr, NULL, 0, NULL, output,
+                                     output_capacity, output_count) != NULL;
+    return !resampler->failed;
+#else
+    return false;
+#endif
+}
+
 double gui_rf_resampler_delay_samples(const gui_rf_resampler_t *resampler) {
     if (!resampler) return 0.0;
     if (resampler->factor == 2u) return 7.5;

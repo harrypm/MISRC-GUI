@@ -48,6 +48,10 @@
 void gui_app_set_status(gui_app_t *app, const char *message) { (void)app; (void)message; }
 void gui_extract_prepare_stream(gui_app_t *app) { (void)app; }
 int gui_extract_start_tagged(gui_app_t *app) { (void)app; return 0; }
+uint64_t gui_extract_playback_stamps_written(int channel) { (void)channel; return 0; }
+bool gui_extract_stamp_playback_channel(int channel, const gui_rf_block_info_t *info, size_t count) {
+    (void)channel; (void)info; (void)count; return true;
+}
 bool gui_extract_stamp_playback(const gui_rf_block_info_t info[2], const size_t counts[2])
 { (void)info; (void)counts; return true; }
 void gui_extract_stop(void) {}
@@ -1407,6 +1411,45 @@ static void test_raw_probe(const char *temp_dir)
     expect_u64((uint64_t)info.real_sample_rate_hz, 10000000, "10msps hint rate");
 }
 
+static void test_hifi_rf_rates(const char *temp_dir)
+{
+    static const struct {
+        const char *filename_rate;
+        uint32_t rate_khz;
+    } rates[] = {{"8", 8000}, {"8.192", 8192}, {"10", 10000}};
+    const uint32_t pid = (uint32_t)getpid();
+    const uint8_t samples[256] = {0};
+    char path[512];
+
+    for (size_t i = 0; i < sizeof(rates) / sizeof(rates[0]); i++) {
+        playback_file_info_t info = {0};
+        const uint32_t rate_hz = rates[i].rate_khz * 1000u;
+        test_case = "hifi_rf_raw_rate";
+        snprintf(path, sizeof(path), "%s/misrc_pb_%u_hifi_%smsps.u8",
+                 temp_dir, pid, rates[i].filename_rate);
+        FILE *f = fopen(path, "wb");
+        expect_true(f && fwrite(samples, 1, sizeof(samples), f) == sizeof(samples),
+                    "write Hi-Fi raw RF fixture");
+        if (f) fclose(f);
+        expect_true(gui_playback_validate_file(path, &info), "Hi-Fi raw RF validates");
+        expect_i64(info.format, PLAYBACK_INPUT_U8, "Hi-Fi raw RF format");
+        expect_near(info.real_sample_rate_hz, rate_hz, "Hi-Fi raw rate from filename");
+        expect_u64(info.total_samples, sizeof(samples), "Hi-Fi raw sample count");
+        unlink(path);
+
+        test_case = "hifi_rf_flac_rate";
+        snprintf(path, sizeof(path), "%s/misrc_pb_%u_hifi_%zu.flac", temp_dir, pid, i);
+        expect_true(write_pattern_flac(path, sizeof(samples), rates[i].rate_khz,
+                                       256, pattern_zeros), "write Hi-Fi RF FLAC fixture");
+        memset(&info, 0, sizeof(info));
+        expect_true(gui_playback_validate_file(path, &info), "Hi-Fi RF FLAC validates");
+        expect_i64(info.format, PLAYBACK_INPUT_FLAC, "Hi-Fi RF FLAC format");
+        expect_near(info.real_sample_rate_hz, rate_hz, "Hi-Fi RF FLAC /1000 rate convention");
+        expect_u64(info.total_samples, sizeof(samples), "Hi-Fi RF FLAC sample count");
+        unlink(path);
+    }
+}
+
 static void test_wav_probe(const char *temp_dir)
 {
     static char path[512];
@@ -1930,6 +1973,7 @@ int main(void)
      * specific errors, and the per-file 16-bit convention. */
     test_conv16_conventions();
     test_raw_probe(temp_dir);
+    test_hifi_rf_rates(temp_dir);
     test_wav_probe(temp_dir);
     test_raw_read_seek(temp_dir);
     test_sniff_errors(temp_dir);

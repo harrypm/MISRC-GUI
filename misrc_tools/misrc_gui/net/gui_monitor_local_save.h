@@ -12,8 +12,10 @@ int gui_monitor_local_save_client_start(const char *host,uint16_t port,const cha
 void gui_monitor_local_save_client_stop(void);
 bool gui_monitor_local_save_client_ready(void);
 bool gui_monitor_local_save_client_error(void);
+bool gui_monitor_local_save_client_take_notice(char *notice,size_t capacity);
 bool gui_monitor_local_save_recording(void);
 bool gui_monitor_local_save_failed(void);
+bool gui_monitor_local_save_commit_unconfirmed(void);
 int gui_monitor_local_save_begin(void);
 int gui_monitor_local_save_send(unsigned type,unsigned id,uint64_t offset,const void *data,size_t bytes);
 bool gui_monitor_local_save_end(bool commit);

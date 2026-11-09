@@ -106,6 +106,7 @@ static net_sock_t s_mls_fd = NET_INVALID_SOCKET;
 static atomic_bool s_mls_active = false;
 static atomic_bool s_mls_record = false;
 static atomic_bool s_mls_failed = false;
+static atomic_bool s_mls_commit_unconfirmed = false;
 static atomic_bool s_mls_request = false;
 /* Diagnostics: time spent transferring and acknowledging payload bytes,
  * independent of the FLAC encoder time. Protected by s_mls_mtx. */
@@ -169,12 +170,14 @@ static void mls_mark_failed_locked(void) {
 static int mls_sender_worker(void *unused);
 bool gui_monitor_local_save_recording(void) { return s_mls_record; }
 bool gui_monitor_local_save_failed(void) { return s_mls_failed; }
+bool gui_monitor_local_save_commit_unconfirmed(void) { return atomic_load(&s_mls_commit_unconfirmed); }
 int gui_monitor_local_save_begin(void) {
     if (!s_mls_lock_ready) return -1;
     net_mutex_lock(&s_mls_mtx);
     int ok = s_mls_active && !s_mls_record && !s_mls_failed && net_sock_valid(s_mls_fd);
     if (ok) {
         mls_proxy_reset_session_ids();
+        atomic_store(&s_mls_commit_unconfirmed, false);
         s_mls_write_bytes = 0;
         s_mls_write_frames = 0;
         s_mls_write_seconds = 0.0;
@@ -213,11 +216,14 @@ static int mls_send_wire_sync(unsigned type, unsigned id, uint64_t offset,
     f.offset=offset; f.crc = bytes ? mls_crc32(buf,bytes) : 0;
     uint8_t h[MLS_HEADER_SIZE];
     double write_started = type == MLS_WRITE ? ((double)get_time_ms()/1000.0) : 0.0;
-    int ok=mls_encode_header(h,&f)==0 && net_send_all(s_mls_fd,h,sizeof(h))==0 &&
-           (!bytes || net_send_all(s_mls_fd,buf,bytes)==0) &&
-           mls_recv_exact(s_mls_fd,h,sizeof(h))==0 &&
-           mls_decode_header(&ack,h,sizeof(h))==0 && ack.type==MLS_ACK &&
-           ack.file_id==id && ack.offset==0 && ack.length==0;
+    bool sent = mls_encode_header(h,&f)==0 && net_send_all(s_mls_fd,h,sizeof(h))==0 &&
+                (!bytes || net_send_all(s_mls_fd,buf,bytes)==0);
+    bool answered = sent && mls_recv_exact(s_mls_fd,h,sizeof(h))==0 &&
+                    mls_decode_header(&ack,h,sizeof(h))==0 && ack.type==MLS_ACK &&
+                    ack.file_id==id && ack.length==0 && ack.offset<=1;
+    bool ok = answered && ack.offset==0;
+    if (type==MLS_COMMIT && sent && !answered)
+        atomic_store(&s_mls_commit_unconfirmed, true);
     if(ok) s_mls_last_ack_time = ((double)get_time_ms()/1000.0);
     if(ok && type == MLS_WRITE) {
         double elapsed = ((double)get_time_ms()/1000.0) - write_started;
@@ -367,7 +373,9 @@ bool gui_monitor_local_save_end(bool commit) {
     if(s_mls_record && commit && !s_mls_failed) {
         complete = gui_monitor_local_save_send(MLS_COMMIT,0,0,NULL,0)==0;
         if(!complete)
-            fprintf(stderr,"[Local Save] ERROR: client did not commit recording\n");
+            fprintf(stderr, "[Local Save] %s\n", gui_monitor_local_save_commit_unconfirmed() ?
+                    "COMMIT was sent but the receiver outcome is unconfirmed" :
+                    "COMMIT was rejected or could not be sent");
     } else if(s_mls_record && s_mls_active && !s_mls_failed) {
         (void)gui_monitor_local_save_send(MLS_ABORT,0,0,NULL,0);
     }
@@ -436,6 +444,33 @@ static char s_receiver_directory[MLS_PATH_MAX],s_receiver_host[128];
 static uint16_t s_receiver_port;
 static atomic_bool s_receiver_error=false;
 static atomic_uintptr_t s_receiver_socket=0;
+static atomic_flag s_receiver_notice_lock=ATOMIC_FLAG_INIT;
+static char s_receiver_notice[256];
+
+static void mls_lock_receiver_notice(void) {
+ while(atomic_flag_test_and_set_explicit(&s_receiver_notice_lock,memory_order_acquire))
+  thrd_sleep_ms(1);
+}
+static void mls_unlock_receiver_notice(void) {
+ atomic_flag_clear_explicit(&s_receiver_notice_lock,memory_order_release);
+}
+static void mls_note_receiver_publication(const char *path,bool ack_sent) {
+ mls_lock_receiver_notice();
+ snprintf(s_receiver_notice,sizeof(s_receiver_notice),"Local Save published %.185s%s",
+          path,ack_sent ? "" : " (server ACK could not be sent)");
+ mls_unlock_receiver_notice();
+}
+bool gui_monitor_local_save_client_take_notice(char *notice,size_t capacity) {
+ if(!notice || !capacity)return false;
+ mls_lock_receiver_notice();
+ bool available=s_receiver_notice[0]!=0;
+ if(available){
+  snprintf(notice,capacity,"%s",s_receiver_notice);
+  s_receiver_notice[0]=0;
+ }
+ mls_unlock_receiver_notice();
+ return available;
+}
 
 static int mls_server_attached(void *unused){
  (void)unused;
@@ -540,14 +575,19 @@ static int mls_client_recv_thread(void *unused){
   if(f.length){payload=malloc(f.length);if(!payload)break;
    if(mls_recv_exact(fd,payload,f.length)!=0){free(payload);break;}}
   int ok=mls_receiver_apply(receiver,&f,payload);free(payload);
-  if(ok==0 && f.type==MLS_COMMIT){
-   (void)mls_receiver_init(receiver,s_receiver_directory,false);
-   fprintf(stderr,"[M-LOCAL] client files committed\n");
-  }
   if(f.type==MLS_WRITE_STREAM && ok==0)continue;
   ack.type=MLS_ACK;ack.file_id=f.file_id;ack.offset=ok==0?0:1;
-  if(mls_encode_header(h,&ack)!=0||net_send_all(fd,h,sizeof(h))!=0||ok!=0)break;
-  if(f.type==MLS_ABORT)break;
+  bool sent=mls_encode_header(h,&ack)==0 && net_send_all(fd,h,sizeof(h))==0;
+  if(ok==0 && f.type==MLS_COMMIT){
+   // The files are already published. A socket failure changes only what
+   // the server can confirm, so keep and report the known receiver result.
+   mls_receiver_finish_commit(receiver);
+   fprintf(stderr,"[M-LOCAL] Published %s%s\n", receiver->published_path,
+           sent ? "" : " (could not acknowledge the server)");
+   mls_note_receiver_publication(receiver->published_path,sent);
+   if(!sent || mls_receiver_init(receiver,s_receiver_directory,false)!=0)break;
+  }
+  if(!sent || ok!=0 || f.type==MLS_ABORT)break;
  }
  mls_receiver_abort(receiver);
 close_fd:

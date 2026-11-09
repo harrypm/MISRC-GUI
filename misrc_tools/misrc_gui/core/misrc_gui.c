@@ -46,6 +46,7 @@
 #include "../output/gui_audio.h"
 #include "../net/gui_net.h"
 #include "../net/gui_monitor_audio.h"
+#include "../net/gui_monitor_transport.h"
 #include "../../common/threading.h"
 #include "../../common/utf8_argv.h"
 #include "version.h"
@@ -335,7 +336,13 @@ typedef struct {
     ddd_device_profile_t ddd_profile;
     char ddd_usb_path[DDD_STABLE_ID_MAX];
 #endif
+#if defined(__ANDROID__) && defined(ENABLE_RTLSDR)
+    android_rtlsdr_usb_identity_t rtl_identity;
+#endif
 } gui_reconnect_target_t;
+#if defined(__ANDROID__) && defined(ENABLE_RTLSDR)
+enum { GUI_RECONNECT_CONFIRM_RTL = -2 };
+#endif
 // Portable case-insensitive substring search (POSIX strcasestr is not
 // available on every target; keeps the binary dependency-light).
 static const char *gui_strcasestr_local(const char *haystack, const char *needle) {
@@ -370,6 +377,9 @@ static void gui_set_reconnect_target_from_selected(const gui_app_t *app, gui_rec
     target->index = -1;
     target->name[0] = '\0';
     target->serial[0] = '\0';
+#if defined(__ANDROID__) && defined(ENABLE_RTLSDR)
+    target->rtl_identity = (android_rtlsdr_usb_identity_t){.usb = {.id = -1}};
+#endif
 #ifdef ENABLE_DDD
     target->ddd_profile = DDD_DEVICE_NOT_DDD;
     target->ddd_usb_path[0] = '\0';
@@ -382,6 +392,11 @@ static void gui_set_reconnect_target_from_selected(const gui_app_t *app, gui_rec
     target->index = dev->index;
     snprintf(target->name, sizeof(target->name), "%s", dev->name);
     snprintf(target->serial, sizeof(target->serial), "%s", dev->serial);
+#if defined(__ANDROID__) && defined(ENABLE_RTLSDR)
+    if (dev->type == DEVICE_TYPE_RTLSDR) {
+        (void)gui_app_rtlsdr_reconnect_identity(dev->index, &target->rtl_identity);
+    }
+#endif
 #ifdef ENABLE_DDD
     if (dev->type == DEVICE_TYPE_DDD) {
         target->ddd_profile = dev->ddd_profile;
@@ -390,8 +405,50 @@ static void gui_set_reconnect_target_from_selected(const gui_app_t *app, gui_rec
     }
 #endif
 }
+#if defined(__ANDROID__) && defined(ENABLE_RTLSDR)
+static int gui_find_android_rtl_reconnect_device(const gui_app_t *app,
+                                                const gui_reconnect_target_t *target)
+{
+    android_rtlsdr_usb_device_t attached[ANDROID_RTL_USB_MAX_DEVICES];
+    int count = android_rtlsdr_list_usb_devices(attached, ANDROID_RTL_USB_MAX_DEVICES);
+    const android_rtlsdr_usb_identity_t *identity = &target->rtl_identity;
+    int candidate = -1;
+    unsigned matches = 0;
+    for (int i = 0; i < app->device_count; ++i) {
+        const device_info_t *device = &app->devices[i];
+        if (device->type != DEVICE_TYPE_RTLSDR) continue;
+        for (int j = 0; j < count; ++j) {
+            if (attached[j].id != device->index) continue;
+            bool same_model = identity->usb.id >= 0 &&
+                              attached[j].vid == identity->usb.vid &&
+                              attached[j].pid == identity->usb.pid;
+            if (device->index == target->index && strcmp(device->name, target->name) == 0 &&
+                (identity->usb.id < 0 || same_model)) return i;
+            if (same_model) {
+                candidate = i;
+                ++matches;
+            }
+            break;
+        }
+    }
+    if (!matches) return -1;
+
+    /* getDeviceId() is attachment-scoped. A single candidate can request
+     * permission so its serial can be verified before opening its descriptor. */
+    const char *serial = identity->serial;
+    while (*serial == '0') ++serial;
+    if (matches != 1 || !*serial || strcmp(serial, "1") == 0) {
+        return GUI_RECONNECT_CONFIRM_RTL;
+    }
+    return candidate;
+}
+#endif
+
 static int gui_find_reconnect_device(const gui_app_t *app, const gui_reconnect_target_t *target) {
     if (!app || !target || !target->valid) return -1;
+#if defined(__ANDROID__) && defined(ENABLE_RTLSDR)
+    if (target->type == DEVICE_TYPE_RTLSDR) return gui_find_android_rtl_reconnect_device(app, target);
+#endif
     int fallback_same_type = -1;
     for (int i = 0; i < app->device_count; i++) {
         const device_info_t *dev = &app->devices[i];
@@ -716,6 +773,7 @@ static int gui_run_role_headless_server(const char *config_path,
     bool started_once = false;
     double next_probe = gui_runtime_time();
     while (!s_headless_stop && !atomic_load(&do_exit)) {
+        gui_record_check_popup(&app);
         gui_net_poll_commands(&app);
         if (app.is_capturing) started_once = true;
         gui_app_poll_capture_start(&app);
@@ -1460,9 +1518,6 @@ int main(int argc, char **argv) {
             last_layout_height = current_layout_height;
         }
 
-        // Check for pending popup result (for async confirmations like file overwrite)
-        gui_record_check_popup(&app);
-
         // One-time startup warning: if FLAC threads is 0 (auto), warn once.
         // Uses a local bool so it fires only once per session, on the first
         // frame where no other popup is open.
@@ -1602,10 +1657,18 @@ int main(int argc, char **argv) {
                     if (app.is_recording) {
                         gui_app_set_status(&app, "Stop recording before disconnecting (protects the capture file)");
                     } else {
+#ifdef __ANDROID__
+                        gui_app_stop_capture_async(&app);
+#else
                         gui_app_stop_capture(&app);
+#endif
                     }
                 } else {
+#ifdef __ANDROID__
+                    gui_app_start_capture_async(&app);
+#else
                     gui_app_start_capture(&app);
+#endif
                 }
             }
 
@@ -1657,10 +1720,8 @@ int main(int argc, char **argv) {
                 }
             } else if (auto_rec_phase == AUTO_REC_RECORDING) {
                 if (!app.is_recording) {
-                    fprintf(stderr, "[AUTO] recording stopped early; finishing\n");
-#if defined(__APPLE__)
-                    if (gui_cxadc_macos_active()) auto_rec_failed = true;
-#endif
+                    fprintf(stderr, "[AUTO] ERROR: recording stopped before the requested duration\n");
+                    auto_rec_failed = true;
                     auto_rec_phase = AUTO_REC_FINALIZING;
                 } else if (auto_now >= auto_rec_deadline) {
                     gui_app_stop_recording(&app);
@@ -1669,6 +1730,10 @@ int main(int argc, char **argv) {
                 }
             } else if (auto_rec_phase == AUTO_REC_FINALIZING) {
                 if (!app.is_recording && !gui_record_is_finalizing()) {
+                    if (gui_record_last_stop_failed()) {
+                        fprintf(stderr, "[AUTO] ERROR: recording finalization failed\n");
+                        auto_rec_failed = true;
+                    }
                     if (app.is_capturing) {
                         gui_app_stop_capture(&app);
                         fprintf(stderr, "[AUTO] capture stopped\n");
@@ -1707,22 +1772,31 @@ int main(int argc, char **argv) {
         // are no-ops when net_mode == Local.
         gui_net_poll_commands(&app);
         gui_net_poll_mirror(&app);
-        // Deferred device re-enumeration after an async net mode transition:
-        // the transition worker (gui_net_request_apply_mode) set the flag on
-        // completion; the device array is main-thread-owned, so the enumerate
-        // runs here, not on the worker.
+        // A queued remote Record Off can cancel an unconsumed overwrite result.
+        gui_record_check_popup(&app);
+#ifndef __ANDROID__
+        // Android completes this handoff inside gui_net_poll_mirror.
         if (atomic_exchange(&app.net_reenumerate_pending, false)) {
             gui_app_enumerate_devices(&app);
         }
+#endif
 
         // stop-on-dropout requests are posted from capture callbacks and consumed here.
-        if (app.is_capturing && atomic_exchange(&app.dropout_stop_requested, false)) {
+        if (
+#ifdef __ANDROID__
+            !gui_app_capture_busy() && !gui_net_capture_controls_locked(&app) &&
+#endif
+            app.is_capturing && atomic_exchange(&app.dropout_stop_requested, false)) {
             gui_dropout_reason_t reason =
                 (gui_dropout_reason_t)atomic_exchange(&app.dropout_stop_reason, GUI_DROPOUT_NONE);
+#ifdef __ANDROID__
+            gui_app_stop_capture_on_dropout_async(&app, gui_dropout_reason_status(reason));
+#else
             gui_app_stop_capture(&app);
             app.reconnect_pending = false;
             app.reconnect_attempts = 0;
             gui_app_set_status(&app, gui_dropout_reason_status(reason));
+#endif
             continue;
         }
 
@@ -1838,16 +1912,14 @@ int main(int argc, char **argv) {
 
             // Attempt reconnection if pending
             if (app.reconnect_pending && !app.is_capturing &&
+#ifdef __ANDROID__
+                app.settings.net_mode != GUI_NET_MODE_CLIENT &&
+                app.settings.net_mode != GUI_NET_MODE_MONITOR_CLIENT &&
+                !gui_net_capture_controls_locked(&app) &&
+#endif
                 !gui_playback_is_starting(&app)) {
 #if defined(__ANDROID__)
-                /* If a USB permission request is mid-flight, the per-frame
-                 * poll in gui_handle_interactions completes the connect; just
-                 * wait and don't burn a reconnect attempt. */
-                extern int android_permission_pending(void);
-                extern int android_usb_has_fd(void);
-                extern int android_request_usb_permission_async(void);
-                extern void android_usb_clear_fd(void);
-                if (android_permission_pending() || gui_app_capture_busy()) {
+                if (gui_app_capture_busy()) {
                     /* wait for the async permission poll / in-flight start-stop
                      * worker to finish before attempting reconnect */
                 } else
@@ -1864,6 +1936,15 @@ int main(int argc, char **argv) {
                     if (app.device_count > 0) {
                         if (reconnect_target.valid) {
                             int reconnect_dev = gui_find_reconnect_device(&app, &reconnect_target);
+#if defined(__ANDROID__) && defined(ENABLE_RTLSDR)
+                            if (reconnect_dev == GUI_RECONNECT_CONFIRM_RTL) {
+                                app.reconnect_pending = false;
+                                app.reconnect_attempts = 0;
+                                gui_app_set_status(&app,
+                                    "RTL-SDR identity is ambiguous. Select a device and connect manually.");
+                                continue;
+                            }
+#endif
                             if (reconnect_dev < 0) {
                                 if (reconnect_target.type == DEVICE_TYPE_HSDAOH) {
                                     char status_waiting[128];
@@ -1884,27 +1965,12 @@ int main(int argc, char **argv) {
                         snprintf(status_buf, sizeof(status_buf), "Reconnecting (attempt %d)...", app.reconnect_attempts);
                         gui_app_set_status(&app, status_buf);
 #if defined(__ANDROID__)
-                        /* Software Test Signal must bypass USB permissions
-                         * even during watchdog/auto reconnect. Real USB
-                         * capture still waits for its Android-granted fd.
-                         * Start on a worker to keep the render loop alive. */
-                        if (app.selected_device >= 0 && app.selected_device < app.device_count &&
-                            app.devices[app.selected_device].type == DEVICE_TYPE_PLAYBACK) {
-                            (void)gui_app_start_capture(&app);
-                        } else if ((app.selected_device >= 0 &&
-                                    app.selected_device < app.device_count &&
-                                    app.devices[app.selected_device].type == DEVICE_TYPE_SIMULATED) ||
-                                   android_usb_has_fd()) {
-                            gui_app_start_capture_async(&app);
-                            gui_set_reconnect_target_from_selected(&app, &reconnect_target);
-                            app.reconnect_pending = false;
-                            app.reconnect_attempts = 0;
-                            gui_app_set_status(&app, "Reconnecting...");
-                        } else {
-                            android_usb_clear_fd();
-                            android_request_usb_permission_async();
-                            gui_app_set_status(&app, "Requesting USB permission (reconnect)...");
-                        }
+#ifdef ENABLE_RTLSDR
+                        if (reconnect_target.valid && reconnect_target.type == DEVICE_TYPE_RTLSDR) {
+                            gui_app_start_rtlsdr_reconnect_async(&app, reconnect_target.rtl_identity.serial);
+                        } else
+#endif
+                        gui_app_start_capture_async(&app);
 #else
                         int reconnect_rc = gui_app_start_capture(&app);
                         if (reconnect_rc == 0 && !gui_playback_is_starting(&app)) {
@@ -1979,16 +2045,25 @@ int main(int argc, char **argv) {
         gui_android_viewport_present_canvas(android_canvas_active);
 #endif
         EndDrawing();
+        if (app.settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT)
+            gui_monitor_client_device_frame_rendered();
     }
 
     // Restore the original window proc (Windows modal move/size driver)
     gui_win32_modal_shutdown();
 
     // Cleanup
+#ifdef __ANDROID__
+    gui_app_finish_capture_transitions(&app);
+#endif
     if (app.is_recording) {
         gui_app_stop_recording(&app);
     }
-    if (app.is_capturing) {
+    if (app.is_capturing
+#ifdef __ANDROID__
+        && !gui_net_is_client(&app)
+#endif
+    ) {
         gui_app_stop_capture(&app);
     }
 
@@ -2016,5 +2091,7 @@ int main(int argc, char **argv) {
 
     // Nonzero exit when the unattended --auto-record cycle failed (0 for
     // normal interactive exits and successful cycles).
+    if (auto_record_seconds > 0 &&
+        (auto_rec_phase != AUTO_REC_IDLE || gui_record_last_stop_failed())) auto_rec_failed = true;
     return auto_rec_failed ? 1 : 0;
 }

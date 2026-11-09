@@ -580,6 +580,7 @@ static int ddd_capture_thread(void *ctx) {
 
             // Transient errors (PIPE, OVERFLOW, BABBLE, INTERRUPTED, IO):
             // log + count, rate-limit stderr, clear halt, and continue.
+            gui_record_mark_source_loss();
             transient_err_count++;
             if (transient_err_count <= 5 || (transient_err_count % 1000) == 0) {
                 fprintf(stderr, "[DdD] Bulk transfer error #%llu on EP 0x%02X: %s (%d)\n",
@@ -651,6 +652,7 @@ static int ddd_capture_thread(void *ctx) {
                         // AGENTS.MD philosophy). Count as a missed frame and
                         // log a burst event once a persistent streak crosses
                         // threshold, then resync.
+                        gui_record_mark_source_loss();
                         s_ddd_seq_skip_streak++;
                         atomic_fetch_add(&app->missed_frame_count, 1);
                         if (s_ddd_seq_skip_streak >= DDD_SEQ_SKIP_BURST_THRESHOLD &&

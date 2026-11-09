@@ -17,6 +17,8 @@ typedef struct {
     struct libusb_transfer *bulk_transfers[GUI_DDD_ASYNC_TRANSFER_COUNT];
     size_t bulk_transfer_count;
     struct libusb_transfer *telemetry_transfer;
+    size_t telemetry_submit_calls;
+    uint64_t expected_interval_ms;
     atomic_bool *capture_running;
     size_t telemetry_failure_callbacks;
     size_t telemetry_success_callbacks;
@@ -25,6 +27,13 @@ typedef struct {
     size_t telemetry_last_size;
     uint8_t telemetry_last_first_byte;
     size_t consume_calls;
+    size_t inspected_tail_count;
+    size_t tail_wait_probes;
+    size_t tail_wait_pumps;
+    size_t tail_wait_completed;
+    uint64_t tail_wait_elapsed_ms;
+    bool contiguous_tail;
+    bool short_bulk_transfer;
 } async_fault_state_t;
 
 static uint64_t advancing_now_ms(void *context)
@@ -51,6 +60,7 @@ static int accept_fake_submit(
     state->submit_calls++;
     if (transfer->type == LIBUSB_TRANSFER_TYPE_CONTROL) {
         state->telemetry_transfer = transfer;
+        state->telemetry_submit_calls++;
     } else if (state->bulk_transfer_count < GUI_DDD_ASYNC_TRANSFER_COUNT) {
         state->bulk_transfers[state->bulk_transfer_count++] = transfer;
     }
@@ -102,6 +112,29 @@ static gui_ddd_async_consume_result_t accept_expected_consume(
     return GUI_DDD_ASYNC_CONSUME_CONTINUE;
 }
 
+static gui_ddd_async_consume_result_t reject_complete_block(
+    void *context,
+    const uint8_t *data,
+    size_t size)
+{
+    (void)accept_expected_consume(context, data, size);
+    return GUI_DDD_ASYNC_CONSUME_FAILED;
+}
+
+static bool inspect_expected_tail(void *context, const uint8_t *data, size_t size)
+{
+    async_fault_state_t *state = (async_fault_state_t *)context;
+    if (!data) {
+        assert(size == 0);
+        state->tail_wait_probes++;
+        return true;
+    }
+    assert(size == GUI_DDD_ASYNC_TRANSFER_BYTES);
+    state->inspected_tail_count++;
+    assert(data[0] == state->inspected_tail_count);
+    return true;
+}
+
 static void record_telemetry_notice(
     void *context,
     const uint8_t *data,
@@ -144,6 +177,89 @@ static void write_valid_telemetry_block(uint8_t *data)
     data[DDD_FIFO_OFFSET_PACKET_WORDS + 1u] = 0x20;
 }
 
+static int drive_first_failure(void *context, long timeout_us)
+{
+    async_fault_state_t *state = (async_fault_state_t *)context;
+    struct libusb_transfer *first = state->bulk_transfers[0];
+    struct libusb_transfer *second = state->bulk_transfers[1];
+    struct libusb_transfer *telemetry = state->telemetry_transfer;
+
+    (void)timeout_us;
+    if (state->event_pump_calls++ == 0) {
+        second->buffer[0] = 1;
+        second->status = LIBUSB_TRANSFER_COMPLETED;
+        second->actual_length = (int)GUI_DDD_ASYNC_TRANSFER_BYTES;
+        second->callback(second);
+        first->status = LIBUSB_TRANSFER_COMPLETED;
+        first->actual_length = (int)GUI_DDD_ASYNC_TRANSFER_BYTES;
+        if (state->short_bulk_transfer) {
+            first->actual_length -= 2;
+            /* libusb converts a successful short read to ERROR when this
+             * flag is set. The native adapter passes the completion through. */
+            if (first->dev_handle && (first->flags & LIBUSB_TRANSFER_SHORT_NOT_OK)) {
+                first->status = LIBUSB_TRANSFER_ERROR;
+            }
+        }
+        first->callback(first);
+        return 0;
+    }
+
+    assert(state->cancel_calls ==
+           GUI_DDD_ASYNC_TRANSFER_COUNT - 1u - state->tail_wait_completed);
+    for (size_t i = 2; i < state->bulk_transfer_count; ++i) {
+        struct libusb_transfer *bulk = state->bulk_transfers[i];
+        if (!bulk) continue; /* The bounded wait already completed this slot. */
+        /* Some transfers finish before the backend handles cancellation. */
+        if (i == 3 || (state->contiguous_tail && i <= 4)) {
+            bulk->buffer[0] = (uint8_t)i;
+            bulk->status = LIBUSB_TRANSFER_COMPLETED;
+            bulk->actual_length = (int)GUI_DDD_ASYNC_TRANSFER_BYTES;
+        } else {
+            bulk->status = LIBUSB_TRANSFER_CANCELLED;
+            bulk->actual_length = 0;
+        }
+        bulk->callback(bulk);
+    }
+    if (state->short_bulk_transfer) {
+        telemetry->status = LIBUSB_TRANSFER_CANCELLED;
+        telemetry->actual_length = 0;
+    } else {
+        /* The control read completed before cancellation reached the backend. */
+        uint8_t *data = libusb_control_transfer_get_data(telemetry);
+        write_valid_telemetry_block(data);
+        data[DDD_FIFO_OFFSET_LATCH_COUNT] = 42;
+        telemetry->status = LIBUSB_TRANSFER_COMPLETED;
+        telemetry->actual_length = (int)DDD_FIFO_TELEMETRY_LENGTH;
+    }
+    telemetry->callback(telemetry);
+    return 0;
+}
+
+static int drive_waiting_failure_tail(void *context, long timeout_us)
+{
+    async_fault_state_t *state = (async_fault_state_t *)context;
+    if (state->event_pump_calls == 0 || state->cancel_calls != 0) {
+        return drive_first_failure(context, timeout_us);
+    }
+    assert(timeout_us == (state->tail_wait_pumps ? 5000L : 10000L));
+    assert(state->submit_calls == GUI_DDD_ASYNC_TRANSFER_COUNT + 1u);
+    state->tail_wait_pumps++;
+    state->tail_wait_elapsed_ms += (uint64_t)timeout_us / 1000u;
+    state->now_ms += (uint64_t)timeout_us / 1000u;
+    if (state->contiguous_tail) {
+        for (size_t i = 2; i < 4; ++i) {
+            struct libusb_transfer *bulk = state->bulk_transfers[i];
+            bulk->buffer[0] = (uint8_t)i;
+            bulk->status = LIBUSB_TRANSFER_COMPLETED;
+            bulk->actual_length = (int)GUI_DDD_ASYNC_TRANSFER_BYTES;
+            bulk->callback(bulk);
+            state->bulk_transfers[i] = NULL;
+            state->tail_wait_completed++;
+        }
+    }
+    return 0;
+}
+
 static int drive_two_telemetry_successes(void *context, long timeout_us)
 {
     async_fault_state_t *state = (async_fault_state_t *)context;
@@ -180,6 +296,39 @@ static int drive_two_telemetry_successes(void *context, long timeout_us)
         atomic_store(state->capture_running, false);
         complete_all_bulk_transfers(state);
     }
+    return 0;
+}
+
+static uint64_t read_fake_time(void *context)
+{
+    return ((async_fault_state_t *)context)->now_ms;
+}
+
+static int drive_telemetry_cadence(void *context, long timeout_us)
+{
+    async_fault_state_t *state = (async_fault_state_t *)context;
+    switch (state->event_pump_calls) {
+        case 0:
+            assert(state->telemetry_submit_calls == 1);
+            state->now_ms += state->expected_interval_ms - 1;
+            return drive_two_telemetry_successes(context, timeout_us);
+        case 1:
+            assert(state->telemetry_submit_calls == 1);
+            state->now_ms++;
+            break;
+        case 2:
+            assert(state->telemetry_submit_calls == 2);
+            state->now_ms += state->expected_interval_ms;
+            break;
+        case 3:
+            /* The next slot is due, but the second poll is still in flight. */
+            assert(state->telemetry_submit_calls == 2);
+            return drive_two_telemetry_successes(context, timeout_us);
+        default:
+            assert(!"unexpected extra iteration");
+            return TEST_EVENT_ERROR;
+    }
+    state->event_pump_calls++;
     return 0;
 }
 
@@ -278,9 +427,13 @@ static gui_ddd_async_config_t make_fault_config(
     return config;
 }
 
-static void test_telemetry_success_primes_then_publishes(void)
+static void test_telemetry_success_primes_then_publishes(uint64_t interval_ms,
+                                                        bool external_io)
 {
-    async_fault_state_t state = {0};
+    async_fault_state_t state = {
+        .expected_interval_ms = interval_ms ? interval_ms :
+            GUI_DDD_ASYNC_TELEMETRY_INTERVAL_MS
+    };
     atomic_bool capture_running = true;
     atomic_bool transfer_ready = false;
     atomic_bool startup_failed = false;
@@ -288,13 +441,16 @@ static void test_telemetry_success_primes_then_publishes(void)
     int device_handle_marker = 2;
     gui_ddd_async_config_t config = make_fault_config(
         &state, &capture_running, &transfer_ready, &startup_failed,
-        &usb_context_marker, &device_handle_marker);
+        external_io ? NULL : &usb_context_marker,
+        external_io ? NULL : &device_handle_marker);
     gui_ddd_async_result_t result;
 
     state.capture_running = &capture_running;
     config.consume = accept_expected_consume;
     config.telemetry = record_telemetry_notice;
-    config.event_pump_override = drive_two_telemetry_successes;
+    config.event_pump_override = drive_telemetry_cadence;
+    config.now_ms_override = read_fake_time;
+    config.telemetry_interval_ms = interval_ms;
     memset(&result, 0, sizeof(result));
 
     assert(gui_ddd_async_run(&config, &result) == 0);
@@ -412,6 +568,101 @@ static void test_result_is_required_for_orphan_ownership(void)
     assert(state.submit_calls == 0);
 }
 
+static void test_failure_snapshot_is_unchanged_by_reap(bool short_transfer,
+                                                       bool contiguous_tail,
+                                                       uint64_t wait_ms,
+                                                       bool native_io)
+{
+    async_fault_state_t state = {
+        .short_bulk_transfer = short_transfer,
+        .contiguous_tail = contiguous_tail,
+    };
+    atomic_bool capture_running = true;
+    atomic_bool transfer_ready = false;
+    atomic_bool startup_failed = false;
+    int usb_context_marker = 1;
+    int device_handle_marker = 2;
+    gui_ddd_async_config_t config = make_fault_config(
+        &state, &capture_running, &transfer_ready, &startup_failed,
+        native_io ? NULL : &usb_context_marker,
+        native_io ? NULL : &device_handle_marker);
+    gui_ddd_async_result_t result;
+
+    config.consume = short_transfer ? reject_unexpected_consume :
+        reject_complete_block;
+    config.inspect_failed_tail = inspect_expected_tail;
+    config.failure_tail_wait_ms = wait_ms;
+    config.event_pump_override = wait_ms ? drive_waiting_failure_tail :
+        drive_first_failure;
+    if (wait_ms) config.now_ms_override = read_fake_time;
+    assert(gui_ddd_async_run(&config, &result) == -1);
+
+    assert(result.code == (short_transfer ? GUI_DDD_ASYNC_RESULT_SHORT_TRANSFER :
+                                            GUI_DDD_ASYNC_RESULT_CONSUMER_FAILURE));
+    assert(result.transfer_status == LIBUSB_TRANSFER_COMPLETED);
+    assert(result.actual_length == (int)GUI_DDD_ASYNC_TRANSFER_BYTES -
+                                   (short_transfer ? 2 : 0));
+    assert(result.submission_id == 0);
+    assert(result.failure.valid);
+    assert(result.failure.in_flight == GUI_DDD_ASYNC_TRANSFER_COUNT - 2u);
+    assert(result.failure.ready_transfers == 1);
+    assert(result.failure.next_consume_id == 0);
+    assert(result.failure.next_submit_id == GUI_DDD_ASYNC_TRANSFER_COUNT);
+    assert(result.failure.completed_transfers == 2);
+    assert(result.failure.consumed_transfers == 0);
+    assert(result.failure.telemetry_in_flight);
+    assert(result.failure.telemetry_readings == 0);
+    assert(result.fifo_completion_after_fault.valid == !short_transfer);
+    if (!short_transfer) {
+        const gui_ddd_async_fifo_completion_t *completion =
+            &result.fifo_completion_after_fault;
+        assert(completion->submitted_ms <= result.failure.time_ms);
+        assert(completion->completed_ms >= result.failure.time_ms);
+        assert(completion->telemetry.latch_count == 42);
+        assert(result.telemetry_readings == 1);
+    }
+    assert(result.completed_transfers == GUI_DDD_ASYNC_TRANSFER_COUNT);
+    assert(!result.transfers_unreaped);
+    assert(state.consume_calls == (short_transfer ? 0u : 1u));
+    assert(state.inspected_tail_count ==
+           (short_transfer ? 0u : (contiguous_tail ? 3u : 1u)));
+    assert(state.submit_calls == GUI_DDD_ASYNC_TRANSFER_COUNT + 1u);
+    if (wait_ms && !short_transfer) {
+        assert(state.tail_wait_probes == 1);
+        assert(state.tail_wait_pumps == (contiguous_tail ? 1u : 2u));
+        assert(state.tail_wait_elapsed_ms == (contiguous_tail ? 10u : 15u));
+    } else {
+        assert(state.tail_wait_probes == 0);
+        assert(state.tail_wait_pumps == 0);
+    }
+    assert(state.event_pump_calls == 2);
+}
+
+static void test_libusb_raw_io_rejects_external_adapter_before_submit(void)
+{
+    async_fault_state_t state = {0};
+    atomic_bool capture_running = true;
+    atomic_bool transfer_ready = false;
+    atomic_bool startup_failed = false;
+    gui_ddd_async_config_t config = make_fault_config(
+        &state, &capture_running, &transfer_ready, &startup_failed, NULL, NULL);
+    config.libusb_raw_io = true;
+    gui_ddd_async_result_t result;
+
+    assert(gui_ddd_async_run(&config, &result) == -1);
+    assert(result.code == GUI_DDD_ASYNC_RESULT_RAW_IO_UNAVAILABLE);
+    assert(result.libusb_error == LIBUSB_ERROR_NOT_SUPPORTED);
+    assert(result.libusb_raw_io_stage && strcmp(result.libusb_raw_io_stage, "backend") == 0);
+    assert(!result.libusb_raw_io_enabled);
+    assert(result.failure.valid);
+    assert(!result.ready_signalled);
+    assert(!result.transfers_unreaped);
+    assert(state.submit_calls == 0);
+    assert(state.event_pump_calls == 0);
+    assert(!atomic_load(&transfer_ready));
+    assert(atomic_load(&startup_failed));
+}
+
 static void test_permanent_event_error_returns_bounded_orphan(void)
 {
     async_fault_state_t state = {0};
@@ -431,6 +682,12 @@ static void test_permanent_event_error_returns_bounded_orphan(void)
 
     assert(result.code == GUI_DDD_ASYNC_RESULT_EVENT_FAILURE);
     assert(result.libusb_error == TEST_EVENT_ERROR);
+    assert(result.transfer_status == -1);
+    assert(result.actual_length == -1);
+    assert(result.failure.valid);
+    assert(result.failure.in_flight == GUI_DDD_ASYNC_TRANSFER_COUNT);
+    assert(result.failure.ready_transfers == 0);
+    assert(result.failure.telemetry_in_flight);
     assert(result.ready_signalled);
     assert(result.transfers_unreaped);
     assert(result.unreaped_transfers ==
@@ -441,7 +698,7 @@ static void test_permanent_event_error_returns_bounded_orphan(void)
     assert(state.cancel_calls == GUI_DDD_ASYNC_TRANSFER_COUNT + 1u);
     assert(state.event_pump_calls > 0);
     assert(state.event_pump_calls <= 4);
-    assert(state.now_ms <=
+    assert(state.now_ms - result.failure.time_ms <=
            GUI_DDD_ASYNC_CANCEL_REAP_TIMEOUT_MS + 1200);
     assert(!atomic_load(&transfer_ready));
     assert(atomic_load(&startup_failed));
@@ -457,9 +714,17 @@ static void test_permanent_event_error_returns_bounded_orphan(void)
 int main(void)
 {
     test_result_is_required_for_orphan_ownership();
-    test_telemetry_success_primes_then_publishes();
+    test_libusb_raw_io_rejects_external_adapter_before_submit();
+    test_telemetry_success_primes_then_publishes(0, false);
+    test_telemetry_success_primes_then_publishes(50, true);
     test_telemetry_failures_do_not_fail_rf_capture();
     test_invalid_telemetry_blocks_disable_instrument();
+    test_failure_snapshot_is_unchanged_by_reap(false, false, 0, false);
+    test_failure_snapshot_is_unchanged_by_reap(false, true, 0, false);
+    test_failure_snapshot_is_unchanged_by_reap(true, false, 15, false);
+    test_failure_snapshot_is_unchanged_by_reap(true, false, 15, true);
+    test_failure_snapshot_is_unchanged_by_reap(false, false, 15, false);
+    test_failure_snapshot_is_unchanged_by_reap(false, true, 15, false);
     test_permanent_event_error_returns_bounded_orphan();
     puts("gui_ddd_async_fault_test: OK");
     return 0;

@@ -27,8 +27,10 @@ static size_t start_test_fread(void *memory,size_t size,size_t count,FILE *file)
 static int start_test_ferror(FILE *file);
 static bool start_test_cache_snapshot(const char *filepath,gui_playback_length_cache_key_t *key);
 static FLAC__uint64 start_test_tail_total(FLAC__StreamDecoder *decoder);
+static bool start_test_ld_mixed_period_pending(void);
 static FLAC__StreamDecoder *start_test_decoder_new(void);
 static void start_test_decoder_delete(FLAC__StreamDecoder *decoder);
+static FLAC__bool start_test_seek_absolute(FLAC__StreamDecoder *decoder, FLAC__uint64 sample);
 
 static FLAC__StreamDecoderInitStatus start_test_decoder_init_stream(
     FLAC__StreamDecoder *decoder,FLAC__StreamDecoderReadCallback read_callback,
@@ -50,12 +52,16 @@ static FLAC__StreamDecoderInitStatus start_test_decoder_init_stream(
 #define FLAC__stream_decoder_find_total_samples start_test_tail_total
 #define FLAC__stream_decoder_new start_test_decoder_new
 #define FLAC__stream_decoder_delete start_test_decoder_delete
+#define FLAC__stream_decoder_seek_absolute start_test_seek_absolute
 #define FLAC__stream_decoder_init_stream start_test_decoder_init_stream
+#define gui_audio_ld_tail_pending start_test_ld_mixed_period_pending
 #include "../misrc_gui/input/gui_playback.c"
+#undef gui_audio_ld_tail_pending
 #undef gui_playback_length_cache_snapshot
 #undef FLAC__stream_decoder_find_total_samples
 #undef FLAC__stream_decoder_init_stream
 #undef FLAC__stream_decoder_delete
+#undef FLAC__stream_decoder_seek_absolute
 #undef FLAC__stream_decoder_new
 #undef fread
 #undef ferror
@@ -94,6 +100,23 @@ static atomic_uint start_test_callback_writes_a,start_test_callback_writes_b;
 static atomic_uint start_test_channel_mask=1;
 static atomic_uint start_test_source_rate=20000000u;
 static atomic_uint_fast64_t start_test_last_epoch[2];
+static atomic_bool start_test_transport_stamps, start_test_drop_a_boundary;
+static atomic_bool start_test_linked_loop_stamps, start_test_mixed_loop_stamps;
+static atomic_bool start_test_independent_scrub_stamps;
+static _Atomic(FLAC__StreamDecoder *) start_test_preroll_decoder;
+static atomic_uint start_test_preroll_stage;
+static atomic_uint_fast64_t start_test_preroll_restore;
+static atomic_bool start_test_preroll_fail_restore;
+#define START_TEST_PREROLL_TARGET (RAW_BUFFER_SAMPLES + 123u)
+static atomic_bool start_test_scrub_pause_at_stamp, start_test_scrub_stamp_waiting;
+static atomic_bool start_test_scrub_stamp_release;
+static atomic_uint_fast64_t start_test_scrub_epoch, start_test_resume_epoch;
+static atomic_uint_fast64_t start_test_resume_sample;
+static gui_rf_block_info_t start_test_mixed_stamp_a;
+static size_t start_test_mixed_count_a;
+static uint32_t start_test_mixed_rates[2] = {20000000u, 40000000u};
+static atomic_uint start_test_channel_writes[2];
+static atomic_uint_fast64_t start_test_last_boundary[2], start_test_rejected_a_boundary;
 static uint32_t start_test_sink[RAW_BUFFER_SAMPLES];
 static gui_app_t start_test_app;
 
@@ -212,6 +235,32 @@ static FLAC__StreamDecoder *start_test_decoder_new(void) {
     if (decoder) atomic_fetch_add(&start_test_live_decoders,1);
     return decoder;
 }
+static FLAC__bool start_test_seek_absolute(FLAC__StreamDecoder *decoder, FLAC__uint64 sample) {
+    if (decoder == atomic_load(&start_test_preroll_decoder)) {
+        const unsigned stage = atomic_load(&start_test_preroll_stage);
+        if (stage == 0) {
+            assert(sample == START_TEST_PREROLL_TARGET);
+            const FLAC__bool result = FLAC__stream_decoder_seek_absolute(decoder, sample);
+            assert(result);
+            atomic_store(&start_test_preroll_stage, 1);
+            return result;
+        }
+        if (stage == 1) {
+            assert(sample == 0);
+            atomic_store(&start_test_preroll_stage, 2);
+            return false; // Fault only after the exact target succeeded.
+        }
+        if (stage == 2) {
+            atomic_store(&start_test_preroll_restore, sample);
+            const FLAC__bool result = !atomic_load(&start_test_preroll_fail_restore) &&
+                FLAC__stream_decoder_seek_absolute(decoder, sample);
+            atomic_store(&start_test_preroll_stage, 3);
+            return result;
+        }
+    }
+    return FLAC__stream_decoder_seek_absolute(decoder, sample);
+}
+
 static void start_test_decoder_delete(FLAC__StreamDecoder *decoder) {
     if (!decoder) return;
     FLAC__stream_decoder_delete(decoder);
@@ -306,13 +355,71 @@ int gui_extract_start_tagged(gui_app_t *app) {
     return 0;
 }
 void gui_extract_stop(void) { atomic_store(&start_test_extract_running,false); }
+static atomic_bool start_test_hold_preview_tail;
+static atomic_bool start_test_ld_mixed_pending;
+static bool start_test_ld_mixed_period_pending(void) {
+    return atomic_load(&start_test_ld_mixed_pending);
+}
+uint64_t gui_extract_playback_stamps_written(int channel) {
+    return channel < 0 ? atomic_load(&start_test_sink_writes)
+                       : atomic_load(&start_test_channel_writes[channel]);
+}
+uint64_t gui_extract_playback_stamps_forwarded(int channel) {
+    return atomic_load(&start_test_hold_preview_tail) ? 0 : gui_extract_playback_stamps_written(channel);
+}
+bool gui_extract_stamp_playback_channel(int channel, const gui_rf_block_info_t *info, size_t count) {
+    assert(atomic_load(&start_test_mixed_loop_stamps));
+    assert(info->sample_rate_hz == start_test_mixed_rates[channel]);
+    if (channel == 0) {
+        start_test_mixed_stamp_a = *info;
+        start_test_mixed_count_a = count;
+        if (atomic_load(&start_test_independent_scrub_stamps)) {
+            if (info->preview_only && info->discontinuity) {
+                atomic_store(&start_test_scrub_epoch, info->epoch);
+                if (atomic_exchange(&start_test_scrub_pause_at_stamp, false)) {
+                    atomic_store(&start_test_scrub_stamp_waiting, true);
+                    while (!atomic_load(&start_test_scrub_stamp_release)) thrd_sleep_ms(1);
+                }
+            } else if (!info->preview_only && atomic_load(&start_test_scrub_epoch) &&
+                       !atomic_load(&start_test_resume_epoch)) {
+                assert(info->discontinuity);
+                atomic_store(&start_test_resume_sample, info->start_sample);
+                atomic_store(&start_test_resume_epoch, info->epoch);
+            }
+        }
+    } else if (!atomic_load(&start_test_independent_scrub_stamps)) {
+        if (start_test_mixed_rates[1] == 2 * start_test_mixed_rates[0]) {
+            assert(count == 2 * start_test_mixed_count_a);
+            assert(info->start_sample == 2 * start_test_mixed_stamp_a.start_sample);
+        }
+        assert(info->discontinuity == start_test_mixed_stamp_a.discontinuity);
+    }
+    atomic_store(&start_test_last_epoch[channel], info->epoch);
+    if (info->discontinuity) atomic_store(&start_test_last_boundary[channel], info->epoch);
+    atomic_fetch_add(&start_test_channel_writes[channel], 1);
+    return true;
+}
 bool gui_extract_stamp_playback(const gui_rf_block_info_t info[2],const size_t counts[2]) {
+    bool transport=atomic_load(&start_test_transport_stamps);
+    if (atomic_load(&start_test_linked_loop_stamps)) {
+        assert(counts[0] == counts[1]);
+        assert(info[0].start_sample == info[1].start_sample);
+        assert(info[0].discontinuity == info[1].discontinuity);
+    }
+    if (transport && info[0].discontinuity && atomic_exchange(&start_test_drop_a_boundary,false)) {
+        atomic_store(&start_test_rejected_a_boundary,info[0].epoch);
+        return false;
+    }
     unsigned channels=atomic_load(&start_test_channel_mask);
     for(unsigned n=0;n<2;++n) {
         bool active=(channels&(1u<<n))!=0;
         assert(info[n].sample_rate_hz==(active?atomic_load(&start_test_source_rate):0u));
-        assert(active ? counts[n]>0 && counts[n]<=RAW_BUFFER_SAMPLES : counts[n]==0);
-        atomic_store(&start_test_last_epoch[n],info[n].epoch);
+        assert(active ? (transport || counts[n]>0) && counts[n]<=RAW_BUFFER_SAMPLES : counts[n]==0);
+        if (!transport || counts[n]) atomic_store(&start_test_last_epoch[n],info[n].epoch);
+        if (transport && counts[n]) {
+            if (info[n].discontinuity) atomic_store(&start_test_last_boundary[n],info[n].epoch);
+            atomic_fetch_add(&start_test_channel_writes[n],1);
+        }
     }
     return true;
 }
@@ -333,14 +440,21 @@ void bufmgr_reset_stats(buffer_manager_t *manager,buffer_id_t id) {
 void *bufmgr_write_begin(buffer_manager_t *manager,buffer_id_t id,size_t bytes,
                          const backpressure_policy_t *policy) {
     (void)manager; (void)policy;
-    assert(id==BUF_CAPTURE_RF && bytes==sizeof(start_test_sink));
+    if (atomic_load(&start_test_mixed_loop_stamps)) {
+        assert((id == BUF_CAPTURE_RF_A || id == BUF_CAPTURE_RF_B) &&
+               bytes > 0 && bytes <= RAW_BUFFER_SAMPLES * sizeof(int16_t));
+    } else {
+        assert(id == BUF_CAPTURE_RF && bytes == sizeof(start_test_sink));
+    }
     return start_test_sink;
 }
 void bufmgr_write_end(buffer_manager_t *manager,buffer_id_t id,size_t bytes) {
-    assert(id==BUF_CAPTURE_RF && bytes==sizeof(start_test_sink));
+    assert(id == BUF_CAPTURE_RF || atomic_load(&start_test_mixed_loop_stamps));
     unsigned channels=atomic_load(&start_test_channel_mask);
-    assert(start_test_sink[0]==encode_raw_sample(channels&1u?-2048:0,channels&2u?-2048:0));
-    assert(start_test_sink[37]==encode_raw_sample(channels&1u?-2011:0,channels&2u?-2011:0));
+    if (!atomic_load(&start_test_transport_stamps)) {
+        assert(start_test_sink[0]==encode_raw_sample(channels&1u?-2048:0,channels&2u?-2048:0));
+        assert(start_test_sink[37]==encode_raw_sample(channels&1u?-2011:0,channels&2u?-2011:0));
+    }
     if(atomic_exchange(&start_test_sink_hold_once,false)) {
         atomic_store(&start_test_sink_entered,true);
         while(!atomic_load(&start_test_sink_release)) thrd_sleep_ms(1);
@@ -683,8 +797,15 @@ static void start_test_wait_index(void) {
 static void start_test_pause_stable(void) {
     gui_playback_pause(&start_test_app);
     assert(gui_playback_get_state(&start_test_app)==PLAYBACK_STATE_PAUSED);
-    /* A currently executing output block may finish after the pause request. */
-    thrd_sleep_ms(60);
+    /* Pause is asynchronous. Wait for the producer to report progress after
+     * the request: its heartbeat follows the in-flight block's cursor update,
+     * or comes from the paused idle branch. A timed sleep cannot prove that
+     * a preempted producer has completed its current block. */
+    uint64_t pause_requested = get_time_ms();
+    while (atomic_load(&start_test_app.last_callback_time_ms) <= pause_requested) {
+        assert(get_time_ms() - pause_requested < START_TEST_TIMEOUT_MS);
+        thrd_sleep_ms(1);
+    }
     unsigned writes=atomic_load(&start_test_sink_writes);
     uint64_t position[2]={gui_playback_get_position_samples_channel(&start_test_app,0),
                           gui_playback_get_position_samples_channel(&start_test_app,1)};
@@ -708,7 +829,8 @@ static void start_test_unknown_seek_noop(int unknown_channel,bool all_unknown) {
         assert(gui_playback_get_position_samples_channel(&start_test_app,(int)n)==position[n]);
     assert(atomic_load(&start_test_sink_writes)==writes);
     assert(atomic_load(&start_test_app.rf_stream_epoch)==epoch);
-    assert(!atomic_load(&s_playback->seek_requested_a) && !atomic_load(&s_playback->seek_requested_b));
+    assert(atomic_load(&s_playback->pending_seek[0]) == PLAYBACK_NO_SEEK &&
+           atomic_load(&s_playback->pending_seek[1]) == PLAYBACK_NO_SEEK);
 }
 static void start_test_begin_held_index(const char *known,const char *unknown) {
     unsigned channels=known?3u:1u;
@@ -847,9 +969,15 @@ static void start_test_index_stop_reopen(const char *unknown,const char *replace
 }
 static void start_test_index_eof(const char *unknown) {
     start_test_begin_held_index(NULL,unknown);
+    gui_playback_set_loop(&start_test_app,true);
+    assert(gui_playback_get_channel_loop(&start_test_app,0));
+    assert(gui_playback_get_channel_loop(&start_test_app,1));
+    atomic_store(&start_test_hold_preview_tail,true);
     gui_playback_set_loop(&start_test_app,false);
+    assert(!gui_playback_get_channel_loop(&start_test_app,0));
+    assert(!gui_playback_get_channel_loop(&start_test_app,1));
     uint64_t begin=start_test_clock_ms();
-    while(gui_playback_get_state(&start_test_app)!=PLAYBACK_STATE_PAUSED) {
+    while(!gui_playback_is_channel_paused(&start_test_app,0)) {
         assert(start_test_clock_ms()-begin<START_TEST_TIMEOUT_MS);
         assert(gui_playback_poll_start(&start_test_app)==0);
         thrd_sleep_ms(1);
@@ -867,13 +995,413 @@ static void start_test_index_eof(const char *unknown) {
     assert(gui_playback_get_total_samples(&start_test_app)==START_TEST_SAMPLES);
     assert(gui_playback_get_position_normalized(&start_test_app)==1.0);
     assert(fabs(gui_playback_get_position_seconds(&start_test_app)-(double)START_TEST_SAMPLES/20000000.0)<1e-12);
-    assert(gui_playback_get_state(&start_test_app)==PLAYBACK_STATE_PAUSED);
+    assert(gui_playback_get_state(&start_test_app)==PLAYBACK_STATE_PLAYING);
     assert(!gui_playback_get_loop(&start_test_app));
     assert(atomic_load(&start_test_sink_writes)==writes);
     assert(atomic_load(&start_test_app.rf_stream_epoch)==epoch);
+    assert(gui_playback_get_channel_rf_end(&start_test_app,0,NULL)==PLAYBACK_RF_END_PENDING);
+    atomic_store(&start_test_hold_preview_tail,false);
+    assert(gui_playback_get_channel_rf_end(&start_test_app,0,NULL)==PLAYBACK_RF_END_READY);
+    uint64_t seek_seq=gui_playback_get_seek_seq_channel(&start_test_app,0);
+    gui_playback_seek_sample_channel(&start_test_app,0,0);
+    begin=start_test_clock_ms();
+    while (gui_playback_get_seek_seq_channel(&start_test_app,0)==seek_seq) {
+        assert(start_test_clock_ms()-begin<START_TEST_TIMEOUT_MS);
+        thrd_sleep_ms(1);
+    }
+    assert(gui_playback_get_channel_rf_end(&start_test_app,0,NULL)==PLAYBACK_RF_END_NONE);
     start_test_stop_clean();
     puts("Playback unknown Loop Off EOF: before/after index position=131072, normalized=1, seconds=0.0065536 preserved passed");
 }
+static uint64_t start_test_wait_channel_rf_end(int channel, playback_rf_end_t expected) {
+    uint64_t begin=start_test_clock_ms(), token;
+    while (gui_playback_get_channel_rf_end(&start_test_app,channel,&token)!=expected) {
+        assert(start_test_clock_ms()-begin<START_TEST_TIMEOUT_MS);
+        thrd_sleep_ms(1);
+    }
+    return token;
+}
+
+static uint64_t start_test_wait_rf_end(playback_rf_end_t expected) {
+    return start_test_wait_channel_rf_end(0, expected);
+}
+
+static void start_test_assert_paused_tail(uint64_t epoch, unsigned writes) {
+    assert(gui_playback_is_channel_paused(&start_test_app,0));
+    // Model a producer iteration that had cached A as active before Pause.
+    // It must still hold after the pending marker has been canceled.
+    assert(gui_playback_hold_ld_loop_tail(s_playback,0,UINT64_MAX));
+    assert(gui_playback_get_channel_rf_end(&start_test_app,0,NULL)==PLAYBACK_RF_END_NONE);
+    assert(gui_playback_get_position_samples_channel(&start_test_app,0)==START_TEST_SAMPLES);
+    assert(atomic_load(&start_test_last_epoch[0])==epoch);
+    assert(atomic_load(&start_test_channel_writes[0])==writes);
+}
+
+static void start_test_ld_loop_transport(const char *a, const char *b) {
+    atomic_store(&start_test_transport_stamps,true);
+    atomic_store(&start_test_channel_mask,3);
+    atomic_store(&start_test_sink_writes,0);
+    atomic_store(&start_test_hold_preview_tail,true);
+    assert(gui_playback_start_async(&start_test_app,a,b)==0);
+    assert(start_test_poll_complete()==1);
+    gui_playback_set_link_separate(&start_test_app,true);
+    gui_playback_set_ld_audio_channel(&start_test_app,0);
+
+    uint64_t pending=start_test_wait_rf_end(PLAYBACK_RF_END_PENDING);
+    assert(!gui_playback_hold_ld_loop_tail(s_playback, 0, 0));
+    atomic_store(&start_test_ld_mixed_pending, true);
+    assert(gui_playback_hold_ld_loop_tail(s_playback, 0, 0));
+    assert(!gui_playback_hold_ld_loop_tail(s_playback, 1, 0));
+    atomic_store(&start_test_ld_mixed_pending, false);
+    unsigned a_writes=atomic_load(&start_test_channel_writes[0]);
+    unsigned b_writes=atomic_load(&start_test_channel_writes[1]);
+    uint64_t old_epoch=atomic_load(&start_test_last_epoch[0]);
+    gui_playback_finish_ld_tail(&start_test_app,0,pending); // Unforwarded RF cannot be ACKed.
+    uint64_t begin=start_test_clock_ms();
+    while (atomic_load(&start_test_channel_writes[1])==b_writes) {
+        assert(start_test_clock_ms()-begin<START_TEST_TIMEOUT_MS);
+        thrd_sleep_ms(1);
+    }
+    assert(start_test_wait_rf_end(PLAYBACK_RF_END_PENDING)==pending);
+    gui_playback_toggle_pause_channel(&start_test_app,0);
+    start_test_assert_paused_tail(old_epoch,a_writes);
+    b_writes=atomic_load(&start_test_channel_writes[1]);
+    begin=start_test_clock_ms();
+    while (atomic_load(&start_test_channel_writes[1])==b_writes) {
+        assert(start_test_clock_ms()-begin<START_TEST_TIMEOUT_MS);
+        thrd_sleep_ms(1);
+    }
+    start_test_assert_paused_tail(old_epoch,a_writes);
+
+    atomic_store(&start_test_hold_preview_tail,false);
+    gui_playback_toggle_pause_channel(&start_test_app,0);
+    uint64_t ready=start_test_wait_rf_end(PLAYBACK_RF_END_READY);
+    assert(ready!=pending && atomic_load(&start_test_last_boundary[0])>old_epoch);
+    gui_playback_finish_ld_tail(&start_test_app,0,pending);
+    assert(start_test_wait_rf_end(PLAYBACK_RF_END_READY)==ready);
+
+    old_epoch=atomic_load(&start_test_last_epoch[0]);
+    a_writes=atomic_load(&start_test_channel_writes[0]);
+    gui_playback_pause(&start_test_app);
+    start_test_assert_paused_tail(old_epoch,a_writes);
+    gui_playback_resume(&start_test_app);
+    uint64_t next=start_test_wait_rf_end(PLAYBACK_RF_END_READY);
+    assert(next!=ready && atomic_load(&start_test_last_boundary[0])>old_epoch);
+    gui_playback_finish_ld_tail(&start_test_app,0,ready);
+    assert(start_test_wait_rf_end(PLAYBACK_RF_END_READY)==next);
+
+    old_epoch=atomic_load(&start_test_last_epoch[0]);
+    gui_playback_finish_ld_tail(&start_test_app,0,next);
+    uint64_t last=start_test_wait_rf_end(PLAYBACK_RF_END_READY);
+    assert(last!=next && atomic_load(&start_test_last_boundary[0])>old_epoch);
+
+    old_epoch=atomic_load(&start_test_last_epoch[0]);
+    gui_playback_set_ld_audio_channel(&start_test_app,-1);
+    assert(gui_playback_get_channel_rf_end(&start_test_app,0,NULL)==PLAYBACK_RF_END_NONE);
+    begin=start_test_clock_ms();
+    while (atomic_load(&start_test_last_boundary[0])<=old_epoch) {
+        assert(start_test_clock_ms()-begin<START_TEST_TIMEOUT_MS);
+        thrd_sleep_ms(1);
+    }
+    gui_playback_set_ld_audio_channel(&start_test_app,0);
+    uint64_t reselected=start_test_wait_rf_end(PLAYBACK_RF_END_READY);
+    gui_playback_finish_ld_tail(&start_test_app,0,last);
+    assert(reselected!=last && start_test_wait_rf_end(PLAYBACK_RF_END_READY)==reselected);
+
+    // Seek while the next lap is held. Discard its first stamp to ensure
+    // the accepted seek boundary survives until a real FIFO commit.
+    atomic_store(&start_test_drop_a_boundary,true);
+    gui_playback_seek_sample_channel(&start_test_app,0,0);
+    begin=start_test_clock_ms();
+    for (;;) {
+        uint64_t rejected=atomic_load(&start_test_rejected_a_boundary);
+        if (rejected && atomic_load(&start_test_last_boundary[0])==rejected) break;
+        assert(start_test_clock_ms()-begin<START_TEST_TIMEOUT_MS);
+        thrd_sleep_ms(1);
+    }
+    start_test_stop_clean();
+    atomic_store(&start_test_transport_stamps,false);
+    atomic_store(&start_test_channel_mask,1);
+    puts("Playback LD loop: paused pending/ready tail, resume, route change, stale ACK, B progress and seek boundary passed");
+}
+
+static void start_test_ld_synced_loop(const char *a, const char *b,
+                                      bool coincident, bool mixed_rate) {
+    const uint64_t endpoint_b = mixed_rate ? 2 * START_TEST_SAMPLES : START_TEST_SAMPLES;
+    atomic_store(&start_test_transport_stamps, true);
+    atomic_store(&start_test_linked_loop_stamps, coincident && !mixed_rate);
+    atomic_store(&start_test_mixed_loop_stamps, mixed_rate);
+    atomic_store(&start_test_channel_mask, 3);
+    atomic_store(&start_test_sink_writes, 0);
+    atomic_store(&start_test_hold_preview_tail, true);
+    assert(gui_playback_start_async(&start_test_app, a, b) == 0);
+    assert(start_test_poll_complete() == 1);
+    gui_playback_set_link_separate(&start_test_app, false);
+    assert(atomic_load(&start_test_app.playback_independent_mode) == mixed_rate);
+    gui_playback_set_ld_audio_channel(&start_test_app, 0);
+
+    uint64_t pending = start_test_wait_rf_end(PLAYBACK_RF_END_PENDING);
+    unsigned a_writes = atomic_load(&start_test_channel_writes[0]);
+    unsigned b_writes = atomic_load(&start_test_channel_writes[1]);
+    assert(gui_playback_get_position_samples_channel(&start_test_app, 0) == START_TEST_SAMPLES);
+    if (coincident) {
+        assert(gui_playback_get_position_samples_channel(&start_test_app, 1) == endpoint_b);
+        thrd_sleep_ms(40);
+        assert(atomic_load(&start_test_channel_writes[1]) == b_writes);
+        assert(gui_playback_get_position_samples_channel(&start_test_app, 1) == endpoint_b);
+    } else {
+        uint64_t begin = start_test_clock_ms();
+        while (atomic_load(&start_test_channel_writes[1]) == b_writes) {
+            assert(start_test_clock_ms() - begin < START_TEST_TIMEOUT_MS);
+            thrd_sleep_ms(1);
+        }
+    }
+    assert(atomic_load(&start_test_channel_writes[0]) == a_writes);
+    assert(start_test_wait_rf_end(PLAYBACK_RF_END_PENDING) == pending);
+    atomic_store(&start_test_hold_preview_tail, false);
+    assert(start_test_wait_rf_end(PLAYBACK_RF_END_READY) == pending);
+    uint64_t previous_epoch = atomic_load(&start_test_app.rf_stream_epoch);
+    gui_playback_finish_ld_tail(&start_test_app, 0, pending);
+    assert(start_test_wait_rf_end(PLAYBACK_RF_END_READY) != pending);
+    assert(atomic_load(&start_test_last_boundary[0]) > previous_epoch);
+    if (coincident) {
+        assert(atomic_load(&start_test_last_boundary[1]) > previous_epoch);
+        assert(gui_playback_get_position_samples_channel(&start_test_app, 1) == endpoint_b);
+    }
+
+    start_test_stop_clean();
+    atomic_store(&start_test_linked_loop_stamps, false);
+    atomic_store(&start_test_mixed_loop_stamps, false);
+    atomic_store(&start_test_transport_stamps, false);
+    atomic_store(&start_test_channel_mask, 1);
+    printf("Playback LD synced loop (%s): %s passed\n",
+           mixed_rate ? "20/40 MSPS" : "same rate", coincident ? "coincident EOF held and rewound in the same batch" :
+                        "unrelated endpoint kept producing through monitor drain");
+}
+
+static void start_test_ld_independent_scrub(const char *a, const char *b, bool after_eof,
+                                            bool immediate_play, bool replace_seek) {
+    atomic_store(&start_test_transport_stamps, true);
+    atomic_store(&start_test_mixed_loop_stamps, true);
+    atomic_store(&start_test_scrub_epoch, 0);
+    atomic_store(&start_test_resume_epoch, 0);
+    atomic_store(&start_test_independent_scrub_stamps, true);
+    atomic_store(&start_test_channel_mask, 3);
+    atomic_store(&start_test_sink_writes, 0);
+    atomic_store(&start_test_sink_entered, false);
+    atomic_store(&start_test_sink_release, false);
+    atomic_store(&start_test_sink_hold_once, true);
+    assert(gui_playback_start_async(&start_test_app, a, b) == 0);
+    assert(start_test_poll_complete() == 1);
+    assert(atomic_load(&start_test_app.playback_independent_mode));
+    start_test_wait_flag(&start_test_sink_entered);
+    gui_playback_set_loop(&start_test_app, false);
+    gui_playback_set_link_separate(&start_test_app, true);
+    if (!after_eof) gui_playback_toggle_pause_channel(&start_test_app, 0);
+
+    const unsigned target = RAW_BUFFER_SAMPLES + 123;
+    if (after_eof) {
+        atomic_store(&start_test_sink_release, true);
+        uint64_t begin = start_test_clock_ms();
+        while (!gui_playback_is_channel_paused(&start_test_app, 0) ||
+               !gui_playback_is_channel_paused(&start_test_app, 1)) {
+            assert(start_test_clock_ms() - begin < START_TEST_TIMEOUT_MS);
+            thrd_sleep_ms(1);
+        }
+    }
+    assert(gui_playback_is_channel_paused(&start_test_app, 0));
+    assert(gui_playback_is_channel_paused(&start_test_app, 1) == after_eof);
+    const uint64_t epoch = atomic_load(&start_test_app.rf_stream_epoch);
+    const uint64_t seek_seq_b = gui_playback_get_seek_seq_channel(&start_test_app, 1);
+    const unsigned peer_writes = atomic_load(&start_test_channel_writes[1]);
+    atomic_store(&start_test_scrub_stamp_waiting, false);
+    atomic_store(&start_test_scrub_stamp_release, false);
+    atomic_store(&start_test_scrub_pause_at_stamp, immediate_play);
+    const uint64_t old_seek_a = gui_playback_get_seek_seq_channel(&start_test_app, 0);
+    gui_playback_seek_sample_channel(&start_test_app, 0, target);
+    atomic_store(&start_test_sink_release, true);
+
+    uint64_t begin = start_test_clock_ms();
+    if (immediate_play) {
+        start_test_wait_flag(&start_test_scrub_stamp_waiting);
+        assert(gui_playback_get_position_samples_channel(&start_test_app, 0) < target);
+        uint64_t expected = target;
+        if (replace_seek) {
+            // These arrive after the original seek was consumed, before the
+            // producer can return to the mailbox. Keep only the newest.
+            gui_playback_seek_sample_channel(&start_test_app, 0, target - 17);
+            expected = target + 31;
+            gui_playback_seek_sample_channel(&start_test_app, 0, expected);
+            assert(atomic_load(&s_playback->pending_seek[0]) == expected);
+        }
+        gui_playback_toggle_pause_channel(&start_test_app, 0);
+        atomic_store(&start_test_scrub_stamp_release, true);
+        while (!atomic_load(&start_test_resume_epoch)) {
+            assert(start_test_clock_ms() - begin < START_TEST_TIMEOUT_MS);
+            thrd_sleep_ms(1);
+        }
+        assert(atomic_load(&start_test_resume_sample) == expected);
+        assert(atomic_load(&start_test_resume_epoch) > atomic_load(&start_test_scrub_epoch));
+        if (replace_seek) thrd_sleep_ms(20); // A duplicate would advance the sequence again.
+        assert(gui_playback_get_seek_seq_channel(&start_test_app, 0) == old_seek_a + 1 + replace_seek);
+        assert(atomic_load(&s_playback->pending_seek[0]) == PLAYBACK_NO_SEEK);
+    } else {
+        while (atomic_load(&start_test_last_boundary[0]) <= epoch ||
+               gui_playback_get_position_samples_channel(&start_test_app, 0) <= target) {
+            assert(start_test_clock_ms() - begin < START_TEST_TIMEOUT_MS);
+            thrd_sleep_ms(1);
+        }
+        unsigned scrub_writes = atomic_load(&start_test_channel_writes[0]);
+        thrd_sleep_ms(30);
+        assert(gui_playback_is_channel_paused(&start_test_app, 0));
+        assert(atomic_load(&start_test_channel_writes[0]) == scrub_writes);
+        assert(gui_playback_get_channel_rf_end(&start_test_app, 0, NULL) == PLAYBACK_RF_END_NONE);
+    }
+    assert(gui_playback_get_seek_seq_channel(&start_test_app, 1) == seek_seq_b);
+    assert(atomic_load(&start_test_last_epoch[1]) == epoch);
+    if (after_eof) {
+        assert(gui_playback_is_channel_paused(&start_test_app, 1));
+        assert(atomic_load(&start_test_channel_writes[1]) == peer_writes);
+    } else {
+        assert(!gui_playback_is_channel_paused(&start_test_app, 1));
+        assert(atomic_load(&start_test_channel_writes[1]) > peer_writes);
+    }
+    start_test_stop_clean();
+    atomic_store(&start_test_independent_scrub_stamps, false);
+    atomic_store(&start_test_mixed_loop_stamps, false);
+    atomic_store(&start_test_transport_stamps, false);
+    atomic_store(&start_test_channel_mask, 1);
+    printf("Playback LD 20/40 MSPS: %s scrub %s without moving peer transport\n",
+           after_eof ? "natural-EOF" : "locally paused",
+           replace_seek ? "consumed only the newest pending target" :
+           immediate_play ? "resumed at exact target" : "emitted a new RF epoch");
+}
+
+static void start_test_ld_preroll_rollback(const char *short_path, const char *long_path,
+                                           int channel, bool fail_restore) {
+    const int peer = 1 - channel;
+    start_test_mixed_rates[channel] = 20000000u;
+    start_test_mixed_rates[peer] = 40000000u;
+    atomic_store(&start_test_transport_stamps, true);
+    atomic_store(&start_test_mixed_loop_stamps, true);
+    atomic_store(&start_test_independent_scrub_stamps, true);
+    atomic_store(&start_test_scrub_epoch, 0);
+    atomic_store(&start_test_channel_mask, 3);
+    atomic_store(&start_test_sink_entered, false);
+    atomic_store(&start_test_sink_release, false);
+    atomic_store(&start_test_sink_hold_once, true);
+    assert(gui_playback_start_async(&start_test_app, channel ? long_path : short_path,
+                                    channel ? short_path : long_path) == 0);
+    assert(start_test_poll_complete() == 1);
+    assert(atomic_load(&start_test_app.playback_independent_mode));
+    start_test_wait_flag(&start_test_sink_entered);
+    gui_playback_set_loop(&start_test_app, false);
+    gui_playback_set_link_separate(&start_test_app, true);
+    atomic_store(&start_test_sink_release, true);
+    uint64_t begin = start_test_clock_ms();
+    while (!gui_playback_is_channel_paused(&start_test_app, channel)) {
+        assert(start_test_clock_ms() - begin < START_TEST_TIMEOUT_MS);
+        thrd_sleep_ms(1);
+    }
+    assert(!gui_playback_is_channel_paused(&start_test_app, peer));
+    const uint64_t eof = gui_playback_get_position_samples_channel(&start_test_app, channel);
+    assert(eof == START_TEST_SAMPLES);
+    const uint64_t epoch = atomic_load(&start_test_app.rf_stream_epoch);
+    const uint64_t peer_epoch = atomic_load(&start_test_last_epoch[peer]);
+    const uint64_t seq = gui_playback_get_seek_seq_channel(&start_test_app, channel);
+    const uint64_t peer_seq = gui_playback_get_seek_seq_channel(&start_test_app, peer);
+    atomic_store(&start_test_preroll_stage, 0);
+    atomic_store(&start_test_preroll_fail_restore, fail_restore);
+    FLAC__StreamDecoder *decoder = channel ? s_playback->decoder_b : s_playback->decoder_a;
+    atomic_store(&start_test_preroll_decoder, decoder);
+    gui_playback_seek_sample_channel(&start_test_app, channel, START_TEST_PREROLL_TARGET);
+    while (atomic_load(&start_test_preroll_stage) < 3) {
+        assert(start_test_clock_ms() - begin < START_TEST_TIMEOUT_MS);
+        thrd_sleep_ms(1);
+    }
+    assert(atomic_load(&start_test_preroll_restore) == eof - 1);
+    const unsigned peer_writes = atomic_load(&start_test_channel_writes[peer]);
+    while (atomic_load(&start_test_channel_writes[peer]) <= peer_writes) {
+        assert(gui_playback_get_state(&start_test_app) == PLAYBACK_STATE_PLAYING);
+        assert(start_test_clock_ms() - begin < START_TEST_TIMEOUT_MS);
+        thrd_sleep_ms(1);
+    }
+    assert(gui_playback_is_channel_paused(&start_test_app, channel));
+    assert(!gui_playback_is_channel_paused(&start_test_app, peer));
+    assert(gui_playback_get_position_samples_channel(&start_test_app, channel) == eof);
+    assert(gui_playback_get_seek_seq_channel(&start_test_app, channel) == seq);
+    assert(gui_playback_get_seek_seq_channel(&start_test_app, peer) == peer_seq);
+    assert(atomic_load(&start_test_app.rf_stream_epoch) == epoch);
+    assert(atomic_load(&start_test_last_epoch[peer]) == peer_epoch);
+    assert(s_playback->seek_recovery_failed[channel] == fail_restore);
+    if (!fail_restore)
+        assert(FLAC__stream_decoder_get_state(decoder) == FLAC__STREAM_DECODER_END_OF_STREAM);
+    atomic_store(&start_test_preroll_decoder, NULL);
+    start_test_stop_clean();
+    atomic_store(&start_test_independent_scrub_stamps, false);
+    atomic_store(&start_test_mixed_loop_stamps, false);
+    atomic_store(&start_test_transport_stamps, false);
+    atomic_store(&start_test_channel_mask, 1);
+    start_test_mixed_rates[0] = 20000000u;
+    start_test_mixed_rates[1] = 40000000u;
+    printf("Playback LD EOF preroll failure on %c: %s and peer stayed live\n",
+           'A' + channel, fail_restore ? "restore failure isolated" : "decoder and cursor restored");
+}
+
+static void start_test_ld_fractional_loop(const char *directory, bool rounded_duration) {
+    char a[512], b[512];
+    // With a remainder inherited from lap one, B reaches EOF one batch
+    // before A on lap two despite the source durations being identical.
+    const uint32_t fast_samples = rounded_duration ? 60 * RAW_BUFFER_SAMPLES : 59 * RAW_BUFFER_SAMPLES + 1;
+    // Round the slower track up so it has one remaining sample when the
+    // faster track ends on a full batch. They represent the same cut time.
+    const uint32_t slow_samples = ((uint64_t)fast_samples * 64u + 124u) / 125u;
+    snprintf(a, sizeof(a), "%s/start-linked-fast.flac", directory);
+    snprintf(b, sizeof(b), "%s/start-linked-slow.flac", directory);
+    start_test_encode_rate_fixture(a, fast_samples, 40000000u, 0);
+    start_test_encode_rate_fixture(b, slow_samples, 20480000u, 0);
+
+    start_test_mixed_rates[0] = 40000000u;
+    start_test_mixed_rates[1] = 20480000u;
+    atomic_store(&start_test_transport_stamps, true);
+    atomic_store(&start_test_mixed_loop_stamps, true);
+    atomic_store(&start_test_channel_mask, 3);
+    atomic_store(&start_test_sink_writes, 0);
+    assert(gui_playback_start_async(&start_test_app, a, b) == 0);
+    assert(start_test_poll_complete() == 1);
+    assert(atomic_load(&start_test_app.playback_independent_mode));
+    gui_playback_set_ld_video_channels(&start_test_app, 3);
+    gui_playback_set_ld_audio_channel(&start_test_app, 0);
+
+    uint64_t previous_a = 0, previous_b = 0;
+    for (unsigned lap = 0; lap < 3; ++lap) {
+        uint64_t end_a = start_test_wait_channel_rf_end(0, PLAYBACK_RF_END_READY);
+        uint64_t end_b = start_test_wait_channel_rf_end(1, PLAYBACK_RF_END_READY);
+        assert(end_a != previous_a && end_b != previous_b && end_a != end_b);
+        assert(gui_playback_get_position_samples_channel(&start_test_app, 0) == fast_samples);
+        assert(gui_playback_get_position_samples_channel(&start_test_app, 1) == slow_samples);
+        gui_playback_set_ld_audio_channel(&start_test_app, -1);
+        assert(start_test_wait_channel_rf_end(0, PLAYBACK_RF_END_READY) == end_a);
+
+        unsigned writes = atomic_load(&start_test_sink_writes);
+        gui_playback_finish_ld_tail(&start_test_app, 0, end_a);
+        thrd_sleep_ms(30);
+        assert(atomic_load(&start_test_sink_writes) == writes);
+        assert(start_test_wait_channel_rf_end(1, PLAYBACK_RF_END_READY) == end_b);
+        gui_playback_finish_ld_tail(&start_test_app, 1, end_b);
+        previous_a = end_a;
+        previous_b = end_b;
+    }
+
+    start_test_stop_clean();
+    atomic_store(&start_test_mixed_loop_stamps, false);
+    atomic_store(&start_test_transport_stamps, false);
+    atomic_store(&start_test_channel_mask, 1);
+    assert(remove(a) == 0 && remove(b) == 0);
+    printf("Playback LD synced loop (40/20.48 MSPS, %s): three aligned laps passed\n",
+           rounded_duration ? "rounded duration" : "exact duration");
+}
+
 static void start_test_index_failure(const char *unknown,unsigned failure) {
     atomic_store(&start_test_sink_writes,0);
     atomic_store(&start_test_channel_mask,1u);
@@ -1522,7 +2050,7 @@ static void start_test_tail_producer_seek(const char *unknown,bool playing) {
     gui_playback_pause(&start_test_app); thrd_sleep_ms(20);
     gui_playback_seek_sample_channel(&start_test_app,0,0);
     uint64_t seek_begin=start_test_clock_ms();
-    while(atomic_load(&s_playback->seek_requested_a)) {
+    while (atomic_load(&s_playback->pending_seek[0]) != PLAYBACK_NO_SEEK) {
         assert(start_test_clock_ms()-seek_begin<START_TEST_TIMEOUT_MS); thrd_sleep_ms(1);
     }
     // A successful paused seek now refills the first raw display batch before
@@ -1540,20 +2068,29 @@ static void start_test_tail_producer_seek(const char *unknown,bool playing) {
     gui_playback_seek_sample_channel(&start_test_app,0,START_TEST_SAMPLES+10000u);
     if(playing) gui_playback_resume(&start_test_app);
     uint64_t begin=start_test_clock_ms();
-    while(atomic_load(&s_playback->seek_requested_a)) {
+    while (atomic_load(&s_playback->pending_seek[0]) != PLAYBACK_NO_SEEK) {
         assert(start_test_clock_ms()-begin<START_TEST_TIMEOUT_MS); thrd_sleep_ms(1);
     }
-    if(playing) start_test_wait_flag(&start_test_sink_entered); else thrd_sleep_ms(20);
-    if(playing) assert(!s_playback->seek_recovery_failed[0]); // Sink release/acquire covers producer writes.
-    assert(gui_playback_get_state(&start_test_app)==(playing ? PLAYBACK_STATE_PLAYING : PLAYBACK_STATE_PAUSED));
-    assert(atomic_load(&s_playback->current_sample_a)==position);
-    assert(atomic_load(&start_test_app.rf_stream_epoch)==epoch);
-    atomic_store(&start_test_release_read,true);
-    if(!playing) {
-        gui_playback_resume(&start_test_app); start_test_wait_flag(&start_test_sink_entered);
-        assert(!s_playback->seek_recovery_failed[0]);
+    if (playing) {
+        start_test_wait_flag(&start_test_sink_entered);
+    } else {
+        thrd_sleep_ms(20);
+        assert(gui_playback_get_state(&start_test_app)==PLAYBACK_STATE_PAUSED);
+        assert(atomic_load(&s_playback->current_sample_a)==position);
         assert(atomic_load(&start_test_app.rf_stream_epoch)==epoch);
     }
+    atomic_store(&start_test_release_read,true);
+    if (!playing) {
+        gui_playback_resume(&start_test_app);
+        start_test_wait_flag(&start_test_sink_entered);
+    }
+    // The failed seek preserves the last valid preview and its target. Play
+    // repositions to that target, rather than continuing from the preroll end.
+    assert(!s_playback->seek_recovery_failed[0]);
+    assert(gui_playback_get_state(&start_test_app)==PLAYBACK_STATE_PLAYING);
+    assert(atomic_load(&s_playback->current_sample_a)==0);
+    ++epoch;
+    assert(atomic_load(&start_test_app.rf_stream_epoch)==epoch);
     // Underestimated endpoint must not end/rewind actual producer data.
     s_playback->info_a.total_samples=1; atomic_store(&s_playback->channel_total_samples[0],1);
     unsigned writes=atomic_load(&start_test_sink_writes);
@@ -1816,6 +2353,32 @@ int main(int argc,char **argv) {
     start_test_index_publish(normal,other_unknown,START_TEST_OTHER_SAMPLES);
     start_test_index_stop_reopen(unknown,other_normal);
     start_test_index_eof(unknown);
+    start_test_ld_loop_transport(normal,other_normal);
+    start_test_ld_synced_loop(normal, normal, true, false);
+    start_test_ld_synced_loop(normal, other_normal, false, false);
+    char mixed_loop[512];
+    snprintf(mixed_loop, sizeof(mixed_loop), "%s/start-mixed-loop.flac", directory);
+    start_test_encode_rate_fixture(mixed_loop, 2 * START_TEST_SAMPLES, 40000000u, 0);
+    start_test_ld_synced_loop(normal, mixed_loop, true, true);
+    assert(remove(mixed_loop) == 0);
+    char scrub_peer[512];
+    snprintf(scrub_peer, sizeof(scrub_peer), "%s/start-scrub-peer.flac", directory);
+    start_test_encode_rate_fixture(scrub_peer, 120u * RAW_BUFFER_SAMPLES, 40000000u, 0);
+    start_test_ld_independent_scrub(normal, scrub_peer, false, false, false);
+    start_test_ld_independent_scrub(normal, scrub_peer, true, false, false);
+    start_test_ld_independent_scrub(normal, scrub_peer, false, true, false);
+    start_test_ld_independent_scrub(normal, scrub_peer, true, true, false);
+    start_test_ld_independent_scrub(normal, scrub_peer, false, true, true);
+    for (int channel = 0; channel < 2; ++channel) {
+        start_test_ld_preroll_rollback(normal, scrub_peer, channel, false);
+        start_test_ld_preroll_rollback(normal, scrub_peer, channel, true);
+    }
+    assert(remove(scrub_peer) == 0);
+    assert(gui_playback_same_duration(40000000u, 40000000u, 20479999u, 20480000u));
+    assert(gui_playback_same_duration(20479999u, 20480000u, 40000000u, 40000000u));
+    assert(!gui_playback_same_duration(40000000u, 40000000u, 20479998u, 20480000u));
+    start_test_ld_fractional_loop(directory, false);
+    start_test_ld_fractional_loop(directory, true);
     start_test_index_failure(unknown,0u);
     start_test_index_failure(unknown,1u);
     start_test_index_failure(unknown,2u);

@@ -527,6 +527,8 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     settings->resample_gain_b = 0.0f;     // No gain
 #ifdef ENABLE_DDD
     settings->ddd_decimation = DDD_DECIMATION_FULL_RATE;
+    settings->ddd_use_winusb = false;
+    settings->ddd_libusb_raw_io = false;
 #endif
     
     // FLAC defaults
@@ -757,6 +759,8 @@ void gui_settings_save(const gui_settings_t *settings) {
     fprintf(f, "  \"resample_gain_b\": %.1f,\n", settings->resample_gain_b);
 #ifdef ENABLE_DDD
     fprintf(f, "  \"ddd_decimation\": %u,\n", (unsigned)settings->ddd_decimation);
+    fprintf(f, "  \"ddd_use_winusb\": %s,\n", settings->ddd_use_winusb ? "true" : "false");
+    fprintf(f, "  \"ddd_libusb_raw_io\": %s,\n", settings->ddd_libusb_raw_io ? "true" : "false");
 #endif
     fprintf(f, "  \"use_flac\": %s,\n", settings->use_flac ? "true" : "false");
     fprintf(f, "  \"flac_12bit\": %s,\n", settings->flac_12bit ? "true" : "false");
@@ -1008,10 +1012,18 @@ static bool gui_settings_pick_path(char *picked, size_t cap, bool folder) {
             IFileOpenDialog_GetOptions(pfd, &options);
             IFileOpenDialog_SetOptions(pfd, options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
         } else {
-            COMDLG_FILTERSPEC filter = { L"FLAC / LDF files", L"*.flac;*.ldf;*.oga;*.ogg" };
-            IFileOpenDialog_SetFileTypes(pfd, 1, &filter);
+            const COMDLG_FILTERSPEC filters[] = {
+                { L"Supported playback files", L"*.flac;*.ldf;*.oga;*.ogg;*.wav;*.lds;*.u8;*.r8;*.8u;*.s8;*.8s;*.u16;*.r16;*.16u;*.s16;*.16s;*.raw;*.bin;*.pcm" },
+                { L"LDS RF captures (*.lds)", L"*.lds" },
+                { L"FLAC / LDF files", L"*.flac;*.ldf;*.oga;*.ogg" },
+                { L"WAV files (*.wav)", L"*.wav" },
+                { L"Raw RF samples", L"*.u8;*.r8;*.8u;*.s8;*.8s;*.u16;*.r16;*.16u;*.s16;*.16s;*.raw;*.bin;*.pcm" },
+                { L"All files (*.*)", L"*.*" }
+            };
+            IFileOpenDialog_SetFileTypes(pfd, (UINT)(sizeof(filters) / sizeof(filters[0])), filters);
+            IFileOpenDialog_SetFileTypeIndex(pfd, 1);
         }
-        IFileOpenDialog_SetTitle(pfd, folder ? L"Select output folder for MISRC captures" : L"Select FLAC / LDF playback file");
+        IFileOpenDialog_SetTitle(pfd, folder ? L"Select output folder for MISRC captures" : L"Select RF / audio playback file");
         if (SUCCEEDED(IFileOpenDialog_Show(pfd, NULL))) {
             IShellItem *psi = NULL;
             if (SUCCEEDED(IFileOpenDialog_GetResult(pfd, &psi))) {
@@ -1031,7 +1043,7 @@ static bool gui_settings_pick_path(char *picked, size_t cap, bool folder) {
 #ifdef __APPLE__
     const char *cmd = folder
         ? "osascript -e 'POSIX path of (choose folder with prompt \"Select output folder for MISRC captures\")'"
-        : "osascript -e 'POSIX path of (choose file with prompt \"Select FLAC / LDF playback file\")'";
+        : "osascript -e 'POSIX path of (choose file with prompt \"Select RF / audio playback file\")'";
 #else
     const char *cmd = folder
         ? "sh -c 'if command -v zenity >/dev/null 2>&1; then "
@@ -1039,9 +1051,21 @@ static bool gui_settings_pick_path(char *picked, size_t cap, bool folder) {
           "elif command -v kdialog >/dev/null 2>&1; then "
           "kdialog --getexistingdirectory \"$HOME\" \"Select output folder for MISRC captures\"; fi'"
         : "sh -c 'if command -v zenity >/dev/null 2>&1; then "
-          "zenity --file-selection --title=\"Select FLAC / LDF playback file\" --file-filter=\"*.flac *.ldf *.oga *.ogg\"; "
+          "zenity --file-selection --title=\"Select RF / audio playback file\" "
+          "--file-filter=\"Supported playback files | *.flac *.ldf *.oga *.ogg *.wav *.lds *.u8 *.r8 *.8u *.s8 *.8s *.u16 *.r16 *.16u *.s16 *.16s *.raw *.bin *.pcm\" "
+          "--file-filter=\"LDS RF captures | *.lds\" "
+          "--file-filter=\"FLAC / LDF files | *.flac *.ldf *.oga *.ogg\" "
+          "--file-filter=\"WAV files | *.wav\" "
+          "--file-filter=\"Raw RF samples | *.u8 *.r8 *.8u *.s8 *.8s *.u16 *.r16 *.16u *.s16 *.16s *.raw *.bin *.pcm\" "
+          "--file-filter=\"All files | *\"; "
           "elif command -v kdialog >/dev/null 2>&1; then "
-          "kdialog --getopenfilename \"$HOME\" \"*.flac *.ldf *.oga *.ogg|FLAC / LDF files\"; fi'";
+          "kdialog --getopenfilename \"$HOME\" "
+          "\"Supported playback files (*.flac *.ldf *.oga *.ogg *.wav *.lds *.u8 *.r8 *.8u *.s8 *.8s *.u16 *.r16 *.16u *.s16 *.16s *.raw *.bin *.pcm)\n"
+          "LDS RF captures (*.lds)\n"
+          "FLAC / LDF files (*.flac *.ldf *.oga *.ogg)\n"
+          "WAV files (*.wav)\n"
+          "Raw RF samples (*.u8 *.r8 *.8u *.s8 *.8s *.u16 *.r16 *.16u *.s16 *.16s *.raw *.bin *.pcm)\n"
+          "All files (*)\"; fi'";
 #endif
     FILE *fp = popen(cmd, "r");
     if (!fp) return false;
@@ -1283,6 +1307,12 @@ void gui_settings_load(gui_settings_t *settings) {
         if (ddd_decimation_is_supported(factor)) {
             settings->ddd_decimation = factor;
         }
+    }
+    if ((value = find_value(content, "ddd_use_winusb")) != NULL) {
+        settings->ddd_use_winusb = (strcmp(value, "true") == 0);
+    }
+    if ((value = find_value(content, "ddd_libusb_raw_io")) != NULL) {
+        settings->ddd_libusb_raw_io = (strcmp(value, "true") == 0);
     }
 #endif
 

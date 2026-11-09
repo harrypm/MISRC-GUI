@@ -47,6 +47,7 @@ void gui_render_layout(gui_app_t *app);
 void gui_handle_interactions(gui_app_t *app);
 // Reconcile mode/device constraints immediately after device selection changes.
 void gui_ui_sync_capture_mode_state(gui_app_t *app);
+void gui_ui_net_mode_apply(gui_app_t *app, int mode);
 void gui_ui_sync_android_keyboard_state(void);
 
 // Application-controlled UI zoom. Layout and pointer coordinates remain in

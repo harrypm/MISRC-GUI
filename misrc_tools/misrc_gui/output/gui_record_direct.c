@@ -192,18 +192,12 @@ int gui_record_direct_writer_thread(void *ctx_ptr) {
     fprintf(stderr, "[DIRECT] Writer thread %c started\n", ctx->channel == 0 ? 'A' : 'B');
 
     bool have_pending = false;
-    size_t pending_len = 0;
+    size_t pending_len = 0, pending_offset = 0;
     uint64_t last_retry_ms = 0;
     uint64_t write_err_count = 0;
 
     while (1) {
-        bool stopping = false;
-        if (ctx->recording_active == NULL || !*ctx->recording_active) {
-            stopping = true;
-        }
-        if (ctx->exit_flag != NULL && atomic_load(ctx->exit_flag) != 0) {
-            stopping = true;
-        }
+        bool stopping = !ctx->writer_draining || atomic_load(ctx->writer_draining);
 
         if (have_pending) {
             // The output file failed mid-write: the failed block is held here
@@ -221,8 +215,14 @@ int gui_record_direct_writer_thread(void *ctx_ptr) {
             if (retry_due) {
                 last_retry_ms = now_ms;
                 clearerr(ctx->file);
-                size_t written = fwrite(block, 1, pending_len, ctx->file);
-                if (written == pending_len && !ferror(ctx->file)) {
+                bool ok;
+                if (pending_offset < pending_len) {
+                    pending_offset += fwrite(block + pending_offset, 1, pending_len - pending_offset, ctx->file);
+                    ok = pending_offset == pending_len && !ferror(ctx->file);
+                } else {
+                    ok = fflush(ctx->file) == 0;
+                }
+                if (ok) {
                     have_pending = false;
                     gui_record_direct_notify_write_error(ctx, false);
                     gui_record_direct_account_write(ctx, pending_len);
@@ -238,14 +238,12 @@ int gui_record_direct_writer_thread(void *ctx_ptr) {
                                           (unsigned long long)write_err_count);
                 }
             }
-            if (stopping) {
-                // The final attempt failed (or the held block was just
-                // written): on failure the held block is lost — the same
-                // semantics as the legacy writer stopping with a locked
-                // output file (logged via the write-error warning).
-                break;
+            if (have_pending) {
+                // On stop, give the oldest block one final attempt. If it
+                // succeeded, continue draining the newer queued blocks.
+                if (stopping) break;
+                thrd_sleep_ms(10);
             }
-            thrd_sleep_ms(10);
             continue;
         }
 
@@ -253,6 +251,9 @@ int gui_record_direct_writer_thread(void *ctx_ptr) {
         // backlog. Variable length: whatever is available, capped at
         // GUI_RECORD_DIRECT_MAX_BLOCK_BYTES, so the final partial block at
         // stop is drained too (no fixed-block tail loss).
+        // Once a spill backlog is observed, sample the ring after it:
+        // the producer may have published older ring bytes just before the spill.
+        uint64_t backlog = ctx->cb.spill_backlog ? ctx->cb.spill_backlog(ctx->cb.user, ctx->channel) : 0;
         size_t fill = bufmgr_fill_level(ctx->bufmgr, (buffer_id_t)ctx->buf_id);
         const void *data = NULL;
         size_t len = 0;
@@ -268,16 +269,12 @@ int gui_record_direct_writer_thread(void *ctx_ptr) {
                 from_ring = true;
             }
         }
-        if (data == NULL && ctx->cb.spill_backlog) {
-            uint64_t backlog = ctx->cb.spill_backlog(ctx->cb.user, ctx->channel);
-            if (backlog > 0 && ctx->cb.spill_read) {
-                size_t want = ((uint64_t)GUI_RECORD_DIRECT_MAX_BLOCK_BYTES < backlog)
-                              ? GUI_RECORD_DIRECT_MAX_BLOCK_BYTES : (size_t)backlog;
-                if (ctx->cb.spill_read(ctx->cb.user, ctx->channel, block, want)) {
-                    data = block;
-                    len = want;
-                    from_ring = false;
-                }
+        if (data == NULL && backlog && ctx->cb.spill_read) {
+            size_t want = ((uint64_t)GUI_RECORD_DIRECT_MAX_BLOCK_BYTES < backlog)
+                          ? GUI_RECORD_DIRECT_MAX_BLOCK_BYTES : (size_t)backlog;
+            if (ctx->cb.spill_read(ctx->cb.user, ctx->channel, block, want)) {
+                data = block;
+                len = want;
             }
         }
 
@@ -293,21 +290,23 @@ int gui_record_direct_writer_thread(void *ctx_ptr) {
         }
 
         size_t written = fwrite(data, 1, len, ctx->file);
+        bool ok = written == len && !ferror(ctx->file);
         if (from_ring) {
+            // Keep the failed block before returning ring memory to the producer.
+            if (!ok) memcpy(block, data, len);
             bufmgr_read_end(ctx->bufmgr, (buffer_id_t)ctx->buf_id, len);
         }
 
-        if (written == len && !ferror(ctx->file)) {
+        if (ok) {
             gui_record_direct_account_write(ctx, len);
             continue;
         }
 
-        // Output file write failed (locked by another app for viewing,
-        // disk full, ...). Hold this block as pending and retry; it is the
-        // oldest unread data, so holding it preserves the stream order.
+        // Retry only the unwritten suffix of the oldest block before reading
+        // any newer ring or spill bytes.
         clearerr(ctx->file);
-        memcpy(block, data, len);
         pending_len = len;
+        pending_offset = written;
         have_pending = true;
         gui_record_direct_notify_write_error(ctx, true);
         write_err_count++;

@@ -319,6 +319,32 @@ cleanup:
     free(input);free(whole);free(split);
 }
 
+#if LIBSOXR_ENABLED
+static void test_delayed_eof_output(void) {
+    enum { input_count = 16384, expected = 10240 };
+    int16_t input[input_count] = {0};
+    float output[expected + 8192];
+    gui_rf_resampler_t *r = gui_rf_resampler_create(32000000u);
+    CHECK(r != NULL, "SOXR EOF fixture allocation");
+    if (!r) return;
+    size_t produced = 0, tail = 0;
+    CHECK(gui_rf_resampler_process(r, input, input_count, output,
+                                 sizeof(output) / sizeof(*output), &produced), "SOXR normal input");
+    CHECK(gui_rf_resampler_process(r, NULL, 0, NULL, 0, &tail) && tail == 0,
+          "empty input does not finish the stream");
+    CHECK(gui_rf_resampler_finish(r, output, sizeof(output) / sizeof(*output), &tail) &&
+          tail > 0 && produced + tail == expected, "SOXR EOF restores the exact output count");
+    CHECK(gui_rf_resampler_finish(r, output, sizeof(output) / sizeof(*output), &tail) && tail == 0,
+          "SOXR does not repeat the final samples");
+    gui_rf_resampler_reset(r);
+    size_t again = 0;
+    CHECK(gui_rf_resampler_process(r, input, input_count, output,
+                                 sizeof(output) / sizeof(*output), &again) && again == produced,
+          "SOXR reset starts a fresh stream after EOF");
+    gui_rf_resampler_destroy(r);
+}
+#endif
+
 int main(void) {
     bypass_and_contract();
     CHECK(gui_rf_resampler_create_ed_beta(16000000u)==NULL,"ED20 rejects insufficient input bandwidth");
@@ -349,6 +375,7 @@ int main(void) {
     impulse_delay(80000000u, 4u, 11.25);
     CHECK(tone_gain(80000000u, 30000000.0) < 0.025, "first 80 MSPS stage rejects high RF");
 #if LIBSOXR_ENABLED
+    test_delayed_eof_output();
     wide_rate_contract(32000000u);wide_rate_contract(54000000u);wide_rate_contract(200000000u);
     compatibility_wrapper(28636363u);
     const uint32_t rates[] = {16000000u, 25000000u, 28636363u, 54000000u, 160000000u, 200000000u};

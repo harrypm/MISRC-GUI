@@ -260,6 +260,8 @@ typedef struct {
     float resample_gain_b;                     // dB
 #ifdef ENABLE_DDD
     uint8_t ddd_decimation;                    // Firmware 3.1 only: 1=40, 2=20 MSPS
+    bool ddd_use_winusb;                        // Windows DdD v1 USB transport preference
+    bool ddd_libusb_raw_io;                     // Windows DdD v1 libusb RAW_IO preference
 #endif
 
     // FLAC compression
@@ -456,7 +458,11 @@ typedef struct gui_app {
 #endif
 
     // Capture state
+#ifdef __ANDROID__
+    atomic_bool is_capturing;   // Published by the Android capture worker.
+#else
     bool is_capturing;
+#endif
     bool is_recording;
     bool user_capture_mode_misrc;      // Authoritative user-selected mode (changes only via mode toggle)
     bool capture_mode_runtime_misrc;   // Mode latched at recording start (stable for recording session)
@@ -504,6 +510,8 @@ typedef struct gui_app {
     // Zero per-channel rate falls back to the live shared rate; explicit rates
     // describe independent hardware/file clocks even when preview is gated.
     atomic_uint_fast32_t rf_source_rate_hz[2];
+    atomic_bool rf_source_is_rtlsdr;
+    atomic_uint_fast64_t rf_source_rtlsdr_tuning;  // center Hz in low word, retune generation in high word
     atomic_bool rf_preview_input_supported;
     // Per-channel FULL SCALE of the display-sample container (the magnitude
     // that rails the panel). Playback decode normalizes EVERY input
@@ -514,6 +522,7 @@ typedef struct gui_app {
     atomic_uint_fast32_t rf_display_full_scale[2];
     atomic_uint_fast64_t rf_stream_epoch;
     atomic_uint_fast32_t audio_sample_rate;
+    atomic_bool cxadc_audio_ready;
 
     // Audio monitoring peaks (24-bit audio magnitude, per channel 1..4)
     atomic_uint_fast32_t audio_peak[4];
@@ -651,11 +660,15 @@ typedef struct gui_app {
     atomic_size_t net_rf_server_queue_bytes;
     atomic_size_t net_audio_server_queue_bytes;
     atomic_bool net_rf_client_stream_live;
+    atomic_int net_rf_client_discard_state;
     /* Set by the async net mode transition worker (gui_net_request_apply_mode)
      * when the main loop should re-enumerate local devices once (leaving a
      * client mode / returning to Local). Consumed on the main thread; the
      * device array itself is main-thread-owned. */
     atomic_bool net_reenumerate_pending;
+#ifdef __ANDROID__
+    atomic_uint net_device_catalogue_generation;  // Odd during local enumeration.
+#endif
 
     // Dedicated network status line, shown ONLY in the info window's Network
     // section. Net code writes this via gui_net_set_status() and must NEVER
@@ -689,13 +702,22 @@ void gui_app_enumerate_devices(gui_app_t *app);
 int gui_app_start_capture(gui_app_t *app);
 /* Commit a prepared FLAC playback start on the UI thread. Call every frame. */
 void gui_app_poll_capture_start(gui_app_t *app);
-/* Android-only: run gui_app_start_capture() on a worker thread so the render
- * loop stays responsive during hsdaoh_open + stream start. On non-Android
- * builds this is not declared/defined. FLAC uses its own preparation worker. */
 #if defined(__ANDROID__)
+/* Main-thread control for Android USB permission and capture workers.
+ * FLAC uses its own preparation worker. */
+#ifdef ENABLE_RTLSDR
+#include "../input/android_rtlsdr_usb.h"
+bool gui_app_rtlsdr_reconnect_identity(int device_id, android_rtlsdr_usb_identity_t *identity);
+void gui_app_start_rtlsdr_reconnect_async(gui_app_t *app, const char *expected_serial);
+#endif
 void gui_app_start_capture_async(gui_app_t *app);
 void gui_app_stop_capture_async(gui_app_t *app);
-int gui_app_capture_busy(void);
+void gui_app_stop_server_capture_async(gui_app_t *app);
+void gui_app_stop_capture_on_dropout_async(gui_app_t *app, const char *status);
+void gui_app_select_capture_device_async(gui_app_t *app, int selection, bool persist, bool restart);
+bool gui_app_capture_busy(void);
+bool gui_app_defer_remote_mode(gui_app_t *app, int mode);
+void gui_app_finish_capture_transitions(gui_app_t *app);
 #endif
 void gui_app_stop_capture(gui_app_t *app);
 int gui_app_start_recording(gui_app_t *app);
