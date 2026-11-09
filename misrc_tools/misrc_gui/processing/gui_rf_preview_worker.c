@@ -6,6 +6,7 @@
 #include "../signal/gui_ld_rf_ac3.h"
 #include "../signal/gui_ld_rf_analog.h"
 #include "../signal/gui_ld_rf_digital.h"
+#include "../signal/gui_ld_dts.h"
 #include "gui_rf_preview_policy.h"
 #include "../signal/gui_rf_resampler.h"
 #include "../../common/threading.h"
@@ -39,6 +40,7 @@ static void rf_mutex_unlock(rf_mutex_t *m) { pthread_mutex_unlock(m); }
 /* Keep track selection and queue invalidation in the same atomic value. */
 #define RF_AUDIO_GENERATION_STEP 4u
 #define RF_AUDIO_MODE_MASK (RF_AUDIO_GENERATION_STEP - 1u)
+_Static_assert(GUI_RF_LD_AUDIO_DTS <= RF_AUDIO_MODE_MASK, "LD audio mode must fit the generation mask");
 /* Rate provisions (see dev/output_stdio_buffer_and_rf_rate_provisions.md):
  * 2x 40 MSPS dual-channel captures use two per-channel workers (each on the
  * 40 MSPS exact path); single-stream captures up to 200 MSPS are accepted. */
@@ -736,6 +738,14 @@ bool gui_rf_preview_worker_audio_is_ld(const void *worker) {
     return w && gui_rf_profile_is_laserdisc((gui_rf_profile_t)
         atomic_load_explicit(&w->requested_profile, memory_order_acquire));
 }
+bool gui_rf_preview_worker_ld_dts_available(void) {
+    return gui_ld_dts_available();
+}
+
+static bool rf_ld_audio_is_digital(gui_rf_ld_audio_t mode) {
+    return mode == GUI_RF_LD_AUDIO_DIGITAL || mode == GUI_RF_LD_AUDIO_DTS;
+}
+
 static void rf_audio_publish(void *context,const float *stereo,size_t frames,uint64_t end_sample) {
     gui_rf_preview_worker_t *w=context;
     if(atomic_load_explicit(&w->audio_callback_installed,memory_order_acquire) &&
@@ -767,10 +777,10 @@ static void rf_audio_laserdisc(gui_rf_preview_worker_t *w,const rf_audio_slot_t 
                                   slot->first_sample, rf_audio_publish, w);
             locked = gui_ld_rf_ac3_locked(w->ld_ac3);
         }
-    } else if (mode == GUI_RF_LD_AUDIO_DIGITAL) {
+    } else if (rf_ld_audio_is_digital(mode)) {
         if (reset) {
             if (!w->ld_digital) w->ld_digital=gui_ld_rf_digital_create();
-            if (w->ld_digital) gui_ld_rf_digital_reset(w->ld_digital);
+            if (w->ld_digital) gui_ld_rf_digital_reset(w->ld_digital, mode == GUI_RF_LD_AUDIO_DTS);
         }
         if (w->ld_digital) {
             gui_ld_rf_digital_process(w->ld_digital,slot->samples,slot->count,
@@ -883,14 +893,14 @@ static int rf_audio_thread(void *context) {
                 // The RF worker publishes its flush after queuing the last samples.
                 if (read != atomic_load_explicit(&w->audio_write, memory_order_acquire)) continue;
                 gui_rf_ld_audio_t mode = (gui_rf_ld_audio_t)(generation & RF_AUDIO_MODE_MASK);
-                if (!needs_reset && ((mode == GUI_RF_LD_AUDIO_DIGITAL && w->ld_digital) ||
+                if (!needs_reset && ((rf_ld_audio_is_digital(mode) && w->ld_digital) ||
                                      (mode == GUI_RF_LD_AUDIO_AC3 && w->ld_ac3))) {
                     if (!rf_audio_acquire_budget(w, generation)) continue;
                     uint64_t begin = rf_now_us(w);
                     atomic_store_explicit(&w->audio_active, true, memory_order_release);
                     if (rf_audio_current(w, generation)) {
                         w->audio_processing_generation = generation;
-                        if (mode == GUI_RF_LD_AUDIO_DIGITAL)
+                        if (rf_ld_audio_is_digital(mode))
                             gui_ld_rf_digital_finish(w->ld_digital, rf_audio_publish, w);
                         else
                             gui_ld_rf_ac3_finish(w->ld_ac3);
@@ -1444,7 +1454,7 @@ bool gui_rf_preview_worker_finish_ld_video(gui_rf_preview_worker_t *w) {
 }
 
 bool gui_rf_preview_worker_set_ld_audio(gui_rf_preview_worker_t *w,gui_rf_ld_audio_t mode) {
-    if (!w || (unsigned)mode > GUI_RF_LD_AUDIO_AC3) return false;
+    if (!w || (unsigned)mode > GUI_RF_LD_AUDIO_DTS) return false;
     uint_fast64_t generation=atomic_load_explicit(&w->audio_generation,memory_order_relaxed);
     do {
         if ((generation & RF_AUDIO_MODE_MASK)==(unsigned)mode) return false;

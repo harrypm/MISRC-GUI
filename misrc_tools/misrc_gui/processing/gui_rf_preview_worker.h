@@ -8,8 +8,11 @@ typedef struct gui_rf_preview_worker gui_rf_preview_worker_t;
 typedef enum {
     GUI_RF_LD_AUDIO_ANALOG = 0,
     GUI_RF_LD_AUDIO_DIGITAL = 1,
-    GUI_RF_LD_AUDIO_AC3 = 2
+    GUI_RF_LD_AUDIO_AC3 = 2,
+    GUI_RF_LD_AUDIO_DTS = 3
 } gui_rf_ld_audio_t;
+
+bool gui_rf_preview_worker_ld_dts_available(void);
 
 static inline bool gui_rf_profile_is_laserdisc(gui_rf_profile_t profile) {
     return profile == GUI_RF_PROFILE_PAL_LASERDISC || profile == GUI_RF_PROFILE_NTSC_LASERDISC;

@@ -5991,6 +5991,7 @@ static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *ap
         bool other=decoder->worker && s_rf_audio_source && decoder->worker!=s_rf_audio_source;
         const char *audio_label=other ? "Audio: Other panel" :
             decoder->overlay.ld_audio==GUI_RF_LD_AUDIO_DIGITAL ? "Audio: Digital PCM" :
+            decoder->overlay.ld_audio==GUI_RF_LD_AUDIO_DTS ? "Audio: DTS" :
             decoder->overlay.ld_audio==GUI_RF_LD_AUDIO_AC3 &&
                 gui_vhs_fm_get_profile(decoder)==GUI_RF_PROFILE_NTSC_LASERDISC
                 ? "Audio: AC-3 RF" : "Audio: Analog FM";
@@ -6146,6 +6147,20 @@ static void cvbs_vtable_render(void *state, gui_app_t *app, int channel,
 // Interaction Functions
 //-----------------------------------------------------------------------------
 
+static gui_rf_ld_audio_t vhs_next_ld_audio(gui_rf_ld_audio_t mode, bool ntsc) {
+    switch (mode) {
+        case GUI_RF_LD_AUDIO_DIGITAL:
+            if (gui_rf_preview_worker_ld_dts_available()) return GUI_RF_LD_AUDIO_DTS;
+            /* fall through */
+        case GUI_RF_LD_AUDIO_DTS:
+            return ntsc ? GUI_RF_LD_AUDIO_AC3 : GUI_RF_LD_AUDIO_ANALOG;
+        case GUI_RF_LD_AUDIO_AC3:
+            return ntsc ? GUI_RF_LD_AUDIO_ANALOG : GUI_RF_LD_AUDIO_DIGITAL;
+        default:
+            return GUI_RF_LD_AUDIO_DIGITAL;
+    }
+}
+
 static bool cvbs_vtable_handle_click(void *state, gui_app_t *app, int channel,
                                       Vector2 mouse_pos, Rectangle bounds) {
     (void)app;
@@ -6221,17 +6236,7 @@ static bool cvbs_vtable_handle_click(void *state, gui_app_t *app, int channel,
             CheckCollisionPointRec(mouse_pos,vhs->overlay.ld_audio_rect)) {
             panel->chrome.last_click_ms=0;
             bool ntsc = gui_vhs_fm_get_profile(vhs) == GUI_RF_PROFILE_NTSC_LASERDISC;
-            switch (vhs->overlay.ld_audio) {
-                case GUI_RF_LD_AUDIO_DIGITAL:
-                    vhs->overlay.ld_audio = ntsc ? GUI_RF_LD_AUDIO_AC3 : GUI_RF_LD_AUDIO_ANALOG;
-                    break;
-                case GUI_RF_LD_AUDIO_AC3:
-                    vhs->overlay.ld_audio = ntsc ? GUI_RF_LD_AUDIO_ANALOG : GUI_RF_LD_AUDIO_DIGITAL;
-                    break;
-                default:
-                    vhs->overlay.ld_audio = GUI_RF_LD_AUDIO_DIGITAL;
-                    break;
-            }
+            vhs->overlay.ld_audio = vhs_next_ld_audio(vhs->overlay.ld_audio, ntsc);
             if (vhs->worker && vhs->worker==s_rf_audio_source) {
                 for (int i=0; i<4; ++i)
                     if (s_rf_bindings[i] && s_rf_bindings[i]->worker==vhs->worker)

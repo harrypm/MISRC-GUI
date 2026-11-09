@@ -19,6 +19,7 @@ typedef struct {
 } route_worker_t;
 static const void *monitor_source;
 static bool transport_running,transport_paused[2];
+static bool ld_dts_available = true;
 static playback_speed_t transport_speed = PLAYBACK_SPEED_1X;
 static unsigned monitor_resets;
 static unsigned seek_monitor_epoch_floor;
@@ -38,7 +39,8 @@ enum {
     OVERLAY_RF_DECODER = 1u << 4,
     OVERLAY_PAL_SYSTEM = 1u << 5,
     OVERLAY_NTSC_SYSTEM = 1u << 6,
-    OVERLAY_HIFI_PRESET = 1u << 7
+    OVERLAY_HIFI_PRESET = 1u << 7,
+    OVERLAY_LD_DTS = 1u << 8
 };
 static struct {
     Rectangle panel, button;
@@ -93,6 +95,7 @@ void gui_text_draw(const char *text, float x, float y, int size, Color color) {
     assert(y*scale>=button.y*scale-.01f && (y+size)*scale<=(button.y+button.height)*scale+.01f);
     if (!strcmp(text,"Format: LaserDisc")) overlay_draw.seen|=OVERLAY_LD_FORMAT;
     if (!strcmp(text,"Audio: Digital PCM")) overlay_draw.seen|=OVERLAY_LD_AUDIO;
+    if (!strcmp(text,"Audio: DTS")) overlay_draw.seen|=OVERLAY_LD_DTS;
     if (!strcmp(text,"LaserDisc")) overlay_draw.seen|=OVERLAY_LD_OPTION;
     if (!strcmp(text,"Basic")) overlay_draw.seen|=OVERLAY_OSD_OPTION;
     if (!strcmp(text,"Decoder: RF Preview")) overlay_draw.seen|=OVERLAY_RF_DECODER;
@@ -129,8 +132,18 @@ static void test_rf_overlay_scale(void) {
                    d->overlay.format_rect.y < d->overlay.ld_audio_rect.y);
         }
     }
-    d->overlay.selected_tape = GUI_RF_FAMILY_VHS;
     d->overlay.tape_dropdown_open = d->overlay.stats_dropdown_open = false;
+    d->overlay.ld_audio = GUI_RF_LD_AUDIO_DTS;
+    for (int system = 0; system < 2; ++system) {
+        gui_vhs_fm_set_format(d, system);
+        overlay_draw.labels = overlay_draw.seen = 0;
+        render_vhs_decoder_overlay(&panel, &route_app, overlay_draw.panel);
+        unsigned expected = OVERLAY_LD_FORMAT | OVERLAY_LD_DTS | OVERLAY_RF_DECODER |
+            (system ? OVERLAY_NTSC_SYSTEM : OVERLAY_PAL_SYSTEM);
+        assert(!overlay_draw.awaiting_label && overlay_draw.seen == expected);
+    }
+
+    d->overlay.selected_tape = GUI_RF_FAMILY_VHS;
     gui_vhs_fm_set_vhs_preset(d, GUI_VHS_PRESET_HIFI);
     for (int system = 0; system < 2; ++system) {
         gui_vhs_fm_set_format(d, system);
@@ -264,6 +277,7 @@ bool gui_audio_get_ld_position(const void *source, uint64_t *sample) {
     (void)sample;
     return false;
 }
+bool gui_rf_preview_worker_ld_dts_available(void) { return ld_dts_available; }
 bool gui_rf_preview_worker_set_ld_audio(gui_rf_preview_worker_t *w,gui_rf_ld_audio_t mode) {
     assert(w && gui_rf_profile_is_laserdisc(((route_worker_t*)w)->profile));
     bool changed = ((route_worker_t*)w)->ld_audio != mode;
@@ -817,6 +831,17 @@ static void test_rf_audio_playback_priority(void) {
     assert(!monitor_source);
 }
 static void test_laserdisc_routes(void) {
+    assert(vhs_next_ld_audio(GUI_RF_LD_AUDIO_ANALOG, false) == GUI_RF_LD_AUDIO_DIGITAL);
+    assert(vhs_next_ld_audio(GUI_RF_LD_AUDIO_DIGITAL, false) == GUI_RF_LD_AUDIO_DTS);
+    assert(vhs_next_ld_audio(GUI_RF_LD_AUDIO_DIGITAL, true) == GUI_RF_LD_AUDIO_DTS);
+    assert(vhs_next_ld_audio(GUI_RF_LD_AUDIO_DTS, false) == GUI_RF_LD_AUDIO_ANALOG);
+    assert(vhs_next_ld_audio(GUI_RF_LD_AUDIO_DTS, true) == GUI_RF_LD_AUDIO_AC3);
+    assert(vhs_next_ld_audio(GUI_RF_LD_AUDIO_AC3, true) == GUI_RF_LD_AUDIO_ANALOG);
+    ld_dts_available = false;
+    assert(vhs_next_ld_audio(GUI_RF_LD_AUDIO_DIGITAL, false) == GUI_RF_LD_AUDIO_ANALOG);
+    assert(vhs_next_ld_audio(GUI_RF_LD_AUDIO_DIGITAL, true) == GUI_RF_LD_AUDIO_AC3);
+    ld_dts_available = true;
+
     _Static_assert(GUI_RF_FAMILY_VHS==0 && GUI_RF_FAMILY_BETAMAX==1 &&
         GUI_RF_FAMILY_LASERDISC==2 && GUI_RF_FAMILY_COUNT==3,
         "append LaserDisc to the existing Format choices");
@@ -852,6 +877,12 @@ static void test_laserdisc_routes(void) {
     assert(a->worker==pal_worker && monitor_source==pal_worker);
     assert(((route_worker_t*)pal_worker)->ld_audio==GUI_RF_LD_AUDIO_DIGITAL);
     assert(monitor_resets == previous_resets + 1);
+    a->overlay.ld_audio = GUI_RF_LD_AUDIO_DTS;
+    gui_video_update_rf_routes(&route_app);
+    assert(a->worker == pal_worker && monitor_source == pal_worker);
+    assert(((route_worker_t *)pal_worker)->ld_audio == GUI_RF_LD_AUDIO_DTS && !monitor_burst_audio);
+    a->overlay.ld_audio = GUI_RF_LD_AUDIO_DIGITAL;
+    gui_video_update_rf_routes(&route_app);
     route_app.settings.audio_monitor_playback=false;
     gui_video_update_rf_routes(&route_app);
     assert(!route_audio_enabled(a));
@@ -894,6 +925,10 @@ static void test_laserdisc_routes(void) {
     gui_vhs_fm_set_format(a,1);
     gui_video_update_rf_routes(&route_app);
     gui_rf_preview_worker_t *ntsc_worker = a->worker;
+    a->overlay.ld_audio = GUI_RF_LD_AUDIO_DTS;
+    gui_video_update_rf_routes(&route_app);
+    assert(a->worker == ntsc_worker && monitor_source == ntsc_worker);
+    assert(((route_worker_t *)ntsc_worker)->ld_audio == GUI_RF_LD_AUDIO_DTS && !monitor_burst_audio);
     a->overlay.ld_audio = GUI_RF_LD_AUDIO_AC3;
     gui_video_update_rf_routes(&route_app);
     assert(a->worker == ntsc_worker && monitor_source == ntsc_worker);
