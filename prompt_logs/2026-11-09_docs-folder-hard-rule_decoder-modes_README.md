@@ -68,6 +68,38 @@ Repo: `/home/harry/MISRC-GUI` (branch `main`, up-to-date with `origin/main`, HEA
   listed above rather than assumed; per-profile validation states cite the
   per-feature dev notes.
 
+## Round 2 (2026-11-09 ~03:36): commit + push, upstream rebase, decoder doc refresh
+
+- User: "commit and push".
+- Pre-commit tidy: restored exec bits on 14 vendored third_party .sh files
+  (working tree had drifted to 644; the git index from b5a3cf5 is 100755 and
+  is authoritative per the shell-script guard). Committed the previous
+  session's uncommitted prompt-log Round 8 update as its own commit.
+- First commit attempt accidentally included the already-staged doc renames;
+  fixed by soft-reset and a clean two-commit split before pushing.
+- Push REJECTED: origin/main had advanced (11 commits, 121 files, PR #24
+  `rf-preview-pr` by JunliangRen — S-VHS, LaserDisc, VHS Hi-Fi, RTL-SDR/USB
+  input work, plus INSTALLATION.md / rf_preview_README.md updates).
+- `git pull --rebase origin main` — clean, no conflicts; static guards
+  re-verified 46/46 PASS on the rebased tree.
+- Upstream decoder surface re-verified from source before pushing the doc:
+  `gui_rf_profile_t` grew 9 → 15 profiles (PAL/NTSC S-VHS, PAL/NTSC
+  LaserDisc, NTSC/PAL VHS Hi-Fi audio-only), `gui_rf_profile_has_hifi` now
+  includes the audio-only profiles, new modules gui_vhs_hifi + gui_ld_*
+  (rf_demod/rf_analog/rf_digital/efm_frontend/ac3_rf/ac3_frames/ac3_codec
+  with vendored liba52), RF Preview selector reworked (Format: VHS/Betamax/
+  LaserDisc; VHS System 4-way PAL/NTSC/SECAM/MESECAM; VHS Preset
+  VHS/S-VHS/Hi-Fi), VIDEO_TAPE_DECODE_UI_ENABLED still 0, demod + monitor
+  video codec surfaces unchanged. New synthetic tests registered:
+  gui_rf_svhs/_color/_stripe, gui_rf_laserdisc, gui_ld_ac3_frames,
+  gui_audio_hifi_monitor.
+- `docs/DECODER_MODES.md` updated for all of the above (15-profile table,
+  LaserDisc audio/digital chains, VHS Hi-Fi audio decoder, new selector
+  layout, revised not-implemented list, PR #24 provenance note) so it was
+  not pushed stale.
+- Committed the doc refresh separately, pushed, then watched the GitHub
+  Actions run to green per the CI gate rule.
+
 ## Not done / boundaries
 
 - No commit or push (not requested). Restore point/zip not created (no

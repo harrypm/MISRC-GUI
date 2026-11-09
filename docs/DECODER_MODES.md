@@ -18,15 +18,21 @@ The **Decoder** button on a Video panel cycles the panel's decoder plugin
 | Mode | Label | Input | State |
 |---|---|---|---|
 | `VIDEO_PLUGIN_CVBS` | CVBS | Baseband composite (PAL/NTSC/SECAM) | Working — in the cycle |
-| `VIDEO_PLUGIN_VHS_FM` | RF Preview | Tape video RF (9 profiles, below) | Working — in the cycle |
+| `VIDEO_PLUGIN_VHS_FM` | RF Preview | Tape video RF (15 profiles, below) | Working — in the cycle |
 | `VIDEO_PLUGIN_TAPE_DECODE` | Tape Decode | Baseband composite with tape-tuned PLL/smoothing | **Hidden from the UI** (`VIDEO_TAPE_DECODE_UI_ENABLED 0`) — code stays compiled, unreachable until it works; flip the define to re-expose |
 
 ## RF Preview tape profiles
 
-`gui_rf_profile_t` in `signal/gui_rf_preview.h`. All are **reduced-bandwidth
-streaming previews**, not full-TBC archival decoders: nonlinear
-sub-de-emphasis, RF equalization, dropout repair and comb filtering are
-deliberately omitted. All weave the two original fields (no deinterlacing).
+`gui_rf_profile_t` in `signal/gui_rf_preview.h` (15 profiles). Selected on
+the Video panel via **Format** (tape family: VHS / Betamax / LaserDisc),
+**System** (VHS: PAL / NTSC / SECAM / MESECAM — the old MESECAM toggle is
+gone, the system selector owns it; LaserDisc: PAL / NTSC) and **Preset**
+(VHS: VHS / S-VHS / Hi-Fi; Betamax: Betamax / Betamax Hi-Fi / SuperBeta /
+ED Beta). Profiles 13–14 are audio-only. All video profiles are
+**reduced-bandwidth streaming previews**, not full-TBC archival decoders:
+nonlinear sub-de-emphasis, RF equalization, dropout repair and comb
+filtering are deliberately omitted. All weave the two original fields (no
+deinterlacing).
 
 | # | Profile | System | Chroma method | Hi-Fi audio | Geometry (Active/Full) | State |
 |---|---|---|---|---|---|---|
@@ -39,19 +45,63 @@ deliberately omitted. All weave the two original fields (no deinterlacing).
 | 6 | SECAM VHS SP (native) | SECAM 625/50 | Native divide-by-four FM chroma (1.0625/1.1015625 MHz) | — | 768×576 / 768×626 | Working; real-file validated (499 fields / 249 frames, zero rejects). Recordings without usable VBI bottles stay grayscale by design |
 | 7 | MESECAM VHS SP | SECAM 625/50 via PAL converter | Heterodyne FM (Dr 654.3 kHz / Db 810.6 kHz), studio deviation | — | 768×576 / 768×626 | Working; real-file validated (colour bars + carrier switch-off files, per-file counters in the dev note) |
 | 8 | NTSC ED Beta | NTSC-J | 688 kHz color-under, 6.8/9.3 MHz carriers | Yes (4-carrier) | 640×480 / 640×526 | Working as a **monitoring preset** — flat de-emphasis, reduced 5 MSPS picture rate; not a full-fidelity ED archival decoder |
+| 9 | PAL S-VHS | PAL 625/50 | Color-under + burst phase/gain stabilization | — | 768×576 / 768×626 | Working; synthetic tests (`gui_rf_svhs`, `gui_rf_svhs_color`, `gui_rf_svhs_stripe`) |
+| 10 | NTSC S-VHS | NTSC 525/60 | Color-under + burst phase/gain stabilization | — | 640×480 / 640×526 | Working; same S-VHS synthetic tests |
+| 11 | PAL LaserDisc | PAL | Composite video FM, chroma at fsc | LD audio chains (below) | 768×576 / 768×626 | Working; synthetic test (`gui_rf_laserdisc`) |
+| 12 | NTSC LaserDisc | NTSC | Composite video FM, chroma at fsc | LD audio chains (below) | 640×480 / 640×526 | Working; synthetic test (`gui_rf_laserdisc`) |
+| 13 | NTSC VHS Hi-Fi | NTSC | — (audio-only profile) | Yes (VHS Hi-Fi decoder) | — | Working (audio only); route + audio-monitor tests |
+| 14 | PAL VHS Hi-Fi | PAL | — (audio-only profile) | Yes (VHS Hi-Fi decoder) | — | Working (audio only); route + audio-monitor tests |
 
 Notes:
 
-- **Hi-Fi audio** (`gui_rf_profile_has_hifi`): profiles 3, 5 and 8 run the
-  separate Beta Hi-Fi audio decoder (four carriers at 87.75/97.25/106.75/116.25
-  × fH, ~300 ms calibration, 48 kHz stereo, Audio Mon gated). The GUI's
-  SuperBeta preset uses the Hi-Fi-capable worker so Audio Mon works without
-  changing the video profile.
-- **Input rates**: 20/40/80 MHz native conversion; other 16–160 MHz rates via
-  libsoxr. ED Beta accepts 20–200 MHz through a dedicated wide-passband
-  converter.
-- **Not implemented**: VHS LP/EP, S-VHS, PAL Betamax, linear (non-Hi-Fi) tape
-  audio, dropout repair, offline TBC/export quality.
+- **S-VHS** (9/10): PAL/NTSC only — selecting S-VHS from SECAM/MESECAM
+  switches to PAL, and SECAM/MESECAM restore the VHS preset. Requires
+  ≥ 20 MSPS input; higher rates use a dedicated wide-passband libsoxr
+  converter, with the picture/sync path working at 5 MSPS. The format's
+  extra linear/nonlinear sub-deemphasis and full RF equalization are
+  omitted.
+- **LaserDisc** (11/12): video decoded by `gui_ld_rf_demod` (20 MSPS RF →
+  5 MSPS luma IRE + complex chroma at fsc); frames are published
+  audio-clock-synced (`gui_rf_preview_worker_take_ld_frame`). Audio chains
+  below.
+- **VHS Hi-Fi** (13/14): audio-only profiles (`gui_rf_profile_is_audio_only`)
+  selected by Preset **Hi-Fi** — no picture is decoded. See the VHS Hi-Fi
+  audio decoder below.
+- **Beta Hi-Fi audio** (`gui_rf_profile_has_hifi`): profiles 3, 5 and 8 plus
+  the audio-only VHS Hi-Fi profiles enable a separate audio decoder. Beta
+  uses four carriers at 87.75/97.25/106.75/116.25 × fH with ~300 ms
+  calibration to 48 kHz stereo, Audio Mon gated; the GUI's SuperBeta preset
+  uses the Hi-Fi-capable worker so Audio Mon works without changing the
+  video profile.
+- **Input rates**: 20/40/80 MHz native conversion; other 16–200 MHz rates
+  via libsoxr. ED Beta and S-VHS use the dedicated wide-passband converter
+  before their reduced-rate preview filters.
+- **Not implemented**: VHS LP/EP, PAL Betamax, linear (non-Hi-Fi) tape audio,
+  dropout repair, offline TBC/export quality, S-VHS sub-deemphasis and full
+  RF equalization.
+- Profiles 9–14 arrived upstream (PR #24, `rf-preview-pr`); their states
+  cite the registered synthetic tests — per-feature dev notes do not exist
+  for them yet.
+
+### LaserDisc audio and digital chains
+
+Analog and digital LaserDisc audio run alongside the LD video profile
+(48 kHz interleaved stereo, lock flags, unusable RF muted):
+
+- `gui_ld_rf_analog` — analog FM audio (PAL/NTSC system select)
+- `gui_ld_efm_frontend` + `gui_ld_rf_digital` — EFM digital audio: run
+  lengths 3–11 recovered from equalized RF, then CIRC/PCM (EOF drain via
+  `finish`)
+- `gui_ld_ac3_rf` → `gui_ld_ac3_frames` → `gui_ld_ac3_codec` — AC-3 RF:
+  QPSK symbol demodulation, framing and decode (vendored liba52)
+
+### VHS Hi-Fi audio decoder
+
+`gui_vhs_hifi.h` — PAL/NTSC VHS Hi-Fi RF to 48 kHz interleaved stereo.
+Accepts 20 MSPS or the native low rates (8 / 8.192 / 10 MSPS), or direct
+complex-baseband I/Q with a center frequency (the RTL-SDR route via
+`gui_video_submit_rtlsdr`). Unusable RF is muted; discontinuities reset
+lock and signal history.
 
 ### RF Preview runtime states
 
