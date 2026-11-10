@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Minimal static FFmpeg for MISRC Monitor Client (AV1, VP9, HEVC).
+# Minimal static FFmpeg for MISRC Monitor Client (AV1, VP9, HEVC) and LD DTS.
 # Unlike a distro FFmpeg --static closure this has no unrelated librsvg,
-# JPEG-XL, Rust, audio or multimedia codecs, preserving Windows one-EXE
+# JPEG-XL, Rust or multimedia codecs, preserving Windows one-EXE
 # packaging and the Android libmisrc_gui.so dependency contract.
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -33,9 +33,10 @@ else
 fi
 mkdir -p "$PREFIX" "$(dirname "$SRC")"
 PREFIX="$(cd "$PREFIX" && pwd)"
+STAMP="$PREFIX/.misrc-ffmpeg-minimal-$MODE-$FFMPEG_TAG-dca"
 if [[ -f "$PREFIX/lib/pkgconfig/libavcodec.pc" ]] &&
    PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" pkg-config --atleast-version=7.1 libavcodec &&
-   [[ -f "$PREFIX/.misrc-ffmpeg-minimal-$MODE-$FFMPEG_TAG" ]]; then
+   [[ -f "$STAMP" ]]; then
   echo "[ffmpeg-minimal] cached $MODE static FFmpeg $FFMPEG_TAG"
   exit 0
 fi
@@ -54,16 +55,16 @@ cd "$BUILD"
   --disable-avdevice --disable-avfilter --disable-avformat --disable-swresample \
   --disable-postproc --disable-everything \
   --enable-avcodec --enable-avutil --enable-swscale \
-  --enable-decoder=av1,hevc,vp9 \
+  --enable-decoder=av1,dca,hevc,vp9 \
   --enable-parser=av1,hevc,vp9 \
   --disable-debug --disable-stripping \
   "${TARGET_ARGS[@]}"
 make -j"${JOBS:-4}"
 make install
-touch "$PREFIX/.misrc-ffmpeg-minimal-$MODE-$FFMPEG_TAG"
+touch "$STAMP"
 if [[ "$MODE" == android ]]; then
   DEPS_PREFIX="$PREFIX" "$ROOT/android/android-pkg-config" --modversion libavcodec
 else
   PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:${PKG_CONFIG_PATH:-}" pkg-config --modversion libavcodec
 fi
-echo "[ffmpeg-minimal] Installed lean static AV1/VP9/HEVC decoder libraries: $PREFIX"
+echo "[ffmpeg-minimal] Installed lean static AV1/VP9/HEVC/DTS decoder libraries: $PREFIX"

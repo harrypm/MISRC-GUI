@@ -59,10 +59,16 @@ The GitHub Linux CI codec job installs FFmpeg development packages explicitly.
 ## Minimal Windows and Android FFmpeg decoders
 
 `scripts/build-monitor-ffmpeg-minimal.sh windows|android` cross-builds pinned
-FFmpeg n7.1.3 as static libavcodec/libavutil/libswscale with only native AV1,
-VP9 and HEVC decoders. Windows uses MSYS2 UCRT64/CLANGARM64; Android uses the
+FFmpeg n7.1.3 as static libavcodec/libavutil/libswscale. Its native AV1, VP9
+and HEVC decoders serve Monitor Video. The same build enables FFmpeg's native
+DCA decoder for [LaserDisc DTS](DECODER_MODES.md#laserdisc-audio-and-digital-chains).
+Windows uses MSYS2 UCRT64/CLANGARM64. Android uses the
 NDK arm64 API 30. Meson `-Dmodern_monitor_codecs=enabled` fails early when
 these libraries are not linked. No additional runtime DLLs are required.
+
+LaserDisc DTS is optional and uses FFmpeg 5.1 or newer `libavcodec` and
+`libavutil` with DCA enabled. It works independently of `libswscale` and
+the `modern_monitor_codecs` option.
 
 This is full **client decoding** support but not software AV1/VP9/HEVC
 **encoding** on Windows/Android servers: the lean FFmpeg intentionally omits

@@ -447,6 +447,7 @@ rf_audio_sources = [
   'misrc_gui/signal/gui_vhs_hifi.c',
   'misrc_gui/signal/gui_ld_rf_analog.c',
   'misrc_gui/signal/gui_ld_rf_digital.c',
+  'misrc_gui/signal/gui_ld_dts.c',
   'misrc_gui/signal/gui_ld_efm_frontend.c',
   'misrc_gui/signal/gui_ld_rf_ac3.c',
   'misrc_gui/signal/gui_ld_ac3_rf.c',
@@ -456,6 +457,23 @@ rf_audio_sources = [
 
 # GUI application (requires raylib)
 raylib_dep = dependency('raylib', required: false, static: windows_static_deps)
+
+# LD DTS shares FFmpeg's audio codec libraries with Monitor Video. It needs
+# AVChannelLayout (FFmpeg 5.1+) but does not need libswscale.
+modern_codecs = get_option('modern_monitor_codecs')
+ffmpeg_static = windows_static_deps or host_system == 'android'
+ffmpeg_required = raylib_dep.found() and modern_codecs.enabled()
+avcodec_dep = dependency('libavcodec', required: ffmpeg_required, static: ffmpeg_static)
+avutil_dep = dependency('libavutil', required: ffmpeg_required, static: ffmpeg_static)
+ld_dts_enabled = (avcodec_dep.found() and avutil_dep.found() and
+                  avcodec_dep.version().version_compare('>=59.37.100') and
+                  avutil_dep.version().version_compare('>=57.28.100'))
+ld_dts_dep = declare_dependency(
+  compile_args: ld_dts_enabled ? ['-DMISRC_HAVE_LD_DTS=1'] : ['-DMISRC_HAVE_LD_DTS=0'],
+  dependencies: ld_dts_enabled ? [avcodec_dep, avutil_dep] : [])
+if ld_dts_enabled
+  message('MISRC LaserDisc DTS decoding enabled')
+endif
 
 if raylib_dep.found()
   if not fftw3f_dep.found()
@@ -582,7 +600,7 @@ if raylib_dep.found()
   # M-Server/M-Client use Zstd-1 for original phosphor/FFT preview.
   zstd_dep = dependency('libzstd', required: true, static: windows_static_deps)
   gui_deps = deps + [ raylib_dep, fftw3f_dep ]
-  gui_deps += [ zstd_dep ]
+  gui_deps += [ zstd_dep, ld_dts_dep ]
   # Monitor & Remote Audio Mon streams 48 kHz / 10 ms Opus mono.
   # Do not silently ship a client with a clickable but nonworking Audio Mon.
   if not soxr_dep.found()
@@ -636,12 +654,9 @@ if raylib_dep.found()
 
   # Optional modern codecs: link FFmpeg when its headers/libs are available.
   # Existing Android and static Windows builds retain OpenH264 fallback.
-  modern_codecs = get_option('modern_monitor_codecs')
-  avcodec_dep = dependency('libavcodec', required: modern_codecs, static: windows_static_deps or host_system == 'android')
-  avutil_dep = dependency('libavutil', required: modern_codecs, static: windows_static_deps or host_system == 'android')
-  swscale_dep = dependency('libswscale', required: modern_codecs, static: windows_static_deps or host_system == 'android')
-  # Windows and Android CI link a minimal static FFmpeg built with just the
-  # required native AV1/VP9/HEVC decoders; no full MSYS2 dependency closure.
+  swscale_dep = dependency('libswscale', required: modern_codecs, static: ffmpeg_static)
+  # Windows and Android CI use a minimal static FFmpeg with the native
+  # AV1/VP9/HEVC and DTS decoders.
   if not modern_codecs.disabled() and avcodec_dep.found() and avutil_dep.found() and swscale_dep.found()
     gui_deps += [avcodec_dep, avutil_dep, swscale_dep]
     ffmpeg_define = '-DMISRC_HAVE_FFMPEG=1'
@@ -722,6 +737,11 @@ if raylib_dep.found()
     # NOTE: no -lpthread on Android — bionic's libc provides pthread (there is
     # no separate libpthread; -lpthread fails to link). -ldl is a bionic stub.
     gui_ldflags += ['-lEGL', '-lGLESv2', '-lGLESv3', '-landroid', '-llog', '-lOpenSLES', '-lm', '-ldl']
+    if ld_dts_enabled
+      # The AArch64 NEON FFT directly addresses tables in static libavutil.
+      # Keep those symbols local to the NativeActivity shared library.
+      gui_ldflags += ['-Wl,--exclude-libs,libavutil.a']
+    endif
     sources_gui += 'misrc_capture/simple_capture/simple_capture_android.c'
     # JNI bridge gives each hsdaoh session its own Java-granted USB descriptor.
     sources_gui += 'misrc_gui/input/android_usb_jni.c'
@@ -1079,7 +1099,7 @@ if raylib_dep.found()
       if host_cpu_family == 'x86_64'
         rf_reconnect_sources += nasm_genb
       endif
-      rf_reconnect_deps = overlay_test_deps + [flac_dep, fftw3f_dep, dependency('threads')]
+      rf_reconnect_deps = overlay_test_deps + [flac_dep, fftw3f_dep, dependency('threads'), ld_dts_dep]
       if soxr_dep.found()
         rf_reconnect_deps += soxr_dep
       endif
@@ -1159,24 +1179,25 @@ test('gui_rf_resampler', rf_resampler_test)
 rf_worker_test = executable('gui_rf_preview_worker_test',
   rf_audio_sources + ['test/gui_rf_preview_worker_test.c', 'misrc_gui/processing/gui_rf_preview_worker.c',
    'misrc_gui/processing/gui_rf_preview_policy.c'],
-  dependencies: [dependency('threads'), meson.get_compiler('c').find_library('m', required: false)], c_args: cflags, link_args: ldflags)
+  dependencies: [dependency('threads'), meson.get_compiler('c').find_library('m', required: false), ld_dts_dep],
+  c_args: cflags, link_args: ldflags)
 test('gui_rf_preview_worker', rf_worker_test)
 if host_machine.system() == 'windows'
   rf_handoff_test = executable('gui_rf_preview_handoff_test',
     rf_audio_sources + ['test/gui_rf_preview_handoff_test.c', 'misrc_gui/processing/gui_rf_preview_policy.c'],
-    dependencies: [dependency('threads'), meson.get_compiler('c').find_library('m', required: false)],
+    dependencies: [dependency('threads'), meson.get_compiler('c').find_library('m', required: false), ld_dts_dep],
     c_args: cflags, link_args: ldflags)
   test('gui_rf_preview_handoff', rf_handoff_test)
   rf_idle_cpu_probe = executable('gui_rf_preview_idle_cpu_probe',
     rf_audio_sources + ['test/gui_rf_preview_idle_cpu_probe.c', 'misrc_gui/processing/gui_rf_preview_policy.c'],
-    dependencies: [dependency('threads')], c_args: rf_test_cflags, link_args: ldflags)
+    dependencies: [dependency('threads'), ld_dts_dep], c_args: rf_test_cflags, link_args: ldflags)
   test('gui_rf_preview_idle_cpu', rf_idle_cpu_probe)
 endif
 rf_file_harness = executable('gui_rf_preview_file',
   rf_preview_sources + rf_audio_sources + ['test/gui_rf_preview_file.c',
    'misrc_gui/signal/gui_rf_resampler.c', 'misrc_gui/processing/gui_rf_preview_worker.c', 'misrc_gui/signal/gui_beta_hifi.c',
    'misrc_gui/processing/gui_rf_preview_policy.c'],
-  dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
+  dependencies: rf_test_deps + [ld_dts_dep], c_args: rf_test_cflags, link_args: ldflags)
 rf_marks_test = executable('gui_rf_stream_marks_test',
   ['test/gui_rf_stream_marks_test.c','misrc_gui/processing/gui_rf_stream_marks.c'],
   dependencies: [dependency('threads')], c_args: cflags, link_args: ldflags)
@@ -1191,7 +1212,7 @@ rf_policy_test = executable('gui_rf_preview_policy_test',
 test('gui_rf_preview_policy', rf_policy_test)
 
 if flac_dep.found()
-  rf_record_deps = rf_test_deps + [flac_dep]
+  rf_record_deps = rf_test_deps + [flac_dep, ld_dts_dep]
   if host_machine.system() == 'windows'
     rf_record_deps += [meson.get_compiler('c').find_library('psapi'),
                        meson.get_compiler('c').find_library('onecore')]

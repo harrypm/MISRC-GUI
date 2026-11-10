@@ -107,7 +107,7 @@ int main(int argc, char **argv) {
          strcmp(argv[3], "ntsc-beta") != 0 && strcmp(argv[3], "ntsc-beta-hifi") != 0 &&
          strcmp(argv[3], "ntsc-superbeta") != 0 && strcmp(argv[3], "ntsc-superbeta-hifi") != 0 && strcmp(argv[3], "ntsc-ed-beta") != 0)) {
         fprintf(stderr, "Usage: %s input.s16le sample_rate_hz pal|ntsc|pal-svhs|ntsc-svhs|pal-ld|ntsc-ld|secam|mesecam|ntsc-beta|ntsc-beta-hifi|ntsc-superbeta|ntsc-superbeta-hifi|ntsc-ed-beta|ntsc-vhs-hifi|pal-vhs-hifi output.ppm|-"
-                        " [--max|--realtime] [--full] [--no-audio|--ld-digital|--ld-ac3] [output.wav] [seconds_cap] [realtime_budget_cores]\n", argv[0]);
+                        " [--max|--realtime] [--full] [--no-audio|--ld-digital|--ld-dts|--ld-ac3] [output.wav] [seconds_cap] [realtime_budget_cores]\n", argv[0]);
         return 1;
     }
     /* Retain the upstream --full / seconds-cap form and the Beta probe's
@@ -118,6 +118,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--full") == 0) full_frame = true;
         else if (strcmp(argv[i], "--no-audio") == 0) no_audio = true;
         else if (strcmp(argv[i], "--ld-digital") == 0) ld_audio = GUI_RF_LD_AUDIO_DIGITAL;
+        else if (strcmp(argv[i], "--ld-dts") == 0) ld_audio = GUI_RF_LD_AUDIO_DTS;
         else if (strcmp(argv[i], "--ld-ac3") == 0) ld_audio = GUI_RF_LD_AUDIO_AC3;
         else {
             char *option_end = NULL;
@@ -173,6 +174,10 @@ int main(int argc, char **argv) {
     }
     if (audio_only && (no_audio || full_frame)) return 1;
     if (ld_audio != GUI_RF_LD_AUDIO_ANALOG && (no_audio || !gui_rf_profile_is_laserdisc(profile))) return 1;
+    if (ld_audio == GUI_RF_LD_AUDIO_DTS && !gui_rf_preview_worker_ld_dts_available()) {
+        fprintf(stderr, "--ld-dts requires a build with the DTS decoder\n");
+        return 1;
+    }
     if (ld_audio == GUI_RF_LD_AUDIO_AC3 && profile != GUI_RF_PROFILE_NTSC_LASERDISC) {
         fprintf(stderr, "--ld-ac3 requires ntsc-ld\n");
         return 1;
@@ -291,6 +296,7 @@ int main(int argc, char **argv) {
     if (gui_rf_profile_is_laserdisc(profile))
         printf(",\"ld_audio\":\"%s\",\"ld_audio_locked\":%s",no_audio ? "off" :
                ld_audio == GUI_RF_LD_AUDIO_AC3 ? "ac3" :
+               ld_audio == GUI_RF_LD_AUDIO_DTS ? "dts" :
                ld_audio == GUI_RF_LD_AUDIO_DIGITAL ? "digital" : "analog",
                stats.ld_audio_locked ? "true" : "false");
     printf(",\"audio_cpu_ms\":%.3f,\"audio_processing_wall_ms\":%.3f,"

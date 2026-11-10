@@ -90,8 +90,13 @@ Analog and digital LaserDisc audio run alongside the LD video profile
 
 - `gui_ld_rf_analog` — analog FM audio (PAL/NTSC system select)
 - `gui_ld_efm_frontend` + `gui_ld_rf_digital` — EFM digital audio: run
-  lengths 3–11 recovered from equalized RF, then CIRC/PCM (EOF drain via
-  `finish`)
+  lengths 3–11 recovered from equalized 20 MSPS RF, followed by CIRC error
+  correction and an EOF drain via `finish`. Choose **Audio: Digital PCM** for
+  linear PCM. On PAL and NTSC, **Audio: DTS** decodes the 44.1 kHz DTS core
+  carried on the same digital track and outputs 48 kHz stereo. Builds without
+  FFmpeg's DCA decoder omit the DTS option and still offer Digital PCM.
+  See the [DTS development record](../misrc_tools/misrc_gui/dev/prompt_ld_dts_readme.md)
+  for validation details.
 - `gui_ld_ac3_rf` → `gui_ld_ac3_frames` → `gui_ld_ac3_codec` — AC-3 RF:
   QPSK symbol demodulation, framing and decode (vendored liba52)
 
@@ -179,9 +184,9 @@ compatible). A codec change always restarts on a keyframe.
 | VP9 | Linux/macOS: host FFmpeg (libvpx) + hardware | as above | Working (same conditions) |
 | HEVC | Linux/macOS: host FFmpeg (libx265) + hardware | as above | Working (license terms reviewed per platform) |
 
-Windows/Android: the pinned static minimal FFmpeg (n7.1.3, decode-only AV1/
-VP9/HEVC, no extra DLLs) provides **client decoding**; those servers still
-encode H.264 via OpenH264. Implementation history and boundaries:
+On Windows and Android, the pinned static minimal FFmpeg (n7.1.3) provides
+**client decoding** for AV1/VP9/HEVC and also includes DCA for LaserDisc DTS.
+Those servers still encode H.264 via OpenH264. Implementation history and boundaries:
 [MONITOR_VIDEO_STAGE1.md](MONITOR_VIDEO_STAGE1.md) (wire framing + I420),
 [MONITOR_VIDEO_STAGE2.md](MONITOR_VIDEO_STAGE2.md) (decoded-frame handoff),
 [MONITOR_VIDEO_CODECS.md](MONITOR_VIDEO_CODECS.md) (negotiation + builds).
