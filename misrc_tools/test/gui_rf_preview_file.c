@@ -1,7 +1,6 @@
 /* Offline end-to-end RF preview probe. Links the production worker, resampler
  * and decoder, without raylib or capture devices. Input is signed s16le RF. */
 #include "../misrc_gui/processing/gui_rf_preview_worker.h"
-#include "../misrc_gui/signal/gui_vhs_hifi.h"
 #include "../common/threading.h"
 
 #include <errno.h>
@@ -168,8 +167,8 @@ int main(int argc, char **argv) {
         strcmp(argv[3],"pal-vhs-hifi")==0 ? GUI_RF_PROFILE_PAL_VHS_HIFI :
         strcmp(argv[3],"ntsc-ed-beta")==0 ? GUI_RF_PROFILE_NTSC_ED_BETA : GUI_RF_PROFILE_NTSC_VHS;
     bool audio_only = gui_rf_profile_is_audio_only(profile);
-    if (rate < 16000000u && !(audio_only && gui_vhs_hifi_is_native_low_rate(rate))) {
-        fprintf(stderr, "RF sample rate must be at least 16 MSPS, or 8, 8.192 or 10 MSPS for VHS Hi-Fi\n");
+    if (audio_only ? !gui_rf_preview_worker_rate_supported(profile, rate) : rate < 16000000u) {
+        fprintf(stderr, "RF sample rate is unsupported for this preview profile\n");
         return 1;
     }
     if (audio_only && (no_audio || full_frame)) return 1;

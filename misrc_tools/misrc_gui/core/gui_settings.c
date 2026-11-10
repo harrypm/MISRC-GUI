@@ -604,11 +604,13 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
 
     // RTL-SDR defaults (only relevant when an RTL-SDR device is selected)
     settings->rtlsdr_freq_hz = 100000000ULL;   // 100.0 MHz (FM broadcast band)
-    settings->rtlsdr_gain_mode = 0;             // 0 = auto, 1 = manual
+    settings->rtlsdr_gain_mode = 1;             // 0 = auto, 1 = manual
     settings->rtlsdr_gain_tenths_db = 0;        // manual gain (tenths dB); unused in auto mode
+    settings->rtlsdr_vga_index = 8;             // Blog V4 stock manual VGA index
     settings->rtlsdr_sample_rate_hz = 2400000U;  // 2.4 MSPS (highest widely-stable)
-    settings->rtlsdr_agc = true;                // RTL2832 AGC on
+    settings->rtlsdr_agc = false;               // RTL2832 AGC off
     settings->rtlsdr_offset_corr = false;       // RTL offset tuning correction off
+    settings->rtlsdr_hifi_rf_record = false;
 
     // Demod view defaults (device-agnostic; apply to the Demod panel)
     settings->demod_mode = 0;                   // 0=WFM,1=NFM,2=AM,3=USB,4=LSB
@@ -792,9 +794,12 @@ void gui_settings_save(const gui_settings_t *settings) {
     fprintf(f, "  \"rtlsdr_freq_hz\": %llu,\n", (unsigned long long)settings->rtlsdr_freq_hz);
     fprintf(f, "  \"rtlsdr_gain_mode\": %d,\n", settings->rtlsdr_gain_mode);
     fprintf(f, "  \"rtlsdr_gain_tenths_db\": %d,\n", settings->rtlsdr_gain_tenths_db);
+    fprintf(f, "  \"rtlsdr_vga_index\": %d,\n", settings->rtlsdr_vga_index);
     fprintf(f, "  \"rtlsdr_sample_rate_hz\": %u,\n", (unsigned)settings->rtlsdr_sample_rate_hz);
     fprintf(f, "  \"rtlsdr_agc\": %s,\n", settings->rtlsdr_agc ? "true" : "false");
     fprintf(f, "  \"rtlsdr_offset_corr\": %s,\n", settings->rtlsdr_offset_corr ? "true" : "false");
+    fprintf(f, "  \"rtlsdr_hifi_rf_record\": %s,\n", settings->rtlsdr_hifi_rf_record ? "true" : "false");
+    gui_settings_write_string(f, "rtlsdr_hifi_rf_tag", settings->rtlsdr_hifi_rf_tag, true);
     fprintf(f, "  \"demod_mode\": %d,\n", settings->demod_mode);
     fprintf(f, "  \"demod_bandwidth_hz\": %d,\n", settings->demod_bandwidth_hz);
     fprintf(f, "  \"demod_squelch\": %.3f,\n", settings->demod_squelch);
@@ -1534,6 +1539,10 @@ void gui_settings_load(gui_settings_t *settings) {
     if ((value = find_value(content, "rtlsdr_gain_tenths_db")) != NULL) {
         settings->rtlsdr_gain_tenths_db = atoi(value);
     }
+    if ((value = find_value(content, "rtlsdr_vga_index")) != NULL &&
+        value[0] >= '0' && value[0] <= '8' && value[1] == '\0') {
+        settings->rtlsdr_vga_index = value[0] - '0';
+    }
     if ((value = find_value(content, "rtlsdr_sample_rate_hz")) != NULL) {
         settings->rtlsdr_sample_rate_hz = (uint32_t)strtoul(value, NULL, 10);
     }
@@ -1542,6 +1551,12 @@ void gui_settings_load(gui_settings_t *settings) {
     }
     if ((value = find_value(content, "rtlsdr_offset_corr")) != NULL) {
         settings->rtlsdr_offset_corr = (strcmp(value, "true") == 0);
+    }
+    if ((value = find_value(content, "rtlsdr_hifi_rf_record")) != NULL) {
+        settings->rtlsdr_hifi_rf_record = strcmp(value, "true") == 0;
+    }
+    if ((value = find_value(content, "rtlsdr_hifi_rf_tag")) != NULL) {
+        gui_settings_load_string(settings->rtlsdr_hifi_rf_tag, sizeof(settings->rtlsdr_hifi_rf_tag), value);
     }
     // Demod view settings
     if ((value = find_value(content, "demod_mode")) != NULL) {

@@ -142,14 +142,20 @@ static unsigned vhs_sdr_decimation(uint32_t rate) {
     }
 }
 
-bool gui_vhs_hifi_iq_supported(gui_rf_format_t format, uint32_t iq_rate_hz,
-                              uint64_t center_hz) {
+bool gui_vhs_hifi_iq_band_fits_passband(gui_rf_format_t format, uint32_t iq_rate_hz,
+                                       uint64_t center_hz, double passband_hz) {
     if (format != GUI_RF_PAL && format != GUI_RF_NTSC) return false;
-    if (!vhs_sdr_decimation(iq_rate_hz)) return false;
     const double *carrier = vhs_hifi_profiles[format].carrier_hz;
-    double span = iq_rate_hz / 2.0 - VHS_IQ_FILTER_HZ - VHS_IQ_EDGE_GUARD_HZ;
+    const double input_edge = iq_rate_hz / 2.0 - VHS_IQ_EDGE_GUARD_HZ;
+    const double span = fmin(input_edge, passband_hz) - VHS_IQ_FILTER_HZ;
     return fabs(carrier[0] - (double)center_hz) <= span &&
            fabs(carrier[1] - (double)center_hz) <= span;
+}
+
+bool gui_vhs_hifi_iq_supported(gui_rf_format_t format, uint32_t iq_rate_hz,
+                              uint64_t center_hz) {
+    return vhs_sdr_decimation(iq_rate_hz) &&
+           gui_vhs_hifi_iq_band_fits_passband(format, iq_rate_hz, center_hz, iq_rate_hz / 2.0);
 }
 
 static gui_vhs_hifi_decoder_t *vhs_create(gui_rf_format_t format, uint32_t rf_rate_hz,

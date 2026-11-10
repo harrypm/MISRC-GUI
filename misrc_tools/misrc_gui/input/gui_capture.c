@@ -1626,6 +1626,7 @@ void gui_app_enumerate_devices(gui_app_t *app) {
             snprintf(dst->serial, sizeof(dst->serial), "%s", rtls[i].serial);
             dst->type = DEVICE_TYPE_RTLSDR;
             dst->index = rtls[i].index;
+            dst->rtlsdr_blog_v4 = rtls[i].blog_v4;
             app->device_count++;
         }
     }
@@ -2145,7 +2146,8 @@ int gui_app_start_capture(gui_app_t *app) {
         // Open + apply settings (freq/gain/rate/agc/offset) first.
         int r = gui_rtlsdr_open(app, dev->index);
         if (r < 0) {
-            gui_app_set_status(app, "Failed to open RTL-SDR device");
+            gui_app_set_status(app, r == GUI_RTLSDR_VGA_FAILED
+                ? "Failed to set Blog V4 manual VGA" : "Failed to open RTL-SDR device");
             proc_set_priority(PROC_PRIORITY_NORMAL);
             return -1;
         }
@@ -2303,12 +2305,7 @@ int gui_app_start_capture(gui_app_t *app) {
     atomic_store(&app->dropout_stop_reason, GUI_DROPOUT_NONE);
     app->low_signal_time = 0.0f;
     app->low_signal_armed = false;
-    atomic_store(&app->recording_bytes, 0);
-    atomic_store(&app->recording_raw_a, 0);
-    atomic_store(&app->recording_raw_b, 0);
-    atomic_store(&app->recording_compressed_a, 0);
-    atomic_store(&app->recording_compressed_b, 0);
-    app->last_recording_duration_s = 0.0;
+    gui_record_reset_stats(app);
     s_capture_last_wait_count = 0;
     s_capture_last_drop_count = 0;
     s_capture_last_logged_drop_total = 0;

@@ -338,6 +338,11 @@ if rtlsdr_pc.found()
   endif
   deps += [ rtlsdr_dep ]
   cflags += ['-DENABLE_RTLSDR=1']
+  if host_system != 'android' and meson.get_compiler('c').has_header_symbol('rtl-sdr.h',
+      'RTLSDR_HAS_BLOG_V4_VGA_INDEX', dependencies: rtlsdr_dep) and meson.get_compiler('c').has_header_symbol('rtl-sdr.h',
+      'rtlsdr_is_blog_v4', dependencies: rtlsdr_dep)
+    cflags += ['-DENABLE_RTLSDR_BLOG_V4_VGA=1']
+  endif
   rtlsdr_enabled = true
   message('librtlsdr found, building with RTL-SDR support')
 else
@@ -774,7 +779,15 @@ if raylib_dep.found()
   # is on its include path -- without it, a fresh parallel build can compile
   # this TU before version.h exists (the standalone misrc_capture gets this via
   # version_target in sources_capture).
-  gui_extra_link_with = []
+  sdr_rf_deps = []
+  if soxr_dep.found()
+    sdr_rf_deps += [soxr_dep]
+  endif
+  # Compile separately so the converter's finite-value check remains active.
+  sdr_rf_lib = static_library('gui_sdr_rf',
+    'misrc_gui/processing/gui_sdr_rf.c',
+    dependencies: sdr_rf_deps, c_args: cflags + ['-fno-fast-math'], pic: true)
+  gui_extra_link_with = [sdr_rf_lib]
   if host_system != 'android'
     misrc_capture_cli_lib = static_library('misrc_capture_cli',
                 'misrc_capture/misrc_capture.c',
@@ -796,6 +809,7 @@ if raylib_dep.found()
                 dependencies: gui_deps,
                 include_directories: gui_includes,
                 link_args: gui_ldflags,
+                link_with: gui_extra_link_with,
                 c_args: gui_cflags,
                 install: true)
   else
@@ -826,6 +840,14 @@ if raylib_dep.found()
       overlay_test_deps += dep.partial_dependency(compile_args: true, includes: true)
     endforeach
     overlay_test_deps += meson.get_compiler('c').find_library('m', required: false)
+    if rtlsdr_enabled
+      rtl_settling_test = executable('gui_rtlsdr_settling_test',
+        'test/gui_rtlsdr_settling_test.c',
+        dependencies: overlay_test_deps + [dependency('threads')],
+        include_directories: gui_includes, c_args: cflags,
+        override_options: ['b_ndebug=false'])
+      test('gui_rtlsdr_settling', rtl_settling_test)
+    endif
     # The harness includes the waveform implementation, which now calls the
     # shared chrome-hide helper (double-click overlay toggle), so compile it
     # in too. Same for the other panel harnesses below.
@@ -904,10 +926,11 @@ if raylib_dep.found()
       record_paths_test = executable('gui_record_paths_test',
         ['test/gui_record_paths_test.c', 'common/file_utils.c', version_target,
          'test/monitor_local_save_stub.c', 'common/flac_writer.c',
-         'misrc_gui/output/gui_record_direct.c',
+         'misrc_gui/output/gui_record_direct.c', 'misrc_gui/signal/gui_vhs_hifi.c',
          'misrc_gui/net/monitor_local_save_protocol.c',
          'common/buffer_manager.c', 'common/ringbuffer.c', 'common/rb_event.c'],
         dependencies: record_paths_deps, include_directories: gui_includes,
+        link_with: sdr_rf_lib,
         c_args: cflags + ['-fwhole-program'], link_args: ldflags,
         override_options: ['b_lto=true', 'optimization=2'])
       test('gui_record_paths', record_paths_test)
@@ -1176,6 +1199,9 @@ rf_resampler_test = executable('gui_rf_resampler_test',
   ['test/gui_rf_resampler_test.c', 'misrc_gui/signal/gui_rf_resampler.c'],
   dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
 test('gui_rf_resampler', rf_resampler_test)
+sdr_rf_test = executable('gui_sdr_rf_test', 'test/gui_sdr_rf_harness.c',
+  dependencies: rf_test_deps, c_args: cflags + ['-fno-fast-math'], link_args: ldflags)
+test('gui_sdr_rf', sdr_rf_test)
 rf_worker_test = executable('gui_rf_preview_worker_test',
   rf_audio_sources + ['test/gui_rf_preview_worker_test.c', 'misrc_gui/processing/gui_rf_preview_worker.c',
    'misrc_gui/processing/gui_rf_preview_policy.c'],

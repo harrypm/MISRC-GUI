@@ -105,8 +105,10 @@ Analog and digital LaserDisc audio run alongside the LD video profile
 `gui_vhs_hifi.h` — PAL/NTSC VHS Hi-Fi RF to 48 kHz interleaved stereo.
 Accepts 20 MSPS or the native low rates (8 / 8.192 / 10 MSPS), or direct
 complex-baseband I/Q with a center frequency (the RTL-SDR route via
-`gui_video_submit_rtlsdr`). Unusable RF is muted; discontinuities reset
-lock and signal history.
+`gui_video_submit_rtlsdr`). The Hi-Fi-only preview profile can resample
+other real RF rates within 8–10 MSPS to 20 MSPS on builds with SoXR.
+Unusable RF is muted, and discontinuities reset lock and signal history.
+See the [RTL-SDR recording and playback guide](RTL-SDR.md#record-a-single-hi-fi-rf-file).
 
 ### RF Preview runtime states
 

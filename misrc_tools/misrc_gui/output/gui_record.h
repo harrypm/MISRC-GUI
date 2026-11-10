@@ -67,6 +67,16 @@ bool gui_record_has_write_error(void);
 
 // Latch input loss during the active recording so finalization fails.
 void gui_record_mark_source_loss(void);
+
+/* Original I/Q pairs, before packed capture and any A/B mapping. */
+bool gui_record_rtlsdr_active(void);
+/* Report Mono Hi-Fi RF for the session represented by the recording counters.
+ * If there is no Mono session, leave use_flac unchanged. */
+bool gui_record_get_rtlsdr_hifi_output(bool *use_flac);
+/* Clear the previous session's recording counters and output mode. */
+void gui_record_reset_stats(gui_app_t *app);
+void gui_record_rtlsdr_gap(gui_app_t *app);
+void gui_record_rtlsdr_push(gui_app_t *app, const uint8_t *iq, size_t pairs, uint64_t tuning);
 /* Capture PCM failure affects recordings that requested a WAV output. */
 void gui_record_mark_audio_source_loss(void);
 

@@ -15,6 +15,7 @@
 #endif
 #endif
 #include "../processing/gui_extract.h"
+#include "../signal/gui_vhs_hifi.h"
 #include "../processing/gui_display_thread.h"
 #include "../output/gui_audio.h"
 #include "../../common/buffer_manager.h"
@@ -94,6 +95,7 @@ typedef struct {
     playback_input_format_t format;
     FILE *file;                 // Audio file handle (aliases ctx->file_a/file_b)
     uint32_t bits;              // On-disk width (8/16/24/32; 10 for .lds)
+    bool hifi_rf_pcm16;         // Recorder mono Hi-Fi RF uses full-range signed PCM
     uint64_t data_offset;       // First audio byte (data chunk body for WAV, else 0)
     uint64_t data_bytes;        // Audio bytes present (clamped to EOF for WAV)
     uint64_t file_size;
@@ -464,25 +466,6 @@ static bool gui_playback_extract_msps_hint(const char *path, double *out_msps) {
     return false;
 }
 
-static double gui_playback_resolve_real_rate_hz(const char *filepath,
-                                                 uint32_t header_sample_rate,
-                                                 const playback_vorbis_rf_tags_t *tags) {
-    if (tags && tags->has_rf_sample_rate && tags->rf_sample_rate > 0) {
-        return (double)tags->rf_sample_rate;
-    }
-    if (header_sample_rate == 0) {
-        return 0.0;
-    }
-    if (gui_playback_is_audio_sample_rate(header_sample_rate)) {
-        return (double)header_sample_rate;
-    }
-    double msps_hint = 0.0;
-    if (gui_playback_extract_msps_hint(filepath, &msps_hint) && msps_hint > 0.0) {
-        return msps_hint * 1000000.0;
-    }
-    return (double)header_sample_rate * 1000.0;
-}
-
 static bool gui_playback_eq_ascii_ci_char(char a, char b) {
     if (a == b) return true;
     return (char)tolower((unsigned char)a) == (char)tolower((unsigned char)b);
@@ -498,6 +481,66 @@ static bool gui_playback_eq_ascii_ci_bytes(const uint8_t *lhs, size_t lhs_len, c
         }
     }
     return true;
+}
+
+// Only the mono recorder's basename suffix outranks an earlier rate hint.
+static uint32_t gui_playback_hifi_rf_filename_rate(const char *path, const char *extension) {
+    static const char marker[] = "_hifi_rf_16-bit";
+    if (!path) return 0;
+    const char *slash = strrchr(path, '/');
+#if defined(_WIN32) || defined(_WIN64)
+    const char *backslash = strrchr(path, '\\');
+    if (backslash && (!slash || backslash > slash)) slash = backslash;
+#endif
+    const char *name = slash ? slash + 1 : path;
+    const char *separator = strrchr(name, '_');
+    size_t marker_len = sizeof(marker) - 1;
+    if (!separator || (size_t)(separator - name) <= marker_len ||
+        !gui_playback_eq_ascii_ci_bytes((const uint8_t *)separator - marker_len,
+                                       marker_len, marker)) {
+        return 0;
+    }
+
+    const char *rate = separator + 1;
+    const char *dot = strchr(rate, '.');
+    if (!dot || dot - rate < 1 || dot - rate > 2 || strlen(dot) < 9 ||
+        !gui_playback_eq_ascii_ci_bytes((const uint8_t *)dot + 4, 5, "msps.") ||
+        !gui_playback_eq_ascii_ci_bytes((const uint8_t *)dot + 9, strlen(dot + 9), extension)) {
+        return 0;
+    }
+
+    uint32_t rate_khz = 0;
+    for (const char *c = rate; c < dot + 4; ++c) {
+        if (c == dot) continue;
+        if (*c < '0' || *c > '9') return 0;
+        rate_khz = rate_khz * 10u + (uint32_t)(*c - '0');
+    }
+    uint32_t rate_hz = rate_khz * 1000u;
+    return rate_hz >= GUI_VHS_HIFI_LOW_RF_MIN_RATE_HZ && rate_hz <= GUI_VHS_HIFI_LOW_RF_MAX_RATE_HZ
+        ? rate_hz : 0;
+}
+
+static double gui_playback_resolve_real_rate_hz(const char *filepath,
+                                                 uint32_t header_sample_rate,
+                                                 const playback_vorbis_rf_tags_t *tags) {
+    if (tags && tags->has_rf_sample_rate && tags->rf_sample_rate > 0) {
+        return (double)tags->rf_sample_rate;
+    }
+    if (header_sample_rate == 0) {
+        return 0.0;
+    }
+    uint32_t hifi_rate = gui_playback_hifi_rf_filename_rate(filepath, "flac");
+    if (hifi_rate && header_sample_rate == hifi_rate / 1000u) {
+        return (double)hifi_rate;
+    }
+    if (gui_playback_is_audio_sample_rate(header_sample_rate)) {
+        return (double)header_sample_rate;
+    }
+    double msps_hint = 0.0;
+    if (gui_playback_extract_msps_hint(filepath, &msps_hint) && msps_hint > 0.0) {
+        return msps_hint * 1000000.0;
+    }
+    return (double)header_sample_rate * 1000.0;
 }
 
 static bool gui_playback_parse_u64_bytes(const uint8_t *src, size_t len, uint64_t *out_value) {
@@ -518,6 +561,38 @@ static bool gui_playback_parse_u64_bytes(const uint8_t *src, size_t len, uint64_
     }
     *out_value = value;
     return true;
+}
+
+static bool gui_playback_has_positive_flac_tag(const FLAC__StreamMetadata *metadata,
+                                              const char *key) {
+    int index = FLAC__metadata_object_vorbiscomment_find_entry_from(metadata, 0, key);
+    if (index < 0) return false;
+    const FLAC__StreamMetadata_VorbisComment_Entry *entry =
+        &metadata->data.vorbis_comment.comments[index];
+    size_t prefix_len = strlen(key) + 1;
+    uint64_t value = 0;
+    return entry->length > prefix_len &&
+           gui_playback_parse_u64_bytes(entry->entry + prefix_len, entry->length - prefix_len, &value) &&
+           value > 0;
+}
+
+static bool gui_playback_flac_is_hifi_rf(const FLAC__StreamMetadata *metadata,
+                                        uint32_t header_rate) {
+    static const char source[] = "RF_SOURCE";
+    int index = FLAC__metadata_object_vorbiscomment_find_entry_from(metadata, 0, source);
+    if (index >= 0) {
+        const FLAC__StreamMetadata_VorbisComment_Entry *entry =
+            &metadata->data.vorbis_comment.comments[index];
+        size_t prefix_len = sizeof(source);
+        return entry->length > prefix_len &&
+               gui_playback_eq_ascii_ci_bytes(entry->entry + prefix_len, entry->length - prefix_len,
+                                              "RTLSDR_HIFI");
+    }
+    // Early mono captures recorded the source rate and center without RF_SOURCE.
+    return header_rate >= GUI_VHS_HIFI_LOW_RF_MIN_RATE_HZ / 1000u &&
+           header_rate <= GUI_VHS_HIFI_LOW_RF_MAX_RATE_HZ / 1000u &&
+           gui_playback_has_positive_flac_tag(metadata, "SOURCE_SAMPLE_RATE") &&
+           gui_playback_has_positive_flac_tag(metadata, "SOURCE_CENTER_FREQUENCY");
 }
 
 static bool gui_playback_parse_f64_bytes(const uint8_t *src, size_t len, double *out_value) {
@@ -1428,8 +1503,11 @@ static bool gui_playback_raw_open(playback_raw_reader_t *r, playback_file_info_t
         goto fail;
     }
 
+    uint32_t hifi_rate = fmt == PLAYBACK_INPUT_S16
+        ? gui_playback_hifi_rf_filename_rate(filepath, "s16") : 0;
     double msps = 0.0;
-    bool have_msps = gui_playback_extract_msps_hint(filepath, &msps) && msps > 0.0;
+    r->hifi_rf_pcm16 = hifi_rate != 0;
+    bool have_msps = r->hifi_rf_pcm16 || gui_playback_extract_msps_hint(filepath, &msps);
 
     if (fmt == PLAYBACK_INPUT_WAV) {
         uint32_t rate = 0, bits = 0;
@@ -1492,8 +1570,8 @@ static bool gui_playback_raw_open(playback_raw_reader_t *r, playback_file_info_t
         r->data_offset = 0;
         r->data_bytes = r->file_size;
         r->total_samples = r->file_size / (uint64_t)(r->bits / 8);
-        info->real_sample_rate_hz = msps * 1000000.0;
-        info->sample_rate = (uint32_t)(msps * 1000.0);  // kHz-domain equivalent (20 MSPS -> 20000)
+        info->real_sample_rate_hz = hifi_rate ? (double)hifi_rate : msps * 1000000.0;
+        info->sample_rate = hifi_rate ? hifi_rate / 1000u : (uint32_t)(msps * 1000.0);
         info->bits_per_sample = (uint8_t)r->bits;
     }
 
@@ -3535,8 +3613,9 @@ static FLAC__StreamDecoderWriteStatus decoder_write_cb_a(
     // values DIRECTLY (a 20000 Hz tape FLAC with +-2190 peaks, 93.8%
     // non-multiples of 16). A blanket >> 4 crushed the second kind to 1/16
     // amplitude - the waveform-playback accuracy bug - so the convention
-    // is detected from the first non-silent frame and is sticky per
-    // channel per file (see gui_playback_decide_conv16):
+    // is detected from the first non-silent frame for unmarked files and
+    // is sticky per channel (see gui_playback_decide_conv16). The recorder's
+    // mono Hi-Fi RF format declares full-range signed 16-bit PCM up front:
     //   16-bit FLAC: recorder 12-bit container << 4 -> >> 4 restore;
     //               container-domain values stored raw (incl. externally
     //               resampled 8/12-bit captures; overshoot clamped to the
@@ -3692,6 +3771,10 @@ static void decoder_metadata_cb_a(
         fprintf(stderr, "[PLAYBACK] File A header: %u Hz, %u-bit, %u ch, %" PRIu64 " samples\n",
                 ctx->info_a.sample_rate, ctx->info_a.bits_per_sample,
                 ctx->stream_a.channels, ctx->info_a.total_samples);
+    } else if (metadata->type == FLAC__METADATA_TYPE_VORBIS_COMMENT &&
+               ctx->info_a.bits_per_sample == 16 &&
+               gui_playback_flac_is_hifi_rf(metadata, ctx->info_a.sample_rate)) {
+        ctx->conv16_state[0] = PLAYBACK_CONV16_SHIFT4;
     }
 }
 
@@ -3722,6 +3805,10 @@ static void decoder_metadata_cb_b(
         fprintf(stderr, "[PLAYBACK] File B header: %u Hz, %u-bit, %u ch, %" PRIu64 " samples\n",
                 ctx->info_b.sample_rate, ctx->info_b.bits_per_sample,
                 ctx->stream_b.channels, ctx->info_b.total_samples);
+    } else if (metadata->type == FLAC__METADATA_TYPE_VORBIS_COMMENT &&
+               ctx->info_b.bits_per_sample == 16 &&
+               gui_playback_flac_is_hifi_rf(metadata, ctx->info_b.sample_rate)) {
+        ctx->conv16_state[1] = PLAYBACK_CONV16_SHIFT4;
     }
 }
 
@@ -4086,9 +4173,12 @@ static playback_audio_source_t *gui_playback_audio_open(const char *filepath,
             snprintf(err, err_len, "not a valid FLAC stream: %s", filepath);
             goto fail;
         }
+        playback_vorbis_rf_tags_t tags = {0};
+        (void)gui_playback_read_vorbis_rf_tags(filepath, &tags);
         double real_hz = gui_playback_resolve_real_rate_hz(
-            filepath, si.data.stream_info.sample_rate, NULL);
-        if (!gui_playback_is_audio_sample_rate((uint32_t)llround(real_hz))) {
+            filepath, si.data.stream_info.sample_rate, &tags);
+        if (real_hz > PLAYBACK_AUDIO_CLASSIFY_MAX_HZ ||
+            !gui_playback_is_audio_sample_rate((uint32_t)llround(real_hz))) {
             snprintf(err, err_len,
                      "FLAC rate %u Hz is not an audio rate (RF file?)",
                      si.data.stream_info.sample_rate);
@@ -4451,8 +4541,10 @@ static playback_drop_kind_t gui_playback_classify_drop(const char *filepath,
             snprintf(err, err_len, "not a valid FLAC stream: %s", filepath);
             return PLAYBACK_DROP_REJECT;
         }
+        playback_vorbis_rf_tags_t tags = {0};
+        (void)gui_playback_read_vorbis_rf_tags(filepath, &tags);
         double real_hz = gui_playback_resolve_real_rate_hz(
-            filepath, si.data.stream_info.sample_rate, NULL);
+            filepath, si.data.stream_info.sample_rate, &tags);
         if (real_hz > 0.0 && real_hz <= (double)PLAYBACK_AUDIO_CLASSIFY_MAX_HZ) {
             if (si.data.stream_info.total_samples == 0) {
                 snprintf(err, err_len, "audio FLAC has an unknown/zero length: %s", filepath);
@@ -5686,6 +5778,7 @@ static bool gui_playback_open_native_flac(playback_ctx_t *ctx, int channel, cons
     }
 
     FLAC__stream_decoder_set_md5_checking(*decoder, false);
+    FLAC__stream_decoder_set_metadata_respond(*decoder, FLAC__METADATA_TYPE_VORBIS_COMMENT);
 
     // Unknown STREAMINFO total removes finalized RF/provisional endpoint
     // clamps while the UI independently tracks the resolved true length.
@@ -5719,6 +5812,11 @@ static bool gui_playback_open_native_flac(playback_ctx_t *ctx, int channel, cons
         snprintf(err, err_len, "FLAC has %u channels (expected mono)", stream->channels);
         return false;
     }
+    // An unfinalized capture may still have only the generated name.
+    uint32_t hifi_rate = gui_playback_hifi_rf_filename_rate(path, "flac");
+    if (info->bits_per_sample == 16 && hifi_rate && info->sample_rate == hifi_rate / 1000u) {
+        ctx->conv16_state[channel] = PLAYBACK_CONV16_SHIFT4;
+    }
     if (cancel && atomic_load(cancel)) {
         snprintf(err, err_len, "cancelled");
         return false;
@@ -5743,6 +5841,7 @@ static bool gui_playback_prepare_raw(playback_ctx_t *ctx, int channel, const cha
     if (channel) ctx->file_b = r->file;
     else ctx->file_a = r->file;
     ctx->input_is_raw[channel] = true;
+    if (r->hifi_rf_pcm16) ctx->conv16_state[channel] = PLAYBACK_CONV16_SHIFT4;
     ctx->channel_rate_hz[channel] = info->real_sample_rate_hz;
     fprintf(stderr,
             "[PLAYBACK] File %c (%s): header rate=%u Hz, %u-bit, total=%" PRIu64

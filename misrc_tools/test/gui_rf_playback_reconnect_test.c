@@ -47,6 +47,7 @@ void panel_process_all(gui_app_t *app,const int16_t *a,const int16_t *b,size_t c
 bool gui_record_check_disk_space_guard(gui_app_t *app,uint32_t frame,char *msg,size_t capacity) {
     (void)app; (void)frame; (void)msg; (void)capacity; return false;
 }
+bool gui_record_rtlsdr_active(void) { return false; }
 bool gui_record_push_converted(gui_app_t *app, int channel, const int16_t *samples,
                                size_t bytes, uint32_t frame, char *msg, size_t capacity) {
     (void)app; (void)channel; (void)samples; (void)bytes; (void)frame; (void)msg; (void)capacity;
@@ -56,6 +57,26 @@ void gui_record_log_capture_event(gui_app_t *app,const char *level,const char *m
     gui_error_class_t error_class,uint32_t count) {
     (void)app; (void)level; (void)message; (void)error_class; (void)count; assert(false);
 }
+
+/* This fixture uses the RF video path without an audio device. */
+void gui_audio_set_hifi_source(const void *source) { (void)source; }
+void gui_audio_set_rf_source(const void *source, bool burst_audio, gui_audio_rf_mode_t mode) {
+    (void)source; (void)burst_audio; (void)mode;
+}
+void gui_audio_push_rf_checked(const void *source, const float *pcm, size_t frames,
+                               uint64_t end_sample, bool (*current)(const void *)) {
+    (void)source; (void)pcm; (void)frames; (void)end_sample; (void)current;
+}
+void gui_audio_push_ld(const void *source, const float *pcm, size_t frames,
+                       uint64_t end_sample, bool (*current)(const void *)) {
+    gui_audio_push_rf_checked(source, pcm, frames, end_sample, current);
+}
+void gui_audio_reset_hifi(const void *source) { (void)source; }
+bool gui_audio_get_ld_position(const void *source, uint64_t *sample) {
+    (void)source; (void)sample; return false;
+}
+bool gui_audio_rf_output_unavailable(void) { return true; }
+bool gui_audio_finish_rf_source(const void *source) { (void)source; return true; }
 
 static void reconnect_submit_observed(gui_app_t *app,const int16_t *a,const int16_t *b,
     size_t count_a,size_t count_b,const gui_rf_block_info_t info[2],bool supported) {

@@ -299,7 +299,8 @@ static int32_t pattern_zeros(uint32_t i)
 }
 
 static bool write_pattern_flac(const char *path, uint32_t num_samples,
-                               uint32_t sample_rate, uint32_t block, pattern_fn gen)
+                               uint32_t sample_rate, uint32_t block, pattern_fn gen,
+                               FLAC__StreamMetadata *tags)
 {
     FILE *f = fopen(path, "w+b");
     if (!f) return false;
@@ -312,6 +313,7 @@ static bool write_pattern_flac(const char *path, uint32_t num_samples,
               FLAC__stream_encoder_set_blocksize(enc, block) &&
               FLAC__stream_encoder_set_verify(enc, false) &&
               FLAC__stream_encoder_set_total_samples_estimate(enc, num_samples) &&
+              (!tags || FLAC__stream_encoder_set_metadata(enc, &tags, 1)) &&
               FLAC__stream_encoder_init_FILE(enc, f, NULL, NULL) ==
                  FLAC__STREAM_ENCODER_INIT_STATUS_OK;
     if (ok) {
@@ -1416,7 +1418,7 @@ static void test_hifi_rf_rates(const char *temp_dir)
     static const struct {
         const char *filename_rate;
         uint32_t rate_khz;
-    } rates[] = {{"8", 8000}, {"8.192", 8192}, {"10", 10000}};
+    } rates[] = {{"8.000", 8000}, {"8.001", 8001}, {"8.192", 8192}, {"10.000", 10000}};
     const uint32_t pid = (uint32_t)getpid();
     const uint8_t samples[256] = {0};
     char path[512];
@@ -1437,10 +1439,25 @@ static void test_hifi_rf_rates(const char *temp_dir)
         expect_u64(info.total_samples, sizeof(samples), "Hi-Fi raw sample count");
         unlink(path);
 
+        test_case = "hifi_rf_raw_s16_rate";
+        snprintf(path, sizeof(path), "%s/misrc_pb_%u_20msps_hifi_rf_16-bit_%smsps.s16",
+                 temp_dir, pid, rates[i].filename_rate);
+        f = fopen(path, "wb");
+        expect_true(f && fwrite(samples, 1, sizeof(samples), f) == sizeof(samples),
+                    "write merged Hi-Fi raw RF fixture");
+        if (f) fclose(f);
+        memset(&info, 0, sizeof(info));
+        expect_true(gui_playback_validate_file(path, &info), "merged Hi-Fi raw RF validates");
+        expect_i64(info.format, PLAYBACK_INPUT_S16, "merged Hi-Fi raw RF is signed 16-bit");
+        expect_near(info.real_sample_rate_hz, rate_hz, "merged Hi-Fi RF output rate suffix wins");
+        expect_u64(info.sample_rate, rates[i].rate_khz, "merged Hi-Fi RF kHz rate is exact");
+        expect_u64(info.total_samples, sizeof(samples) / 2u, "merged Hi-Fi raw RF sample count");
+        unlink(path);
+
         test_case = "hifi_rf_flac_rate";
         snprintf(path, sizeof(path), "%s/misrc_pb_%u_hifi_%zu.flac", temp_dir, pid, i);
         expect_true(write_pattern_flac(path, sizeof(samples), rates[i].rate_khz,
-                                       256, pattern_zeros), "write Hi-Fi RF FLAC fixture");
+                                       256, pattern_zeros, NULL), "write Hi-Fi RF FLAC fixture");
         memset(&info, 0, sizeof(info));
         expect_true(gui_playback_validate_file(path, &info), "Hi-Fi RF FLAC validates");
         expect_i64(info.format, PLAYBACK_INPUT_FLAC, "Hi-Fi RF FLAC format");
@@ -1448,6 +1465,138 @@ static void test_hifi_rf_rates(const char *temp_dir)
         expect_u64(info.total_samples, sizeof(samples), "Hi-Fi RF FLAC sample count");
         unlink(path);
     }
+}
+
+enum { HIFI_TEST_BLOCK = 16, HIFI_TEST_SAMPLES = 2 * HIFI_TEST_BLOCK };
+
+static int32_t pattern_hifi_rf_scaling(uint32_t i)
+{
+    static const int32_t lead[] = {17, -129, 3001};
+    static const int32_t program[] = {10240, -10240, 16384};
+    return i < HIFI_TEST_BLOCK ? lead[i % 3] : program[(i - HIFI_TEST_BLOCK) % 3];
+}
+
+static void test_hifi_rf_scaling(const char *temp_dir)
+{
+    const uint32_t pid = (uint32_t)getpid();
+    static const struct {
+        const char *filename;
+        bool merged;
+    } raw[] = {
+        {"20msps_hifi_rf_16-bit_8.000msps.s16", true},
+#if !defined(_WIN32) && !defined(_WIN64)
+        {"20msps\\_hifi_rf_16-bit_8.000msps.s16", true},
+#endif
+        {"Tape01_Side_A_20msps_hifi_rf_16-bit_8.000msps.s16", true},
+        {"20msps_8.000msps.s16", false},
+    };
+    uint8_t bytes[2 * HIFI_TEST_SAMPLES];
+    int16_t merged[HIFI_TEST_SAMPLES];
+    int16_t legacy[HIFI_TEST_SAMPLES];
+    char path[512];
+    for (uint32_t i = 0; i < HIFI_TEST_SAMPLES; i++) {
+        int32_t v = pattern_hifi_rf_scaling(i);
+        bytes[2 * i] = (uint8_t)v;
+        bytes[2 * i + 1] = (uint8_t)((uint16_t)v >> 8);
+        merged[i] = (int16_t)(v >> 4);
+        legacy[i] = (int16_t)(v > 2047 ? 2047 : v < -2048 ? -2048 : v);
+    }
+
+    for (size_t i = 0; i < sizeof(raw) / sizeof(raw[0]); i++) {
+        test_case = raw[i].filename;
+        snprintf(path, sizeof(path), "%s/misrc_pb_%u_%s", temp_dir, pid, raw[i].filename);
+        FILE *f = fopen(path, "wb");
+        expect_true(f && fwrite(bytes, 1, sizeof(bytes), f) == sizeof(bytes),
+                    "write 16-bit raw scaling fixture");
+        if (f) fclose(f);
+        playback_file_info_t info = {0};
+        expect_true(gui_playback_validate_file(path, &info), "raw scaling fixture validates");
+        expect_near(info.real_sample_rate_hz, raw[i].merged ? 8000000.0 : 20000000.0,
+                    "only generated mono names prefer the final rate token");
+        raw_harness_channel(path, PLAYBACK_INPUT_S16, HIFI_TEST_SAMPLES, HIFI_TEST_BLOCK,
+                            HIFI_TEST_BLOCK + 1, raw[i].merged ? merged : legacy);
+        unlink(path);
+    }
+
+    static const char *flac_names[] = {
+        "0.192msps_tagged_renamed.bin", "legacy_renamed.flac", "20msps_hifi_rf_16-bit_8.000msps.flac",
+        "Tape01_Side_A_20msps_hifi_rf_16-bit_8.000msps.flac"
+    };
+    for (size_t i = 0; i < sizeof(flac_names) / sizeof(flac_names[0]); i++) {
+        test_case = flac_names[i];
+        snprintf(path, sizeof(path), "%s/misrc_pb_%u_%s", temp_dir, pid, flac_names[i]);
+        FLAC__StreamMetadata *tags = i < 2
+            ? FLAC__metadata_object_new(FLAC__METADATA_TYPE_VORBIS_COMMENT) : NULL;
+        if (i < 2) {
+            expect_true(tags != NULL, "allocate Vorbis tags");
+            if (!tags) continue;
+            if (i == 0) {
+                expect_true(append_tag(tags, "RF_SOURCE", "RTLSDR_HIFI") &&
+                            append_tag(tags, "RF_SAMPLE_RATE", "8000000"), "set mono RF tags");
+            } else {
+                expect_true(append_tag(tags, "SOURCE_SAMPLE_RATE", "1024000") &&
+                            append_tag(tags, "SOURCE_CENTER_FREQUENCY", "1500000"),
+                            "set legacy mono RF source tags");
+            }
+        }
+        expect_true(write_pattern_flac(path, HIFI_TEST_SAMPLES, 8000, HIFI_TEST_BLOCK,
+                                       pattern_hifi_rf_scaling, tags), "write FLAC scaling fixture");
+        if (tags) FLAC__metadata_object_delete(tags);
+
+        char err[192] = {0};
+        expect_i64(gui_playback_classify_drop(path, err, sizeof(err)), PLAYBACK_DROP_RF,
+                   "drag-and-drop selects the RF slot");
+        playback_file_info_t info = {0};
+        expect_true(gui_playback_validate_file(path, &info), "FLAC scaling fixture validates");
+        expect_near(info.real_sample_rate_hz, 8000000.0, "FLAC probe uses the true rate");
+
+        playback_ctx_t *ctx = (playback_ctx_t *)calloc(1, sizeof(*ctx));
+        expect_true(ctx != NULL, "allocate context");
+        if (ctx) {
+            bool channel_b = i == 1;
+            int prepared = gui_playback_prepare(ctx, &s_test_app, channel_b ? NULL : path,
+                                                channel_b ? path : NULL, NULL);
+            expect_i64(prepared, 0, "FLAC scaling fixture prepares");
+            if (prepared == 0) {
+                FLAC__StreamDecoder *decoder = channel_b ? ctx->decoder_b : ctx->decoder_a;
+                expect_near(ctx->channel_rate_hz[channel_b], 8000000.0,
+                            "FLAC playback uses the true rate");
+                expect_i64(ctx->conv16_state[channel_b], PLAYBACK_CONV16_SHIFT4,
+                           "known PCM16 scaling selected before the first frame");
+                expect_true(FLAC__stream_decoder_process_single(decoder), "decode quiet lead");
+                expect_true(FLAC__stream_decoder_process_single(decoder), "decode program");
+                expect_u64(channel_b ? ctx->decode_available_b : ctx->decode_available_a,
+                           HIFI_TEST_SAMPLES, "two FLAC frames decoded");
+                const int16_t *decoded = channel_b ? ctx->decode_buf_b : ctx->decode_buf_a;
+                expect_true(memcmp(decoded, merged, sizeof(merged)) == 0,
+                            "quiet lead and later RF retain the correct scale");
+            }
+            gui_playback_release_context(ctx);
+            free(ctx);
+        }
+        unlink(path);
+    }
+}
+
+static void test_flac_monitor_rate_bounds(const char *temp_dir)
+{
+    test_case = "flac_monitor_rate_bounds";
+    char path[512], err[192] = {0};
+    snprintf(path, sizeof(path), "%s/misrc_pb_%u_monitor_rate.flac",
+             temp_dir, (uint32_t)getpid());
+    FLAC__StreamMetadata *tags = FLAC__metadata_object_new(FLAC__METADATA_TYPE_VORBIS_COMMENT);
+    expect_true(tags != NULL, "allocate Vorbis tags");
+    if (!tags) return;
+    // This RF rate would wrap to a supported 192 kHz when narrowed to uint32_t.
+    expect_true(append_tag(tags, "RF_SAMPLE_RATE", "4295159296"), "set out-of-range RF rate");
+    expect_true(write_pattern_flac(path, 256, 8000, 256, pattern_zeros, tags),
+                "write monitor rate bounds fixture");
+    FLAC__metadata_object_delete(tags);
+
+    playback_audio_source_t *audio = gui_playback_audio_open(path, err, sizeof(err));
+    expect_true(!audio && strstr(err, "not an audio rate"), "reject RF rate before narrowing");
+    gui_playback_audio_destroy(&audio);
+    unlink(path);
 }
 
 static void test_wav_probe(const char *temp_dir)
@@ -1567,7 +1716,7 @@ static void test_sniff_errors(const char *temp_dir)
     test_case = "sniff_renamed_flac";
     snprintf(path, sizeof(path), "%s/misrc_pb_%u_renamed.bin", temp_dir, pid);
     expect_true(write_pattern_flac(path, 4096, TEST_SAMPLE_RATE_KHZ, 4096,
-                                    pattern_recorder_x16), "renamed .bin FLAC fixture");
+                                    pattern_recorder_x16, NULL), "renamed .bin FLAC fixture");
     memset(&info, 0, sizeof(info));
     expect_true(gui_playback_validate_file(path, &info), "renamed .bin with fLaC magic validates");
     expect_i64(info.format, PLAYBACK_INPUT_FLAC, ".bin with fLaC magic is native FLAC");
@@ -1756,7 +1905,7 @@ static void test_ogg_flac(const char *temp_dir)
     test_case = "ogg_fixture";
     snprintf(native_path, sizeof(native_path), "%s/misrc_pb_%u_ogg_native.flac", temp_dir, pid);
     expect_true(write_pattern_flac(native_path, N, TEST_SAMPLE_RATE_KHZ, BLOCK,
-                                    pattern_recorder_x16), "native 16-bit fixture written");
+                                    pattern_recorder_x16, NULL), "native 16-bit fixture written");
     decode_ref_t ref;
     expect_true(decode_flac_i32(native_path, &ref, N), "reference decode");
     expect_u64(ref.count, N, "reference sample count");
@@ -1974,6 +2123,8 @@ int main(void)
     test_conv16_conventions();
     test_raw_probe(temp_dir);
     test_hifi_rf_rates(temp_dir);
+    test_hifi_rf_scaling(temp_dir);
+    test_flac_monitor_rate_bounds(temp_dir);
     test_wav_probe(temp_dir);
     test_raw_read_seek(temp_dir);
     test_sniff_errors(temp_dir);

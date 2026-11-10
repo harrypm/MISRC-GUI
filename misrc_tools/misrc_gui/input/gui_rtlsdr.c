@@ -61,6 +61,8 @@ static rtlsdr_dev_t *s_rtlsdr_dev = NULL;
 static int s_rtlsdr_android_fd = -1;
 #endif
 static atomic_bool s_rtlsdr_running = false;
+static atomic_uint s_rtlsdr_actual_rate;
+static atomic_uint_fast64_t s_rtlsdr_record_tuning;
 static void *s_rtlsdr_thread = NULL;
 
 //-----------------------------------------------------------------------------
@@ -97,6 +99,7 @@ int gui_rtlsdr_enumerate(rtlsdr_device_info_t *devices, int max_devices) {
         const char *name = rtlsdr_get_device_name_by_usb_id(attached[i].vid, attached[i].pid);
         devices[i].index = attached[i].id;
         devices[i].serial[0] = '\0';
+        devices[i].blog_v4 = false;
         snprintf(devices[i].name, sizeof(devices[i].name), "%s (USB %d)",
                  name ? name : "RTL-SDR", attached[i].id);
     }
@@ -112,11 +115,13 @@ int gui_rtlsdr_enumerate(rtlsdr_device_info_t *devices, int max_devices) {
         snprintf(dst->name, sizeof(dst->name), "%s", name ? name : "RTL-SDR");
 
         dst->serial[0] = '\0';
+        dst->blog_v4 = false;
         char manufact[256] = {0};
         char product[256] = {0};
         char serial[256] = {0};
         if (rtlsdr_get_device_usb_strings(i, manufact, product, serial) == 0) {
             snprintf(dst->serial, sizeof(dst->serial), "%s", serial);
+            dst->blog_v4 = strcmp(manufact, "RTLSDRBlog") == 0 && strcmp(product, "Blog V4") == 0;
         }
         added++;
     }
@@ -151,7 +156,8 @@ int gui_rtlsdr_open(gui_app_t *app, int device_index) {
 
     uint32_t rate = app->settings.rtlsdr_sample_rate_hz;
     if (rate == 0) rate = RTL_DEFAULT_RATE_HZ;
-    if (rtlsdr_set_sample_rate(s_rtlsdr_dev, rate) < 0) {
+    const int rate_result = rtlsdr_set_sample_rate(s_rtlsdr_dev, rate);
+    if (rate_result < 0) {
         fprintf(stderr, "[RTL-SDR] Warning: set_sample_rate(%u) failed\n", rate);
     }
 
@@ -163,14 +169,33 @@ int gui_rtlsdr_open(gui_app_t *app, int device_index) {
     // AGC: rtlsdr_set_agc_mode(1=on,0=off). Gain mode: 0=auto,1=manual.
     rtlsdr_set_agc_mode(s_rtlsdr_dev, app->settings.rtlsdr_agc ? 1 : 0);
     if (app->settings.rtlsdr_gain_mode == 1) {
-        rtlsdr_set_tuner_gain_mode(s_rtlsdr_dev, 1);  // manual
-        rtlsdr_set_tuner_gain(s_rtlsdr_dev, app->settings.rtlsdr_gain_tenths_db);
+        const int mode_result = rtlsdr_set_tuner_gain_mode(s_rtlsdr_dev, 1);
+        const int gain_result = rtlsdr_set_tuner_gain(s_rtlsdr_dev, app->settings.rtlsdr_gain_tenths_db);
+#ifdef ENABLE_RTLSDR_BLOG_V4_VGA
+        if (rtlsdr_is_blog_v4(s_rtlsdr_dev)) {
+            const int index = app->settings.rtlsdr_vga_index;
+            r = mode_result < 0 ? mode_result : gain_result;
+            if (r == 0) r = rtlsdr_set_blog_v4_vga_index(s_rtlsdr_dev, index);
+            if (r < 0) {
+                fprintf(stderr, "[RTL-SDR] Failed to apply Blog V4 manual VGA index 0x%02X (err %d)\n",
+                        (unsigned)index, r);
+                gui_rtlsdr_close(app);
+                return GUI_RTLSDR_VGA_FAILED;
+            }
+            fprintf(stderr, "[RTL-SDR] Blog V4 manual VGA index: 0x%02X\n", (unsigned)index);
+        }
+#else
+        (void)mode_result;
+        (void)gain_result;
+#endif
     } else {
         rtlsdr_set_tuner_gain_mode(s_rtlsdr_dev, 0);  // auto
     }
 
     rtlsdr_set_offset_tuning(s_rtlsdr_dev, app->settings.rtlsdr_offset_corr ? 1 : 0);
     rtlsdr_reset_buffer(s_rtlsdr_dev);
+    // The getter can return a cached rate even after a failed USB register write.
+    atomic_store(&s_rtlsdr_actual_rate, rate_result == 0 ? rtlsdr_get_sample_rate(s_rtlsdr_dev) : 0);
     atomic_store(&app->rf_source_rtlsdr_tuning, RTL_TUNE_STEP | rtlsdr_get_center_freq(s_rtlsdr_dev));
 
     fprintf(stderr, "[RTL-SDR] Opened device %d: %u Hz, freq %llu Hz, agc=%d, gain_mode=%d\n",
@@ -181,6 +206,8 @@ int gui_rtlsdr_open(gui_app_t *app, int device_index) {
 
 void gui_rtlsdr_close(gui_app_t *app) {
     (void)app;
+    atomic_store(&s_rtlsdr_record_tuning, 0);
+    atomic_store(&s_rtlsdr_actual_rate, 0);
     if (s_rtlsdr_dev) {
         rtlsdr_close(s_rtlsdr_dev);
         s_rtlsdr_dev = NULL;
@@ -197,12 +224,21 @@ void gui_rtlsdr_close(gui_app_t *app) {
 // Capture thread
 //-----------------------------------------------------------------------------
 
+static bool rtlsdr_interrupt_recording_on_read_gap(gui_app_t *app, int status, int bytes, bool timed_out) {
+    if (status >= 0 || (timed_out && bytes > 0)) return false;
+    atomic_store(&s_rtlsdr_record_tuning, 0);
+    gui_record_rtlsdr_gap(app);
+    return true;
+}
+
 static int rtlsdr_capture_thread(void *ctx) {
     gui_app_t *app = (gui_app_t *)ctx;
     thrd_set_priority(THRD_PRIORITY_CRITICAL);
 
     uint8_t *in = (uint8_t *)malloc(RTL_READ_BYTES + 1u);
     if (!in) {
+        atomic_store(&s_rtlsdr_record_tuning, 0);
+        gui_record_rtlsdr_gap(app);
         gui_record_mark_source_loss();
         fprintf(stderr, "[RTL-SDR] Failed to allocate capture buffer\n");
         atomic_store(&s_rtlsdr_running, false);
@@ -214,11 +250,15 @@ static int rtlsdr_capture_thread(void *ctx) {
     atomic_store(&app->last_callback_time_ms, get_time_ms());
 
     uint64_t batch_count = 0, preview_sample = 0, last_tuning = 0;
+    uint64_t settling_tuning = 0;
+    size_t settling_pairs = 0;
     unsigned int carry = 0;
     bool preview_gap = true;
     const uint32_t rate = atomic_load(&app->sample_rate);
+    const bool record_rate_valid = atomic_load(&s_rtlsdr_actual_rate) != 0;
     while (atomic_load(&s_rtlsdr_running) && !atomic_load(&do_exit)) {
         const uint64_t tuning = atomic_load(&app->rf_source_rtlsdr_tuning);
+        const bool record_settled = (uint32_t)tuning && tuning == atomic_load(&s_rtlsdr_record_tuning);
         if (!(uint32_t)tuning && tuning != last_tuning) {
             // Reset on the I/Q producer, after any earlier block submission.
             gui_video_reset_rtlsdr(app);
@@ -235,17 +275,18 @@ static int rtlsdr_capture_thread(void *ctx) {
         const bool timed_out = false;
 #endif
         if (!atomic_load(&s_rtlsdr_running) || atomic_load(&do_exit)) break;
-        if (r < 0 && !timed_out) {
+        if (rtlsdr_interrupt_recording_on_read_gap(app, r, n_read, timed_out)) {
+            settling_pairs = 0;
+            preview_gap = true;
+            if (timed_out) continue;
             gui_record_mark_source_loss();
             carry = 0;
-            preview_gap = true;
             fprintf(stderr, "[RTL-SDR] read_sync error %d\n", r);
             thrd_sleep_ms(10);
             continue;
         }
         if (n_read <= 0) {
-            if (timed_out) preview_gap = true;
-            else thrd_sleep_ms(1);
+            thrd_sleep_ms(1);
             continue;
         }
 
@@ -255,6 +296,26 @@ static int rtlsdr_capture_thread(void *ctx) {
         carry = (unsigned int)(received & 1u);
         if (received < 2u) continue;
         const size_t pairs = received / 2;
+        // Record only reads started after settling, independently of the display FIFO.
+        if (record_rate_valid && (uint32_t)tuning &&
+            tuning == atomic_load(&app->rf_source_rtlsdr_tuning)) {
+            if (record_settled) {
+                gui_record_rtlsdr_push(app, in, pairs, tuning);
+            } else {
+                // Drain a full batch after connecting or retuning, even if Android delivers it
+                // in pieces. Retuning does not reset the USB byte phase, so keep
+                // carrying any trailing I byte into the next read.
+                if (settling_tuning != tuning) {
+                    settling_tuning = tuning;
+                    settling_pairs = 0;
+                }
+                settling_pairs += pairs;
+                if (settling_pairs >= RTL_READ_BYTES / 2u)
+                    atomic_store(&s_rtlsdr_record_tuning, tuning);
+            }
+        } else if (record_settled) {
+            gui_record_rtlsdr_gap(app);
+        }
         const size_t write_bytes = pairs * sizeof(uint32_t);
         uint32_t *out = bufmgr_write_begin(&app->buffers, BUF_CAPTURE_RF, write_bytes, NULL);
         if (out) {
@@ -301,6 +362,7 @@ static int rtlsdr_capture_thread(void *ctx) {
         batch_count++;
     }
 
+    atomic_store(&s_rtlsdr_record_tuning, 0);
     fprintf(stderr, "[RTL-SDR] Capture thread exiting after %llu batches\n",
             (unsigned long long)batch_count);
     free(in);
@@ -426,8 +488,25 @@ bool gui_rtlsdr_is_running(gui_app_t *app) {
     return atomic_load(&s_rtlsdr_running);
 }
 
+bool gui_rtlsdr_get_rf_source(const gui_app_t *app, uint32_t *rate, uint64_t *tuning) {
+    if (!app || !rate || !tuning || !atomic_load(&s_rtlsdr_running))
+        return false;
+    const uint64_t current_tuning = atomic_load(&app->rf_source_rtlsdr_tuning);
+    const uint32_t actual_rate = atomic_load(&s_rtlsdr_actual_rate);
+    if (!actual_rate || !(uint32_t)current_tuning ||
+        current_tuning != atomic_load(&s_rtlsdr_record_tuning))
+        return false;
+    *rate = actual_rate;
+    *tuning = current_tuning;
+    return true;
+}
+
 int gui_rtlsdr_set_frequency(gui_app_t *app, uint64_t hz) {
     if (!app) return -1;
+    if (gui_record_rtlsdr_active()) {
+        gui_app_set_status(app, "Stop Hi-Fi RF recording before retuning");
+        return -1;
+    }
     // Persist so the next capture start uses the new frequency even if not live.
     app->settings.rtlsdr_freq_hz = hz;
     gui_settings_save(&app->settings);
@@ -436,6 +515,7 @@ int gui_rtlsdr_set_frequency(gui_app_t *app, uint64_t hz) {
         const uint64_t tuning =
             (atomic_load(&app->rf_source_rtlsdr_tuning) & ~(RTL_TUNE_STEP - 1)) + RTL_TUNE_STEP;
         atomic_store(&app->rf_source_rtlsdr_tuning, tuning);
+        atomic_store(&s_rtlsdr_record_tuning, 0);
         int r = rtlsdr_set_center_freq(s_rtlsdr_dev, (uint32_t)hz);
         atomic_store(&app->rf_source_rtlsdr_tuning, tuning | rtlsdr_get_center_freq(s_rtlsdr_dev));
         if (r < 0) {

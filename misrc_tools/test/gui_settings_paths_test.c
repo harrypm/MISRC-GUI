@@ -48,6 +48,16 @@ int main(void) {
     CHECK(gui_settings_format(config, sizeof(config), "%s/settings.json", nested));
     gui_settings_t before, after;
     gui_settings_init_defaults(&before);
+    CHECK(before.rtlsdr_gain_mode == 1);
+    CHECK(before.rtlsdr_gain_tenths_db == 0);
+    CHECK(!before.rtlsdr_agc);
+    CHECK(before.rtlsdr_vga_index == 8);
+    CHECK(!before.rtlsdr_hifi_rf_tag[0]);
+    CHECK(gui_settings_copy(before.rtlsdr_hifi_rf_tag, sizeof(before.rtlsdr_hifi_rf_tag), unicode));
+    before.rtlsdr_gain_mode = 0;
+    before.rtlsdr_gain_tenths_db = 170;
+    before.rtlsdr_agc = true;
+    before.rtlsdr_vga_index = 0;
 #ifdef ENABLE_DDD
     CHECK(!before.ddd_use_winusb);
     CHECK(!before.ddd_libusb_raw_io);
@@ -69,6 +79,11 @@ int main(void) {
     CHECK(!strcmp(before.playback_file_a, after.playback_file_a));
     CHECK(!strcmp(before.playback_file_b, after.playback_file_b));
     CHECK(!strcmp(before.ingest_notes, after.ingest_notes));
+    CHECK(after.rtlsdr_gain_mode == 0);
+    CHECK(after.rtlsdr_gain_tenths_db == 170);
+    CHECK(after.rtlsdr_agc);
+    CHECK(after.rtlsdr_vga_index == 0);
+    CHECK(!strcmp(before.rtlsdr_hifi_rf_tag, after.rtlsdr_hifi_rf_tag));
 #ifdef ENABLE_DDD
     CHECK(after.ddd_use_winusb);
     CHECK(after.ddd_libusb_raw_io);
@@ -78,6 +93,11 @@ int main(void) {
     gui_settings_load(&after);
     CHECK(!strcmp(after.output_path, "C:\\tapes\\new\\"));
     CHECK(!strcmp(after.playback_file_a, "C:\\video\\test.flac"));
+    CHECK(after.rtlsdr_gain_mode == 1);
+    CHECK(after.rtlsdr_gain_tenths_db == 0);
+    CHECK(!after.rtlsdr_agc);
+    CHECK(after.rtlsdr_vga_index == 8);
+    CHECK(!after.rtlsdr_hifi_rf_tag[0]);
 #ifdef ENABLE_DDD
     CHECK(!after.ddd_use_winusb);
     CHECK(!after.ddd_libusb_raw_io);
@@ -92,6 +112,15 @@ int main(void) {
     CHECK(find_value("{\"settings_format_version\": 2,\"output_path\": \"\\u", "output_path") == NULL);
     CHECK(find_value("{\"settings_format_version\": 2,\"output_path\": \"\\u12", "output_path") == NULL);
     CHECK(find_value("{\"settings_format_version\": 2,\"output_path\": \"\\ud800\\u", "output_path") == NULL);
+
+    const char *invalid_vga[] = {"-1", "9", "2.5", "2oops", "true", "\"\""};
+    for (size_t i = 0; i < sizeof(invalid_vga) / sizeof(invalid_vga[0]); ++i) {
+        char json[64];
+        snprintf(json, sizeof(json), "{\"rtlsdr_vga_index\": %s}", invalid_vga[i]);
+        CHECK(write_config(config, json));
+        gui_settings_load(&after);
+        CHECK(after.rtlsdr_vga_index == 8);
+    }
 
     // A leading BOM must preserve both legacy paths and current JSON escapes,
     // including the values that automatic saving would otherwise overwrite.
@@ -136,6 +165,12 @@ int main(void) {
     CHECK(write_config(config, name_json));
     gui_settings_load(&after);
     CHECK(after.output_path[0] == '\0');
+    CHECK(gui_settings_format(name_json, sizeof(name_json),
+        "{\"output_path\": \".\",\"rtlsdr_hifi_rf_tag\": \"%s\"}", oversized_name));
+    CHECK(write_config(config, name_json));
+    gui_settings_load(&after);
+    CHECK(!strcmp(after.output_path, "."));
+    CHECK(!after.rtlsdr_hifi_rf_tag[0]);
     char small[] = "unchanged";
     CHECK(!gui_settings_copy(small, sizeof(small), "too-long-to-copy"));
     CHECK(!strcmp(small, "unchanged"));

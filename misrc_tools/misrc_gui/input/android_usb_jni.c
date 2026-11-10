@@ -91,7 +91,7 @@ enum {
     ANDROID_PICKER_KIND_PLAYBACK_B = 3,
 };
 static pthread_mutex_t s_async_picker_mtx = PTHREAD_MUTEX_INITIALIZER;
-static int  s_async_picker_active = 0;        /* 1 = picker launched */
+static int  s_async_picker_active = 0;        /* launched, until the render thread consumes */
 static int  s_async_picker_result_pending = 0;
 static int  s_async_picker_result_kind = 0;
 static int  s_async_picker_result_ok = 0;
@@ -284,31 +284,45 @@ Java_dev_misrc_gui_MainActivity_nativeUsbPermissionResult(JNIEnv *env, jobject t
     LOGI("nativeUsbPermissionResult: granted=%d", granted ? 1 : 0);
 }
 
-/* MainActivity.nativePickerResult(int kind, boolean accepted, String path) */
-JNIEXPORT void JNICALL
-Java_dev_misrc_gui_MainActivity_nativePickerResult(JNIEnv *env, jobject thiz, jint kind, jboolean accepted, jstring path)
+/* MainActivity.nativePickerResult(int kind, boolean accepted, byte[] utf8Path) */
+JNIEXPORT jboolean JNICALL
+Java_dev_misrc_gui_MainActivity_nativePickerResult(JNIEnv *env, jobject thiz, jint kind,
+                                                  jboolean accepted, jbyteArray path)
 {
     (void)thiz;
-    const char *cpath = path ? (*env)->GetStringUTFChars(env, path, NULL) : NULL;
+    char cpath[sizeof(s_async_picker_result_path)] = {0};
+    jsize length = path ? (*env)->GetArrayLength(env, path) : 0;
+    bool valid_path = (size_t)length < sizeof(cpath) &&
+                      (!accepted || kind == ANDROID_PICKER_KIND_OUTPUT_DIR || length > 0);
+    if (valid_path && length > 0) {
+        (*env)->GetByteArrayRegion(env, path, 0, length, (jbyte *)cpath);
+        if ((*env)->ExceptionCheck(env)) {
+            clear_pending_jni_exception(env, "GetByteArrayRegion(picker path)");
+            valid_path = false;
+        } else if (memchr(cpath, '\0', (size_t)length)) {
+            valid_path = false;
+        }
+    }
 
     pthread_mutex_lock(&s_async_picker_mtx);
-    s_async_picker_result_kind = (int)kind;
-    s_async_picker_result_ok = accepted ? 1 : 0;
-    if (cpath) {
-        snprintf(s_async_picker_result_path, sizeof(s_async_picker_result_path), "%s", cpath);
-    } else {
-        s_async_picker_result_path[0] = '\0';
+    bool queued = s_async_picker_active && !s_async_picker_result_pending &&
+                  s_async_picker_result_kind == (int)kind;
+    if (queued) {
+        s_async_picker_result_ok = accepted && valid_path;
+        if (s_async_picker_result_ok) {
+            memcpy(s_async_picker_result_path, cpath, (size_t)length + 1);
+        } else {
+            s_async_picker_result_path[0] = '\0';
+        }
+        s_async_picker_result_pending = 1;
     }
-    s_async_picker_result_pending = 1;
-    s_async_picker_active = 0;
     pthread_mutex_unlock(&s_async_picker_mtx);
 
-    LOGI("nativePickerResult: kind=%d accepted=%d path=%s",
-         (int)kind, accepted ? 1 : 0, cpath ? cpath : "(null)");
-
-    if (cpath) {
-        (*env)->ReleaseStringUTFChars(env, path, cpath);
+    if (queued) {
+        LOGI("nativePickerResult: kind=%d accepted=%d path=%s",
+             (int)kind, accepted && valid_path, valid_path ? cpath : "(invalid)");
     }
+    return queued && valid_path ? JNI_TRUE : JNI_FALSE;
 }
 
 /* MainActivity.nativeSetUsbDevicePresent(boolean present) — Java reports
@@ -643,23 +657,32 @@ static int android_launch_picker_async(int picker_kind, int playback_channel)
     }
 
     pthread_mutex_lock(&s_async_picker_mtx);
-    s_async_picker_active = 1;
-    s_async_picker_result_pending = 0;
-    s_async_picker_result_kind = picker_kind;
+    bool started = !s_async_picker_active;
+    if (started) {
+        s_async_picker_active = 1;
+        s_async_picker_result_kind = picker_kind;
+    }
     pthread_mutex_unlock(&s_async_picker_mtx);
 
-    if (picker_kind == ANDROID_PICKER_KIND_OUTPUT_DIR) {
-        (*env)->CallVoidMethod(env, activity, mid);
-        clear_pending_jni_exception(env, "CallVoidMethod(requestOutputFolderFromNative async)");
-    } else {
-        (*env)->CallVoidMethod(env, activity, mid, (jint)playback_channel);
-        clear_pending_jni_exception(env, "CallVoidMethod(requestPlaybackFileFromNative async)");
+    if (started) {
+        if (picker_kind == ANDROID_PICKER_KIND_OUTPUT_DIR) {
+            (*env)->CallVoidMethod(env, activity, mid);
+        } else {
+            (*env)->CallVoidMethod(env, activity, mid, (jint)playback_channel);
+        }
+        if ((*env)->ExceptionCheck(env)) {
+            clear_pending_jni_exception(env, "CallVoidMethod(Android picker async)");
+            pthread_mutex_lock(&s_async_picker_mtx);
+            started = s_async_picker_result_pending != 0;
+            if (!started) s_async_picker_active = 0;
+            pthread_mutex_unlock(&s_async_picker_mtx);
+        }
     }
 
     (*env)->DeleteLocalRef(env, cls);
     (*env)->DeleteLocalRef(env, activity);
     (*s_jvm)->DetachCurrentThread(s_jvm);
-    return 1;
+    return started ? 1 : 0;
 }
 
 int android_pick_output_folder_async(void)
@@ -695,7 +718,13 @@ int android_poll_picker_result(int *out_kind, int *out_ok, char *out_path, size_
     if (out_kind) *out_kind = s_async_picker_result_kind;
     if (out_ok)   *out_ok   = s_async_picker_result_ok;
     if (out_path && out_path_len > 0) {
-        snprintf(out_path, out_path_len, "%s", s_async_picker_result_path);
+        size_t path_len = strlen(s_async_picker_result_path);
+        if (path_len < out_path_len) {
+            memcpy(out_path, s_async_picker_result_path, path_len + 1);
+        } else {
+            out_path[0] = '\0';
+            if (out_ok) *out_ok = 0;
+        }
     }
     pthread_mutex_unlock(&s_async_picker_mtx);
     return 1;

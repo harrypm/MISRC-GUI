@@ -16,6 +16,20 @@ USB handle. Android capture also uses a bounded synchronous bulk read
 that returns partial I/Q data on timeout. This lets capture stop before
 the USB handle and descriptor are closed.
 
+The patch also adds `rtlsdr_is_blog_v4` and
+`rtlsdr_set_blog_v4_vga_index`. The device check matches the opened
+receiver's R828D tuner and cached USB manufacturer/product strings
+(`RTLSDRBlog` / `Blog V4`). The setter accepts indices `0x00`–`0x08` in
+manual tuner gain mode with the tuner active. The default is `0x08`.
+The library retains the selected index for that device handle and reapplies
+it on manual gain writes. A failed I²C write restores the register shadow
+so the write can be retried. MISRC enables the GUI control on desktop
+builds that detect the patched API.
+
+The R82xx tuning path now returns an error if the PLL fails to lock. This
+allows MISRC to reject Hi-Fi RF recording until the receiver has a valid
+tuned center frequency.
+
 The upstream CMake and pkg-config metadata report 2.0.1 at this tag.
 The tag and commit identify the actual source pin. See [COPYING](COPYING)
 and the notices in the original source files.

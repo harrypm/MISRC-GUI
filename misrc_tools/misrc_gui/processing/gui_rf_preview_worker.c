@@ -459,7 +459,9 @@ static bool rf_uses_native_audio(gui_rf_profile_t profile, uint32_t rate, uint32
 }
 bool gui_rf_preview_worker_rate_supported(gui_rf_profile_t profile, uint32_t rate) {
     if (rf_uses_native_audio(profile, rate, 0)) return true;
-    if (rate < RF_MIN_RATE || rate > RF_MAX_RATE) return false;
+    if (rate < RF_MIN_RATE)
+        return gui_rf_profile_is_audio_only(profile) && gui_rf_resampler_output_capacity_hifi(rate, 1);
+    if (rate > RF_MAX_RATE) return false;
     if (rf_wideband_profile(profile))
         return rate >= GUI_RF_DECODE_RATE_HZ &&
                gui_rf_resampler_output_capacity_ed_beta(rate, 1) != 0;
@@ -472,7 +474,7 @@ static const char *rf_rate_error(const gui_rf_preview_worker_t *w) {
         return "Hi-Fi I/Q: use 1.024/1.200/1.536/2.048/2.400 MSPS and center both carriers";
     }
     if (gui_rf_profile_is_audio_only(w->profile) && w->source_rate < RF_MIN_RATE)
-        return "Unsupported Hi-Fi RF rate: use 8, 8.192, 10 or at least 16 MSPS";
+        return "Unsupported Hi-Fi RF rate: use 8/8.192/10 MSPS, or 8–10 MSPS with SoXR";
     if (rf_wideband_profile(w->profile) && w->source_rate < GUI_RF_DECODE_RATE_HZ) {
         if (gui_rf_profile_is_laserdisc(w->profile))
             return "Unsupported LaserDisc RF rate: requires at least 20 MSPS";
@@ -493,9 +495,11 @@ static bool rf_configure_rate(gui_rf_preview_worker_t *w, uint32_t rate, uint32_
     if (w->native_audio_rate) return true;
     if (iq_center || !gui_rf_preview_worker_rate_supported(w->profile, rate)) return false;
     bool wideband = rf_wideband_profile(w->profile);
-    if (!rf_reserve_output(&w->output, &w->output_capacity,
-            gui_rf_resampler_output_capacity(rate, RF_BLOCK_SAMPLES))) return false;
-    w->resampler = gui_rf_resampler_create(rate);
+    const bool low_hifi = rate < RF_MIN_RATE;
+    const size_t capacity = low_hifi ? gui_rf_resampler_output_capacity_hifi(rate, RF_BLOCK_SAMPLES)
+                                     : gui_rf_resampler_output_capacity(rate, RF_BLOCK_SAMPLES);
+    if (!rf_reserve_output(&w->output, &w->output_capacity, capacity)) return false;
+    w->resampler = low_hifi ? gui_rf_resampler_create_hifi(rate) : gui_rf_resampler_create(rate);
     if (!w->resampler) return false;
     if (wideband) {
         /* ED Beta, S-VHS and LaserDisc keep RF up to the wider 20 MSPS
@@ -1110,12 +1114,18 @@ static int rf_worker_thread(void *context) {
         }
         uint64_t control = atomic_load_explicit(&w->control, memory_order_acquire);
         if (control != w->applied_control) {
-            bool was_wideband = rf_wideband_profile(w->profile);
+            const gui_rf_profile_t previous_profile = w->profile;
             w->profile = (gui_rf_profile_t)atomic_load_explicit(&w->requested_profile, memory_order_relaxed);
             if (gui_rf_profile_has_audio(w->profile)) (void)rf_audio_start(w);
-            if (w->source_rate && (was_wideband != rf_wideband_profile(w->profile) ||
-                (w->native_audio_rate != 0) != rf_uses_native_audio(w->profile, w->source_rate, w->source_iq_center)))
-                (void)rf_configure_rate(w, w->source_rate, w->source_iq_center);
+            const uint32_t rate = w->source_rate;
+            const uint32_t iq_center = w->source_iq_center;
+            const bool low_rf_support_changed = rate && rate < RF_MIN_RATE && !iq_center &&
+                gui_rf_preview_worker_rate_supported(previous_profile, rate) !=
+                gui_rf_preview_worker_rate_supported(w->profile, rate);
+            if (rate && (rf_wideband_profile(previous_profile) != rf_wideband_profile(w->profile) ||
+                (w->native_audio_rate != 0) != rf_uses_native_audio(w->profile, rate, iq_center) ||
+                low_rf_support_changed))
+                (void)rf_configure_rate(w, rate, iq_center);
             /* Publish completion only after reset and audio invalidation. */
             rf_reset_decoder(w, w->source_rate && !w->resampler && !w->native_audio_rate
                 ? rf_rate_error(w) : "RF preview reset; acquiring");
@@ -1551,7 +1561,7 @@ static bool rf_submit(gui_rf_preview_worker_t *w, const void *samples, size_t co
     uint64_t read = atomic_load_explicit(&w->read_index, memory_order_acquire);
     uint64_t freed = atomic_load_explicit(&w->freed_duration_us, memory_order_acquire);
     uint32_t rate = info->sample_rate_hz;
-    if (!rate || (!info->iq_center_hz && rate < RF_MIN_RATE && !gui_vhs_hifi_is_native_low_rate(rate)))
+    if (!rate || (!info->iq_center_hz && rate < GUI_VHS_HIFI_LOW_RF_MIN_RATE_HZ))
         rate = RF_MIN_RATE;
     uint64_t duration = ((uint64_t)count * 1000000u + rate - 1) / rate;
     /* Admit one low-rate I/Q batch so the worker can report an unsupported rate. */

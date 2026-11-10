@@ -8,6 +8,7 @@
 #include "gui_cvbs.h"
 #include "../input/gui_playback.h"
 #include "../output/gui_audio.h"
+#include "../output/gui_record.h"
 #include "gui_trigger.h"
 #include "gui_vhs_fm.h"
 #include "gui_vhs_hifi.h"
@@ -5539,7 +5540,9 @@ static void video_submit_rf(gui_app_t *app, const int16_t *samples_a, const int1
     uint64_t drops=atomic_load(&app->buffers.stats[BUF_CAPTURE_RF].write_drops) +
                    atomic_load(&app->buffers.stats[BUF_RECORD_A].write_drops) +
                    atomic_load(&app->buffers.stats[BUF_RECORD_B].write_drops);
-    if (app->is_recording) {
+    if (gui_record_rtlsdr_active()) {
+        record=video_buffer_percent(app,BUF_RECORD_A);
+    } else if (app->is_recording) {
         for (int ch=0;ch<2;++ch) {
             if (!(ch ? app->settings.capture_b : app->settings.capture_a)) continue;
             buffer_id_t id=ch ? BUF_RECORD_B : BUF_RECORD_A;

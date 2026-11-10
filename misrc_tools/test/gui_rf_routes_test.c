@@ -28,6 +28,8 @@ static atomic_bool hold_copy, copy_entered, detach_done;
 static vhs_fm_decoder_t *detach_decoder;
 static gui_app_t route_app;
 static size_t simulated_fill;
+static bool mono_recording;
+bool gui_record_rtlsdr_active(void) { return mono_recording; }
 static int16_t route_a[2]={123,-456}, route_b[2]={789,-123};
 static gui_rf_block_info_t route_info[2]={{40000000,123456,42,false},{20000000,654321,43,true}};
 
@@ -1318,6 +1320,20 @@ int main(void) {
     gui_video_submit_rf(&route_app,NULL,NULL,0,0,route_info,true);
     route_app.is_recording=true; gui_video_submit_rf(&route_app,NULL,NULL,0,0,route_info,true);
     assert(!atomic_load(&s_rf_pressure_paused));
+    // Mono records through A even when the saved native channel is disabled.
+    route_app.settings.capture_a=false;
+    atomic_store(&route_app.buffers.stats[BUF_RECORD_A].bytes_written,2000);
+    gui_video_submit_rf(&route_app,NULL,NULL,0,0,route_info,true);
+    assert(!atomic_load(&s_rf_pressure_paused));
+    mono_recording=true;
+    gui_video_submit_rf(&route_app,NULL,NULL,0,0,route_info,true);
+    assert(atomic_load(&s_rf_pressure_paused));
+    mono_recording=false;
+    route_app.is_capturing=false;
+    atomic_store(&route_app.buffers.stats[BUF_RECORD_A].bytes_written,1024);
+    gui_video_submit_rf(&route_app,NULL,NULL,0,0,route_info,true);
+    route_app.settings.capture_a=true;
+    route_app.is_capturing=true;
     // Independent B source preserves its own metadata and receives one copy.
     route_app.panel_config_b.left_view=PANEL_VIEW_CVBS; route_app.panel_config_b.left_state=b;
     atomic_store(&b->active_plugin,VIDEO_PLUGIN_VHS_FM); gui_video_update_rf_routes(&route_app);
