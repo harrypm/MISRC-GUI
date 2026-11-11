@@ -8,11 +8,11 @@
 #include <limits.h>
 
 #include "../../common/libusb_compat.h"
-#include "../../common/ddd_protocol.h"
 #include "../../common/threading.h"
 #include "gui_ddd_async.h"
 
 #define GUI_DDD_ASYNC_EVENT_POLL_US 10000L
+#define GUI_DDD_ASYNC_FAILED_TAIL_BLOCK_LIMIT 3u
 
 _Static_assert(GUI_DDD_ASYNC_TRANSFER_COUNT == 96,
                "DDD 3.1 queue geometry must remain 96 x 128 KiB");
@@ -50,6 +50,7 @@ struct gui_ddd_async_orphan {
     uint8_t *telemetry_buffer;
     atomic_bool telemetry_in_flight;
     uint64_t telemetry_due_ms;
+    uint64_t telemetry_submitted_ms;
     unsigned telemetry_failures;
     bool telemetry_primed;
     bool telemetry_cancel_requested;
@@ -106,6 +107,8 @@ static void gui_ddd_async_latch_failure(gui_ddd_async_engine_t *engine,
                                         int actual_length,
                                         uint64_t submission_id)
 {
+    gui_ddd_async_failure_snapshot_t *failure;
+
     if (!engine || engine->failed) return;
     engine->failed = true;
     engine->accepting_submissions = false;
@@ -114,6 +117,23 @@ static void gui_ddd_async_latch_failure(gui_ddd_async_engine_t *engine,
     engine->result.transfer_status = transfer_status;
     engine->result.actual_length = actual_length;
     engine->result.submission_id = submission_id;
+
+    failure = &engine->result.failure;
+    failure->valid = true;
+    failure->time_ms = gui_ddd_async_now_ms(engine);
+    failure->in_flight = atomic_load(&engine->in_flight);
+    for (size_t i = 0; i < GUI_DDD_ASYNC_TRANSFER_COUNT; ++i) {
+        if (engine->policy_slots[i].state == GUI_DDD_ASYNC_SLOT_COMPLETE) {
+            failure->ready_transfers++;
+        }
+    }
+    failure->next_consume_id = engine->order.next_consume_id;
+    failure->next_submit_id = engine->next_submit_id;
+    failure->completed_transfers = engine->result.completed_transfers;
+    failure->consumed_transfers = engine->result.consumed_transfers;
+    failure->telemetry_readings = engine->result.telemetry_readings;
+    failure->telemetry_failures = engine->result.telemetry_failures;
+    failure->telemetry_in_flight = atomic_load(&engine->telemetry_in_flight);
     gui_ddd_async_signal_failure(engine);
 }
 
@@ -133,15 +153,16 @@ static void LIBUSB_CALL gui_ddd_async_transfer_callback(
 
     if (policy_slot->state != GUI_DDD_ASYNC_SLOT_SUBMITTED ||
         atomic_load(&engine->in_flight) == 0) {
+        policy_slot->state = GUI_DDD_ASYNC_SLOT_FAILED;
         gui_ddd_async_latch_failure(
             engine, GUI_DDD_ASYNC_RESULT_ORDER_FAILURE, 0,
             (int)transfer->status, transfer->actual_length,
             policy_slot->submission_id);
-        policy_slot->state = GUI_DDD_ASYNC_SLOT_FAILED;
         atomic_fetch_sub(&engine->callbacks_active, 1);
         return;
     }
 
+    atomic_fetch_sub(&engine->in_flight, 1);
     engine->result.completed_transfers++;
     slot->actual_length = transfer->actual_length;
 
@@ -153,12 +174,10 @@ static void LIBUSB_CALL gui_ddd_async_transfer_callback(
                 engine, GUI_DDD_ASYNC_RESULT_SHORT_TRANSFER, 0,
                 (int)transfer->status, transfer->actual_length,
                 policy_slot->submission_id);
-            atomic_fetch_sub(&engine->in_flight, 1);
             atomic_fetch_sub(&engine->callbacks_active, 1);
             return;
         }
         policy_slot->state = GUI_DDD_ASYNC_SLOT_COMPLETE;
-        atomic_fetch_sub(&engine->in_flight, 1);
         atomic_fetch_sub(&engine->callbacks_active, 1);
         return;
     }
@@ -166,7 +185,6 @@ static void LIBUSB_CALL gui_ddd_async_transfer_callback(
     if (transfer->status == LIBUSB_TRANSFER_CANCELLED &&
         (slot->cancel_requested || engine->failed)) {
         policy_slot->state = GUI_DDD_ASYNC_SLOT_CANCELLED;
-        atomic_fetch_sub(&engine->in_flight, 1);
         atomic_fetch_sub(&engine->callbacks_active, 1);
         return;
     }
@@ -176,7 +194,6 @@ static void LIBUSB_CALL gui_ddd_async_transfer_callback(
         engine, GUI_DDD_ASYNC_RESULT_TRANSFER_FAILURE, 0,
         (int)transfer->status, transfer->actual_length,
         policy_slot->submission_id);
-    atomic_fetch_sub(&engine->in_flight, 1);
     atomic_fetch_sub(&engine->callbacks_active, 1);
 }
 
@@ -199,7 +216,9 @@ static int gui_ddd_async_submit_slot(gui_ddd_async_engine_t *engine,
                              gui_ddd_async_transfer_callback,
                              slot,
                              0);
-    slot->transfer->flags = LIBUSB_TRANSFER_SHORT_NOT_OK;
+    /* The shared completion handler checks length. Keep libusb from
+     * turning a successful short read into a generic transfer error. */
+    slot->transfer->flags = 0;
 
     if (engine->config->submit_override) {
         rc = engine->config->submit_override(
@@ -210,7 +229,7 @@ static int gui_ddd_async_submit_slot(gui_ddd_async_engine_t *engine,
     if (rc < 0) {
         policy_slot->state = GUI_DDD_ASYNC_SLOT_FAILED;
         gui_ddd_async_latch_failure(
-            engine, GUI_DDD_ASYNC_RESULT_SUBMIT_FAILURE, rc, 0, 0,
+            engine, GUI_DDD_ASYNC_RESULT_SUBMIT_FAILURE, rc, -1, -1,
             policy_slot->submission_id);
         return -1;
     }
@@ -232,7 +251,7 @@ static void gui_ddd_async_note_telemetry_failure(
     }
     if (engine->telemetry_failures ==
             GUI_DDD_ASYNC_TELEMETRY_MAX_FAILURES &&
-        !engine->stopping && engine->config->telemetry) {
+        !engine->stopping && !engine->failed && engine->config->telemetry) {
         /* Remove a stale instrument after the bounded retry budget. The
          * backend callback is deliberately parse/publish-only, so this cannot
          * stall the USB event pump. */
@@ -265,7 +284,14 @@ static void LIBUSB_CALL gui_ddd_async_telemetry_callback(
                 gui_ddd_async_note_telemetry_failure(engine);
             } else {
                 engine->result.telemetry_readings++;
-                if (!engine->stopping && engine->config->telemetry &&
+                if (engine->failed && engine->config->telemetry) {
+                    gui_ddd_async_fifo_completion_t *completion =
+                        &engine->result.fifo_completion_after_fault;
+                    completion->valid = true;
+                    completion->submitted_ms = engine->telemetry_submitted_ms;
+                    completion->completed_ms = gui_ddd_async_now_ms(engine);
+                    completion->telemetry = validated;
+                } else if (!engine->stopping && engine->config->telemetry &&
                     gui_ddd_async_policy_telemetry_should_publish(
                         &engine->telemetry_primed)) {
                     engine->config->telemetry(
@@ -303,8 +329,9 @@ static void gui_ddd_async_maybe_submit_telemetry(
             engine->telemetry_due_ms)) {
         return;
     }
-    engine->telemetry_due_ms =
-        now_ms + GUI_DDD_ASYNC_TELEMETRY_INTERVAL_MS;
+    uint64_t interval_ms = engine->config->telemetry_interval_ms;
+    if (interval_ms == 0) interval_ms = GUI_DDD_ASYNC_TELEMETRY_INTERVAL_MS;
+    engine->telemetry_due_ms = now_ms + interval_ms;
     engine->telemetry_cancel_requested = false;
 
     libusb_fill_control_setup(
@@ -333,6 +360,7 @@ static void gui_ddd_async_maybe_submit_telemetry(
         gui_ddd_async_note_telemetry_failure(engine);
         return;
     }
+    engine->telemetry_submitted_ms = now_ms;
     atomic_store(&engine->telemetry_in_flight, true);
 }
 
@@ -384,7 +412,7 @@ static void gui_ddd_async_cancel_in_flight(gui_ddd_async_engine_t *engine)
         if (rc < 0 && rc != LIBUSB_ERROR_NOT_FOUND) {
             /* Preserve the original failure, but keep pumping callbacks. */
             gui_ddd_async_latch_failure(
-                engine, GUI_DDD_ASYNC_RESULT_EVENT_FAILURE, rc, 0, 0,
+                engine, GUI_DDD_ASYNC_RESULT_EVENT_FAILURE, rc, -1, -1,
                 policy_slot->submission_id);
         }
     }
@@ -414,7 +442,7 @@ static int gui_ddd_async_consume_ready(gui_ddd_async_engine_t *engine)
         if (next_state == GUI_DDD_ASYNC_NEXT_WAIT) return 0;
         if (next_state == GUI_DDD_ASYNC_NEXT_STALE) {
             gui_ddd_async_latch_failure(
-                engine, GUI_DDD_ASYNC_RESULT_ORDER_FAILURE, 0, 0, 0,
+                engine, GUI_DDD_ASYNC_RESULT_ORDER_FAILURE, 0, -1, -1,
                 engine->order.next_consume_id);
             return -1;
         }
@@ -428,8 +456,8 @@ static int gui_ddd_async_consume_ready(gui_ddd_async_engine_t *engine)
             engine->policy_slots[slot_index].state =
                 GUI_DDD_ASYNC_SLOT_FAILED;
             gui_ddd_async_latch_failure(
-                engine, GUI_DDD_ASYNC_RESULT_CONSUMER_FAILURE, 0, 0,
-                slot->actual_length,
+                engine, GUI_DDD_ASYNC_RESULT_CONSUMER_FAILURE, 0,
+                LIBUSB_TRANSFER_COMPLETED, slot->actual_length,
                 engine->policy_slots[slot_index].submission_id);
             return -1;
         }
@@ -448,7 +476,8 @@ static int gui_ddd_async_consume_ready(gui_ddd_async_engine_t *engine)
     }
 }
 
-static int gui_ddd_async_pump_events(gui_ddd_async_engine_t *engine)
+static int gui_ddd_async_pump_events(gui_ddd_async_engine_t *engine,
+                                     long timeout_us)
 {
     struct timeval timeout;
     int rc;
@@ -456,20 +485,62 @@ static int gui_ddd_async_pump_events(gui_ddd_async_engine_t *engine)
     if (engine->config->event_pump_override) {
         rc = engine->config->event_pump_override(
             engine->config->event_pump_context,
-            GUI_DDD_ASYNC_EVENT_POLL_US);
+            timeout_us);
     } else {
         timeout.tv_sec = 0;
-        timeout.tv_usec = GUI_DDD_ASYNC_EVENT_POLL_US;
+        timeout.tv_usec = timeout_us;
         rc = libusb_handle_events_timeout_completed(
             engine->config->usb_context, &timeout, NULL);
     }
     if (rc < 0 && rc != LIBUSB_ERROR_INTERRUPTED) {
         gui_ddd_async_latch_failure(
-            engine, GUI_DDD_ASYNC_RESULT_EVENT_FAILURE, rc, 0, 0,
+            engine, GUI_DDD_ASYNC_RESULT_EVENT_FAILURE, rc, -1, -1,
             engine->order.next_consume_id);
         return -1;
     }
     return 0;
+}
+
+static bool gui_ddd_async_failed_tail_pending(
+    const gui_ddd_async_engine_t *engine)
+{
+    gui_ddd_async_order_policy_t tail = engine->order;
+    gui_ddd_async_order_policy_advance(&tail);
+    for (size_t i = 0; i < GUI_DDD_ASYNC_FAILED_TAIL_BLOCK_LIMIT; ++i) {
+        size_t index = (size_t)(tail.next_consume_id % tail.slot_count);
+        const gui_ddd_async_policy_slot_t *slot = &engine->policy_slots[index];
+        if (slot->submission_id != tail.next_consume_id) return false;
+        if (slot->state != GUI_DDD_ASYNC_SLOT_COMPLETE) {
+            return slot->state == GUI_DDD_ASYNC_SLOT_SUBMITTED;
+        }
+        gui_ddd_async_order_policy_advance(&tail);
+    }
+    return false;
+}
+
+static void gui_ddd_async_wait_failed_tail(gui_ddd_async_engine_t *engine)
+{
+    const gui_ddd_async_config_t *config = engine->config;
+    if (engine->result.code != GUI_DDD_ASYNC_RESULT_CONSUMER_FAILURE ||
+        engine->stopping || !config->failure_tail_wait_ms ||
+        !config->inspect_failed_tail ||
+        !config->inspect_failed_tail(config->consume_context, NULL, 0)) {
+        return;
+    }
+
+    uint64_t started_ms = gui_ddd_async_now_ms(engine);
+    /* The failure has already disabled submission. Give only preexisting
+     * transfers a short chance to finish before the normal cancellation. */
+    while (gui_ddd_async_failed_tail_pending(engine)) {
+        uint64_t elapsed_ms = gui_ddd_async_now_ms(engine) - started_ms;
+        if (elapsed_ms >= config->failure_tail_wait_ms) break;
+        uint64_t remaining_ms = config->failure_tail_wait_ms - elapsed_ms;
+        long timeout_us = GUI_DDD_ASYNC_EVENT_POLL_US;
+        if (remaining_ms < (uint64_t)(timeout_us / 1000L)) {
+            timeout_us = (long)remaining_ms * 1000L;
+        }
+        if (gui_ddd_async_pump_events(engine, timeout_us) < 0) break;
+    }
 }
 
 static int gui_ddd_async_allocate(gui_ddd_async_engine_t *engine)
@@ -482,7 +553,7 @@ static int gui_ddd_async_allocate(gui_ddd_async_engine_t *engine)
     if (!engine->slots || !engine->buffer_pool) {
         gui_ddd_async_latch_failure(
             engine, GUI_DDD_ASYNC_RESULT_ALLOCATION_FAILURE,
-            LIBUSB_ERROR_NO_MEM, 0, 0, 0);
+            LIBUSB_ERROR_NO_MEM, -1, -1, 0);
         return -1;
     }
 
@@ -496,7 +567,7 @@ static int gui_ddd_async_allocate(gui_ddd_async_engine_t *engine)
         if (!slot->transfer) {
             gui_ddd_async_latch_failure(
                 engine, GUI_DDD_ASYNC_RESULT_ALLOCATION_FAILURE,
-                LIBUSB_ERROR_NO_MEM, 0, 0, i);
+                LIBUSB_ERROR_NO_MEM, -1, -1, i);
             return -1;
         }
     }
@@ -548,6 +619,75 @@ static void gui_ddd_async_destroy(gui_ddd_async_engine_t *engine)
     free(engine);
 }
 
+static void gui_ddd_async_inspect_failed_tail(gui_ddd_async_engine_t *engine)
+{
+    gui_ddd_async_failed_tail_fn inspect = engine->config->inspect_failed_tail;
+    if (!inspect || engine->result.code != GUI_DDD_ASYNC_RESULT_CONSUMER_FAILURE) {
+        return;
+    }
+
+    gui_ddd_async_order_policy_t tail = engine->order;
+    gui_ddd_async_order_policy_advance(&tail);
+    for (size_t i = 0; i < GUI_DDD_ASYNC_FAILED_TAIL_BLOCK_LIMIT; ++i) {
+        size_t slot_index;
+        if (gui_ddd_async_order_policy_peek(
+                &tail, engine->policy_slots, &slot_index) !=
+            GUI_DDD_ASYNC_NEXT_READY) {
+            break;
+        }
+        const gui_ddd_async_slot_t *slot = &engine->slots[slot_index];
+        if (!inspect(engine->config->consume_context, slot->buffer,
+                     (size_t)slot->actual_length)) {
+            break;
+        }
+        gui_ddd_async_order_policy_advance(&tail);
+    }
+}
+
+static int gui_ddd_async_prepare_libusb_raw_io(gui_ddd_async_engine_t *engine)
+{
+    const gui_ddd_async_config_t *config = engine->config;
+    gui_ddd_async_result_t *result = &engine->result;
+    if (!config->libusb_raw_io) return LIBUSB_SUCCESS;
+    if (!config->device_handle) {
+        result->libusb_raw_io_stage = "backend";
+        return LIBUSB_ERROR_NOT_SUPPORTED;
+    }
+
+#if defined(_WIN32) && defined(LIBUSB_API_VERSION) && LIBUSB_API_VERSION >= 0x0100010C
+    result->libusb_raw_io_stage = "support";
+    int supported = libusb_endpoint_supports_raw_io(config->device_handle, config->endpoint);
+    if (supported <= 0) return supported < 0 ? supported : LIBUSB_ERROR_NOT_SUPPORTED;
+
+    result->libusb_raw_io_stage = "packet_size";
+    /* RAW_IO aligns to wMaxPacketSize. The alternate-setting query can
+     * return the SuperSpeed companion's zero wBytesPerInterval for bulk. */
+    int packet_size = libusb_get_max_packet_size(
+        libusb_get_device(config->device_handle), config->endpoint);
+    if (packet_size < 0) return packet_size;
+    result->libusb_raw_io_packet_size = packet_size;
+    if (packet_size == 0 || GUI_DDD_ASYNC_TRANSFER_BYTES % (size_t)packet_size != 0) {
+        return LIBUSB_ERROR_INVALID_PARAM;
+    }
+
+    result->libusb_raw_io_stage = "max_transfer_size";
+    int max_size = libusb_get_max_raw_io_transfer_size(config->device_handle, config->endpoint);
+    if (max_size < 0) return max_size;
+    result->libusb_raw_io_max_transfer_size = max_size;
+    if ((size_t)max_size < GUI_DDD_ASYNC_TRANSFER_BYTES) return LIBUSB_ERROR_OVERFLOW;
+
+    result->libusb_raw_io_stage = "enable";
+    int rc = libusb_endpoint_set_raw_io(config->device_handle, config->endpoint, 1);
+    if (rc != LIBUSB_SUCCESS) return rc;
+    result->libusb_raw_io_enabled = true;
+    result->libusb_raw_io_stage = NULL;
+    return LIBUSB_SUCCESS;
+#else
+    result->libusb_raw_io_stage = "api";
+    return LIBUSB_ERROR_NOT_SUPPORTED;
+#endif
+}
+
 int gui_ddd_async_run(const gui_ddd_async_config_t *config,
                       gui_ddd_async_result_t *result)
 {
@@ -558,8 +698,15 @@ int gui_ddd_async_run(const gui_ddd_async_config_t *config,
 
     memset(&local_result, 0, sizeof(local_result));
     local_result.code = GUI_DDD_ASYNC_RESULT_INVALID_ARGUMENT;
+    local_result.transfer_status = -1;
+    local_result.actual_length = -1;
 
-    if (!result || !config || !config->usb_context || !config->device_handle ||
+    /* A native adapter supplies all three I/O operations and needs no libusb
+     * device/context. The shared queue still owns the transfer descriptors. */
+    const bool external_io = config && !config->usb_context && !config->device_handle &&
+        config->submit_override && config->cancel_override && config->event_pump_override;
+    if (!result || !config ||
+        ((!config->usb_context || !config->device_handle) && !external_io) ||
         !config->capture_running || !config->transfer_ready ||
         !config->startup_failed || !config->consume) {
         if (config && config->transfer_ready) {
@@ -586,6 +733,8 @@ int gui_ddd_async_run(const gui_ddd_async_config_t *config,
     engine->config_storage = *config;
     engine->config = &engine->config_storage;
     engine->result.code = GUI_DDD_ASYNC_RESULT_SUCCESS;
+    engine->result.transfer_status = -1;
+    engine->result.actual_length = -1;
     engine->accepting_submissions = true;
     atomic_init(&engine->in_flight, 0);
     atomic_init(&engine->callbacks_active, 0);
@@ -593,6 +742,12 @@ int gui_ddd_async_run(const gui_ddd_async_config_t *config,
     gui_ddd_async_order_policy_init(&engine->order,
                                     GUI_DDD_ASYNC_TRANSFER_COUNT);
 
+    int raw_io = gui_ddd_async_prepare_libusb_raw_io(engine);
+    if (raw_io != LIBUSB_SUCCESS) {
+        gui_ddd_async_latch_failure(engine, GUI_DDD_ASYNC_RESULT_RAW_IO_UNAVAILABLE,
+                                   raw_io, -1, -1, 0);
+        goto finished;
+    }
     if (gui_ddd_async_allocate(engine) < 0) goto finished;
 
     for (i = 0; i < GUI_DDD_ASYNC_TRANSFER_COUNT; i++) {
@@ -608,7 +763,7 @@ int gui_ddd_async_run(const gui_ddd_async_config_t *config,
     } else if (!engine->failed) {
         gui_ddd_async_latch_failure(
             engine, GUI_DDD_ASYNC_RESULT_SUBMIT_FAILURE,
-            LIBUSB_ERROR_OTHER, 0, 0, engine->next_submit_id);
+            LIBUSB_ERROR_OTHER, -1, -1, engine->next_submit_id);
     }
 
     if (engine->failed) gui_ddd_async_cancel_in_flight(engine);
@@ -634,6 +789,7 @@ int gui_ddd_async_run(const gui_ddd_async_config_t *config,
 
         if (!engine->failed &&
             gui_ddd_async_consume_ready(engine) < 0) {
+            gui_ddd_async_wait_failed_tail(engine);
             gui_ddd_async_cancel_in_flight(engine);
         }
 
@@ -645,7 +801,7 @@ int gui_ddd_async_run(const gui_ddd_async_config_t *config,
         } else if (engine->stopping && total_in_flight > 0 &&
                    now_ms >= stop_deadline_ms) {
             gui_ddd_async_latch_failure(
-                engine, GUI_DDD_ASYNC_RESULT_DRAIN_TIMEOUT, 0, 0, 0,
+                engine, GUI_DDD_ASYNC_RESULT_DRAIN_TIMEOUT, 0, -1, -1,
                 engine->order.next_consume_id);
             gui_ddd_async_cancel_in_flight(engine);
         }
@@ -671,13 +827,13 @@ int gui_ddd_async_run(const gui_ddd_async_config_t *config,
         }
         if (!engine->failed && capture_running && in_flight == 0) {
             gui_ddd_async_latch_failure(
-                engine, GUI_DDD_ASYNC_RESULT_ORDER_FAILURE, 0, 0, 0,
+                engine, GUI_DDD_ASYNC_RESULT_ORDER_FAILURE, 0, -1, -1,
                 engine->order.next_consume_id);
             gui_ddd_async_cancel_in_flight(engine);
             continue;
         }
 
-        if (gui_ddd_async_pump_events(engine) < 0) {
+        if (gui_ddd_async_pump_events(engine, GUI_DDD_ASYNC_EVENT_POLL_US) < 0) {
             gui_ddd_async_cancel_in_flight(engine);
             thrd_sleep_ms(1);
         }
@@ -700,6 +856,9 @@ finished:
         return -1;
     }
 
+    /* Inspect only after all existing callbacks have been reaped. There is no
+     * additional USB activity, and these blocks never reach the consumer. */
+    gui_ddd_async_inspect_failed_tail(engine);
     local_result = engine->result;
     gui_ddd_async_destroy(engine);
     *result = local_result;
@@ -755,6 +914,22 @@ const char *gui_ddd_async_result_name(gui_ddd_async_result_code_t code)
         case GUI_DDD_ASYNC_RESULT_DRAIN_TIMEOUT: return "DrainTimeout";
         case GUI_DDD_ASYNC_RESULT_ORDER_FAILURE: return "OrderFailure";
         case GUI_DDD_ASYNC_RESULT_CONSUMER_FAILURE: return "ConsumerFailure";
+        case GUI_DDD_ASYNC_RESULT_RAW_IO_UNAVAILABLE: return "RawIoUnavailable";
+        default: return "Unknown";
+    }
+}
+
+const char *gui_ddd_async_transfer_status_name(int status)
+{
+    switch (status) {
+        case -1: return "NotObserved";
+        case LIBUSB_TRANSFER_COMPLETED: return "Completed";
+        case LIBUSB_TRANSFER_ERROR: return "Error";
+        case LIBUSB_TRANSFER_TIMED_OUT: return "TimedOut";
+        case LIBUSB_TRANSFER_CANCELLED: return "Cancelled";
+        case LIBUSB_TRANSFER_STALL: return "Stall";
+        case LIBUSB_TRANSFER_NO_DEVICE: return "NoDevice";
+        case LIBUSB_TRANSFER_OVERFLOW: return "Overflow";
         default: return "Unknown";
     }
 }

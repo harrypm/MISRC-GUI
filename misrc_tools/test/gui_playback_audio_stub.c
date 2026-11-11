@@ -3,9 +3,8 @@
  *
  * The gui_playback harnesses compile gui_playback.c directly into their own
  * TU (no gui_audio.c: it needs raylib's AudioStream + the soxr monitor
- * resampler). The drag-and-drop audio feed's only gui_audio dependency is
- * the monitor-queue pair below; these stubs satisfy the link so the
- * harnesses keep testing the playback machinery without the audio monitor.
+ * resampler). Stub the sidecar monitor queue and LD mixer query so the
+ * harnesses can test the playback machinery without an audio device.
  */
 #include <stddef.h>
 #include <stdint.h>
@@ -17,4 +16,8 @@ void gui_audio_push_playback(const int16_t *stereo_48k, size_t frames) {
 }
 
 void gui_audio_reset_playback_queue(void) {
+}
+
+bool gui_audio_ld_tail_pending(void) {
+    return false;
 }

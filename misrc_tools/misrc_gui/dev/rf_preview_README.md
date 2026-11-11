@@ -1,7 +1,7 @@
 # Tape RF preview
 
-The RF Preview panel provides PAL/NTSC VHS SP, NTSC Betamax and ordinary NTSC
-SuperBeta video-RF preview. It weaves two original fields into alternating
+The RF Preview panel provides PAL/NTSC/SECAM VHS SP (native or MESECAM), PAL/NTSC S-VHS,
+NTSC Betamax, ordinary NTSC SuperBeta and NTSC-J ED Beta video-RF preview. It weaves two original fields into alternating
 rows, without deinterlacing, field duplication or motion interpolation.
 Output is RGBA at 768x576 PAL or 640x480 NTSC, displayed at 4:3. Nominal
 output rates are 25 and 29.97 fps.
@@ -9,14 +9,18 @@ output rates are 25 and 29.97 fps.
 ## Operation
 
 1. Open a Video panel for the desired RF channel.
-2. Cycle Decoder to **RF Preview**, choose **Tape: VHS** or **Tape: Betamax**,
-   and select the system. Betamax currently supports NTSC only. Under Betamax,
-   **SuperBeta** is an optional toggle, off by default; enable it for a
-   SuperBeta recording. **Beta Hi-Fi** is a separate, independent toggle:
-   turn it on for a Hi-Fi recording to enable stereo monitoring. With
-   SuperBeta off, Hi-Fi also selects the ordinary Betamax Hi-Fi video carriers;
-   SuperBeta uses the same video parameters with either Hi-Fi state.
-   **Audio Mon** can subsequently mute or unmute playback.
+2. Cycle Decoder to **RF Preview** and choose **Format: VHS** or
+   **Format: Betamax**. In VHS mode, **System** cycles through PAL, NTSC,
+   SECAM and MESECAM. Choose **System: SECAM** for native frequency-divided
+   recording or **System: MESECAM** for heterodyne recording.
+   Cycle **Preset** between **VHS** (default) and **S-VHS**. S-VHS supports
+   manual PAL/NTSC selection. Selecting SECAM or MESECAM restores the VHS
+   preset. Selecting S-VHS from either system switches to PAL. Betamax currently
+   supports NTSC only. Cycle **Preset** through **Betamax** (default),
+   **Betamax Hi-Fi**, **SuperBeta** and **ED Beta** to select the video recording profile.
+   **Audio Mon** independently controls Hi-Fi listening for Betamax Hi-Fi,
+   SuperBeta and ED Beta. Changing a preset does not enable monitoring; muting keeps the
+   video profile and lock.
 3. Connect a capture device or select FLAC playback files and connect.
 4. The shared Budget button cycles 0.50, 0.75, 1.00, 1.50, 2.00 or 3.00
    logical cores and is saved with the existing application settings. Its
@@ -38,20 +42,36 @@ Worker age starts at preview submission; it excludes device buffering, the
 upstream capture FIFO and final UI presentation. These counters are separate
 from recording drops.
 
+Active frames are 768x576 for PAL/SECAM/MESECAM or 640x480 for NTSC. Full
+frames retain 768x626 or 640x526 samples, including horizontal and vertical
+blanking. Full display pixels are wider because its horizontal window spans
+the entire line. The UI corrects that pixel aspect using the actual delivered
+frame size, preserving 4:3 inside the active picture even while modes switch.
+The complete Full raster therefore has a display aspect about 1.5100 for
+PAL-family profiles or 1.4562 for NTSC-family profiles. Window resizing only
+fits and centers that geometry; it does not change the decoded sample count.
+See [MESECAM details](mesecam_vhs_preview_README.md) for signal and validation
+limits distinct from [native SECAM](secam_vhs_preview_README.md).
+
 ## Sample rates and continuity
 
-The decoder processes RF internally at 20 MSPS:
+The decoder processes RF internally at 20 MSPS. Ordinary VHS, Betamax and
+SuperBeta use these conversion paths:
 
 | Physical input | Conversion |
 | --- | --- |
 | 20 MHz | No rate conversion |
 | 40 MHz | Stateful halfband FIR, 2:1 |
 | 80 MHz | Two stateful halfband FIR stages, 4:1 |
-| Other 16..160 MHz | libsoxr HQ, when available |
+| Other 16..200 MHz | libsoxr HQ, when available |
 
-Without libsoxr, only 20/40/80 MHz are supported. Unsupported rates fail
-explicitly. Rate support does not establish usable signal bandwidth or
-picture quality for every device.
+Without libsoxr, these ordinary profiles support only 20/40/80 MHz.
+S-VHS and ED Beta require at least 20 MSPS input. Native 20 MSPS bypasses
+rate conversion; higher rates, including 40/80 MSPS, use their dedicated
+libsoxr converter with a 9.5 MHz passband and 10 MHz stopband. The S-VHS
+picture/sync path then works at 5 MSPS. Capture RF retains its original
+physical rate. Unsupported rates fail explicitly. Rate support does not
+establish usable signal bandwidth or picture quality for every device.
 
 Every input block carries its physical rate, absolute sample position,
 epoch and discontinuity flag. Rate changes, seeks, looping, channel mapping
@@ -63,9 +83,16 @@ recording channel presence and mapping using available capture information.
 
 FLAC uses actual decoded sample counts; final-block padding is not decoded as
 RF. Its physical rate is retained independently of whether length is known.
-The paired reader currently requires equal physical clocks for both channels.
-Mixed-rate pairs show an explicit unsupported message; independent channel
-cursors/resampling are outside this change.
+Same-rate pairs share the paired reader and FIFO. A MIXED-RATE pair (both
+files loaded, different resolved rates) runs the player's INDEPENDENT mode
+(2026-11-03, user request: "Player should run files independently"): each
+file feeds its own per-channel RF FIFO at its own true clock, the preview
+workers are fed per channel with honest rate/position metadata, and both
+decoders run time-correctly. Link mode: Synced (default) keeps one shared
+transport; Separate gives each file its own Play/Pause + Loop next to its
+file input row. A channel reaching its end without loop pauses only that
+channel. Recording stays impossible during playback, so the archival paths
+never see the independent streams.
 
 ## Processing and ownership
 
@@ -92,6 +119,12 @@ queue -> rate normalization -> RF decoder -> newest RGBA -> UI`
 The streaming decoder performs quadrature FM demodulation, luma deemphasis,
 independent color-under IQ recovery, horizontal/equalization/vertical sync,
 measured line resampling, burst phase/gain correction and PAL/NTSC conversion.
+Native SECAM uses separate FM chroma discrimination, causal LF deemphasis,
+alternating D'R/D'B identification and same-field line memory instead of the
+PAL/NTSC burst/phase path. Its luma calibration uses validated H-sync tips and
+porches, preserving fades without normalizing each picture line. See
+[native SECAM VHS](secam_vhs_preview_README.md) for recording-type and
+identification limits.
 Y and chroma share the line map. Field parity and cadence must agree before
 publishing a woven frame. Missing chroma falls back to grayscale.
 
@@ -101,17 +134,20 @@ when tape playback returns, without reconnecting or changing PAL/NTSC. Sample
 positions, DSP filters, diagnostic totals and the capture session stay intact.
 
 Luma uses fixed profile levels with bounded, slow timing correction rather
-than noisy per-line black/gain normalization. NTSC VHS display deemphasis is
-independent of its sync plane; Beta synchronization uses its matched shelf.
-Chroma averaging uses neighbors from the same
-field and retains the original luma rows.
+than noisy per-line black/gain normalization. NTSC VHS and PAL/NTSC S-VHS
+display deemphasis is independent of the sync plane; Beta synchronization
+uses its matched shelf. S-VHS also stabilizes burst phase/gain and gates
+neighboring color pairs at luma or chroma boundaries. Chroma averaging uses
+neighbors from the same field and retains the original luma rows.
 
 The input-rate separation, field assembly and color-under concepts were
 informed by vhs-decode-dotnet. The halfband coefficients originate from its
 `VHSDecode.Core/Rf/HalfRateSampleLoader.cs`; source attribution is retained in
 `gui_rf_resampler.c`. This preview does not implement the complete offline
-.NET TBC/color pipeline or promise output equivalence. SECAM, VHS LP/EP,
-S-VHS, PAL Betamax, dropout repair and advanced comb filtering are not implemented.
+.NET TBC/color pipeline or promise output equivalence. VHS LP/EP,
+PAL Betamax, dropout repair and advanced comb filtering are not implemented.
+The S-VHS preview omits its additional linear/nonlinear sub-deemphasis and
+full RF equalization.
 
 ## Capture protection
 
@@ -193,6 +229,7 @@ Windows executables have `.exe`:
 ```sh
 build/gui_rf_preview_file input.s16le 20000000 ntsc output.ppm --realtime
 build/gui_rf_preview_file input.s16le 40000000 pal output.ppm --max
+build/gui_rf_preview_file input.s16le 40000000 pal-svhs output.ppm --max
 build/gui_rf_preview_file input.s16le 40000000 ntsc-beta-hifi output.ppm --max output.wav 6
 build/gui_rf_preview_file input.s16le 40000000 ntsc-beta-hifi output.ppm --realtime output.wav 32 1.5
 build/gui_rf_preview_record_load input.s16le 20000000 ntsc output-prefix 60 on 1 4 1.0

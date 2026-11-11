@@ -182,8 +182,42 @@ Color gui_dropdown_option_color(bool selected, bool hovered)
 
 /* Stub: the production scale-dropdown click handler persists the selection via
  * gui_settings_save; the harness doesn't link gui_settings.c, so provide a
- * no-op so the link resolves. Signature must match gui_app.h. */
+ * no-op. */
 void gui_settings_save(const gui_settings_t *settings) { (void)settings; }
+
+/* Stub: the Simulated-device system selector's click handler reports the
+ * new system via gui_app_set_status; the harness doesn't link the status
+ * module. */
+void gui_app_set_status(gui_app_t *app, const char *message) { (void)app; (void)message; }
+
+/* Stub: the Gen box click handler switches the Video panel decoders via
+ * gui_video_follow_generator_system (gui_cvbs.c); the harness doesn't link
+ * the video panel, so record the requested system for assertions. */
+static int test_follow_system = -1;
+static int test_follow_calls = 0;
+void gui_video_follow_generator_system(gui_app_t *app, int system)
+{
+    (void)app;
+    test_follow_system = system;
+    test_follow_calls++;
+}
+
+/* Stub: the generator row (waveform_render) and the Gen box click handler
+ * (waveform_panel_handle_click) read the system/tape-format names and
+ * clamps from gui_testgen.c; the harness doesn't link the generator. */
+int gui_testgen_clamp_system(int system)
+{
+    return (system < 0 || system >= 4) ? 0 : system;
+}
+int gui_testgen_clamp_format(int format)
+{
+    return (format < 0 || format >= 5) ? 0 : format;
+}
+const char *gui_testgen_format_name(int format)
+{
+    static const char *names[5] = { "VHS", "S-VHS", "Betamax", "Video8", "Hi8" };
+    return names[gui_testgen_clamp_format(format)];
+}
 
 /* Stub: the production overlay scales text measurements to logical units via
  * gui_ui_get_scale_factor(); the harness doesn't link gui_ui_scale.c,

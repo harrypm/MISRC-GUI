@@ -1,9 +1,10 @@
 /*
  * Private VHS monitor filter design. GPL-3.0, as the containing project.
  *
- * NTSC parameter/profile and inverse high-shelf construction ported from
+ * VHS/S-VHS parameter/profile and inverse high-shelf construction ported from
  * machcnz/vhs-decode-dotnet, VHSDecode.Core/Dsp/IirFilterDesign.cs:873-933
- * and Formats/format-params.snapshot.json (NTSC VHS SP deemph_gain/mid/q).
+ * and Formats/format-params.snapshot.json (NTSC VHS and PAL/NTSC S-VHS
+ * deemph_gain/mid/q).
  * The upstream Shelf is the parameterized RBJ second-order high shelf;
  * VideoDeEmphasisShelf swaps numerator and denominator before normalization.
  *
@@ -11,7 +12,8 @@
  * it preserves DC, the physical midpoint and both shelf plateaus; bilinear
  * warping and phase differ from a design evaluated at 20MHz or 40MHz. There
  * is no extra rate multiplier, brightness gain, or zero-phase processing.
- * PAL keeps its existing filter; do not use this NTSC profile for PAL.
+ * Ordinary PAL VHS keeps its existing filter. PAL S-VHS uses its matched
+ * display shelf while retaining the legacy PAL sync filter.
  */
 #ifndef GUI_RF_PREVIEW_FILTERS_H
 #define GUI_RF_PREVIEW_FILTERS_H
@@ -28,6 +30,31 @@ static inline bool gui_rf_deemph_finite(double value)
     _Static_assert(sizeof(bits) == sizeof(value), "IEEE binary64 required");
     memcpy(&bits, &value, sizeof(bits));
     return (bits & UINT64_C(0x7ff0000000000000)) != UINT64_C(0x7ff0000000000000);
+}
+
+/* ED's discriminator runs at 5 MSPS. Fold finite quadrants to [0,1]
+ * with one division, then use an odd degree-17 minimax atan polynomial.
+ * P(1)=pi/4 keeps the octant boundary continuous. Approximation error is
+ * below 7e-9 rad (0.006 Hz at 5 MSPS), within the existing 2e-8 contract.
+ * Keep the previous atan2f behavior for nonfinite or zero-vector input. */
+static inline double gui_rf_preview_phase(double x, double z)
+{
+    if (!gui_rf_deemph_finite(x) || !gui_rf_deemph_finite(z) || (x == 0.0 && z == 0.0))
+        return atan2f((float)x, (float)z);
+    const double half_pi = 1.57079632679489661923;
+    const double pi = 3.14159265358979323846;
+    double a = fabs(x), b = fabs(z);
+    double r = fmin(a,b)/fmax(a,b);
+    double r2 = r*r;
+    double r4=r2*r2, r8=r4*r4, r16=r8*r8;
+    double p0=0.9999998810943069305+r2*(-0.3333256796434149738);
+    double p1=0.1998544876555760907+r2*(-0.141580314737084545);
+    double p2=0.1048723202627780543+r2*(-0.07210727034448327633);
+    double p3=0.03950019139406944768+r2*(-0.01422876183184047967);
+    double phase=r*((p0+r4*p1)+r8*(p2+r4*p3)+r16*(0.002413309547541135462));
+    if (a > b) phase = half_pi-phase;
+    if (z < 0.0) phase = pi-phase;
+    return copysign(phase,x);
 }
 
 /* H(z) = (b0+b1*z^-1+b2*z^-2)/(1+a1*z^-1+a2*z^-2).

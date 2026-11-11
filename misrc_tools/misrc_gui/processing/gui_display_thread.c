@@ -27,6 +27,70 @@ extern atomic_int do_exit;
 #define DISPLAY_CHANNEL_SIZE (DISPLAY_FRAME_SAMPLES * sizeof(int16_t))
 
 /*
+ * Independent mixed-rate playback display loop (player only).
+ *
+ * Extraction forwarded each channel's display-domain blocks into
+ * BUF_DISPLAY_A/B at that file's own true rate. Process each channel's
+ * panels independently (panel_process_all already dispatches per channel)
+ * and publish to the render-thread mirror per update. The published
+ * sample_rate for each side is that channel's own clock (falling back to
+ * the shared runtime rate when a per-channel rate is not resolved).
+ */
+static int display_thread_independent(display_thread_t *dt) {
+    gui_app_t *app = dt->app;
+    buffer_manager_t *bufmgr = dt->bufmgr;
+    thrd_set_priority(THRD_PRIORITY_CRITICAL);
+
+    fprintf(stderr, "[DISPLAY] Independent mixed-rate display thread started\n");
+
+    const size_t frame_bytes = DISPLAY_FRAME_SAMPLES * sizeof(int16_t);
+    while (!atomic_load(&dt->stop_requested) && !atomic_load(&do_exit)) {
+        bool processed = false;
+        for (int ch = 0; ch < 2; ++ch) {
+            buffer_id_t id = ch ? BUF_DISPLAY_B : BUF_DISPLAY_A;
+            void *buf = bufmgr_read_begin(bufmgr, id, frame_bytes, 20);
+            if (!buf) continue;
+            const int16_t *samples = (const int16_t *)buf;
+
+            uint32_t rate = atomic_load(&app->rf_source_rate_hz[ch]);
+            if (!rate) rate = atomic_load(&app->sample_rate);
+
+            /* Per-channel panel dispatch: the trigger source globals fall
+             * back to the panel's own buffer for the other channel (existing
+             * NULL-source semantics in gui_oscilloscope.c). */
+            if (ch == 0) {
+                gui_waveform_set_trigger_source_buffers(samples, NULL,
+                                                        DISPLAY_FRAME_SAMPLES);
+                panel_process_all(app, samples, NULL, DISPLAY_FRAME_SAMPLES, rate);
+                memcpy(dt->samples.samples_a, samples, frame_bytes);
+                dt->samples.sample_count = DISPLAY_FRAME_SAMPLES;
+            } else {
+                gui_waveform_set_trigger_source_buffers(NULL, samples,
+                                                        DISPLAY_FRAME_SAMPLES);
+                panel_process_all(app, NULL, samples, DISPLAY_FRAME_SAMPLES, rate);
+                memcpy(dt->samples.samples_b, samples, frame_bytes);
+                dt->samples.sample_count_b = DISPLAY_FRAME_SAMPLES;
+            }
+
+            bufmgr_read_end(bufmgr, id, frame_bytes);
+            processed = true;
+        }
+
+        if (processed) {
+            dt->samples.sample_rate = atomic_load(&app->sample_rate);
+            atomic_store(&dt->samples.ready, true);
+            atomic_fetch_add(&dt->samples.frame, 1);
+            atomic_fetch_add(&dt->frames_processed, 1);
+        }
+        /* Idle (both channels paused/EOF): loop and check for exit. */
+    }
+
+    atomic_store(&dt->running, false);
+    fprintf(stderr, "[DISPLAY] Independent mixed-rate display thread exiting\n");
+    return 0;
+}
+
+/*
  * Display thread main function
  */
 static int display_thread_func(void *ctx) {
@@ -36,6 +100,11 @@ static int display_thread_func(void *ctx) {
     thrd_set_priority(THRD_PRIORITY_CRITICAL);
 
     fprintf(stderr, "[DISPLAY] Display thread started\n");
+
+    /* Independent mixed-rate playback: per-channel FIFOs + dispatch. */
+    if (atomic_load(&app->playback_independent_mode)) {
+        return display_thread_independent(dt);
+    }
 
     while (!atomic_load(&dt->stop_requested) && !atomic_load(&do_exit)) {
         /* Read from display buffer with timeout */

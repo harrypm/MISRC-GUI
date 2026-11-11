@@ -107,6 +107,11 @@ int rb_write_finished(ringbuffer_t *rb, size_t size) {
     return 0;
 }
 
+size_t rb_fill_level(const ringbuffer_t *rb) {
+    (void)rb;
+    return 0;
+}
+
 void rb_close(ringbuffer_t *rb) {
     (void)rb;
 }

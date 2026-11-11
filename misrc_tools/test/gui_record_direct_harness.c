@@ -190,7 +190,7 @@ static void run_passthrough_test(void) {
     FILE *out = tmpfile();
     expect_true(out != NULL, "tmpfile for passthrough output");
 
-    volatile bool rec_active = true;
+    atomic_bool writer_draining = false;
     atomic_uint_fast64_t total_read;
     atomic_uint_fast64_t total_written;
     atomic_uint_fast64_t ch_written;
@@ -204,8 +204,7 @@ static void run_passthrough_test(void) {
     ctx.buf_id = BUF_RECORD_A;
     ctx.channel = 0;
     ctx.file = out;
-    ctx.recording_active = &rec_active;
-    ctx.exit_flag = NULL;
+    ctx.writer_draining = &writer_draining;
     ctx.bytes_read_total = &total_read;
     ctx.bytes_written_total = &total_written;
     ctx.bytes_written_channel = &ch_written;
@@ -253,7 +252,7 @@ static void run_passthrough_test(void) {
     thrd_t writer;
     expect_true(thrd_create(&writer, gui_record_direct_writer_thread, &ctx) == thrd_success,
                 "writer thread started");
-    rec_active = false;
+    atomic_store(&writer_draining, true);
     thrd_join(writer, NULL);
 
     expect_true(atomic_load(&total_read) == total, "tap counted every pushed byte");
@@ -286,7 +285,7 @@ static void run_write_error_recovery_test(void) {
     FILE *out = tmpfile();
     expect_true(out != NULL, "tmpfile for recovery output");
 
-    volatile bool rec_active = true;
+    atomic_bool writer_draining = false;
     atomic_uint_fast64_t total_read;
     atomic_uint_fast64_t total_written;
     atomic_uint_fast64_t ch_written;
@@ -300,8 +299,7 @@ static void run_write_error_recovery_test(void) {
     ctx.buf_id = BUF_RECORD_A;
     ctx.channel = 0;
     ctx.file = full;
-    ctx.recording_active = &rec_active;
-    ctx.exit_flag = NULL;
+    ctx.writer_draining = &writer_draining;
     ctx.bytes_read_total = &total_read;
     ctx.bytes_written_total = &total_written;
     ctx.bytes_written_channel = &ch_written;
@@ -347,7 +345,7 @@ static void run_write_error_recovery_test(void) {
     }
     expect_true(!g_write_error_state[0], "write error cleared after the output file became writable");
 
-    rec_active = false;
+    atomic_store(&writer_draining, true);
     thrd_join(writer, NULL);
     expect_true(atomic_load(&total_written) == total, "recovered writer accounted all bytes");
     expect_true(file_matches_pattern(out, total),

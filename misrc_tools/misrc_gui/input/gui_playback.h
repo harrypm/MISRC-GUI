@@ -94,8 +94,8 @@ typedef struct {
     // only consulted for headerless raw PCM.
     int format;                  // playback_input_format_t (int keeps this struct assignable across the enum)
     // Specific probe rejection detail (empty when the probe succeeded). The
-    // generic UI status line says only "Playback failed to start"; this field
-    // carries the actionable reason (missing <n>msps hint, non-FLAC Ogg codec,
+    // startup status includes this detail and the failing channel; this field
+    // also carries the actionable reason (missing <n>msps hint, non-FLAC Ogg codec,
     // ID3-prefixed FLAC, unsupported extension, non-mono layout...).
     char error[192];
 } playback_file_info_t;
@@ -209,6 +209,34 @@ bool gui_playback_handle_dropped_files(gui_app_t *app, const char *const *paths,
 // Loop mode: restart from beginning when EOF reached
 void gui_playback_set_loop(gui_app_t *app, bool loop);
 bool gui_playback_get_loop(gui_app_t *app);
+
+// Per-channel transport + link mode (player). Link: Synced (default) keeps
+// ONE shared transport for both files; Separate gives each file its own
+// play/pause + loop next to its file input row. True per-channel pipelines
+// exist only in independent mixed-rate mode (both files, different rates);
+// every other session shape maps the per-channel controls onto the shared
+// transport so the buttons always behave coherently.
+void gui_playback_set_link_separate(gui_app_t *app, bool separate);
+bool gui_playback_get_link_separate(gui_app_t *app);
+// channel: 0=A, 1=B. In Synced mode these drive the shared transport.
+void gui_playback_toggle_pause_channel(gui_app_t *app, int channel);
+bool gui_playback_is_channel_paused(gui_app_t *app, int channel);
+typedef enum {
+    PLAYBACK_RF_END_NONE,
+    PLAYBACK_RF_END_PENDING,
+    PLAYBACK_RF_END_READY
+} playback_rf_end_t;
+// Natural EOF and visible/monitored LD loops. READY means the final RF input was forwarded.
+// token identifies this endpoint for ACK, and may be NULL when only polling state.
+playback_rf_end_t gui_playback_get_channel_rf_end(gui_app_t *app, int channel, uint64_t *token);
+// GUI monitor route, -1 when no LD file is audible.
+void gui_playback_set_ld_audio_channel(gui_app_t *app, int channel);
+// Bits 0 and 1 select channels with a visible LD decoder.
+void gui_playback_set_ld_video_channels(gui_app_t *app, unsigned channels);
+// Acknowledge after video and any selected audio have drained.
+void gui_playback_finish_ld_tail(gui_app_t *app, int channel, uint64_t token);
+void gui_playback_set_channel_loop(gui_app_t *app, int channel, bool loop);
+bool gui_playback_get_channel_loop(gui_app_t *app, int channel);
 
 //-----------------------------------------------------------------------------
 // DAW-Style Paused Analysis Window (direct file random access)

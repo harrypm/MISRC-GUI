@@ -18,6 +18,9 @@
          android.permission.CAMERA. CAMERA is a dangerous (runtime) permission
          on API 23+, so MainActivity requests it at runtime before requesting
          USB permission. Without this, no USB permission prompt ever appears. -->
+    <!-- Network access for Server / Client and M-Server / M-Client -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />

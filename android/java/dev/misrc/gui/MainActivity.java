@@ -14,12 +14,16 @@ import android.hardware.usb.UsbManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
+import android.os.ParcelFileDescriptor;
 import android.provider.DocumentsContract;
 import android.provider.Settings;
 import android.text.Editable;
 import android.text.InputType;
 import android.util.Log;
 import android.view.KeyEvent;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
+import android.view.WindowManager;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.inputmethod.BaseInputConnection;
@@ -32,8 +36,12 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.UUID;
 
 /**
  * NativeActivity entry point for the MISRC GUI Android build with USB Host
@@ -53,9 +61,8 @@ import java.util.Map;
  *      permission; a BroadcastReceiver catches the granted result.
  *   3. On grant, openUsbDeviceAndHandFd() opens the device, reads its file
  *      descriptor, and calls native nativeSetUsbFd(fd).
- *   4. The native capture path (hsdaoh_open on Android) reads that fd via
- *      android_usb_get_fd() and uses uvc_wrap() instead of
- *      uvc_find_device()+uvc_open().
+ *   4. JNI duplicates the descriptor before Java closes the connection. Each
+ *      native capture obtains its own duplicate to use with uvc_wrap().
  */
 public class MainActivity extends NativeActivity {
     private static final String TAG = "MISRC";
@@ -84,6 +91,9 @@ public class MainActivity extends NativeActivity {
         }
     }
     private static final String ACTION_USB_PERMISSION = "dev.misrc.gui.USB_PERMISSION";
+    private static final String ACTION_RTL_USB_PERMISSION = "dev.misrc.gui.RTL_USB_PERMISSION";
+    private static final String EXTRA_RTL_USB_TOKEN = "dev.misrc.gui.RTL_USB_TOKEN";
+    private static final int REQ_RTL_USB_PERMISSION = 0x5254;
     private static final int REQ_CAMERA = 0x5143;  // 'CA' -> CAMERA runtime request code
     private static final int REQ_MEDIA = 0x4d45;   // 'ME' -> media runtime request code
     private static final int REQ_PICK_OUTPUT_DIR = 0x4f44;  // 'OD'
@@ -106,12 +116,13 @@ public class MainActivity extends NativeActivity {
     private UsbManager mUsbManager;
     private BroadcastReceiver mUsbReceiver;
     private boolean mReceiverRegistered = false;
-    private final HashMap<String, UsbDeviceConnection> mOpenConnections = new HashMap<>();
+    private UsbDevice mPendingRtlUsbDevice;
+    private String mPendingRtlUsbToken;
     private int mPendingPlaybackChannel = -1;
     private NativeTextInputEditText mNativeTextInputView;
 
     /** Native bridge: store the granted USB device file descriptor. */
-    private native void nativeSetUsbFd(int fd);
+    private native boolean nativeSetUsbFd(int fd);
     /** Native bridge: register this Activity so native can call
      * requestPermissionFromNative() when the user presses "connect". */
     private native void nativeRegisterActivity(android.app.Activity activity);
@@ -131,6 +142,39 @@ public class MainActivity extends NativeActivity {
      * MS2130 entry when it is really present (the hsdaoh Android patch
      * cannot enumerate /dev/bus/usb without root, so Java owns presence). */
     private native void nativeSetUsbDevicePresent(boolean present);
+    private native boolean nativeIsRtlUsbDevice(int vid, int pid);
+    private native void nativeSetRtlUsbDevices(int[] devices);
+    private native void nativeRtlUsbPermissionResult(int deviceId, boolean granted, String serial);
+
+    /** Hide the Android system bars; swipes can temporarily reveal them. */
+    private void enforceImmersiveMode() {
+        WindowInsetsController controller = getWindow().getInsetsController();
+        if (controller != null) {
+            controller.setSystemBarsBehavior(
+                    WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+            controller.hide(WindowInsets.Type.systemBars());
+        }
+    }
+
+    /** Full-width immersive window. The native UI is no longer globally
+     * shrunk/translated by display-cutout insets. Keep crucial controls away
+     * from the camera's *physical* cutout in a future localized layout pass. */
+    private void configureFullscreenDisplay() {
+        WindowManager.LayoutParams params = getWindow().getAttributes();
+        params.layoutInDisplayCutoutMode =
+                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
+        getWindow().setAttributes(params);
+        getWindow().setDecorFitsSystemWindows(false);
+        enforceImmersiveMode();
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus) {
+            enforceImmersiveMode();
+        }
+    }
 
     @Override
     public void onCreate(android.os.Bundle savedInstanceState) {
@@ -149,6 +193,7 @@ public class MainActivity extends NativeActivity {
         }
         // Start NativeActivity (loads libmisrc_gui.so, runs android_main -> main()).
         super.onCreate(savedInstanceState);
+        configureFullscreenDisplay();
         // Native symbols are guaranteed after super.onCreate(); push startup
         // storage path now so native fopen() uses app-private external storage.
         if (startupStoragePath != null) {
@@ -257,6 +302,7 @@ public class MainActivity extends NativeActivity {
     @Override
     protected void onResume() {
         super.onResume();
+        enforceImmersiveMode();
         try {
             nativeRegisterActivity(this);
         } catch (UnsatisfiedLinkError e) {
@@ -344,16 +390,122 @@ public class MainActivity extends NativeActivity {
             Log.e(TAG, "nativeSetUsbDevicePresent unavailable: " + e.getMessage());
         }
         Log.i(TAG, "USB capture device present: " + present);
+        updateRtlUsbDevices();
     }
 
-    private void closeUsbConnectionForDeviceName(String deviceName) {
-        if (deviceName == null || deviceName.isEmpty()) return;
-        UsbDeviceConnection conn = mOpenConnections.remove(deviceName);
-        if (conn != null) {
-            try { conn.close(); } catch (Exception ignored) {}
+    private boolean isRtlUsbDevice(UsbDevice device) {
+        return device != null && nativeIsRtlUsbDevice(device.getVendorId(), device.getProductId());
+    }
+
+    private void updateRtlUsbDevices() {
+        ArrayList<UsbDevice> rtlDevices = new ArrayList<>();
+        if (mUsbManager != null) {
+            for (UsbDevice device : mUsbManager.getDeviceList().values()) {
+                if (isRtlUsbDevice(device)) rtlDevices.add(device);
+            }
+        }
+        Collections.sort(rtlDevices, new Comparator<UsbDevice>() {
+            @Override public int compare(UsbDevice first, UsbDevice second) {
+                return Integer.compare(first.getDeviceId(), second.getDeviceId());
+            }
+        });
+        int[] devices = new int[rtlDevices.size() * 3];
+        for (int i = 0; i < rtlDevices.size(); ++i) {
+            UsbDevice device = rtlDevices.get(i);
+            devices[3 * i] = device.getDeviceId();
+            devices[3 * i + 1] = device.getVendorId();
+            devices[3 * i + 2] = device.getProductId();
+        }
+        nativeSetRtlUsbDevices(devices);
+    }
+
+    private UsbDevice findRtlUsbDevice(int deviceId) {
+        if (mUsbManager == null) return null;
+        for (UsbDevice device : mUsbManager.getDeviceList().values()) {
+            if (device.getDeviceId() == deviceId && isRtlUsbDevice(device)) return device;
+        }
+        return null;
+    }
+
+    private static String rtlUsbSerial(UsbDevice device) {
+        try {
+            return device.getSerialNumber();
+        } catch (SecurityException e) {
+            // Permission can disappear if the adapter is unplugged.
+            return null;
         }
     }
 
+    private void finishRtlUsbPermission(boolean granted) {
+        UsbDevice device = mPendingRtlUsbDevice;
+        if (device == null) return;
+        mPendingRtlUsbDevice = null;
+        mPendingRtlUsbToken = null;
+        nativeRtlUsbPermissionResult(device.getDeviceId(), granted,
+                granted ? rtlUsbSerial(device) : null);
+    }
+
+    public int requestRtlUsbPermissionFromNative(final int deviceId) {
+        runOnUiThread(new Runnable() {
+            @Override public void run() {
+                requestRtlUsbPermission(deviceId);
+            }
+        });
+        return 1;
+    }
+
+    private void requestRtlUsbPermission(int deviceId) {
+        UsbDevice device = findRtlUsbDevice(deviceId);
+        if (isDestroyed() || device == null) {
+            nativeRtlUsbPermissionResult(deviceId, false, null);
+            return;
+        }
+        if (mUsbManager.hasPermission(device)) {
+            nativeRtlUsbPermissionResult(deviceId, true, rtlUsbSerial(device));
+            return;
+        }
+        if (!mReceiverRegistered) {
+            nativeRtlUsbPermissionResult(deviceId, false, null);
+            return;
+        }
+        mPendingRtlUsbDevice = device;
+        mPendingRtlUsbToken = UUID.randomUUID().toString();
+        Intent reply = new Intent(ACTION_RTL_USB_PERMISSION).setPackage(getPackageName());
+        reply.putExtra(EXTRA_RTL_USB_TOKEN, mPendingRtlUsbToken);
+        try {
+            PendingIntent pending = PendingIntent.getBroadcast(this, REQ_RTL_USB_PERMISSION,
+                    reply, PendingIntent.FLAG_MUTABLE | PendingIntent.FLAG_ONE_SHOT
+                            | PendingIntent.FLAG_CANCEL_CURRENT);
+            mUsbManager.requestPermission(device, pending);
+        } catch (RuntimeException e) {
+            Log.w(TAG, "RTL-SDR USB permission request failed", e);
+            finishRtlUsbPermission(false);
+        }
+    }
+
+    /** Returns a descriptor owned by native code, or -1. */
+    public int openRtlUsbFdFromNative(int deviceId, int vendorId, int productId,
+                                      String expectedSerial) {
+        UsbDevice device = findRtlUsbDevice(deviceId);
+        if (device == null || !mUsbManager.hasPermission(device)
+                || device.getVendorId() != vendorId || device.getProductId() != productId
+                || (expectedSerial != null && !expectedSerial.equals(rtlUsbSerial(device)))) {
+            return -1;
+        }
+        UsbDeviceConnection connection = null;
+        try {
+            connection = mUsbManager.openDevice(device);
+            if (connection == null || connection.getFileDescriptor() < 0) return -1;
+            try (ParcelFileDescriptor duplicate = ParcelFileDescriptor.fromFd(connection.getFileDescriptor())) {
+                return duplicate.detachFd();
+            }
+        } catch (java.io.IOException | RuntimeException e) {
+            Log.w(TAG, "Could not open the selected RTL-SDR USB device", e);
+            return -1;
+        } finally {
+            if (connection != null) connection.close();
+        }
+    }
 
     private void registerUsbReceiver() {
         if (mReceiverRegistered) return;
@@ -378,6 +530,14 @@ public class MainActivity extends NativeActivity {
                     // Signal the native thread that may be blocked in
                     // android_request_usb_permission() waiting on the result.
                     signalNativeUsbPermissionResult(fdReady);
+                } else if (ACTION_RTL_USB_PERMISSION.equals(action)) {
+                    if (mPendingRtlUsbDevice == null || !mPendingRtlUsbToken.equals(
+                            intent.getStringExtra(EXTRA_RTL_USB_TOKEN))) return;
+                    UsbDevice device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+                    UsbDevice attached = findRtlUsbDevice(mPendingRtlUsbDevice.getDeviceId());
+                    finishRtlUsbPermission(attached != null && attached.equals(device)
+                            && intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
+                            && mUsbManager.hasPermission(attached));
                 } else if (UsbManager.ACTION_USB_DEVICE_ATTACHED.equals(action)) {
                     UsbDevice device = (UsbDevice)
                             intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
@@ -390,9 +550,11 @@ public class MainActivity extends NativeActivity {
                     UsbDevice device = (UsbDevice)
                             intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
                     updateUsbDevicePresence();
+                    if (device != null && device.equals(mPendingRtlUsbDevice)) {
+                        finishRtlUsbPermission(false);
+                    }
                     if (device != null && isPermissionCandidate(device)) {
                         Log.i(TAG, "USB device detached: " + device.getDeviceName());
-                        closeUsbConnectionForDeviceName(device.getDeviceName());
                         clearNativeUsbFd();
                         signalNativeUsbPermissionResult(false);
                     }
@@ -400,6 +562,7 @@ public class MainActivity extends NativeActivity {
             }
         };
         IntentFilter filter = new IntentFilter(ACTION_USB_PERMISSION);
+        filter.addAction(ACTION_RTL_USB_PERMISSION);
         filter.addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED);
         filter.addAction(UsbManager.ACTION_USB_DEVICE_DETACHED);
         // CRITICAL: use RECEIVER_EXPORTED, not NOT_EXPORTED. The permission-
@@ -691,7 +854,7 @@ public class MainActivity extends NativeActivity {
                 if (openUsbDeviceAndHandFd(device)) {
                     openedFdCount++;
                 }
-            } else {
+            } else if (mReceiverRegistered) {
                 int flags = PendingIntent.FLAG_UPDATE_CURRENT;
                 if (Build.VERSION.SDK_INT >= 31) flags |= PendingIntent.FLAG_MUTABLE;
                 // CRITICAL: the intent MUST be explicit (set our package) or
@@ -738,37 +901,26 @@ public class MainActivity extends NativeActivity {
 
     private boolean openUsbDeviceAndHandFd(UsbDevice device) {
         if (device == null || mUsbManager == null) return false;
-        String key = device.getDeviceName();
-        // Always reopen on handoff to avoid stale/reused descriptors after
-        // previous native sessions close wrapped libusb handles.
-        closeUsbConnectionForDeviceName(key);
         UsbDeviceConnection connection = mUsbManager.openDevice(device);
         if (connection == null) {
             Log.e(TAG, "openDevice() returned null for " + device.getDeviceName());
             return false;
         }
 
-        int fd = connection.getFileDescriptor();
-        if (fd < 0) {
-            try { connection.close(); } catch (Exception ignored) {}
-            Log.e(TAG, "openDevice() returned invalid fd for " + device.getDeviceName());
-            return false;
-        }
-        mOpenConnections.put(key, connection);
-
-        Log.i(TAG, "USB granted for " + device.getDeviceName() + ", fd=" + fd);
-        Toast.makeText(this, "USB fd handed to native: " + fd, Toast.LENGTH_LONG).show();
         try {
-            nativeSetUsbFd(fd);
+            int fd = connection.getFileDescriptor();
+            if (fd < 0 || !nativeSetUsbFd(fd)) {
+                Log.e(TAG, "Could not hand off USB descriptor for " + device.getDeviceName());
+                return false;
+            }
+            Log.i(TAG, "USB granted for " + device.getDeviceName());
             return true;
         } catch (UnsatisfiedLinkError e) {
             Log.e(TAG, "nativeSetUsbFd unavailable: " + e.getMessage());
+            return false;
+        } finally {
+            connection.close();
         }
-        return false;
-        // Keep the connection alive: native code (libusb) now owns the fd, but
-        // Android requires the UsbDeviceConnection to stay reachable so the fd
-        // remains valid. We intentionally do not close it here; it is closed when
-        // the native side is done (hsdaoh_close / app teardown).
     }
 
     private int pickerKindForPlaybackChannel(int channel) {
@@ -995,14 +1147,8 @@ public class MainActivity extends NativeActivity {
 
     @Override
     protected void onDestroy() {
+        finishRtlUsbPermission(false);
         clearNativeUsbFd();
-        for (Map.Entry<String, UsbDeviceConnection> entry : mOpenConnections.entrySet()) {
-            UsbDeviceConnection conn = entry.getValue();
-            if (conn != null) {
-                try { conn.close(); } catch (Exception ignored) {}
-            }
-        }
-        mOpenConnections.clear();
         if (mReceiverRegistered) {
             try { unregisterReceiver(mUsbReceiver); } catch (Exception ignored) {}
             mReceiverRegistered = false;

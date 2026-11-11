@@ -401,6 +401,10 @@ static double beta_quantile(double *values,int count,double fraction) {
     return values[lo]+(values[hi]-values[lo])*(pos-lo);
 }
 
+/* A rolling acquisition window can straddle a programme/head-level change
+ * even while the live head detector still follows regular, usable RF. An
+ * invalid refresh must retain the last verified calibration; the independent
+ * live cadence and active-carrier loss guards decide when a lock is lost. */
 static void beta_calibrate(gui_beta_hifi_decoder_t *d) {
     if(d->cal_count<250 || d->iq_count-d->calibration_iq_start<125000) return;
     double values[BETA_CAL_POINTS],p10,p90;
@@ -408,7 +412,8 @@ static void beta_calibrate(gui_beta_hifi_decoder_t *d) {
     p10=beta_quantile(values,d->cal_count,.1);
     p90=beta_quantile(values,d->cal_count,.9);
     if(p90-p10<=10) {
-        beta_unlock(d,"Waiting for alternating NTSC Beta HiFi carriers");
+        if(!d->status.locked)
+            beta_unlock(d,"Waiting for alternating NTSC Beta HiFi carriers");
         return;
     }
     double midpoint=(p10+p90)/2,references[4];
@@ -416,7 +421,6 @@ static void beta_calibrate(gui_beta_hifi_decoder_t *d) {
      * physical head states can lie on the same side of zero dominance.
      * Reclassify this ordered 1 ms window with the newly measured midpoint;
      * using the provisional live detector here would deadlock calibration. */
-    d->midpoint=midpoint;
     int oldest=(d->cal_next+BETA_CAL_POINTS-d->cal_count)%BETA_CAL_POINTS;
     int previous_head=0,last_edge=-1,window_switches=0,regular_switches=0;
     for(int i=0;i<d->cal_count;i++) {
@@ -431,7 +435,8 @@ static void beta_calibrate(gui_beta_hifi_decoder_t *d) {
         previous_head=current;
     }
     if(window_switches<8 || regular_switches*10<(window_switches-1)*7) {
-        beta_unlock(d,"Waiting for regular NTSC Beta HiFi head cadence");
+        if(!d->status.locked)
+            beta_unlock(d,"Waiting for regular NTSC Beta HiFi head cadence");
         return;
     }
     for(int branch=0;branch<4;branch++) {
@@ -444,7 +449,9 @@ static void beta_calibrate(gui_beta_hifi_decoder_t *d) {
         }
         references[branch]=beta_quantile(values,active,.9);
         if(active<40 || references[branch]<fmax(1e-20,d->input_power*1e-7)) {
-            beta_unlock(d,"Missing NTSC Beta HiFi carrier");return;
+            if(!d->status.locked)
+                beta_unlock(d,"Missing NTSC Beta HiFi carrier");
+            return;
         }
         /* Do not require this carrier to be stronger than its other-head
          * residual. Actual Beta captures can have much weaker head B RF,
@@ -452,6 +459,8 @@ static void beta_calibrate(gui_beta_hifi_decoder_t *d) {
          * programme. The reference .NET decoder calibrates each active
          * carrier independently after joint dominance/cadence classification. */
     }
+    /* Commit the candidate as a whole only after every acquisition check. */
+    d->midpoint=midpoint;
     for(int i=0;i<4;i++) d->carrier[i].reference=references[i];
     if(!d->status.locked) {
         d->bad_count=0;

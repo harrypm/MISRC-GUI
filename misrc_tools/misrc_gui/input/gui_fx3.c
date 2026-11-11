@@ -33,6 +33,7 @@
 #endif
 
 #include "gui_fx3.h"
+#include "../output/gui_record.h"
 #include "../core/gui_app.h"
 #include "../processing/gui_extract.h"
 #include "../processing/gui_display_thread.h"
@@ -1131,12 +1132,15 @@ static int fx3_capture_thread(void *ctx) {
 
     while (atomic_load(&app->fx3_running)) {
         // Perform bulk transfer from FX3
+        actual_length = 0;
         int r = fx3_usb_bulk_transfer(s_fx3_handle, current_ep,
                                        transfer_buf, FX3_TRANSFER_SIZE,
                                        &actual_length, FX3_TRANSFER_TIMEOUT);
+        if (!atomic_load(&app->fx3_running)) break;
 
         if (r < 0) {
             if (r == LIBUSB_ERROR_TIMEOUT) {
+                if (actual_length > 0) gui_record_mark_source_loss();
                 timeout_count++;
                 if (timeout_count <= 3) {
                     fprintf(stderr, "[FX3] Bulk transfer timeout #%llu on EP 0x%02X (no data received)\n",
@@ -1144,6 +1148,7 @@ static int fx3_capture_thread(void *ctx) {
                 }
                 // After 3 timeouts on current endpoint, try next one
                 if (timeout_count == 3 && current_ep_idx < (endpoint_count - 1)) {
+                    if (batch_count != 0 && actual_length == 0) gui_record_mark_source_loss();
                     current_ep_idx++;
                     current_ep = endpoints_to_try[current_ep_idx];
                     fprintf(stderr, "[FX3] Switching to endpoint 0x%02X\n", current_ep);
@@ -1152,6 +1157,7 @@ static int fx3_capture_thread(void *ctx) {
                 }
                 continue;
             }
+            gui_record_mark_source_loss();
             // Fatal errors: the device/handle is gone. Break out of the loop
             // instead of spinning and spamming hundreds of thousands of errors
             // (verified: LIBUSB_ERROR_NO_DEVICE spammed 432684x when the FX3
@@ -1188,6 +1194,13 @@ static int fx3_capture_thread(void *ctx) {
         // First successful transfer
         if (batch_count == 0) {
             fprintf(stderr, "[FX3] First data received: %d bytes\n", actual_length);
+        }
+
+        size_t wire_sample_bytes = active_protocol == FX3_PROTOCOL_FX3USBADC
+            ? sizeof(int16_t) : sizeof(uint32_t);
+        if ((size_t)actual_length % wire_sample_bytes != 0) {
+            gui_record_mark_source_loss();
+            continue;
         }
 
         size_t num_samples = 0;

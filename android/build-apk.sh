@@ -124,6 +124,12 @@ log "adding native libs..."
 mkdir -p "$WORK/libdir/lib/arm64-v8a"
 cp "$BUILD_DIR/libmisrc_gui.so" "$WORK/libdir/lib/arm64-v8a/"
 cp "$DEPS_PREFIX/lib/libhsdaoh.so" "$WORK/libdir/lib/arm64-v8a/"
+# OpenH264 is linked with the NDK's shared C++ runtime. If libc++_shared.so
+# is not bundled, Android's loader fails before NativeActivity can start.
+[[ -n "${ANDROID_NDK_HOME:-}" ]] || fail "ANDROID_NDK_HOME is required to package libc++_shared.so"
+CXX_RUNTIME="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"
+[[ -f "$CXX_RUNTIME" ]] || fail "Android C++ runtime not found at $CXX_RUNTIME"
+cp "$CXX_RUNTIME" "$WORK/libdir/lib/arm64-v8a/"
 # NOTE: no -j flag — the lib/arm64-v8a/ path prefix MUST be preserved (Android
 # only loads .so files from lib/<abi>/ inside the APK). -0 stores uncompressed
 # so zipalign can page-align the .so files.

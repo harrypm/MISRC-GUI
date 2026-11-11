@@ -5,6 +5,14 @@
  */
 
 #include "gui_ui.h"
+#if defined(__ANDROID__)
+#include "../core/gui_android_viewport.h"
+#ifdef ENABLE_RTLSDR
+#include "../input/android_rtlsdr_usb.h"
+#endif
+// Gesture-filtered single taps replace native mouse-press events on Android.
+#define IsMouseButtonPressed(button) gui_android_viewport_click_pressed(button)
+#endif
 #include "gui_dropdown.h"
 #include "gui_popup.h"
 #include "gui_device_label.h"
@@ -26,6 +34,9 @@
 #include "../output/gui_record.h"
 #include "../input/gui_capture.h" // Support hsdoah-rp2350 Error & stats
 #include "../net/gui_net.h"
+#include "../net/gui_net_queue_limits.h"
+#include "../net/gui_monitor_transport.h"
+#include "../net/gui_monitor_local_save.h"
 #include "../core/gui_updater.h" // Manifest-driven updater: releases page + auto-patch manifest + confirmed self-update
 #include "version.h"
 #include "../visualization/gui_custom_elements.h"
@@ -170,7 +181,11 @@ Vector2 gui_ui_get_render_scale(void)
 
 Vector2 gui_ui_get_mouse_position(void)
 {
+#if defined(__ANDROID__)
+    Vector2 position = gui_android_viewport_pointer();
+#else
     Vector2 position = GetMousePosition();
+#endif
     float scale = gui_ui_get_scale_factor();
     position.x /= scale;
     position.y /= scale;
@@ -456,6 +471,7 @@ static bool gui_ui_selected_device_is_playback(const gui_app_t *app)
     return app->devices[app->selected_device].type == DEVICE_TYPE_PLAYBACK;
 }
 
+
 #ifdef ENABLE_DDD
 // DdD is single-channel (channel A only); channel B has no signal source.
 static bool gui_ui_selected_device_is_ddd(const gui_app_t *app)
@@ -651,6 +667,8 @@ typedef enum {
     UI_TEXT_FIELD_NONE = 0,
     UI_TEXT_FIELD_OUTPUT_BASE_NAME,
     UI_TEXT_FIELD_OUTPUT_PATH,
+    UI_TEXT_FIELD_MONITOR_LOCAL_SAVE_PATH,
+    UI_TEXT_FIELD_MONITOR_SERVER_BROWSER_PATH,
     UI_TEXT_FIELD_FLAC_AFFINITY,
     UI_TEXT_FIELD_RF_TAG_A,
     UI_TEXT_FIELD_RF_TAG_B,
@@ -672,13 +690,26 @@ typedef enum {
     UI_TEXT_FIELD_INGEST_OPERATOR,
     UI_TEXT_FIELD_INGEST_LOCATION,
     UI_TEXT_FIELD_INGEST_NOTES,
-    UI_TEXT_FIELD_RTLSDR_FREQ,         // RTL-SDR center frequency (Hz, digits only)
+    UI_TEXT_FIELD_RTLSDR_FREQ,
+    UI_TEXT_FIELD_RTLSDR_RATE,
     UI_TEXT_FIELD_NET_SERVER_PORT,      // Network server port (digits only)
     UI_TEXT_FIELD_NET_CLIENT_HOST,      // Network client server host (IP/hostname)
     UI_TEXT_FIELD_NET_CLIENT_PORT,      // Network client server port (digits only)
 } ui_text_field_t;
 
 // Unified cursor-based text editing state (settings panel)
+/* The M-Client browser navigates the SERVER filesystem, never Windows disk. */
+static bool s_monitor_folder_open=false;
+static unsigned s_monitor_folder_page=0;
+static char s_monitor_folder_path[FILE_PATH_MAX]={0};
+static char s_monitor_folder_parent[FILE_PATH_MAX]={0};
+static char s_monitor_folder_edit_path[FILE_PATH_MAX]={0};
+static char s_monitor_folder_path_display[FILE_PATH_MAX]={0};
+static char s_monitor_folder_labels[12][256];
+static bool s_monitor_folder_computer=false;
+static bool s_monitor_folder_recovered=false;
+static bool s_monitor_folder_error=false;
+static bool s_monitor_folder_more=false;
 static ui_text_field_t s_active_text_field = UI_TEXT_FIELD_NONE;
 static int s_active_text_cursor = 0;
 static int s_active_text_selection_anchor = -1;
@@ -690,14 +721,127 @@ static double s_active_text_last_click_time = -1.0;
 static Clay_ElementId s_active_text_last_click_element_id = { 0 };
 static double s_active_text_backspace_repeat_at = 0.0;
 
-// RTL-SDR frequency text field mirrors settings.rtlsdr_freq_hz (a uint64).
-// Synced in render_settings_panel: format Hz->str when not editing, parse str->Hz when editing.
-static char s_rtlsdr_freq_str[32] = {0};
+#ifdef ENABLE_RTLSDR
+#define DROPDOWN_RTLSDR_PRESET "RtlsdrPreset"
+
+typedef struct {
+    uint32_t value;
+    const char *label;
+} sdr_preset_t;
+
+static const sdr_preset_t s_rtlsdr_frequency_presets[] = {
+    {1500000, "1.500 MHz (NTSC Hi-Fi)"},
+    {1600000, "1.600 MHz (PAL Hi-Fi)"},
+    {100000000, "100 MHz (FM example)"},
+    {1090000000, "1090 MHz (ADS-B)"}
+};
+static const sdr_preset_t s_rtlsdr_rate_presets[] = {
+    {250000, "0.250 MSPS"},
+    {1024000, "1.024 MSPS"},
+    {1200000, "1.200 MSPS"},
+    {1536000, "1.536 MSPS"},
+    {2000000, "2.000 MSPS"},
+    {2048000, "2.048 MSPS"},
+    {2400000, "2.400 MSPS"}
+};
+
+static const struct {
+    ui_text_field_t field;
+    const sdr_preset_t *presets;
+    int count;
+} s_rtlsdr_fields[] = {
+    {UI_TEXT_FIELD_RTLSDR_FREQ, s_rtlsdr_frequency_presets,
+     sizeof(s_rtlsdr_frequency_presets) / sizeof(s_rtlsdr_frequency_presets[0])},
+    {UI_TEXT_FIELD_RTLSDR_RATE, s_rtlsdr_rate_presets,
+     sizeof(s_rtlsdr_rate_presets) / sizeof(s_rtlsdr_rate_presets[0])}
+};
+static char s_rtlsdr_draft[32];
+#endif
 
 // Record-limit popup state (toolbar clock button)
 static bool s_record_limit_window_open = false;
 // Version info popup state (toolbar "i" badge button)
 static bool s_version_info_window_open = false;
+// Net mode hold-press menu (About window "Mode" toggle): a press arms the
+// decision, a quick release cycles the mode, holding >= 450 ms opens a
+// direct-select menu. Resolution runs per frame in gui_handle_interactions
+// (clicks fire on press, so the toggle itself only arms).
+static bool s_net_mode_menu_open = false;
+static bool s_net_mode_press_armed = false;
+static double s_net_mode_press_time = 0.0;
+static bool s_net_mode_hold_fired = false;
+
+// Forward declaration (defined later in this file; the net mode apply helper
+// below runs before the definition site).
+static void gui_ui_clear_text_edit(void);
+
+// Net mode cycle order (keep numeric mode 3 as a saved-config alias only):
+// Local -> Server -> Client -> Monitor & Remote -> Local.
+static int gui_ui_net_mode_cycle_next(int cur) {
+    if (cur < GUI_NET_MODE_LOCAL || cur > GUI_NET_MODE_LAST) cur = GUI_NET_MODE_LOCAL;
+    if (cur == GUI_NET_MODE_MONITOR_SERVER) return GUI_NET_MODE_LOCAL;
+    if (cur == GUI_NET_MODE_CLIENT) return GUI_NET_MODE_MONITOR_CLIENT;
+    if (cur == GUI_NET_MODE_MONITOR_CLIENT) return GUI_NET_MODE_LOCAL;
+    return cur + 1;
+}
+
+// Shared by the quick-click cycle and the hold-press menu: update the mode,
+// save, and hand the stop/start sequence to the async net transition worker.
+// The synchronous gui_net_apply_mode joins network worker threads that can
+// sit in multi-second socket timeouts - running it inline in the click
+// handler is what made switching to Monitor & Remote stall the UI.
+void gui_ui_net_mode_apply(gui_app_t *app, int next) {
+    if (!app) return;
+#ifdef __ANDROID__
+    if (gui_app_capture_busy() || gui_net_capture_controls_locked(app)) {
+        gui_app_set_status(app, "Wait for the current capture or network change to finish");
+        return;
+    }
+    if (next != app->settings.net_mode &&
+        (app->is_recording || gui_record_is_finalizing())) {
+        gui_app_set_status(app, "Stop recording before changing network mode");
+        return;
+    }
+#endif
+    if (gui_playback_is_starting(app)) {
+        gui_app_set_status(app, "Network mode is locked while playback prepares");
+        return;
+    }
+    int cur = app->settings.net_mode;
+    if (cur < GUI_NET_MODE_LOCAL || cur > GUI_NET_MODE_LAST) cur = GUI_NET_MODE_LOCAL;
+    if (next != cur && (gui_monitor_local_save_recording() ||
+        (cur == GUI_NET_MODE_CLIENT && app->is_recording))) {
+        gui_app_set_status(app, "Stop recording before changing network mode");
+        return;
+    }
+#ifdef __ANDROID__
+    if (gui_app_defer_remote_mode(app, next)) return;
+#endif
+    if (next != cur) gui_record_cancel_capture_confirmation(app);
+    app->settings.net_mode = next;
+    gui_ui_clear_text_edit();
+    gui_settings_save(&app->settings);
+    char msg[96];
+    snprintf(msg, sizeof(msg), "Network mode: %s", gui_net_mode_name(next));
+    gui_app_set_status(app, msg);
+    /* Rapid cycling: a click while a transition is running is QUEUED (the
+     * worker chases settings.net_mode), never refused - the label follows
+     * the click immediately. Leaving a client mode / returning to Local must
+     * bring the local device list back (the worker defers that enumerate to
+     * the main loop); reenum here only feeds the sync fallback below. */
+    bool reenum = (next == GUI_NET_MODE_LOCAL || cur == GUI_NET_MODE_CLIENT ||
+                   cur == GUI_NET_MODE_MONITOR_CLIENT);
+    if (gui_net_request_apply_mode(app, cur, false) != 0) {
+        // Worker unavailable (spawn failure): fall back to the synchronous
+        // apply so the mode never ends up half-applied.
+        (void)gui_net_apply_mode(app);
+#ifdef __ANDROID__
+        if (reenum) atomic_store(&app->net_reenumerate_pending, true);
+#else
+        if (reenum) gui_app_enumerate_devices(app);
+#endif
+    }
+}
 // Metadata popup state (toolbar scroll badge button)
 static bool s_metadata_window_open = false;
 static bool s_record_limit_armed = false;
@@ -1465,8 +1609,10 @@ static char playback_timeline_display_a[64];
 static char playback_timeline_display_b[64];
 static char playback_readout_display_a[32];
 static char playback_readout_display_b[32];
-static char playback_name_display_a[64];
-static char playback_name_display_b[64];
+/* Full filenames (gui_ui_playback_file_basename): sized for whole basenames,
+   not abbreviated ones - the timeline name slot budgets from these. */
+static char playback_name_display_a[128];
+static char playback_name_display_b[128];
 static char playback_fileinfo_display_a[48];
 static char playback_fileinfo_display_b[48];
 static char playback_index_display[2][96];
@@ -1919,15 +2065,30 @@ static void update_status_free_space(gui_app_t *app)
     }
     s_status_free_space_last_update_s = now;
 
+    bool m_client=app->settings.net_mode==GUI_NET_MODE_MONITOR_CLIENT;
+    gui_monitor_record_stats_t remote={0};
+    bool have_remote=m_client && gui_monitor_client_record_stats(&remote);
+    bool remote_recording=have_remote && gui_monitor_client_peer_state()==2;
     uint64_t free_bytes = 0;
-    if (gui_record_get_output_free_space_bytes(app, &free_bytes)) {
+    bool free_valid;
+    if(m_client){
+        /* Local Save ON targets the client's disk. Otherwise the server's
+         * configured Output folder, which may not exist on Windows. */
+        bool use_local=app->settings.monitor_local_save_enabled;
+        if(remote_recording)use_local=remote.local_save;
+        free_valid=use_local
+          ? file_disk_free_space_utf8(app->settings.monitor_local_save_path,&free_bytes)
+          : have_remote && remote.server_free_valid;
+        if(!use_local && free_valid)free_bytes=remote.server_free_bytes;
+    }else free_valid=gui_record_get_output_free_space_bytes(app,&free_bytes);
+    if (free_valid) {
         s_status_free_space_cached_bytes = free_bytes;
         s_status_free_space_valid = true;
     } else {
         s_status_free_space_valid = false;
     }
 
-    if (!app->is_recording) {
+    if (!app->is_recording && !remote_recording) {
         s_status_output_last_bytes = 0;
         s_status_output_last_sample_s = 0.0;
         s_status_output_rate_bps = 0.0;
@@ -1935,6 +2096,11 @@ static void update_status_free_space(gui_app_t *app)
     }
 
     uint64_t output_bytes = gui_ui_recording_output_total_bytes(app);
+    if(m_client && have_remote){
+        output_bytes=remote.use_flac
+            ? remote.compressed[0]+remote.compressed[1]
+            : remote.raw[0]+remote.raw[1];
+    }
     if (s_status_output_last_sample_s > 0.0 && output_bytes >= s_status_output_last_bytes) {
         double elapsed_s = now - s_status_output_last_sample_s;
         if (elapsed_s > 0.0) {
@@ -2307,8 +2473,28 @@ static void gui_ui_clear_text_edit(void)
 
 static bool gui_ui_settings_locked(const gui_app_t *app)
 {
-    return app && (app->is_recording || gui_playback_is_starting((gui_app_t *)app));
+    return app && (app->is_recording ||
+        (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT &&
+         gui_monitor_client_peer_state() == 2) ||
+#ifdef __ANDROID__
+        gui_app_capture_busy() ||
+#endif
+        gui_playback_is_starting((gui_app_t *)app));
 }
+
+#if defined(ENABLE_DDD) && defined(ENABLE_DDD_WINUSB)
+static bool gui_ui_ddd_usb_backend_visible(const gui_app_t *app)
+{
+    return gui_ui_selected_device_is_ddd_v1(app) &&
+        app->settings.net_mode != GUI_NET_MODE_CLIENT &&
+        app->settings.net_mode != GUI_NET_MODE_MONITOR_CLIENT;
+}
+
+static bool gui_ui_ddd_usb_backend_locked(const gui_app_t *app)
+{
+    return app->is_capturing || app->is_recording || gui_record_is_finalizing();
+}
+#endif
 
 // One-time per-session low-rate warning: pops a dismissible info dialog
 // only when the resample cycle lands on the 14.3 MSPS stock 10-bit CXADC
@@ -2351,6 +2537,14 @@ static bool gui_ui_text_field_get_buffer(gui_app_t *app, ui_text_field_t field, 
         case UI_TEXT_FIELD_OUTPUT_PATH:
             *dst = app->settings.output_path;
             *cap = sizeof(app->settings.output_path);
+            return true;
+        case UI_TEXT_FIELD_MONITOR_SERVER_BROWSER_PATH:
+            *dst=s_monitor_folder_edit_path;
+            *cap=sizeof(s_monitor_folder_edit_path);
+            return true;
+        case UI_TEXT_FIELD_MONITOR_LOCAL_SAVE_PATH:
+            *dst = app->settings.monitor_local_save_path;
+            *cap = sizeof(app->settings.monitor_local_save_path);
             return true;
         case UI_TEXT_FIELD_FLAC_AFFINITY:
             *dst = app->settings.flac_affinity_cpu_list;
@@ -2436,6 +2630,13 @@ static bool gui_ui_text_field_get_buffer(gui_app_t *app, ui_text_field_t field, 
             *dst = app->settings.ingest_notes;
             *cap = sizeof(app->settings.ingest_notes);
             return true;
+#ifdef ENABLE_RTLSDR
+        case UI_TEXT_FIELD_RTLSDR_FREQ:
+        case UI_TEXT_FIELD_RTLSDR_RATE:
+            *dst = s_rtlsdr_draft;
+            *cap = sizeof(s_rtlsdr_draft);
+            return true;
+#endif
         case UI_TEXT_FIELD_NET_SERVER_PORT:
             *dst = app->settings.net_server_port_str;
             *cap = sizeof(app->settings.net_server_port_str);
@@ -2486,7 +2687,12 @@ static bool gui_ui_text_field_can_edit(gui_app_t *app, ui_text_field_t field)
         case UI_TEXT_FIELD_OUTPUT_BASE_NAME:
             return app->settings.auto_names_enabled;
         case UI_TEXT_FIELD_OUTPUT_PATH:
-            return true;
+            /* Server Output path is authoritative in M-Client. Use browser. */
+            return app->settings.net_mode!=GUI_NET_MODE_MONITOR_CLIENT;
+        case UI_TEXT_FIELD_MONITOR_SERVER_BROWSER_PATH:
+            return app->settings.net_mode==GUI_NET_MODE_MONITOR_CLIENT && s_monitor_folder_open;
+        case UI_TEXT_FIELD_MONITOR_LOCAL_SAVE_PATH:
+            return app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT;
         case UI_TEXT_FIELD_FLAC_AFFINITY:
             return app->settings.show_core_pinning_in_settings &&
                    app->settings.use_flac &&
@@ -2502,7 +2708,8 @@ static bool gui_ui_text_field_can_edit(gui_app_t *app, ui_text_field_t field)
         case UI_TEXT_FIELD_AUDIO_LABEL_3:
         case UI_TEXT_FIELD_AUDIO_LABEL_4:
             return app->settings.auto_names_enabled;
-        case UI_TEXT_FIELD_RTLSDR_FREQ: {
+        case UI_TEXT_FIELD_RTLSDR_FREQ:
+        case UI_TEXT_FIELD_RTLSDR_RATE: {
 #ifdef ENABLE_RTLSDR
             return gui_ui_selected_device_is_sdr(app);
 #else
@@ -2540,20 +2747,18 @@ static bool gui_ui_text_field_char_allowed(ui_text_field_t field, int ch)
         // Keep these permissive for ingest entry, but still block JSON-breaking quote chars.
         return (ch >= 32 && ch < 127 && ch != '\"');
     }
-    if (field == UI_TEXT_FIELD_RTLSDR_FREQ) {
-        // Frequency in Hz: digits only (parsed to uint64 on commit).
-        return (ch >= '0' && ch <= '9');
-    }
-    if (field == UI_TEXT_FIELD_NET_SERVER_PORT ||
-        field == UI_TEXT_FIELD_NET_CLIENT_PORT) {
-        // TCP port: digits only.
+    if (field == UI_TEXT_FIELD_RTLSDR_FREQ || field == UI_TEXT_FIELD_RTLSDR_RATE ||
+        field == UI_TEXT_FIELD_NET_SERVER_PORT || field == UI_TEXT_FIELD_NET_CLIENT_PORT) {
         return (ch >= '0' && ch <= '9');
     }
     if (field == UI_TEXT_FIELD_NET_CLIENT_HOST) {
         // Hostname or IP: allow printable ASCII except quote (JSON-safe).
         return (ch >= 32 && ch < 127 && ch != '\"');
     }
-    return gui_text_path_char_allowed(ch, field == UI_TEXT_FIELD_OUTPUT_PATH);
+    return gui_text_path_char_allowed(ch,
+            field == UI_TEXT_FIELD_OUTPUT_PATH ||
+            field == UI_TEXT_FIELD_MONITOR_LOCAL_SAVE_PATH ||
+            field == UI_TEXT_FIELD_MONITOR_SERVER_BROWSER_PATH);
 }
 
 static void gui_ui_text_field_font(ui_text_field_t field, int *font_size, int *font_id)
@@ -2563,6 +2768,8 @@ static void gui_ui_text_field_font(ui_text_field_t field, int *font_size, int *f
     switch (field) {
         case UI_TEXT_FIELD_OUTPUT_BASE_NAME:
         case UI_TEXT_FIELD_OUTPUT_PATH:
+        case UI_TEXT_FIELD_MONITOR_SERVER_BROWSER_PATH:
+        case UI_TEXT_FIELD_MONITOR_LOCAL_SAVE_PATH:
             size = FONT_SIZE_NORMAL;
             id = 0;
             break;
@@ -2581,6 +2788,8 @@ static void gui_ui_text_field_font(ui_text_field_t field, int *font_size, int *f
         case UI_TEXT_FIELD_AUDIO_LABEL_4:
         case UI_TEXT_FIELD_LEVEL_AUTOSTOP_LEVEL:
         case UI_TEXT_FIELD_LEVEL_AUTOSTOP_DURATION:
+        case UI_TEXT_FIELD_RTLSDR_FREQ:
+        case UI_TEXT_FIELD_RTLSDR_RATE:
         case UI_TEXT_FIELD_INGEST_PROJECT:
         case UI_TEXT_FIELD_INGEST_TAPE_ID:
         case UI_TEXT_FIELD_INGEST_TAPE_FORMAT:
@@ -2747,9 +2956,12 @@ static bool gui_ui_text_insert_filtered(ui_text_field_t field, char *dst, size_t
     if (!filtered) return false;
     size_t count = 0;
     bool valid = true;
-    bool path_field = field == UI_TEXT_FIELD_OUTPUT_BASE_NAME ||
-                      field == UI_TEXT_FIELD_OUTPUT_PATH ||
-                      (field >= UI_TEXT_FIELD_RF_TAG_A && field <= UI_TEXT_FIELD_AUDIO_LABEL_4);
+    bool strict_paste = field == UI_TEXT_FIELD_OUTPUT_BASE_NAME ||
+                        field == UI_TEXT_FIELD_OUTPUT_PATH ||
+                        field == UI_TEXT_FIELD_MONITOR_LOCAL_SAVE_PATH ||
+                        field == UI_TEXT_FIELD_MONITOR_SERVER_BROWSER_PATH ||
+                        (field >= UI_TEXT_FIELD_RF_TAG_A && field <= UI_TEXT_FIELD_AUDIO_LABEL_4) ||
+                        field == UI_TEXT_FIELD_RTLSDR_FREQ || field == UI_TEXT_FIELD_RTLSDR_RATE;
     for (const char *p = src; *p; ) {
         int size = 0;
         int ch = GetCodepointNext(p, &size);
@@ -2760,7 +2972,7 @@ static bool gui_ui_text_insert_filtered(ui_text_field_t field, char *dst, size_t
             break;
         }
         if (!gui_ui_text_field_char_allowed(field, ch)) {
-            if (path_field) { valid = false; break; }
+            if (strict_paste) { valid = false; break; }
             p += size;
             continue;
         }
@@ -2977,6 +3189,34 @@ static bool gui_ui_text_delete(char *dst, int *cursor)
     return gui_text_replace(dst, len + 1, cursor, *cursor, gui_text_next(dst, *cursor), NULL, 0);
 }
 
+#ifdef ENABLE_RTLSDR
+static void gui_ui_apply_rtlsdr_value(gui_app_t *app, ui_text_field_t field, uint32_t value)
+{
+    if (field == UI_TEXT_FIELD_RTLSDR_FREQ) app->settings.rtlsdr_freq_hz = value;
+    else app->settings.rtlsdr_sample_rate_hz = value;
+    gui_settings_save(&app->settings);
+    if (app->is_capturing)
+        gui_app_set_status(app, "SDR setting saved. Reconnect to apply.");
+}
+
+static bool gui_ui_commit_rtlsdr_value(gui_app_t *app, ui_text_field_t field, const char *draft)
+{
+    const bool rate = field == UI_TEXT_FIELD_RTLSDR_RATE;
+    const bool digits_only = draft[0] && !draft[strspn(draft, "0123456789")];
+    unsigned long long value = digits_only ? strtoull(draft, NULL, 10) : 0;
+    const bool rate_supported = (value >= 225001 && value <= 300000) ||
+                                (value >= 900001 && value <= 3200000);
+    if (value == 0 || value > UINT32_MAX || (rate && !rate_supported)) {
+        gui_app_set_status(app, rate
+            ? "Enter a sample rate in S/s (225001-300000 or 900001-3200000)"
+            : "Enter a frequency in Hz (1-4294967295)");
+        return false;
+    }
+    gui_ui_apply_rtlsdr_value(app, field, (uint32_t)value);
+    return true;
+}
+#endif
+
 static void gui_ui_handle_active_text_edit(gui_app_t *app)
 {
     if (s_active_text_field == UI_TEXT_FIELD_NONE) return;
@@ -2990,13 +3230,12 @@ static void gui_ui_handle_active_text_edit(gui_app_t *app)
     }
     gui_ui_text_clamp_state(dst);
 
-    // RTL-SDR frequency text field mirrors settings.rtlsdr_freq_hz (a uint64).
-    // Sync string -> uint64 here so every gui_settings_save() below commits the
-    // current value (including on Enter/Esc). Non-digits parse to 0 and are ignored.
-    if (s_active_text_field == UI_TEXT_FIELD_RTLSDR_FREQ && s_rtlsdr_freq_str[0]) {
-        unsigned long long parsed = strtoull(s_rtlsdr_freq_str, NULL, 10);
-        if (parsed > 0) app->settings.rtlsdr_freq_hz = (uint64_t)parsed;
-    }
+#ifdef ENABLE_RTLSDR
+    const bool sdr_edit = s_active_text_field == UI_TEXT_FIELD_RTLSDR_FREQ ||
+                          s_active_text_field == UI_TEXT_FIELD_RTLSDR_RATE;
+#else
+    const bool sdr_edit = false;
+#endif
     // Level-autostop level text field: clamp the edited 0.X into 0.1-0.8 on commit.
     // The live string is allowed to be partial while typing; final clamping happens
     // here so the saved value is always in range.
@@ -3084,6 +3323,13 @@ static void gui_ui_handle_active_text_edit(gui_app_t *app)
         }
         if (finish_edit_requested) {
             gui_ui_text_clamp_state(dst);
+#ifdef ENABLE_RTLSDR
+            if (sdr_edit) {
+                if (gui_ui_commit_rtlsdr_value(app, s_active_text_field, dst))
+                    gui_ui_clear_text_edit();
+                return;
+            }
+#endif
             gui_settings_save(&app->settings);
             gui_ui_clear_text_edit();
             return;
@@ -3139,12 +3385,24 @@ static void gui_ui_handle_active_text_edit(gui_app_t *app)
     }
 
     gui_ui_text_clamp_state(dst);
-    if (changed) {
+    if (changed && !sdr_edit && s_active_text_field != UI_TEXT_FIELD_MONITOR_SERVER_BROWSER_PATH) {
         gui_settings_save(&app->settings);
     }
 
     if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER) || IsKeyPressed(KEY_ESCAPE)) {
-        gui_settings_save(&app->settings);
+#ifdef ENABLE_RTLSDR
+        if (sdr_edit) {
+            if (IsKeyPressed(KEY_ESCAPE) || gui_ui_commit_rtlsdr_value(app, s_active_text_field, dst))
+                gui_ui_clear_text_edit();
+            return;
+        }
+#endif
+        if(s_active_text_field==UI_TEXT_FIELD_MONITOR_SERVER_BROWSER_PATH){
+            if(!IsKeyPressed(KEY_ESCAPE)){
+                s_monitor_folder_page=0;
+                gui_monitor_client_browse_folders(s_monitor_folder_edit_path,0);
+            }
+        }else gui_settings_save(&app->settings);
         gui_ui_clear_text_edit();
     }
 }
@@ -3159,8 +3417,151 @@ static CustomLayoutElement s_record_limit_icon_element;
 static CustomLayoutElement s_version_icon_element;
 static CustomLayoutElement s_metadata_icon_element;
 
+#ifdef ENABLE_RTLSDR
+static Clay_ElementDeclaration gui_ui_channel_menu(Clay_ElementId button_id, int width, int option_count);
+
+static uint64_t gui_ui_rtlsdr_value(const gui_app_t *app, ui_text_field_t field)
+{
+    return field == UI_TEXT_FIELD_RTLSDR_FREQ ? app->settings.rtlsdr_freq_hz
+                                            : app->settings.rtlsdr_sample_rate_hz;
+}
+
+static void render_rtlsdr_setting(const gui_app_t *app, int index)
+{
+    const ui_text_field_t field = s_rtlsdr_fields[index].field;
+    const bool frequency = field == UI_TEXT_FIELD_RTLSDR_FREQ;
+    const bool editing = gui_ui_is_text_field_active(field);
+    const bool menu_open = gui_dropdown_is_open(DROPDOWN_RTLSDR_PRESET, index);
+    const sdr_preset_t *presets = s_rtlsdr_fields[index].presets;
+    const int count = s_rtlsdr_fields[index].count;
+    const uint64_t value = gui_ui_rtlsdr_value(app, field);
+    const Clay_ElementId button_id = CLAY_IDI("RtlsdrSettingValue", index);
+    static char display[2][32];
+
+    const char *label = frequency ? "Frequency (Hz)" : editing ? "Sample rate (S/s)" : "Sample rate";
+    const char *value_text = display[index];
+    snprintf(display[index], sizeof(display[index]), frequency ? "%" PRIu64 : "%" PRIu64 " S/s", value);
+    if (!frequency) {
+        for (int i = 0; i < count; ++i)
+            if (presets[i].value == value) value_text = presets[i].label;
+    }
+
+    CLAY(CLAY_IDI("RtlsdrSettingRow", index), {
+        .layout = {
+            .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) },
+            .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
+            .childGap = 10
+        }
+    }) {
+        CLAY_TEXT(make_string(label), CLAY_TEXT_CONFIG({
+            .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT)
+        }));
+        CLAY(button_id, {
+            .layout = {
+                .sizing = { CLAY_SIZING_FIXED(136), CLAY_SIZING_FIXED(28) },
+                .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER },
+                .padding = { 8, 8, 0, 0 },
+                .childGap = 6
+            },
+            .backgroundColor = to_clay_color(editing || menu_open ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON),
+            .cornerRadius = CLAY_CORNER_RADIUS(4)
+        }) {
+            if (editing) {
+                gui_ui_render_active_text(field, s_rtlsdr_draft, FONT_SIZE_STATS, 1, COLOR_TEXT);
+            } else {
+                CLAY_TEXT(make_string(value_text), CLAY_TEXT_CONFIG({
+                    .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT)
+                }));
+                CLAY_TEXT(CLAY_STRING("v"), CLAY_TEXT_CONFIG({
+                    .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM)
+                }));
+            }
+        }
+    }
+
+    if (menu_open) {
+        Clay_ElementDeclaration menu = gui_ui_channel_menu(button_id, 224, count + 1);
+        menu.floating.zIndex = 1;
+        CLAY(CLAY_ID("RtlsdrPresetOptions"), menu) {
+            for (int i = 0; i <= count; ++i) {
+                const Clay_ElementId id = CLAY_IDI("RtlsdrPresetOption", i);
+                const bool selected = i < count && presets[i].value == value;
+                CLAY(id, {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(20) },
+                        .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
+                        .padding = { 8, 8, 0, 0 }
+                    },
+                    .backgroundColor = to_clay_color(gui_dropdown_option_color(selected, Clay_PointerOver(id)))
+                }) {
+                    CLAY_TEXT(make_string(i < count ? presets[i].label : "Custom..."), CLAY_TEXT_CONFIG({
+                        .fontSize = FONT_SIZE_DROPDOWN_OPT, .textColor = to_clay_color(COLOR_TEXT)
+                    }));
+                }
+            }
+        }
+    }
+}
+
+static bool gui_ui_handle_rtlsdr_setting_click(gui_app_t *app)
+{
+    if (!app->settings_panel_open || gui_ui_settings_locked(app) || !gui_ui_selected_device_is_sdr(app))
+        return false;
+
+    const bool editing = s_active_text_field == UI_TEXT_FIELD_RTLSDR_FREQ ||
+                         s_active_text_field == UI_TEXT_FIELD_RTLSDR_RATE;
+    if (editing && !Clay_PointerOver(s_active_text_element_id)) {
+        if (!gui_ui_commit_rtlsdr_value(app, s_active_text_field, s_rtlsdr_draft))
+            return true;
+        gui_ui_clear_text_edit();
+    }
+
+    for (int index = 0; index < 2; ++index) {
+        const Clay_ElementId id = CLAY_IDI("RtlsdrSettingValue", index);
+        const ui_text_field_t field = s_rtlsdr_fields[index].field;
+        if (gui_dropdown_is_open(DROPDOWN_RTLSDR_PRESET, index)) {
+            const int count = s_rtlsdr_fields[index].count;
+            for (int i = 0; i <= count; ++i) {
+                if (!Clay_PointerOver(CLAY_IDI("RtlsdrPresetOption", i))) continue;
+                gui_dropdown_close_all();
+                if (i == count) {
+                    snprintf(s_rtlsdr_draft, sizeof(s_rtlsdr_draft), "%" PRIu64,
+                             gui_ui_rtlsdr_value(app, field));
+                    gui_ui_begin_text_edit(app, field, id, 8.0f, 8.0f);
+                    s_active_text_selection_anchor = 0;
+                    s_active_text_cursor = (int)strlen(s_rtlsdr_draft);
+                    s_active_text_drag_selecting = false;
+                } else {
+                    gui_ui_apply_rtlsdr_value(app, field, s_rtlsdr_fields[index].presets[i].value);
+                }
+                return true;
+            }
+        }
+        if (Clay_PointerOver(id)) {
+            if (gui_ui_is_text_field_active(field)) {
+                gui_ui_begin_text_edit(app, field, id, 8.0f, 8.0f);
+            } else {
+                gui_ui_clear_text_edit();
+                gui_dropdown_toggle(DROPDOWN_RTLSDR_PRESET, index);
+            }
+            return true;
+        }
+    }
+    if (gui_dropdown_is_open(DROPDOWN_RTLSDR_PRESET, 0) ||
+        gui_dropdown_is_open(DROPDOWN_RTLSDR_PRESET, 1))
+        gui_dropdown_close_all();
+    return false;
+}
+#endif
+
 // Render settings panel (floating modal)
 static void render_settings_panel(gui_app_t *app) {
+    if(app->settings.net_mode==GUI_NET_MODE_MONITOR_CLIENT){
+        char server_path[FILE_PATH_MAX];
+        if(gui_monitor_client_output_path(server_path,sizeof(server_path)) &&
+           !gui_ui_is_text_field_active(UI_TEXT_FIELD_OUTPUT_PATH))
+            snprintf(app->settings.output_path,sizeof(app->settings.output_path),"%s",server_path);
+    }
     if (!app->settings_panel_open) return;
     int settings_max_width = gui_ui_modal_max_extent(gui_ui_get_layout_width(), 1080);
     int settings_max_height = gui_ui_modal_max_extent(gui_ui_get_layout_height(), 780);
@@ -3297,6 +3698,75 @@ static void render_settings_panel(gui_app_t *app) {
             }
         }
 
+/* Local Save controls are M-Client-exclusive. Never silently record
+ * on the M-Server when the client-owned receiver cannot be attached. */
+if (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT) {
+    CLAY(CLAY_ID("MonitorLocalSaveRow"), {
+        .layout = { .sizing={CLAY_SIZING_GROW(0),CLAY_SIZING_FIXED(32)},
+                    .layoutDirection=CLAY_LEFT_TO_RIGHT,
+                    .childAlignment={.y=CLAY_ALIGN_Y_CENTER}, .childGap=10 }
+    }) {
+        CLAY_TEXT(CLAY_STRING("Local Save:"),
+            CLAY_TEXT_CONFIG({ .fontSize=FONT_SIZE_NORMAL, .textColor=to_clay_color(COLOR_TEXT) }));
+        CLAY(CLAY_ID("MonitorLocalSaveToggle"), {
+            .layout={ .sizing={CLAY_SIZING_FIXED(104),CLAY_SIZING_FIXED(28)},
+                      .childAlignment={.x=CLAY_ALIGN_X_CENTER,.y=CLAY_ALIGN_Y_CENTER} },
+            .backgroundColor=to_clay_color(app->settings.monitor_local_save_enabled ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON),
+            .cornerRadius=CLAY_CORNER_RADIUS(4)
+        }) {
+            CLAY_TEXT(app->settings.monitor_local_save_enabled ? CLAY_STRING("ON") : CLAY_STRING("OFF"),
+                CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_NORMAL,.textColor=to_clay_color(COLOR_TEXT_DIM)}));
+        }
+        CLAY_TEXT(CLAY_STRING("client-owned recording; .partial until commit"),
+            CLAY_TEXT_CONFIG({ .fontSize=FONT_SIZE_STATS, .textColor=to_clay_color(COLOR_TEXT_DIM) }));
+    }
+    // Display only the currently selected recording destination. The
+    // alternate path remains saved, but is hidden until its mode is selected.
+    if (app->settings.monitor_local_save_enabled) {
+    // Local Save is M-Client-only; its destination must be editable on
+    // the CLIENT computer. Never reuse OutputPathBox / settings.output_path:
+    // those describe the separate capture-output configuration.
+    CLAY_TEXT(CLAY_STRING("Local folder (this computer; click to edit):"),
+        CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_STATS,.textColor=to_clay_color(COLOR_TEXT_DIM)}));
+    CLAY(CLAY_ID("MonitorLocalSavePathRow"), {
+        .layout={.sizing={CLAY_SIZING_GROW(0),CLAY_SIZING_FIXED(32)},
+                 .layoutDirection=CLAY_LEFT_TO_RIGHT,
+                 .childAlignment={.y=CLAY_ALIGN_Y_CENTER},.childGap=8}
+    }) {
+        CLAY(CLAY_ID("MonitorLocalSavePathBox"), {
+            .layout={.sizing={CLAY_SIZING_GROW(0),CLAY_SIZING_FIXED(32)},
+                     .childAlignment={.x=CLAY_ALIGN_X_LEFT,.y=CLAY_ALIGN_Y_CENTER},
+                     .padding={10,10,0,0}},
+            .backgroundColor=to_clay_color((Color){25,25,30,255}),
+            .cornerRadius=CLAY_CORNER_RADIUS(4),
+            .clip={.horizontal=true}
+        }) {
+            const char *local_path=app->settings.monitor_local_save_path;
+            if (gui_ui_is_text_field_active(UI_TEXT_FIELD_MONITOR_LOCAL_SAVE_PATH)) {
+                gui_ui_render_active_text(UI_TEXT_FIELD_MONITOR_LOCAL_SAVE_PATH,
+                    local_path, FONT_SIZE_NORMAL, 0, COLOR_TEXT);
+            } else {
+                CLAY_TEXT(make_string(local_path[0] ? local_path : "Click here or Choose..."),
+                    CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_NORMAL,
+                                      .textColor=to_clay_color(local_path[0] ? COLOR_TEXT : COLOR_TEXT_DIM)}));
+            }
+        }
+        CLAY(CLAY_ID("MonitorLocalSaveChooseFolder"), {
+            .layout={.sizing={CLAY_SIZING_FIXED(96),CLAY_SIZING_FIXED(30)},
+                     .childAlignment={.x=CLAY_ALIGN_X_CENTER,.y=CLAY_ALIGN_Y_CENTER}},
+            .backgroundColor=to_clay_color(COLOR_BUTTON),.cornerRadius=CLAY_CORNER_RADIUS(4)
+        }) {
+            CLAY_TEXT(CLAY_STRING("Choose..."),
+                CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_NORMAL,.textColor=to_clay_color(COLOR_TEXT)}));
+        }
+    }
+    } // Local Save ON: client directory row only
+}
+
+// Show the server/normal Output folder only when Local Save is not selected.
+// Non-M-Client modes retain their original folder controls unconditionally.
+if (app->settings.net_mode != GUI_NET_MODE_MONITOR_CLIENT ||
+    !app->settings.monitor_local_save_enabled) {
 // Output path display + choose button
 CLAY(CLAY_ID("SettingsOutputPath"), {
     .layout = {
@@ -3305,7 +3775,9 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
         .childGap = 6
     }
 }) {
-    CLAY_TEXT(CLAY_STRING("Output folder:"),
+    CLAY_TEXT(app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT
+        ? CLAY_STRING("Server Output folder:")
+        : CLAY_STRING("Output folder:"),
         CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
 
     CLAY(CLAY_ID("OutputPathRow"), {
@@ -3348,6 +3820,7 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
         }
     }
 }
+} // Local Save OFF (or non-M-Client): server/normal output directory
 
 
         // Scrollable settings body
@@ -3382,40 +3855,10 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                     // helper-like rows
 #ifdef ENABLE_RTLSDR
                     if (gui_ui_selected_device_is_sdr(app)) {
-                        // Display sync: when not editing, format uint64 -> string.
-                        if (s_active_text_field != UI_TEXT_FIELD_RTLSDR_FREQ) {
-                            snprintf(s_rtlsdr_freq_str, sizeof(s_rtlsdr_freq_str), "%llu",
-                                     (unsigned long long)app->settings.rtlsdr_freq_hz);
-                        }
-
                         CLAY_TEXT(CLAY_STRING("SDR:"),
                             CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-
-                        // Frequency (Hz) row
-                        CLAY(CLAY_ID("RtlsdrFreqRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
-                            CLAY_TEXT(CLAY_STRING("Frequency (Hz):"),
-                                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-                            CLAY(CLAY_ID("RtlsdrFreqField"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER }, .padding = { 8, 8, 0, 0 } }, .backgroundColor = to_clay_color((Color){25,25,30,255}), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                                if (gui_ui_is_text_field_active(UI_TEXT_FIELD_RTLSDR_FREQ)) {
-                                    gui_ui_render_active_text(UI_TEXT_FIELD_RTLSDR_FREQ, s_rtlsdr_freq_str, FONT_SIZE_STATS, 1, COLOR_TEXT);
-                                } else {
-                                    CLAY_TEXT(make_string(s_rtlsdr_freq_str), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT) }));
-                                }
-                            }
-                            CLAY(CLAY_ID("RtlsdrFreqHint"), { .layout = { .sizing = { CLAY_SIZING_FIXED(90), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER } } }) {
-                                CLAY_TEXT(CLAY_STRING("(click to edit)"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-                            }
-                        }
-
-                        // Sample rate row (cycle box)
-                        CLAY(CLAY_ID("RtlsdrSampleRateRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
-                            CLAY_TEXT(CLAY_STRING("Sample rate:"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
-                            char sr_buf[24];
-                            snprintf(sr_buf, sizeof(sr_buf), "%.2f MSPS", (double)app->settings.rtlsdr_sample_rate_hz / 1.0e6);
-                            CLAY(CLAY_ID("RtlsdrSampleRateBox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                                CLAY_TEXT(make_string(sr_buf), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
-                            }
-                        }
+                        render_rtlsdr_setting(app, 0);
+                        render_rtlsdr_setting(app, 1);
 
                         // Gain mode toggle row
                         CLAY(CLAY_ID("RtlsdrGainModeRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
@@ -3429,7 +3872,7 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                         // Gain stepper row
                         CLAY(CLAY_ID("RtlsdrGainRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
                             CLAY(CLAY_ID("RtlsdrGainMinus"), { .layout = { .sizing = { CLAY_SIZING_FIXED(28), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) { CLAY_TEXT(CLAY_STRING("-"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) })); }
-                            char gain_buf[24];
+                            static char gain_buf[24];
                             snprintf(gain_buf, sizeof(gain_buf), "Gain: %.1f dB", (double)app->settings.rtlsdr_gain_tenths_db / 10.0);
                             CLAY(CLAY_ID("RtlsdrGainValue"), { .layout = { .sizing = { CLAY_SIZING_FIXED(140), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER }, .padding = { 8, 8, 0, 0 } }, .backgroundColor = to_clay_color((Color){25,25,30,255}), .cornerRadius = CLAY_CORNER_RADIUS(4) }) { CLAY_TEXT(make_string(gain_buf), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) })); }
                             CLAY(CLAY_ID("RtlsdrGainPlus"), { .layout = { .sizing = { CLAY_SIZING_FIXED(28), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) { CLAY_TEXT(CLAY_STRING("+"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) })); }
@@ -3653,6 +4096,49 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                         }
                     }
 
+#if defined(ENABLE_DDD) && defined(ENABLE_DDD_WINUSB)
+                    if (gui_ui_ddd_usb_backend_visible(app)) {
+                        bool locked = gui_ui_ddd_usb_backend_locked(app);
+                        Color button_bg = locked ? ui_disabled_color(COLOR_BUTTON) : COLOR_BUTTON;
+                        Color text_fg = locked ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT;
+                        CLAY(CLAY_ID("DddUsbBackendRow"), {
+                            .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) },
+                                .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 }
+                        }) {
+                            CLAY(CLAY_ID("DddUsbBackendToggle"), {
+                                .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) },
+                                    .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } },
+                                .backgroundColor = to_clay_color(button_bg), .cornerRadius = CLAY_CORNER_RADIUS(4)
+                            }) {
+                                CLAY_TEXT(app->settings.ddd_use_winusb ? CLAY_STRING("WinUSB") : CLAY_STRING("libusb"),
+                                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(text_fg) }));
+                            }
+                            CLAY_TEXT(CLAY_STRING("DdD USB backend"),
+                                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(text_fg) }));
+                        }
+                        if (!app->settings.ddd_use_winusb) {
+                            Color raw_io_bg = locked ? button_bg :
+                                (app->settings.ddd_libusb_raw_io ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON);
+                            CLAY(CLAY_ID("DddLibusbRawIoRow"), {
+                                .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) },
+                                    .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                                    .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 }
+                            }) {
+                                CLAY(CLAY_ID("DddLibusbRawIoToggle"), {
+                                    .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) },
+                                        .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } },
+                                    .backgroundColor = to_clay_color(raw_io_bg), .cornerRadius = CLAY_CORNER_RADIUS(4)
+                                }) {
+                                    CLAY_TEXT(app->settings.ddd_libusb_raw_io ? CLAY_STRING("ON") : CLAY_STRING("OFF"),
+                                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(text_fg) }));
+                                }
+                                CLAY_TEXT(CLAY_STRING("libusb RAW_IO"),
+                                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(text_fg) }));
+                            }
+                        }
+                    } else
+#endif
                     CLAY(CLAY_ID("ToggleRowResampleB"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
                         Color resample_b_toggle_bg = settings_b_controls_disabled
                             ? ui_disabled_color(COLOR_BUTTON)
@@ -3778,8 +4264,21 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                     }
 
                     // Playback files section
-                    CLAY_TEXT(CLAY_STRING("Playback files (FLAC / drop onto a channel panel):"),
+                    CLAY_TEXT(CLAY_STRING("Playback files (RF / audio; drag and drop):"),
                         CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+
+                    // Player link mode: Synced = one shared transport (legacy
+                    // behaviour); Separate = per-file Play/Pause + Loop on the
+                    // rows below. Only rendered for the Playback device.
+                    if (gui_ui_selected_device_is_playback(app)) {
+                        bool link_sep = gui_playback_get_link_separate(app);
+                        CLAY(CLAY_ID("PlaybackLinkRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 6 } }) {
+                            CLAY(CLAY_ID("PlaybackLinkToggle"), { .layout = { .sizing = { CLAY_SIZING_FIXED(120), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(link_sep ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                                CLAY_TEXT(link_sep ? CLAY_STRING("Link: Separate") : CLAY_STRING("Link: Synced"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
+                            }
+                            CLAY_TEXT(make_string(link_sep ? "per-file transport" : "shared transport"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                        }
+                    }
 
                     // Channel A playback file
                     CLAY(CLAY_ID("PlaybackFileARow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 6 } }) {
@@ -3795,6 +4294,8 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                         CLAY(CLAY_ID("PlaybackFileClearA"), { .layout = { .sizing = { CLAY_SIZING_FIXED(28), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
                             CLAY_TEXT(CLAY_STRING("X"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
                         }
+                        // Per-file Play/Pause + Loop moved to the right end of
+                        // each playback timeline row (user request 2026-11-03).
                     }
 
                     // Channel B playback file
@@ -4199,9 +4700,13 @@ static void render_version_info_window(gui_app_t *app)
 
     const char *state_label;
     Color state_col;
-    if (app->is_recording)      { state_label = "Recording";  state_col = COLOR_CLIP_RED;   }
-    else if (app->is_capturing) { state_label = "Capturing";  state_col = COLOR_SYNC_GREEN; }
-    else                        { state_label = "Idle";       state_col = COLOR_TEXT_DIM;   }
+    int m_peer = (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT &&
+                  gui_monitor_client_connected()) ? gui_monitor_client_peer_state() : -1;
+    if (m_peer == 2 || (m_peer < 0 && app->is_recording))
+        { state_label = "Recording"; state_col = COLOR_CLIP_RED; }
+    else if (m_peer == 1 || (m_peer < 0 && app->is_capturing))
+        { state_label = "Capturing"; state_col = COLOR_SYNC_GREEN; }
+    else { state_label = "Idle"; state_col = COLOR_TEXT_DIM; }
     snprintf(vi_state, sizeof(vi_state), "%s", state_label);
 
     if (app->device_count > 0 &&
@@ -4223,9 +4728,18 @@ static void render_version_info_window(gui_app_t *app)
     }
 
     bool update_check_running = atomic_load_explicit(&s_update_check_running, memory_order_acquire);
+    /* Dev/unversioned builds (dev-YYYY-MM-DD-<sha>, unknown_version) are never
+     * comparable with a release tag; show what they are instead of claiming an
+     * update. The old lexical compare ('d' < 'v') permanently reported
+     * "Available: vN.N.N" on every dev build. */
+    bool update_current_comparable = gui_updater_version_is_comparable(MIRSC_TOOLS_VERSION);
     Color update_status_color = COLOR_TEXT_DIM;
     if (update_check_running) {
         snprintf(vi_update_status, sizeof(vi_update_status), "Checking...");
+    } else if (!update_current_comparable && app->settings.update_last_release_tag[0]) {
+        snprintf(vi_update_status, sizeof(vi_update_status),
+                 "Dev build (%s) - latest release %s",
+                 MIRSC_TOOLS_VERSION, app->settings.update_last_release_tag);
     } else if (app->settings.update_last_release_tag[0]) {
         int update_cmp = gui_updater_compare_versions(MIRSC_TOOLS_VERSION, app->settings.update_last_release_tag);
         if (update_cmp < 0) {
@@ -4249,6 +4763,7 @@ static void render_version_info_window(gui_app_t *app)
     // without a manifest. Two-click confirm: first click arms, second runs.
     bool update_install_available =
         !update_check_running &&
+        update_current_comparable &&
         app->settings.update_last_release_tag[0] &&
         (gui_updater_compare_versions(MIRSC_TOOLS_VERSION, app->settings.update_last_release_tag) < 0);
     bool update_install_blocked = update_check_running ||
@@ -4592,14 +5107,19 @@ static void render_version_info_window(gui_app_t *app)
         // Server hosts the HTTP control + RF/audio stream; Client connects to a
         // host and mirrors its device list/controls/capture state (master/slave).
         // v1 is LAN-only, no auth/encryption (mirrors the reference cxadc server).
-        CLAY_TEXT(CLAY_STRING("Network (Server/Client):"),
+        CLAY_TEXT(CLAY_STRING("Network mode:"),
             CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_HEADING, .textColor = to_clay_color(COLOR_TEXT) }));
 
         {
             int mode = app->settings.net_mode;
-            if (mode < GUI_NET_MODE_LOCAL || mode > GUI_NET_MODE_CLIENT) mode = GUI_NET_MODE_LOCAL;
+            if (mode < GUI_NET_MODE_LOCAL || mode > GUI_NET_MODE_LAST) mode = GUI_NET_MODE_LOCAL;
             const char *mode_label = gui_net_mode_name(mode);
             Color mode_bg = (mode == GUI_NET_MODE_LOCAL) ? COLOR_BUTTON : COLOR_BUTTON_ACTIVE;
+            /* Reverted pre-PR compact toggle style, sized to the longest mode
+             * label so "Monitor & Remote" never clips; the hint names the
+             * modes again instead of the count. */
+            int mode_btn_w = gui_ui_measure_button_width(app, gui_net_mode_name(GUI_NET_MODE_MONITOR_CLIENT),
+                                                         FONT_SIZE_NORMAL, 8, 0, 90, 220);
             CLAY(CLAY_ID("VersionInfoNetModeRow"), {
                 .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 }
             }) {
@@ -4609,7 +5129,7 @@ static void render_version_info_window(gui_app_t *app)
                 }
                 CLAY(CLAY_ID("VersionInfoNetModeToggle"), {
                     .layout = {
-                        .sizing = { CLAY_SIZING_FIXED(90), CLAY_SIZING_FIXED(28) },
+                        .sizing = { CLAY_SIZING_FIXED(mode_btn_w), CLAY_SIZING_FIXED(28) },
                         .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
                     },
                     .backgroundColor = to_clay_color(mode_bg),
@@ -4618,7 +5138,33 @@ static void render_version_info_window(gui_app_t *app)
                     CLAY_TEXT(make_string(mode_label),
                         CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
                 }
-                CLAY_TEXT(CLAY_STRING("click to cycle Local / Server / Client"),
+                CLAY_TEXT(CLAY_STRING("Local / Server / Client / Monitor & Remote (hold for list)"),
+                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+            }
+            /* Hold-press direct-select menu (armed by a >= 450 ms press on
+             * the toggle; consumed in the version-window click gate). */
+            if (s_net_mode_menu_open) {
+                static const int menu_ids[4] = {
+                    GUI_NET_MODE_LOCAL, GUI_NET_MODE_SERVER,
+                    GUI_NET_MODE_CLIENT, GUI_NET_MODE_MONITOR_CLIENT
+                };
+                for (int i = 0; i < 4; i++) {
+                    bool sel = (app->settings.net_mode == menu_ids[i]);
+                    Color item_bg = sel ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
+                    CLAY(CLAY_IDI("VersionInfoNetModeMenuItem", i), {
+                        .layout = {
+                            .sizing = { CLAY_SIZING_FIXED(mode_btn_w), CLAY_SIZING_FIXED(26) },
+                            .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER },
+                            .padding = { 8, 8, 0, 0 }
+                        },
+                        .backgroundColor = to_clay_color(item_bg),
+                        .cornerRadius = CLAY_CORNER_RADIUS(4)
+                    }) {
+                        CLAY_TEXT(make_string(gui_net_mode_name(menu_ids[i])),
+                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
+                    }
+                }
+                CLAY_TEXT(CLAY_STRING("click a mode to switch directly"),
                     CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
             }
         }
@@ -4654,8 +5200,10 @@ static void render_version_info_window(gui_app_t *app)
             }
         }
 
-        // Client: discovered-server list (primary) + compact manual host:port fallback.
-        if (app->settings.net_mode == GUI_NET_MODE_CLIENT) {
+        // The legacy Client and discovery-only M-Client share the same UI.
+        // M-Client must never connect through the legacy RF ingest backend.
+        if (app->settings.net_mode == GUI_NET_MODE_CLIENT ||
+            app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT) {
             CLAY_TEXT(CLAY_STRING("Discovered servers:"),
                 CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
             {
@@ -4706,8 +5254,13 @@ static void render_version_info_window(gui_app_t *app)
                         CLAY_TEXT(make_string(disc_more_label),
                             CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
                     }
-                    CLAY_TEXT(CLAY_STRING("click a server to connect (LAN only, no auth)"),
-                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                    if (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT) {
+                        CLAY_TEXT(CLAY_STRING("click a server to connect (MISRC-M/2 monitor protocol)"),
+                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                    } else {
+                        CLAY_TEXT(CLAY_STRING("click a server to connect (LAN only, no auth)"),
+                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                    }
                 }
             }
             // Compact manual host:port fallback (fixed widths so the window stays narrow).
@@ -4761,8 +5314,9 @@ static void render_version_info_window(gui_app_t *app)
                         CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
                 }
                 bool net_connected = gui_net_active(app);
+                bool connection_running=gui_net_client_connection_running(app);
                 Color connect_bg = net_connected ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
-                const char *connect_label = net_connected ? "Disconnect" : "Connect";
+                const char *connect_label = connection_running ? "Disconnect" : "Connect";
                 CLAY(CLAY_ID("VersionInfoNetConnectButton"), {
                     .layout = {
                         .sizing = { CLAY_SIZING_FIXED(96), CLAY_SIZING_FIXED(28) },
@@ -4774,8 +5328,13 @@ static void render_version_info_window(gui_app_t *app)
                     CLAY_TEXT(make_string(connect_label),
                         CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
                 }
-                CLAY_TEXT(CLAY_STRING("toggle client connection"),
-                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                if (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT) {
+                    CLAY_TEXT(CLAY_STRING("Phosphor preview (Zstd-1)"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                } else {
+                    CLAY_TEXT(CLAY_STRING("toggle client connection"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                }
             }
         }
 
@@ -4783,6 +5342,26 @@ static void render_version_info_window(gui_app_t *app)
         {
             static char net_status[160];
             gui_net_status_string(app, net_status, sizeof(net_status));
+            /* Warn about actual RF queue pressure/dropouts without claiming the
+             * physical LAN is necessarily the bottleneck. Server and legacy
+             * Client statistics are independent from the monitor transport. */
+            bool rf_transport_warning = false;
+            if (app->settings.net_mode == GUI_NET_MODE_SERVER) {
+                rf_transport_warning = atomic_load(&app->net_rf_server_stream_drops) > 0 ||
+                    atomic_load(&app->net_audio_server_stream_drops) > 0 ||
+                    atomic_load(&app->net_rf_server_queue_bytes) >=
+                        gui_net_queue_warn_bytes(GUI_NET_RF_QUEUE_LIMIT_BYTES) ||
+                    atomic_load(&app->net_audio_server_queue_bytes) >=
+                        gui_net_queue_warn_bytes(GUI_NET_AUDIO_QUEUE_LIMIT_BYTES);
+            } else if (app->settings.net_mode == GUI_NET_MODE_CLIENT) {
+                rf_transport_warning = atomic_load(&app->net_rf_client_interruptions) > 0 ||
+                    atomic_load(&app->net_audio_client_interruptions) > 0 ||
+                    atomic_load(&app->net_rf_server_stream_drops) > 0 ||
+                    atomic_load(&app->net_rf_server_queue_bytes) >=
+                        gui_net_queue_warn_bytes(GUI_NET_RF_QUEUE_LIMIT_BYTES);
+            }
+            Color net_status_color = rf_transport_warning
+                ? (Color){255, 170, 80, 255} : COLOR_TEXT;
             CLAY(CLAY_ID("VersionInfoNetStatusRow"), {
                 .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 }
             }) {
@@ -4791,7 +5370,7 @@ static void render_version_info_window(gui_app_t *app)
                         CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
                 }
                 CLAY_TEXT(make_string(net_status),
-                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
+                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(net_status_color) }));
             }
         }
         // Credits (without license/year text).
@@ -5374,7 +5953,9 @@ typedef struct gui_ui_toolbar_profile {
     int mode_max_width;
     int audio_mon_width;
     int audio_ch_width;
-    int bars_panel_width;
+    int bars_panel_width;   // Historical constant; the ACTUAL panel width is
+                            // derived (8 + meter_gap*3 + meter_col_width*4) so
+                            // the AudioLevelBars background has uniform borders
     int meter_col_width;
     int meter_width;
     int meter_height;
@@ -5460,6 +6041,7 @@ static gui_ui_toolbar_profile_t gui_ui_toolbar_profile_for_tier(int tier)
             .mode_min_width = 112, .mode_max_width = 230,
             .audio_mon_width = 90, .audio_ch_width = 70, .bars_panel_width = 240,
             .meter_col_width = 54, .meter_width = 50, .meter_height = 8,
+            .meter_gap = 4,
             .record_width = 80, .dropdown_padding = 10,
             .show_audio_meter_labels = true, .show_version_icon = true,
             .show_device_label = true,
@@ -5486,7 +6068,11 @@ static int gui_ui_toolbar_required_width(const gui_ui_toolbar_profile_t *p,
         (show_metadata_icon ? 8 : (p->show_version_icon ? 4 : 0)) +
         device_label_width + dd_width +
         p->connect_width + mode_width + (mode_width > 0 ? p->gap : 0) +
-        p->audio_mon_width + p->audio_ch_width + p->bars_panel_width +
+        // AudioLevelBars exact content width (2*4 padding + 4 columns +
+        // 3 gaps) - keep in lock-step with the derived panel width in
+        // render_toolbar so the tier fit matches what actually renders.
+        p->audio_mon_width + p->audio_ch_width +
+        (8 + p->meter_gap * 3 + p->meter_col_width * 4) +
         (p->gap * 2) +
         p->record_width + (p->icon_button_size * 2) +
         // All actual gaps and the fixed spacer are already counted above.
@@ -5712,7 +6298,14 @@ static void render_toolbar(gui_app_t *app, bool ddd_compact_labels) {
     int dropdown_padding = prof.dropdown_padding;
     // The tiny profile still shows all four meters, but compresses them enough
     // for the 640px minimum window at 200% scale (320 logical pixels).
-    int audio_bars_panel_width = prof.bars_panel_width;
+    // AudioLevelBars panel: derive the EXACT width from its content
+    // (2*4 padding + 4 meter columns + 3 gaps) so the contrasting background
+    // wraps the meters with UNIFORM borders. The profile constants were up to
+    // 16 px wider than the content (the FULL tier was also missing its meter
+    // gap), leaving dead space on the right side of the box (user report
+    // 2026-11-03: "the right side has a little extra, the bordering is not
+    // uniform"). Same formula the two-row overflow path below already uses.
+    int audio_bars_panel_width = 8 + prof.meter_gap * 3 + prof.meter_col_width * 4;
     int audio_meter_col_width = prof.meter_col_width;
     int audio_meter_width = prof.meter_width;
     int audio_meter_height = prof.meter_height;
@@ -5904,7 +6497,8 @@ static void render_toolbar(gui_app_t *app, bool ddd_compact_labels) {
                                        audio_meter_height,
                                        audio_meter_gap);
         }
-        bool playback_mode = gui_ui_selected_device_is_playback(app);
+        bool playback_mode = app->settings.net_mode != GUI_NET_MODE_MONITOR_CLIENT &&
+                             gui_ui_selected_device_is_playback(app);
         bool playback_running = playback_mode && gui_playback_is_running(app);
         playback_state_t playback_state = playback_running
             ? gui_playback_get_state(app)
@@ -5912,9 +6506,14 @@ static void render_toolbar(gui_app_t *app, bool ddd_compact_labels) {
         bool playback_paused = (playback_state == PLAYBACK_STATE_PAUSED);
 
         // Record button (capture) / Play-Pause button (playback mode)
-        bool record_finalizing = gui_record_is_finalizing();
-        Color record_color = record_finalizing ? (Color){184, 118, 20, 255} : (app->is_recording ? COLOR_CLIP_RED : COLOR_BUTTON);
-        const char *record_label = record_finalizing ? "Finalize" : (app->is_recording ? "Stop Rec" : "Record");
+        bool monitor_client = app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT;
+        int remote_state = monitor_client && gui_monitor_client_connected()
+                          ? gui_monitor_client_peer_state() : 0;
+        bool record_active = monitor_client ? remote_state == 2 : app->is_recording;
+        bool can_record = monitor_client ? remote_state >= 1 : app->is_capturing;
+        bool record_finalizing = !monitor_client && gui_record_is_finalizing();
+        Color record_color = record_finalizing ? (Color){184, 118, 20, 255} : (record_active ? COLOR_CLIP_RED : COLOR_BUTTON);
+        const char *record_label = record_finalizing ? "Finalize" : (record_active ? "Stop Rec" : "Record");
         // Flash the finalize icon red if a persistent output-file write error
         // is active (e.g. file locked by another app) so the user knows the
         // recording had write issues. Blink at ~1 Hz between the finalize
@@ -5931,13 +6530,13 @@ static void render_toolbar(gui_app_t *app, bool ddd_compact_labels) {
         if (!playback_mode && toolbar_very_narrow) {
             if (record_finalizing) {
                 record_display_label = "Fin";
-            } else if (app->is_recording) {
+            } else if (record_active) {
                 record_display_label = "Stop";
             } else {
                 record_display_label = "Rec";
             }
         }
-        if (!app->is_capturing) record_color = (Color){ 50, 50, 55, 255 };
+        if (!can_record) record_color = (Color){ 50, 50, 55, 255 };
         CLAY(CLAY_ID("RecordButton"), {
             .layout = {
                 .sizing = { CLAY_SIZING_FIXED(record_button_width), CLAY_SIZING_FIXED(32) },
@@ -5946,7 +6545,7 @@ static void render_toolbar(gui_app_t *app, bool ddd_compact_labels) {
             .backgroundColor = to_clay_color(record_color),
             .cornerRadius = CLAY_CORNER_RADIUS(4)
         }) {
-            Color text_color = app->is_capturing ? COLOR_TEXT : COLOR_TEXT_DIM;
+            Color text_color = can_record ? COLOR_TEXT : COLOR_TEXT_DIM;
             CLAY_TEXT(make_string(record_display_label),
                 CLAY_TEXT_CONFIG({ .fontSize = toolbar_text_size, .textColor = to_clay_color(text_color) }));
         }
@@ -6053,6 +6652,13 @@ static void render_toolbar(gui_app_t *app, bool ddd_compact_labels) {
 
 // Fixed width for labels to ensure alignment
 #define LABEL_WIDTH 50
+// Recording stat rows (Dur/RAW/FLAC/Ratio) use Space Mono at a user-fixed
+// 18px (harrypm, 2026-11-08: 1.1x the original v1.2.6 16px readout — 1.3x
+// proved too large), drawn from the same bilinear-filtered 64px atlas so it
+// stays antialiased. gui_ui_stats_layout must reserve width with this exact
+// size/font. HARD UX rule: dev/gui_ux_change_approval_rules.md — this value
+// only changes on a direct user instruction.
+#define FONT_SIZE_RECORD_READOUT 18
 
 typedef struct {
     uint32_t clip_pos, clip_neg;
@@ -6111,12 +6717,13 @@ static gui_channel_stats_layout_t gui_ui_stats_layout(gui_app_t *app,
     // Also keep both existing 22px CXADC DC buttons intact.
     if (44 + gap > view_width) view_width = 44 + gap;
     float width = label_width + gap + view_width + padding * 2;
-    // Preserve room for the full RAW size readout in Space Mono, even at
-    // UINT64_MAX, without letting live recording bytes change the width.
-    char record_size_max[32];
-    snprintf(record_size_max, sizeof(record_size_max), "RAW: %.2f GB",
-             (double)UINT64_MAX / 1000000000.0);
-    int record_width = gui_ui_measure_text_width(app, record_size_max, FONT_SIZE_STATS, 1);
+    // Preserve room for the size readouts in Space Mono up to a realistic
+    // ~100 TB bound (harrypm 2026-11-08: don't push dead space for the
+    // UINT64_MAX sample). Static sample, so live recording bytes still
+    // never change the width; the FLAC row (with its label) is the longest
+    // of the restored rows.
+    int record_width = gui_ui_measure_text_width(app, "FLAC: 99999.99 GB",
+                                                 FONT_SIZE_RECORD_READOUT, 1);
     width = fmaxf(width, record_width + padding * 2);
     if (!compact) width = fmaxf(width, ceilf(185 * gui_ui_stats_width_scale(s_ui_scale_percent)));
     view_width = (int)width - label_width - gap - padding * 2;
@@ -6186,7 +6793,8 @@ static Clay_ElementDeclaration gui_ui_channel_menu(Clay_ElementId button_id,
 // Render per-channel stats panel (trigger controls moved to waveform panel overlay)
 static void render_channel_stats(gui_app_t *app, int channel,
                                    const gui_channel_stats_values_t *values,
-                                   const gui_channel_stats_layout_t *layout) {
+                                   const gui_channel_stats_layout_t *layout,
+                                   const gui_monitor_record_stats_t *m_record) {
     // Only the sidebar width grows more slowly than the global zoom.
     // Text, controls and their hit areas retain the normal UI scale.
     float stats_width = layout->width;
@@ -6333,9 +6941,15 @@ static void render_channel_stats(gui_app_t *app, int channel,
         {
             uint64_t raw_bytes = values->raw_bytes;
             uint64_t comp_bytes = values->compressed_bytes;
-            bool show_record_stats = app->is_capturing && (app->is_recording || raw_bytes > 0 || comp_bytes > 0 || app->last_recording_duration_s > 0.0);
+            bool remote_recording=m_record && gui_monitor_client_peer_state()==2;
+            bool remote_active=m_record && gui_monitor_client_peer_state()>0;
+            bool remote_ch_enabled=!m_record || (channel==0?m_record->capture_a:m_record->capture_b);
+            bool show_record_stats = remote_active
+                ? (remote_ch_enabled && (remote_recording || raw_bytes>0 || comp_bytes>0 || m_record->elapsed_ms>0))
+                : (app->is_capturing && (app->is_recording || raw_bytes > 0 || comp_bytes > 0 || app->last_recording_duration_s > 0.0));
             if (show_record_stats) {
-                double shown_duration = app->is_recording ? (GetTime() - app->recording_start_time) : app->last_recording_duration_s;
+                double shown_duration = m_record ? (double)m_record->elapsed_ms/1000.0
+                    : (app->is_recording ? (GetTime() - app->recording_start_time) : app->last_recording_duration_s);
                 int d_hours = (int)(shown_duration / 3600.0);
                 int d_mins = ((int)(shown_duration / 60.0)) % 60;
                 int d_secs = ((int)(shown_duration)) % 60;
@@ -6351,7 +6965,7 @@ static void render_channel_stats(gui_app_t *app, int channel,
                     double raw_mb = (double)raw_bytes / 1000000.0;
                     snprintf(buf_rec_raw, 32, "RAW: %.2f MB", raw_mb);
                 }
-                if (comp_bytes > 0 || app->settings.use_flac) {
+                if (comp_bytes > 0 || (m_record ? m_record->use_flac : app->settings.use_flac)) {
                     double ratio = (comp_bytes > 0) ? ((double)raw_bytes / (double)comp_bytes) : 0.0;
                     if (comp_bytes >= 1000000000ULL) {
                         double comp_gb = (double)comp_bytes / 1000000000.0;
@@ -6365,26 +6979,31 @@ static void render_channel_stats(gui_app_t *app, int channel,
                     buf_rec_flac[0] = '\0';
                     buf_rec_ratio[0] = '\0';
                 }
+                // v1.2.6 compact readout restored (HARD UX rule:
+                // dev/gui_ux_change_approval_rules.md — no UX/layout changes
+                // without direct sign-off from harrypm). Plain Space Mono
+                // rows in the channel colour; gui_ui_stats_layout reserves
+                // the sidebar width for this exact font/size.
                 CLAY(CLAY_IDI("RecDurationRow", channel), { .layout = STAT_ROW_LAYOUT }) {
                     CLAY_TEXT(make_string(buf_rec_duration),
-                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(channel_value_color) }));
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_RECORD_READOUT, .fontId = 1, .textColor = to_clay_color(channel_value_color) }));
                 }
                 if (!quarter_scale_layout) {
                     CLAY(CLAY_IDI("RecRawRow", channel), { .layout = STAT_ROW_LAYOUT }) {
                         CLAY_TEXT(make_string(buf_rec_raw),
-                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(channel_value_color) }));
+                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_RECORD_READOUT, .fontId = 1, .textColor = to_clay_color(channel_value_color) }));
                     }
                 }
                 if (buf_rec_flac[0]) {
                     CLAY(CLAY_IDI("RecFlacRow", channel), { .layout = STAT_ROW_LAYOUT }) {
                         CLAY_TEXT(make_string(buf_rec_flac),
-                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(channel_value_color) }));
+                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_RECORD_READOUT, .fontId = 1, .textColor = to_clay_color(channel_value_color) }));
                     }
                 }
                 if (buf_rec_ratio[0]) {
                     CLAY(CLAY_IDI("RecRatioRow", channel), { .layout = STAT_ROW_LAYOUT }) {
                         CLAY_TEXT(make_string(buf_rec_ratio),
-                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(channel_value_color) }));
+                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_RECORD_READOUT, .fontId = 1, .textColor = to_clay_color(channel_value_color) }));
                     }
                 }
             }
@@ -6555,6 +7174,72 @@ static void render_channel_stats(gui_app_t *app, int channel,
     }
 }
 
+// Per-channel transport icon buttons (Play/Pause + Loop) beside the scrub
+// slider on each playback timeline row (user request 2026-11-03: icons, not
+// text labels).
+#define PLAYBACK_TRANSPORT_BTN_W 28
+#define PLAYBACK_TRANSPORT_BTN_H 20
+#define PLAYBACK_TRANSPORT_ICON_SIZE 12
+
+// Per-channel transport icon group for one playback timeline row: Play/Pause
+// + Loop as compact icon buttons (font-free custom Clay elements, matching
+// the toolbar's loop icon). Reuses the PlaybackPauseBtn/PlaybackLoopBtn Clay
+// IDs the old settings-panel text buttons used, so the existing click
+// handlers keep working unchanged. Non-stacked rows call this from inside
+// the timeline (directly after the scrub track); stacked narrow rows call it
+// as a row-level group at the right end (see render_playback_timeline_row).
+static void render_playback_transport_buttons(int channel_index, bool pb_active,
+                                               bool pb_paused, bool pb_loop) {
+    static CustomLayoutElement s_pause_icon[2];
+    static CustomLayoutElement s_loop_icon[2];
+    // Toolbar RecordButton convention: the Play glyph shows when paused or
+    // not running; the Pause glyph only while actually playing.
+    bool playing = pb_active && !pb_paused;
+    s_pause_icon[channel_index].type = playing
+        ? CUSTOM_LAYOUT_ELEMENT_TYPE_PAUSE_ICON
+        : CUSTOM_LAYOUT_ELEMENT_TYPE_PLAY_ICON;
+    s_loop_icon[channel_index].type = CUSTOM_LAYOUT_ELEMENT_TYPE_LOOP_ICON;
+    Color pause_bg = !pb_active ? ui_disabled_color(COLOR_BUTTON)
+        : (pb_paused ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON);
+    Color loop_bg = !pb_active ? ui_disabled_color(COLOR_BUTTON)
+        : (pb_loop ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON);
+    CLAY(CLAY_IDI("PlaybackTransportBtns", channel_index), {
+        .layout = {
+            .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) },
+            .layoutDirection = CLAY_LEFT_TO_RIGHT,
+            .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
+            .childGap = 4
+        }
+    }) {
+        CLAY(CLAY_IDI("PlaybackPauseBtn", channel_index), {
+            .layout = {
+                .sizing = { CLAY_SIZING_FIXED(PLAYBACK_TRANSPORT_BTN_W), CLAY_SIZING_FIXED(PLAYBACK_TRANSPORT_BTN_H) },
+                .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
+            },
+            .backgroundColor = to_clay_color(pause_bg),
+            .cornerRadius = CLAY_CORNER_RADIUS(4)
+        }) {
+            CLAY(CLAY_IDI("PlaybackPauseIcon", channel_index), {
+                .layout = { .sizing = { CLAY_SIZING_FIXED(PLAYBACK_TRANSPORT_ICON_SIZE), CLAY_SIZING_FIXED(PLAYBACK_TRANSPORT_ICON_SIZE) } },
+                .custom = { .customData = &s_pause_icon[channel_index] }
+            }) {}
+        }
+        CLAY(CLAY_IDI("PlaybackLoopBtn", channel_index), {
+            .layout = {
+                .sizing = { CLAY_SIZING_FIXED(PLAYBACK_TRANSPORT_BTN_W), CLAY_SIZING_FIXED(PLAYBACK_TRANSPORT_BTN_H) },
+                .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
+            },
+            .backgroundColor = to_clay_color(loop_bg),
+            .cornerRadius = CLAY_CORNER_RADIUS(4)
+        }) {
+            CLAY(CLAY_IDI("PlaybackLoopIcon", channel_index), {
+                .layout = { .sizing = { CLAY_SIZING_FIXED(PLAYBACK_TRANSPORT_ICON_SIZE), CLAY_SIZING_FIXED(PLAYBACK_TRANSPORT_ICON_SIZE) } },
+                .custom = { .customData = &s_loop_icon[channel_index] }
+            }) {}
+        }
+    }
+}
+
 typedef struct {
     int left_padding, right_padding, label_width, track_width;
     int readout_width;      // "8-bit 20.0 MSPS" slot; 0 = no horizontal room
@@ -6579,18 +7264,49 @@ static gui_playback_timeline_layout_t gui_ui_playback_timeline_layout(gui_app_t 
     int label_min = screen_width < 900 ? 120 : 150;
     if (label_width < label_min) label_width = label_min;
     int available = screen_width - spacing.horizontal_gap * 4 - left_padding - right_padding;
+    // Transport icon group (beside the scrub slider) takes a fixed two-button
+    // group plus one extra gap — the timeline's 8px internal gap on normal
+    // rows, or the row gap on stacked narrow rows. Budget it so the scrub
+    // track and info tiers adapt instead of overflowing.
+    {
+        int transport_gap = spacing.horizontal_gap > 8 ? spacing.horizontal_gap : 8;
+        available -= PLAYBACK_TRANSPORT_BTN_W * 2 + 4 + transport_gap;
+    }
     if (available < 1) available = 1;
     int track_width = screen_width < 900 ? 180 : (screen_width < 1150 ? 240 : 300);
     bool stacked = available - label_width - 8 < 64;
     // Right-side file info slots (see the HARD DEV NOTE above the helpers):
     // fixed representative widths per tier so value changes never reflow the
-    // row; tiers degrade full -> compact-fileinfo -> name+readout -> readout
-    // only. Stacked rows fit the info line separately below the track.
+    // row. The FILENAME slot now budgets from the actual loaded filenames
+    // (full names, not a fixed sample width - see gui_ui_playback_file_basename);
+    // tiers degrade full -> compact-fileinfo -> name+readout -> readout only.
+    // Stacked rows fit the info line separately below the track.
     int readout_full = gui_ui_measure_text_width(app, "16-bit 999.9 MSPS", FONT_SIZE_STATUS, 1);
     int readout_compact_w = gui_ui_measure_text_width(app, "16-bit 999M", FONT_SIZE_STATUS, 1);
     int fileinfo_full = gui_ui_measure_text_width(app, "RAW 9999.9GiB FLAC 9999.9GiB 99.9x", FONT_SIZE_STATUS, 1);
     int fileinfo_compact_w = gui_ui_measure_text_width(app, "9999.9G/999.9G", FONT_SIZE_STATUS, 1);
-    int name_slot = gui_ui_measure_text_width(app, "Tape_08_2026.10.11_01.49.01.flac", FONT_SIZE_STATUS, 1);
+    // Full-name budget: the widest loaded basename this session (sticky, so
+    // loading a longer name resizes the slot and it never shrinks mid-file).
+    // Capped at 420 px (the discovery-row cap) so a pathological basename
+    // cannot starve the readouts; only beyond the cap does the name ellipsize.
+    #define PLAYBACK_NAME_SLOT_MAX_W 420
+    static int s_playback_name_slot_w = 0;
+    if (app) {
+        static char s_name_probe[128];
+        int session_w = 0;
+        for (int ch = 0; ch < 2; ch++) {
+            s_name_probe[0] = '\0';
+            gui_ui_playback_file_basename(app, ch, s_name_probe, sizeof(s_name_probe));
+            if (s_name_probe[0]) {
+                int w = gui_ui_measure_text_width(app, s_name_probe, FONT_SIZE_STATUS, 1);
+                if (w > session_w) session_w = w;
+            }
+        }
+        if (session_w > s_playback_name_slot_w) s_playback_name_slot_w = session_w;
+        if (s_playback_name_slot_w > PLAYBACK_NAME_SLOT_MAX_W) s_playback_name_slot_w = PLAYBACK_NAME_SLOT_MAX_W;
+    }
+    int name_slot = s_playback_name_slot_w > 0 ? s_playback_name_slot_w
+        : gui_ui_measure_text_width(app, "Tape_08_2026.10.11_01.49.01.flac", FONT_SIZE_STATUS, 1);
     int readout_width = 0;
     int fileinfo_width = 0;
     int name_width = 0;
@@ -6601,6 +7317,7 @@ static gui_playback_timeline_layout_t gui_ui_playback_timeline_layout(gui_app_t 
         int full_all = name_slot + 8 + readout_full + 8 + fileinfo_full;
         int mid_all = name_slot + 8 + readout_full + 8 + fileinfo_compact_w;
         int name_readout = name_slot + 8 + readout_full;
+        int name_compact_readout = name_slot + 8 + readout_compact_w;
         if (room >= full_all) {
             name_width = name_slot;
             readout_width = readout_full;
@@ -6613,6 +7330,10 @@ static gui_playback_timeline_layout_t gui_ui_playback_timeline_layout(gui_app_t 
         } else if (room >= name_readout) {
             name_width = name_slot;
             readout_width = readout_full;
+        } else if (room >= name_compact_readout) {
+            name_width = name_slot;
+            readout_width = readout_compact_w;
+            readout_compact = true;
         } else if (room >= readout_compact_w) {
             readout_width = readout_compact_w;
             readout_compact = true;
@@ -6679,6 +7400,11 @@ static void render_playback_timeline_row(gui_app_t *app, int channel_index, char
     Color timeline_track_color = seekable ? (Color){45, 45, 52, 255} : (Color){33, 33, 38, 255};
     Color timeline_fill_color = seekable ? (provisional ? COLOR_METER_YELLOW : COLOR_SYNC_GREEN) : COLOR_TEXT_DIM;
     Color readout_color = loaded ? COLOR_TEXT_DIM : ui_disabled_color(COLOR_TEXT_DIM);
+    // Per-channel transport icon state (icons beside the scrub slider).
+    bool pb_live = app->is_capturing && gui_playback_is_running(app);
+    bool pb_active = pb_live && loaded;
+    bool pb_paused = pb_active && gui_playback_is_channel_paused(app, channel_index);
+    bool pb_loop = loaded && gui_playback_get_channel_loop(app, channel_index);
     bool show_length_status = loaded && (provisional || verification_failed);
     char *index_text = playback_index_display[channel_index == 1 ? 1 : 0];
     if (show_length_status) {
@@ -6764,6 +7490,13 @@ static void render_playback_timeline_row(gui_app_t *app, int channel_index, char
                 }
             }
 
+            // Transport icons directly next to the scrub slider (user request
+            // 2026-11-03). Stacked narrow rows render them at the row's right
+            // end instead — the vertical timeline would overflow the row.
+            if (!layout->stacked) {
+                render_playback_transport_buttons(channel_index, pb_active, pb_paused, pb_loop);
+            }
+
             // Right-side file info line: [basename][bit-depth + rate][RAW/FLAC]
             // — flows after the scrub track horizontally / its own line stacked.
             if (layout->name_width > 0 || layout->readout_width > 0 || layout->fileinfo_width > 0) {
@@ -6820,6 +7553,13 @@ static void render_playback_timeline_row(gui_app_t *app, int channel_index, char
             }
         }
 
+        // Stacked (very narrow) rows: the timeline flows vertically, so the
+        // transport icons render here at the row's right end instead of
+        // inside it (normal rows put them next to the scrub slider).
+        if (layout->stacked) {
+            render_playback_transport_buttons(channel_index, pb_active, pb_paused, pb_loop);
+        }
+
         CLAY(CLAY_IDI("PlaybackTimelineRightPad", channel_index), {
             .layout = { .sizing = { CLAY_SIZING_FIXED(layout->right_padding), CLAY_SIZING_GROW(0) } }
         }) {}
@@ -6855,6 +7595,9 @@ static void render_channels_panel(gui_app_t *app, gui_ui_channel_spacing_t spaci
     Clay_SizingAxis channel_a_height = CLAY_SIZING_GROW(0);
     bool playback_mode = gui_ui_selected_device_is_playback(app);
 
+    bool m_client_stats=app->settings.net_mode==GUI_NET_MODE_MONITOR_CLIENT;
+    gui_monitor_record_stats_t m_record={0};
+    bool have_m_record=m_client_stats && gui_monitor_client_record_stats(&m_record);
     gui_channel_stats_values_t stats[2] = {
         { atomic_load(&app->clip_count_a_pos), atomic_load(&app->clip_count_a_neg),
           app->vu_a.peak_pos, app->vu_a.peak_neg,
@@ -6863,6 +7606,14 @@ static void render_channels_panel(gui_app_t *app, gui_ui_channel_spacing_t spaci
           app->vu_b.peak_pos, app->vu_b.peak_neg,
           atomic_load(&app->recording_raw_b), atomic_load(&app->recording_compressed_b) }
     };
+    if (have_m_record) {
+        for (int ch=0;ch<2;ch++) {
+            stats[ch].clip_pos=m_record.clip_pos[ch];
+            stats[ch].clip_neg=m_record.clip_neg[ch];
+            stats[ch].raw_bytes=m_record.raw[ch];
+            stats[ch].compressed_bytes=m_record.compressed[ch];
+        }
+    }
     // Drive the on-disk size readout from stat() of the actual output file so
     // it is 1:1 with `ls`/file-manager (kills the writer-atomic > file
     // "over" report from the FILE* buffer lead, and the decimal-MB unit below
@@ -6908,8 +7659,8 @@ static void render_channels_panel(gui_app_t *app, gui_ui_channel_spacing_t spaci
     s_vu_a_element.type = CUSTOM_LAYOUT_ELEMENT_TYPE_VU_METER;
     s_vu_a_element.customData.vu_meter.meter = &app->vu_a;
     s_vu_a_element.customData.vu_meter.label = "CH A";
-    s_vu_a_element.customData.vu_meter.is_clipping_pos = atomic_load(&app->clip_count_a_pos) > 0;
-    s_vu_a_element.customData.vu_meter.is_clipping_neg = atomic_load(&app->clip_count_a_neg) > 0;
+    s_vu_a_element.customData.vu_meter.is_clipping_pos = (have_m_record ? m_record.clip_pos[0] : atomic_load(&app->clip_count_a_pos)) > 0;
+    s_vu_a_element.customData.vu_meter.is_clipping_neg = (have_m_record ? m_record.clip_neg[0] : atomic_load(&app->clip_count_a_neg)) > 0;
     s_vu_a_element.customData.vu_meter.channel_color = COLOR_CHANNEL_A;
 
     s_osc_a_element.type = CUSTOM_LAYOUT_ELEMENT_TYPE_CHANNEL_PANEL;
@@ -6919,8 +7670,8 @@ static void render_channels_panel(gui_app_t *app, gui_ui_channel_spacing_t spaci
     s_vu_b_element.type = CUSTOM_LAYOUT_ELEMENT_TYPE_VU_METER;
     s_vu_b_element.customData.vu_meter.meter = &app->vu_b;
     s_vu_b_element.customData.vu_meter.label = "CH B";
-    s_vu_b_element.customData.vu_meter.is_clipping_pos = atomic_load(&app->clip_count_b_pos) > 0;
-    s_vu_b_element.customData.vu_meter.is_clipping_neg = atomic_load(&app->clip_count_b_neg) > 0;
+    s_vu_b_element.customData.vu_meter.is_clipping_pos = (have_m_record ? m_record.clip_pos[1] : atomic_load(&app->clip_count_b_pos)) > 0;
+    s_vu_b_element.customData.vu_meter.is_clipping_neg = (have_m_record ? m_record.clip_neg[1] : atomic_load(&app->clip_count_b_neg)) > 0;
     s_vu_b_element.customData.vu_meter.channel_color = COLOR_CHANNEL_B;
 
     s_osc_b_element.type = CUSTOM_LAYOUT_ELEMENT_TYPE_CHANNEL_PANEL;
@@ -7028,7 +7779,7 @@ static void render_channels_panel(gui_app_t *app, gui_ui_channel_spacing_t spaci
             }) {}
 
             // Stats panel A
-            render_channel_stats(app, 0, &stats[0], &stats_layout);
+            render_channel_stats(app, 0, &stats[0], &stats_layout, have_m_record?&m_record:NULL);
         }
 
         // Channel B row: VU meter + waveform + stats
@@ -7063,7 +7814,7 @@ static void render_channels_panel(gui_app_t *app, gui_ui_channel_spacing_t spaci
                 }) {}
 
                 // Stats panel B
-                render_channel_stats(app, 1, &stats[1], &stats_layout);
+                render_channel_stats(app, 1, &stats[1], &stats_layout, have_m_record?&m_record:NULL);
             }
         }
     }
@@ -7073,9 +7824,15 @@ static void render_channels_panel(gui_app_t *app, gui_ui_channel_spacing_t spaci
 static bool render_main_panels(gui_app_t *app) {
     int status_width = gui_ui_get_layout_width();
     int status_height = gui_ui_get_layout_height();
+    // Remote recording occupies the same status-bar space as local recording.
+    // Determine it before deciding which status layout/message to display.
+    gui_monitor_record_stats_t m_status = {0};
+    bool m_status_valid = app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT &&
+        gui_monitor_client_record_stats(&m_status);
+    bool m_recording = m_status_valid && gui_monitor_client_peer_state() == 2;
     gui_ui_status_layout_mode_t status_layout =
         gui_ui_get_status_layout_mode(status_width, status_height,
-                                      app->is_recording);
+                                      app->is_recording || m_recording);
     bool status_quarter_scale =
         status_width <= GUI_UI_STATUS_QUARTER_MAX_WIDTH &&
         status_height <= GUI_UI_STATUS_QUARTER_MAX_HEIGHT;
@@ -7106,7 +7863,15 @@ static bool render_main_panels(gui_app_t *app) {
     // readout (and widen the message budget) so the actual error text isn't
     // truncated behind the free-space label. This is what makes CXADC/USB
     // permission failures readable in the bottom bar instead of "CXADC permi...".
+    /* Preview failure is a live M-Client state, not a permanent status
+     * message.  This prevents an old failure from surviving preview recovery,
+     * Disconnect/Connect, or switching away from Monitor Client mode. */
+    const char *const preview_status = "Monitor preview error: showing last valid frame";
     const char *raw_status_gate = (app->status_message[0] != '\0') ? app->status_message : NULL;
+    if (raw_status_gate && strcmp(raw_status_gate, preview_status) == 0) {
+        /* Ignore the legacy sticky text if an older code path stored it. */
+        raw_status_gate = NULL;
+    }
     bool status_is_error = false;
     if (raw_status_gate) {
         status_is_error =
@@ -7120,11 +7885,77 @@ static bool render_main_panels(gui_app_t *app) {
             strstr(raw_status_gate, "timed out") != NULL ||
             strstr(raw_status_gate, "Capture stopped:") != NULL;
     }
+    if (!status_is_error && app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT &&
+        gui_monitor_client_running() && gui_monitor_client_preview_error()) {
+        raw_status_gate = preview_status;
+        status_is_error = true;
+    }
+    /* Network backpressure is distinct from USB/capture buffer errors.
+     * Server-reported RF queue overflow proves that the transfer path cannot
+     * sustain source rate, but not whether NIC/Wi-Fi or client CPU is to blame. */
+    bool rf_transport_banner = false;
+    bool rf_transport_critical = false;
+    static char rf_transport_banner_text[96];
+    if (!status_is_error && app->settings.net_mode == GUI_NET_MODE_SERVER) {
+        uint_fast64_t rf_drops = atomic_load(&app->net_rf_server_stream_drops);
+        uint_fast64_t au_drops = atomic_load(&app->net_audio_server_stream_drops);
+        size_t rf_q = atomic_load(&app->net_rf_server_queue_bytes);
+        size_t au_q = atomic_load(&app->net_audio_server_queue_bytes);
+        if (rf_drops) {
+            snprintf(rf_transport_banner_text, sizeof(rf_transport_banner_text),
+                     "RF TRANSFER TOO SLOW - server dropped %llu stream(s)",
+                     (unsigned long long)rf_drops);
+            rf_transport_banner = rf_transport_critical = true;
+        } else if (au_drops) {
+            snprintf(rf_transport_banner_text, sizeof(rf_transport_banner_text),
+                     "Audio stream overload - dropped %llu stream(s)",
+                     (unsigned long long)au_drops);
+            rf_transport_banner = rf_transport_critical = true;
+        } else if (rf_q >= gui_net_queue_warn_bytes(GUI_NET_RF_QUEUE_LIMIT_BYTES)) {
+            snprintf(rf_transport_banner_text, sizeof(rf_transport_banner_text),
+                     "RF NETWORK BOTTLENECK - queue %u%% of 256MiB (link/receiver)",
+                     gui_net_queue_percent(rf_q, GUI_NET_RF_QUEUE_LIMIT_BYTES));
+            rf_transport_banner = true;
+        } else if (au_q >= gui_net_queue_warn_bytes(GUI_NET_AUDIO_QUEUE_LIMIT_BYTES)) {
+            snprintf(rf_transport_banner_text, sizeof(rf_transport_banner_text),
+                     "Audio network backlog - queue %u%% of 64MiB",
+                     gui_net_queue_percent(au_q, GUI_NET_AUDIO_QUEUE_LIMIT_BYTES));
+            rf_transport_banner = true;
+        }
+    } else if (!status_is_error && app->settings.net_mode == GUI_NET_MODE_CLIENT) {
+        uint_fast64_t rf = atomic_load(&app->net_rf_client_interruptions);
+        uint_fast64_t au = atomic_load(&app->net_audio_client_interruptions);
+        uint_fast64_t server_drops = atomic_load(&app->net_rf_server_stream_drops);
+        size_t server_queue = atomic_load(&app->net_rf_server_queue_bytes);
+        if (server_drops) {
+            snprintf(rf_transport_banner_text, sizeof(rf_transport_banner_text),
+                     "RF TRANSFER TOO SLOW - server queue overflow (%llu drop(s))",
+                     (unsigned long long)server_drops);
+            rf_transport_banner = rf_transport_critical = true;
+        } else if (server_queue >= gui_net_queue_warn_bytes(GUI_NET_RF_QUEUE_LIMIT_BYTES)) {
+            snprintf(rf_transport_banner_text, sizeof(rf_transport_banner_text),
+                     "RF transfer backlog on server - %u%% (network/receiver)",
+                     gui_net_queue_percent(server_queue, GUI_NET_RF_QUEUE_LIMIT_BYTES));
+            rf_transport_banner = true;
+        } else if (rf || au) {
+            snprintf(rf_transport_banner_text, sizeof(rf_transport_banner_text),
+                     "RF/Audio stream interrupted RF:%llu Audio:%llu (check link/receiver)",
+                     (unsigned long long)rf, (unsigned long long)au);
+            rf_transport_banner = rf_transport_critical = true;
+        }
+    }
+    if (rf_transport_banner) {
+        raw_status_gate = rf_transport_banner_text;
+        if (rf_transport_critical) status_is_error = true;
+    }
     // Decide error rows below, once the complete message and fixed readout
     // widths are known. Normal recording status is redundant with the timer.
     bool status_two_rows = false;
-    bool show_status_message = status_is_error ||
-        (!status_minimal && !app->is_recording);
+    // An acknowledged remote recording supersedes the stale "start recording
+    // requested" message, just as an active local recording does. Keep
+    // transport warnings and real errors visible in either mode.
+    bool show_status_message = rf_transport_banner || status_is_error ||
+        (!status_minimal && !app->is_recording && !m_recording);
     /* Keep free-space visible by default and let the dynamic budget contract
      * gaps/widths first; only hide it as a last resort. Error status still
      * reserves the left-side for readable failure text. */
@@ -7144,6 +7975,9 @@ static bool render_main_panels(gui_app_t *app) {
     int status_right_gap = status_tiny ? 8 : 10;
     int status_left_gap = status_tiny ? 4 : 8;
     int status_font_size = FONT_SIZE_STATUS;
+    // Inter is clearer than the small Space Mono glyphs in the status bar.
+    // Use the same font for measuring, truncating and rendering readouts.
+    const int status_readout_font_id = 0;
     int device_buffer_tier_width[3] = { 0, 0, 0 };
     int device_buffer_caption_width[3] = { 0, 0, 0 };
     const char *device_buffer_caption_budget[3] = {
@@ -7155,7 +7989,7 @@ static bool render_main_panels(gui_app_t *app) {
             bool full = tier == GUI_DEVICE_BUFFER_LAYOUT_FULL;
             int inner_gap = tier == GUI_DEVICE_BUFFER_LAYOUT_TINY ? 2 : 4;
             device_buffer_caption_width[tier] = gui_ui_measure_text_width(
-                app, device_buffer_caption_budget[tier], status_font_size, 1);
+                app, device_buffer_caption_budget[tier], status_font_size, status_readout_font_id);
             device_buffer_tier_width[tier] = gui_ui_measure_text_width(
                 app, full ? "HW Buffer:" : "HW:", status_font_size, 0) +
                 device_buffer_caption_width[tier] + inner_gap;
@@ -7185,9 +8019,10 @@ static bool render_main_panels(gui_app_t *app) {
     const char *errors_label = status_compact_labels ? errors_label_compact : errors_label_full;
     update_status_free_space(app);
 
-    bool show_record_indicator = app->is_recording && !status_quarter_scale;
+    bool show_record_indicator = (app->is_recording || m_recording) && !status_quarter_scale;
     if (show_record_indicator) {
-        double rec_duration = GetTime() - app->recording_start_time;
+        double rec_duration = m_recording ? (double)m_status.elapsed_ms/1000.0
+                                         : GetTime() - app->recording_start_time;
         int rec_hours = (int)(rec_duration / 3600);
         int rec_mins  = ((int)(rec_duration / 60)) % 60;
         int rec_secs  = ((int)rec_duration) % 60;
@@ -7195,12 +8030,14 @@ static bool render_main_panels(gui_app_t *app) {
                  "%02d:%02d:%02d", rec_hours, rec_mins, rec_secs);
     }
 
-    const char *raw_status = (app->status_message[0] != '\0')
-        ? app->status_message
-        : (app->is_capturing ? "Capturing..." : "Ready");
+    const char *raw_status = rf_transport_banner ? rf_transport_banner_text :
+        (raw_status_gate ? raw_status_gate :
+         (app->is_capturing ? "Capturing..." : "Ready"));
     Color status_color = COLOR_TEXT_DIM;
     if (status_is_error) {
         status_color = COLOR_CLIP_RED;
+    } else if (rf_transport_banner) {
+        status_color = COLOR_METER_YELLOW;
     } else if (strstr(raw_status, "Requesting") != NULL ||
                strstr(raw_status, "Reconnecting") != NULL ||
                strstr(raw_status, "Waiting") != NULL ||
@@ -7218,7 +8055,7 @@ static bool render_main_panels(gui_app_t *app) {
             char runway_hms[24];
             format_status_free_space_label(free_only_full, sizeof(free_only_full), s_status_free_space_cached_bytes);
             format_status_free_space_compact_label(free_only_compact, sizeof(free_only_compact), s_status_free_space_cached_bytes);
-            if (app->is_recording) {
+            if (app->is_recording || m_recording) {
                 bool runway_known = s_status_output_rate_bps > 0.0;
                 if (runway_known) {
                     double runway_s = (double)s_status_free_space_cached_bytes / s_status_output_rate_bps;
@@ -7250,7 +8087,7 @@ static bool render_main_panels(gui_app_t *app) {
             } else if (s_status_free_space_cached_bytes < STATUS_FREE_SPACE_WARN_BYTES) {
                 free_space_color = COLOR_METER_YELLOW;
             }
-        } else if (app->is_recording) {
+        } else if (app->is_recording || m_recording) {
             snprintf(status_free_space_display_full, sizeof(status_free_space_display_full),
                      "Free: N/A | Runway --:--:--");
             if (status_tiny) {
@@ -7295,12 +8132,12 @@ static bool render_main_panels(gui_app_t *app) {
     if (show_free_space) {
         for (int tier = 0; tier < 3; tier++) {
             status_free_space_tier_width[tier] = gui_ui_measure_text_width(
-                app, free_space_budget[tier], status_font_size, 1);
+                app, free_space_budget[tier], status_font_size, status_readout_font_id);
         }
     }
 
     uint32_t status_sample_rate_raw = atomic_load(&app->sample_rate);
-    uint64_t status_samples_raw = atomic_load(&app->samples_a);
+    uint64_t status_samples_raw = m_status_valid ? m_status.samples_a : atomic_load(&app->samples_a);
 
     /* Tiered right-side value text: tier 0 is the full readout, higher tiers
      * shorten it under width pressure instead of hiding the readout. All
@@ -7323,23 +8160,25 @@ static bool render_main_panels(gui_app_t *app) {
                      tier < 2 ? "-- MSPS" : "--");
         }
         status_sample_rate_tier_width[tier] = gui_ui_measure_text_width(
-            app, sample_rate_budget[tier], status_font_size, 1);
+            app, sample_rate_budget[tier], status_font_size, status_readout_font_id);
         format_status_samples_tier(status_samples_tier_text[tier],
                                    sizeof(status_samples_tier_text[tier]),
                                    status_samples_raw, tier);
         status_samples_tier_width[tier] = gui_ui_measure_text_width(
-            app, samples_budget[tier], status_font_size, 1);
+            app, samples_budget[tier], status_font_size, status_readout_font_id);
     }
 
     int status_rf_pct = 0;
     int status_aud_pct = 0;
-    uint32_t missed = app->is_capturing ? atomic_load(&app->missed_frame_count) : 0;
-    uint32_t errors = app->is_capturing ? atomic_load(&app->error_count) : 0;
+    uint32_t missed = m_status_valid ? gui_monitor_client_peer_missed() :
+        (app->is_capturing ? atomic_load(&app->missed_frame_count) : 0);
+    uint32_t errors = m_status_valid ? gui_monitor_client_peer_errors() :
+        (app->is_capturing ? atomic_load(&app->error_count) : 0);
     const char *fault_captions[4] = { "", "M!", "E!", "M! E!" };
     int fault_caption_width[4] = { 0, 0, 0, 0 };
     for (int i = 1; i < 4; i++) {
         fault_caption_width[i] = gui_ui_measure_text_width(
-            app, fault_captions[i], status_font_size, 1);
+            app, fault_captions[i], status_font_size, status_readout_font_id);
     }
     bool show_fault_summary = false;
     int fault_summary_flags = 0;
@@ -7347,22 +8186,16 @@ static bool render_main_panels(gui_app_t *app) {
      * width budget. Buffer fill and fault colors may still update normally. */
     {
         format_status_counter(status_frames_display, sizeof(status_frames_display),
-                              atomic_load(&app->frame_count));
+                              (m_status_valid ? gui_monitor_client_peer_frames() : atomic_load(&app->frame_count)));
         format_status_counter(status_missed_display, sizeof(status_missed_display),
                               missed);
         format_status_counter(status_errors_display, sizeof(status_errors_display),
                               errors);
-        size_t status_rf_head = atomic_load(&app->buffers.buffers[BUF_CAPTURE_RF].head);
-        size_t status_rf_tail = atomic_load(&app->buffers.buffers[BUF_CAPTURE_RF].tail);
-        size_t status_rf_size = app->buffers.buffers[BUF_CAPTURE_RF].buffer_size;
-        status_rf_pct = status_rf_size > 0
-            ? (int)(((status_rf_tail - status_rf_head) * 100) / status_rf_size) : 0;
+        status_rf_pct = (int)(100.0f * bufmgr_fill_percent(&app->buffers, BUF_CAPTURE_RF));
+        if(m_status_valid)status_rf_pct=(int)m_status.rf_fill_pct;
         snprintf(status_rf_buf_display, sizeof(status_rf_buf_display), "%d%%", status_rf_pct);
-        size_t status_aud_head = atomic_load(&app->buffers.buffers[BUF_CAPTURE_AUDIO].head);
-        size_t status_aud_tail = atomic_load(&app->buffers.buffers[BUF_CAPTURE_AUDIO].tail);
-        size_t status_aud_size = app->buffers.buffers[BUF_CAPTURE_AUDIO].buffer_size;
-        status_aud_pct = status_aud_size > 0
-            ? (int)(((status_aud_tail - status_aud_head) * 100) / status_aud_size) : 0;
+        status_aud_pct = (int)(100.0f * bufmgr_fill_percent(&app->buffers, BUF_CAPTURE_AUDIO));
+        if(m_status_valid)status_aud_pct=(int)m_status.aud_fill_pct;
         snprintf(status_aud_buf_display, sizeof(status_aud_buf_display), "%d%%", status_aud_pct);
     }
 
@@ -7384,13 +8217,30 @@ static bool render_main_panels(gui_app_t *app) {
     int errors_label_width_compact = gui_ui_measure_text_width(app, errors_label_compact, status_font_size, 0);
     int rf_label_width_compact = gui_ui_measure_text_width(app, rf_buffer_label_compact, status_font_size, 0);
     int audio_label_width_compact = gui_ui_measure_text_width(app, audio_buffer_label_compact, status_font_size, 0);
-    int record_timer_text_width = show_record_indicator
-        ? gui_ui_measure_text_width(app, "99:59:59", status_font_size, 1)
-        : 0;
-    int frames_text_width = gui_ui_measure_text_width(app, "999M", status_font_size, 1);
+    int record_timer_text_width = 0;
+    if (show_record_indicator) {
+        // Inter has proportional digits: measuring "88:88:88" can be narrower
+        // than the actual "00:00:42", causing the elapsed timer to be
+        // ellipsized and appear to collide with the adjacent status message.
+        // Reserve the widest six-digit clock, not a single digit pattern.
+        char timer_probe[] = "00:00:00";
+        for (char digit = '0'; digit <= '9'; digit++) {
+            timer_probe[0] = timer_probe[1] = timer_probe[3] =
+                timer_probe[4] = timer_probe[6] = timer_probe[7] = digit;
+            int width = gui_ui_measure_text_width(app, timer_probe,
+                status_font_size, status_readout_font_id);
+            if (width > record_timer_text_width) record_timer_text_width = width;
+        }
+        // Account for three-digit hour counts and renderer rounding.
+        int live_width = gui_ui_measure_text_width(app, status_record_timer_display,
+            status_font_size, status_readout_font_id);
+        if (live_width > record_timer_text_width) record_timer_text_width = live_width;
+        record_timer_text_width += 8;
+    }
+    int frames_text_width = gui_ui_measure_text_width(app, "999M", status_font_size, status_readout_font_id);
     int missed_text_width = frames_text_width;
     int errors_text_width = frames_text_width;
-    int rf_text_width = gui_ui_measure_text_width(app, "100%", status_font_size, 1);
+    int rf_text_width = gui_ui_measure_text_width(app, "100%", status_font_size, status_readout_font_id);
     int aud_text_width = rf_text_width;
     int free_space_text_width = status_free_space_tier_width[status_free_space_tier];
     int free_space_width_budget = free_space_text_width;
@@ -7683,7 +8533,7 @@ static bool render_main_panels(gui_app_t *app) {
     if (show_device_buffer_status) {
         status_device_buffer_view = device_buffer_views[device_buffer_level];
         gui_ui_ellipsize_text(app, status_device_buffer_view.caption,
-            sizeof(status_device_buffer_view.caption), status_font_size, 1,
+            sizeof(status_device_buffer_view.caption), status_font_size, status_readout_font_id,
             device_buffer_caption_width[device_buffer_level]);
     }
     gui_device_buffer_layout_t device_buffer_layout =
@@ -7721,20 +8571,20 @@ static bool render_main_panels(gui_app_t *app) {
     if (show_free_space && free_space_width_budget > 0) {
         gui_ui_ellipsize_text(app, status_free_space_display,
                               sizeof(status_free_space_display),
-                              status_font_size, 1, free_space_width_budget);
+                              status_font_size, status_readout_font_id, free_space_width_budget);
     }
     gui_ui_ellipsize_text(app, status_sample_rate_display, sizeof(status_sample_rate_display),
-                          status_font_size, 1, sample_rate_value_width);
+                          status_font_size, status_readout_font_id, sample_rate_value_width);
     gui_ui_ellipsize_text(app, status_samples_display, sizeof(status_samples_display),
-                          status_font_size, 1, samples_value_width);
+                          status_font_size, status_readout_font_id, samples_value_width);
     gui_ui_ellipsize_text(app, status_rf_buf_display, sizeof(status_rf_buf_display),
-                          status_font_size, 1, buffer_value_width);
+                          status_font_size, status_readout_font_id, buffer_value_width);
     gui_ui_ellipsize_text(app, status_aud_buf_display, sizeof(status_aud_buf_display),
-                          status_font_size, 1, buffer_value_width);
+                          status_font_size, status_readout_font_id, buffer_value_width);
     if (show_record_indicator) {
         gui_ui_ellipsize_text(app, status_record_timer_display,
                               sizeof(status_record_timer_display),
-                              status_font_size, 1, record_timer_text_width);
+                              status_font_size, status_readout_font_id, record_timer_text_width);
     }
     // DdD aliases begin only when the entire sample-rate readout is hidden.
     // Pass the same-frame choice to the toolbar and return it for its dropdown;
@@ -7790,7 +8640,7 @@ static bool render_main_panels(gui_app_t *app) {
                     .layout = { .sizing = { CLAY_SIZING_FIXED(record_timer_text_width), CLAY_SIZING_FIT(0) } }
                 }) {
                     CLAY_TEXT(make_string(status_record_timer_display),
-                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = status_readout_font_id, .textColor = to_clay_color(COLOR_TEXT), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                 }
             }
 
@@ -7815,7 +8665,7 @@ static bool render_main_panels(gui_app_t *app) {
                     }
                 }) {
                     CLAY_TEXT(make_string(status_free_space_display),
-                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(free_space_color), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                        CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = status_readout_font_id, .textColor = to_clay_color(free_space_color), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                 }
             }
         }
@@ -7839,7 +8689,7 @@ static bool render_main_panels(gui_app_t *app) {
                 }
             }) {
                 if (show_sync_status) {
-                    bool synced = atomic_load(&app->stream_synced);
+                    bool synced = m_status_valid ? m_status.stream_synced : atomic_load(&app->stream_synced);
                     Color sync_color = synced ? COLOR_SYNC_GREEN : COLOR_SYNC_RED;
                     CLAY(CLAY_ID("SyncStatus"), {
                         .layout = {
@@ -7864,7 +8714,7 @@ static bool render_main_panels(gui_app_t *app) {
                         .layout = { .sizing = { CLAY_SIZING_FIXED(sample_rate_value_width), CLAY_SIZING_FIT(0) } }
                     }) {
                         CLAY_TEXT(make_string(status_sample_rate_display),
-                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT_DIM), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = status_readout_font_id, .textColor = to_clay_color(COLOR_TEXT_DIM), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                     }
                 }
                 if (show_samples_count) {
@@ -7882,7 +8732,7 @@ static bool render_main_panels(gui_app_t *app) {
                             .layout = { .sizing = { CLAY_SIZING_FIXED(samples_value_width), CLAY_SIZING_FIT(0) } }
                         }) {
                             CLAY_TEXT(make_string(status_samples_display),
-                                CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                                CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = status_readout_font_id, .textColor = to_clay_color(COLOR_TEXT), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                         }
                     }
                     if (show_frame_count) {
@@ -7899,7 +8749,7 @@ static bool render_main_panels(gui_app_t *app) {
                                 .layout = { .sizing = { CLAY_SIZING_FIXED(frames_value_width), CLAY_SIZING_FIT(0) } }
                             }) {
                                 CLAY_TEXT(make_string(status_frames_display),
-                                    CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(COLOR_TEXT), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                                    CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = status_readout_font_id, .textColor = to_clay_color(COLOR_TEXT), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                             }
                         }
                     }
@@ -7919,7 +8769,7 @@ static bool render_main_panels(gui_app_t *app) {
                             .layout = { .sizing = { CLAY_SIZING_FIXED(small_counter_width), CLAY_SIZING_FIT(0) } }
                         }) {
                             CLAY_TEXT(make_string(status_missed_display),
-                                CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(missed > 0 ? COLOR_CLIP_RED : COLOR_TEXT), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                                CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = status_readout_font_id, .textColor = to_clay_color(missed > 0 ? COLOR_CLIP_RED : COLOR_TEXT), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                         }
                     }
                 }
@@ -7938,7 +8788,7 @@ static bool render_main_panels(gui_app_t *app) {
                             .layout = { .sizing = { CLAY_SIZING_FIXED(small_counter_width), CLAY_SIZING_FIT(0) } }
                         }) {
                             CLAY_TEXT(make_string(status_errors_display),
-                                CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(errors > 0 ? COLOR_CLIP_RED : COLOR_TEXT), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                                CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = status_readout_font_id, .textColor = to_clay_color(errors > 0 ? COLOR_CLIP_RED : COLOR_TEXT), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                         }
                     }
                 }
@@ -7951,7 +8801,7 @@ static bool render_main_panels(gui_app_t *app) {
                                 ? COLOR_BUTTON_HOVER : COLOR_TOOLBAR_BG)
                     }) {
                         CLAY_TEXT(make_string(fault_captions[fault_summary_flags]),
-                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1,
+                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = status_readout_font_id,
                                 .textColor = to_clay_color(COLOR_CLIP_RED), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                     }
                 }
@@ -8019,7 +8869,7 @@ static bool render_main_panels(gui_app_t *app) {
                             .layout = { .sizing = { CLAY_SIZING_FIXED(device_buffer_caption_width[device_buffer_level]), CLAY_SIZING_FIT(0) } }
                         }) {
                             CLAY_TEXT(make_string(status_device_buffer_view.caption),
-                                CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(device_buffer_color), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                                CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = status_readout_font_id, .textColor = to_clay_color(device_buffer_color), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                         }
                     }
                 }
@@ -8040,7 +8890,7 @@ static bool render_main_panels(gui_app_t *app) {
                     }) {
                         Color rf_color = (rf_pct > 90) ? COLOR_CLIP_RED : (rf_pct > 75) ? COLOR_METER_YELLOW : COLOR_TEXT;
                         CLAY_TEXT(make_string(status_rf_buf_display),
-                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(rf_color), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = status_readout_font_id, .textColor = to_clay_color(rf_color), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                     }
                 }
 
@@ -8060,7 +8910,7 @@ static bool render_main_panels(gui_app_t *app) {
                     }) {
                         Color aud_color = (aud_pct > 90) ? COLOR_CLIP_RED : (aud_pct > 75) ? COLOR_METER_YELLOW : COLOR_TEXT;
                         CLAY_TEXT(make_string(status_aud_buf_display),
-                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = 1, .textColor = to_clay_color(aud_color), .wrapMode = CLAY_TEXT_WRAP_NONE }));
+                            CLAY_TEXT_CONFIG({ .fontSize = status_font_size, .fontId = status_readout_font_id, .textColor = to_clay_color(aud_color), .wrapMode = CLAY_TEXT_WRAP_NONE }));
                     }
                 }
             }
@@ -8131,6 +8981,164 @@ static void render_ui_scale_hud(void)
     }
 }
 
+/* Remote folder picker with server-absolute navigation.  The save directory
+ * never restricts browsing: Linux root is '/', Windows root lists drives. */
+static void render_monitor_folder_picker(gui_app_t *app){
+    if(!s_monitor_folder_open||!(app->settings.net_mode==GUI_NET_MODE_MONITOR_CLIENT)||!app->settings_panel_open)return;
+    int n=gui_monitor_client_folder_count();
+    char remote_path[FILE_PATH_MAX],remote_parent[FILE_PATH_MAX];
+    bool recovered=false,computer=false,failed=false,more=false;
+    if(gui_monitor_client_folder_state(remote_path,sizeof(remote_path),
+          remote_parent,sizeof(remote_parent),&computer,&recovered,&failed,&more)){
+        if(!failed){
+            snprintf(s_monitor_folder_path,sizeof(s_monitor_folder_path),"%s",remote_path);
+            snprintf(s_monitor_folder_parent,sizeof(s_monitor_folder_parent),"%s",remote_parent);
+            s_monitor_folder_computer=computer;
+            s_monitor_folder_recovered=recovered;
+        }
+        s_monitor_folder_error=failed;
+        s_monitor_folder_more=more;
+    }
+    more=s_monitor_folder_more;
+    int w=gui_ui_modal_max_extent(gui_ui_get_layout_width(),900);
+    int h=gui_ui_modal_max_extent(gui_ui_get_layout_height(),690);
+    if(!gui_ui_is_text_field_active(UI_TEXT_FIELD_MONITOR_SERVER_BROWSER_PATH))
+        snprintf(s_monitor_folder_edit_path,sizeof(s_monitor_folder_edit_path),"%s",s_monitor_folder_path);
+    /* More of the address stays visible than in the old filename-tail helper;
+     * the full path is always available for editing by clicking the bar. */
+    const char *address=s_monitor_folder_computer?"Server drives":s_monitor_folder_path;
+    size_t addr_len=strlen(address);
+    if(addr_len<=96){
+        snprintf(s_monitor_folder_path_display,sizeof(s_monitor_folder_path_display),"%s",address);
+    }else{
+        size_t start=addr_len-93;
+        while(start<addr_len&&((unsigned char)address[start]&0xc0)==0x80)start++;
+        snprintf(s_monitor_folder_path_display,sizeof(s_monitor_folder_path_display),"...%s",address+start);
+    }
+    CLAY(CLAY_ID("RemoteBrowseShade"), {
+        .layout={.sizing={CLAY_SIZING_GROW(0),CLAY_SIZING_GROW(0)}},
+        .floating={.attachTo=CLAY_ATTACH_TO_ROOT,.zIndex=1500,
+                   .attachPoints={.element=CLAY_ATTACH_POINT_LEFT_TOP,.parent=CLAY_ATTACH_POINT_LEFT_TOP}},
+        .backgroundColor=(Clay_Color){0,0,0,190}
+    }){}
+    CLAY(CLAY_ID("RemoteBrowseDialog"), {
+        .layout={.sizing={CLAY_SIZING_FIXED(w),CLAY_SIZING_FIXED(h)},
+                 .layoutDirection=CLAY_TOP_TO_BOTTOM,.padding={20,20,16,16},.childGap=10},
+        .floating={.attachTo=CLAY_ATTACH_TO_ROOT,.zIndex=1501,
+                   .attachPoints={.element=CLAY_ATTACH_POINT_CENTER_CENTER,.parent=CLAY_ATTACH_POINT_CENTER_CENTER}},
+        .backgroundColor=to_clay_color(COLOR_PANEL_BG),.cornerRadius=CLAY_CORNER_RADIUS(10)
+    }){
+        CLAY_TEXT(CLAY_STRING("Choose recording folder on server"),
+            CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_TITLE,.textColor=to_clay_color(COLOR_TEXT)}));
+        CLAY(CLAY_ID("RemoteBrowseCurrent"),{
+            .layout={.sizing={CLAY_SIZING_GROW(0),CLAY_SIZING_FIXED(48)},
+                     .padding={10,10,8,8},.childAlignment={.y=CLAY_ALIGN_Y_CENTER}},
+            .backgroundColor=(Clay_Color){24,26,32,255},.cornerRadius=CLAY_CORNER_RADIUS(5)
+        }){
+            if(gui_ui_is_text_field_active(UI_TEXT_FIELD_MONITOR_SERVER_BROWSER_PATH)){
+                gui_ui_render_active_text(UI_TEXT_FIELD_MONITOR_SERVER_BROWSER_PATH,s_monitor_folder_edit_path,
+                    FONT_SIZE_NORMAL,0,COLOR_TEXT);
+            }else{
+                CLAY_TEXT(make_string(s_monitor_folder_path_display),
+                    CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_NORMAL,.textColor=to_clay_color(COLOR_TEXT)}));
+            }
+        }
+        CLAY(CLAY_ID("RemoteBrowseNavigation"),{
+            .layout={.sizing={CLAY_SIZING_GROW(0),CLAY_SIZING_FIXED(36)},
+                     .layoutDirection=CLAY_LEFT_TO_RIGHT,.childGap=8}
+        }){
+            CLAY(CLAY_ID("RemoteBrowseUp"),{
+                .layout={.sizing={CLAY_SIZING_FIXED(60),CLAY_SIZING_FIXED(34)},
+                         .childAlignment={.x=CLAY_ALIGN_X_CENTER,.y=CLAY_ALIGN_Y_CENTER}},
+                .backgroundColor=to_clay_color(COLOR_BUTTON),.cornerRadius=CLAY_CORNER_RADIUS(5)
+            }){CLAY_TEXT(CLAY_STRING("Up"),CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_STATS,.textColor=to_clay_color(COLOR_TEXT)}));}
+            CLAY(CLAY_ID("RemoteBrowseRoot"),{
+                .layout={.sizing={CLAY_SIZING_FIXED(175),CLAY_SIZING_FIXED(34)},
+                         .childAlignment={.x=CLAY_ALIGN_X_CENTER,.y=CLAY_ALIGN_Y_CENTER}},
+                .backgroundColor=to_clay_color(COLOR_BUTTON),.cornerRadius=CLAY_CORNER_RADIUS(5)
+            }){CLAY_TEXT(CLAY_STRING("Filesystem / Drives"),CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_STATS,.textColor=to_clay_color(COLOR_TEXT)}));}
+            CLAY(CLAY_ID("RemoteBrowseHome"),{
+                .layout={.sizing={CLAY_SIZING_FIXED(75),CLAY_SIZING_FIXED(34)},
+                         .childAlignment={.x=CLAY_ALIGN_X_CENTER,.y=CLAY_ALIGN_Y_CENTER}},
+                .backgroundColor=to_clay_color(COLOR_BUTTON),.cornerRadius=CLAY_CORNER_RADIUS(5)
+            }){CLAY_TEXT(CLAY_STRING("Home"),CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_STATS,.textColor=to_clay_color(COLOR_TEXT)}));}
+            CLAY(CLAY_ID("RemoteBrowseRecordings"),{
+                .layout={.sizing={CLAY_SIZING_FIXED(175),CLAY_SIZING_FIXED(34)},
+                         .childAlignment={.x=CLAY_ALIGN_X_CENTER,.y=CLAY_ALIGN_Y_CENTER}},
+                .backgroundColor=to_clay_color(COLOR_BUTTON),.cornerRadius=CLAY_CORNER_RADIUS(5)
+            }){CLAY_TEXT(CLAY_STRING("Current recording"),CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_STATS,.textColor=to_clay_color(COLOR_TEXT)}));}
+            CLAY(CLAY_ID("RemoteBrowseRefresh"),{
+                .layout={.sizing={CLAY_SIZING_FIXED(80),CLAY_SIZING_FIXED(34)},
+                         .childAlignment={.x=CLAY_ALIGN_X_CENTER,.y=CLAY_ALIGN_Y_CENTER}},
+                .backgroundColor=to_clay_color(COLOR_BUTTON),.cornerRadius=CLAY_CORNER_RADIUS(5)
+            }){CLAY_TEXT(CLAY_STRING("Refresh"),CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_STATS,.textColor=to_clay_color(COLOR_TEXT)}));}
+        }
+        CLAY_TEXT(CLAY_STRING("Click the address above to type any server path; press Enter to open it."),
+            CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_STATS,.textColor=to_clay_color(COLOR_TEXT_DIM)}));
+        if(s_monitor_folder_error){
+            CLAY_TEXT(CLAY_STRING("Folder listing failed (access denied or connection lost). Use Up, Home, or Drives."),
+                CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_STATS,.textColor=to_clay_color(COLOR_TEXT_DIM)}));
+        }else if(s_monitor_folder_recovered){
+            CLAY_TEXT(CLAY_STRING("Previous folder was unavailable; showing the server filesystem root."),
+                CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_STATS,.textColor=to_clay_color(COLOR_TEXT_DIM)}));
+        }
+        CLAY(CLAY_ID("RemoteBrowseContents"),{
+            .layout={.sizing={CLAY_SIZING_GROW(0),CLAY_SIZING_GROW(0)},
+                     .layoutDirection=CLAY_TOP_TO_BOTTOM,.childGap=3,.padding={6,6,6,6}},
+            .backgroundColor=(Clay_Color){24,26,32,255},.cornerRadius=CLAY_CORNER_RADIUS(5)
+        }){
+            if(n==-1)CLAY_TEXT(CLAY_STRING("Loading server folders..."),
+                 CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_NORMAL,.textColor=to_clay_color(COLOR_TEXT_DIM)}));
+            else if(n==0)CLAY_TEXT(CLAY_STRING("No subfolders (you may choose this folder)"),
+                 CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_NORMAL,.textColor=to_clay_color(COLOR_TEXT_DIM)}));
+            for(int i=0;i<n&&i<12;i++){
+                if(!gui_monitor_client_folder_name(i,s_monitor_folder_labels[i],sizeof(s_monitor_folder_labels[i])))continue;
+                CLAY(CLAY_IDI("RemoteBrowseItem",i),{
+                    .layout={.sizing={CLAY_SIZING_GROW(0),CLAY_SIZING_FIXED(25)},
+                             .padding={10,8,0,0},.childAlignment={.y=CLAY_ALIGN_Y_CENTER}},
+                    .backgroundColor=to_clay_color(COLOR_BUTTON),.cornerRadius=CLAY_CORNER_RADIUS(3)
+                }){
+                    CLAY_TEXT(CLAY_STRING("[DIR]"),CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_STATS,.textColor=to_clay_color(COLOR_TEXT_DIM)}));
+                    CLAY_TEXT(make_string(s_monitor_folder_labels[i]),
+                        CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_STATS,.textColor=to_clay_color(COLOR_TEXT)}));
+                }
+            }
+        }
+        CLAY(CLAY_ID("RemoteBrowsePager"),{
+            .layout={.sizing={CLAY_SIZING_GROW(0),CLAY_SIZING_FIXED(32)},
+                     .layoutDirection=CLAY_LEFT_TO_RIGHT,.childGap=10}
+        }){
+            CLAY(CLAY_ID("RemoteBrowsePrev"),{
+                .layout={.sizing={CLAY_SIZING_FIXED(100),CLAY_SIZING_FIXED(30)},
+                         .childAlignment={.x=CLAY_ALIGN_X_CENTER,.y=CLAY_ALIGN_Y_CENTER}},
+                .backgroundColor=to_clay_color(COLOR_BUTTON),.cornerRadius=CLAY_CORNER_RADIUS(4)
+            }){CLAY_TEXT(CLAY_STRING("Previous"),CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_NORMAL,.textColor=to_clay_color(COLOR_TEXT)}));}
+            CLAY(CLAY_ID("RemoteBrowseNext"),{
+                .layout={.sizing={CLAY_SIZING_FIXED(100),CLAY_SIZING_FIXED(30)},
+                         .childAlignment={.x=CLAY_ALIGN_X_CENTER,.y=CLAY_ALIGN_Y_CENTER}},
+                .backgroundColor=to_clay_color(COLOR_BUTTON),.cornerRadius=CLAY_CORNER_RADIUS(4)
+            }){CLAY_TEXT(more?CLAY_STRING("Next >"):CLAY_STRING("Last page"),
+                CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_NORMAL,.textColor=to_clay_color(COLOR_TEXT)}));}
+        }
+        CLAY(CLAY_ID("RemoteBrowseActions"),{
+            .layout={.sizing={CLAY_SIZING_GROW(0),CLAY_SIZING_FIXED(36)},
+                     .layoutDirection=CLAY_LEFT_TO_RIGHT,.childGap=14}
+        }){
+            CLAY(CLAY_ID("RemoteBrowseCancel"),{
+                .layout={.sizing={CLAY_SIZING_GROW(0),CLAY_SIZING_FIXED(36)},
+                         .childAlignment={.x=CLAY_ALIGN_X_CENTER,.y=CLAY_ALIGN_Y_CENTER}},
+                .backgroundColor=to_clay_color(COLOR_BUTTON),.cornerRadius=CLAY_CORNER_RADIUS(5)
+            }){CLAY_TEXT(CLAY_STRING("Cancel"),CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_NORMAL,.textColor=to_clay_color(COLOR_TEXT)}));}
+            CLAY(CLAY_ID("RemoteBrowseSelect"),{
+                .layout={.sizing={CLAY_SIZING_GROW(0),CLAY_SIZING_FIXED(36)},
+                         .childAlignment={.x=CLAY_ALIGN_X_CENTER,.y=CLAY_ALIGN_Y_CENTER}},
+                .backgroundColor=to_clay_color(COLOR_BUTTON_ACTIVE),.cornerRadius=CLAY_CORNER_RADIUS(5)
+            }){CLAY_TEXT(CLAY_STRING("Use this folder"),CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_NORMAL,.textColor=to_clay_color(COLOR_TEXT)}));}
+        }
+    }
+}
+
+
 // Main layout function
 void gui_render_layout(gui_app_t *app) {
     gui_ui_sync_capture_mode_state(app);
@@ -8151,6 +9159,7 @@ void gui_render_layout(gui_app_t *app) {
 
     // Settings panel overlay (if open)
     render_settings_panel(app);
+    render_monitor_folder_picker(app);
 
     // Record-limit popup overlay (if open)
     if (!gui_ui_selected_device_is_playback(app)) {
@@ -8260,9 +9269,6 @@ void gui_render_layout(gui_app_t *app) {
 static void gui_ui_poll_android_results(gui_app_t *app)
 {
     extern int android_poll_picker_result(int *out_kind, int *out_ok, char *out_path, size_t out_path_len);
-    extern int android_poll_usb_permission_result(int *out_granted);
-    extern int android_permission_pending(void);
-    extern int android_usb_has_fd(void);
     extern int android_usb_device_present(void);
 
     /* Re-enumerate the device list whenever the Java-reported physical USB
@@ -8272,24 +9278,47 @@ static void gui_ui_poll_android_results(gui_app_t *app)
      * capturing or while a start/stop worker is in flight. */
     static int s_last_usb_present = -1;
     int usb_present_now = android_usb_device_present();
-    if (usb_present_now != s_last_usb_present) {
-        if (!app->is_capturing && !gui_app_capture_busy() && !gui_playback_is_starting(app)) {
+    bool usb_devices_changed = usb_present_now != s_last_usb_present;
+#ifdef ENABLE_RTLSDR
+    static unsigned s_last_rtl_revision;
+    unsigned rtl_revision = android_rtlsdr_device_revision();
+    usb_devices_changed |= rtl_revision != s_last_rtl_revision;
+#endif
+    if (usb_devices_changed &&
+        app->settings.net_mode != GUI_NET_MODE_CLIENT &&
+        app->settings.net_mode != GUI_NET_MODE_MONITOR_CLIENT) {
+        if (!app->is_capturing && !gui_app_capture_busy() &&
+            !gui_net_transition_busy() && !gui_playback_is_starting(app)) {
             int prev_selected_type = -1;
+#ifdef ENABLE_RTLSDR
+            int prev_selected_rtl_id = -1;
+#endif
             if (app->selected_device >= 0 && app->selected_device < app->device_count) {
                 prev_selected_type = (int)app->devices[app->selected_device].type;
+#ifdef ENABLE_RTLSDR
+                if (prev_selected_type == DEVICE_TYPE_RTLSDR) {
+                    prev_selected_rtl_id = app->devices[app->selected_device].index;
+                }
+#endif
             }
             gui_app_enumerate_devices(app);
             /* Keep the user's selection on the same device type if possible
              * (e.g. stay on Test Signal when the MS2130 appears). */
             if (prev_selected_type >= 0) {
                 for (int i = 0; i < app->device_count; i++) {
-                    if ((int)app->devices[i].type == prev_selected_type) {
-                        app->selected_device = i;
-                        break;
-                    }
+                    if ((int)app->devices[i].type != prev_selected_type) continue;
+#ifdef ENABLE_RTLSDR
+                    if (prev_selected_type == DEVICE_TYPE_RTLSDR &&
+                        app->devices[i].index != prev_selected_rtl_id) continue;
+#endif
+                    app->selected_device = i;
+                    break;
                 }
             }
             s_last_usb_present = usb_present_now;
+#ifdef ENABLE_RTLSDR
+            s_last_rtl_revision = rtl_revision;
+#endif
         }
         /* else: retry on a later frame once capture/start/stop settles */
     }
@@ -8336,29 +9365,18 @@ static void gui_ui_poll_android_results(gui_app_t *app)
         }
     }
 
-    /* USB permission result -> complete the connect that the Connect button
-     * (or auto-reconnect) launched asynchronously. Run the (potentially slow)
-     * capture startup on a worker thread so the render loop stays alive. */
-    if (android_permission_pending()) {
-        int granted = 0;
-        if (android_poll_usb_permission_result(&granted)) {
-            if (gui_playback_is_starting(app)) {
-                // Consume the permission result without starting another source.
-            } else if (granted && android_usb_has_fd()) {
-                gui_app_set_status(app, "USB permission granted, starting capture...");
-                gui_app_start_capture_async(app);
-            } else {
-                gui_app_set_status(app, "USB permission denied or no USB capture device found");
-                app->reconnect_pending = false;
-                app->reconnect_attempts = 0;
-            }
-        }
-    }
+
 }
 #endif
 
 // Handle UI interactions
 void gui_handle_interactions(gui_app_t *app) {
+#if defined(__ANDROID__)
+    if (gui_android_viewport_block_controls()) {
+        gui_ui_set_click_consumed();
+        return;
+    }
+#endif
 #if defined(__APPLE__)
     if(gui_cxadc_macos_ui_handle(app))return;
 #endif
@@ -8455,8 +9473,18 @@ void gui_handle_interactions(gui_app_t *app) {
         s_record_limit_window_open = false;
     }
     if (s_version_info_window_open && IsKeyPressed(KEY_ESCAPE)) {
-        s_version_info_window_open = false;
-        s_update_install_armed = false;
+        // ESC closes the hold-press mode menu first; only a second ESC (or a
+        // menu already closed) dismisses the window.
+        if (s_net_mode_menu_open) {
+            s_net_mode_menu_open = false;
+            s_net_mode_press_armed = false;
+            s_net_mode_hold_fired = false;
+        } else {
+            s_version_info_window_open = false;
+            s_update_install_armed = false;
+            s_net_mode_press_armed = false;
+            s_net_mode_hold_fired = false;
+        }
     }
     if (s_metadata_window_open && IsKeyPressed(KEY_ESCAPE)) {
         s_metadata_window_open = false;
@@ -8482,6 +9510,13 @@ void gui_handle_interactions(gui_app_t *app) {
         (s_active_text_field == UI_TEXT_FIELD_NET_SERVER_PORT ||
          s_active_text_field == UI_TEXT_FIELD_NET_CLIENT_HOST ||
          s_active_text_field == UI_TEXT_FIELD_NET_CLIENT_PORT);
+#ifdef ENABLE_RTLSDR
+    if ((gui_dropdown_is_open(DROPDOWN_RTLSDR_PRESET, 0) ||
+         gui_dropdown_is_open(DROPDOWN_RTLSDR_PRESET, 1)) &&
+        (IsKeyPressed(KEY_ESCAPE) || !app->settings_panel_open || gui_ui_settings_locked(app) ||
+         !gui_ui_selected_device_is_sdr(app)))
+        gui_dropdown_close_all();
+#endif
     if (las_text_field_active && s_record_limit_window_open) {
         gui_ui_handle_active_text_edit(app);
     } else if (net_text_field_active && s_version_info_window_open &&
@@ -8642,8 +9677,108 @@ void gui_handle_interactions(gui_app_t *app) {
 
     // Handle clicks
     if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+        if(s_monitor_folder_open&&(app->settings.net_mode==GUI_NET_MODE_MONITOR_CLIENT)){
+            if(gui_ui_is_text_field_active(UI_TEXT_FIELD_MONITOR_SERVER_BROWSER_PATH) &&
+               !Clay_PointerOver(CLAY_ID("RemoteBrowseCurrent")) &&
+               !Clay_PointerOver(CLAY_ID("RemoteBrowseSelect"))){
+                /* Navigation cancels an unfinished address edit, not a save. */
+                snprintf(s_monitor_folder_edit_path,sizeof(s_monitor_folder_edit_path),"%s",s_monitor_folder_path);
+                gui_ui_clear_text_edit();
+            }
+            if(Clay_PointerOver(CLAY_ID("RemoteBrowseCurrent"))){
+                gui_ui_begin_text_edit(app,UI_TEXT_FIELD_MONITOR_SERVER_BROWSER_PATH,
+                    CLAY_ID("RemoteBrowseCurrent"),10.0f,10.0f);
+            }else if(Clay_PointerOver(CLAY_ID("RemoteBrowseCancel")) ||
+               Clay_PointerOver(CLAY_ID("RemoteBrowseShade"))){
+                /* Close first so text-edit cleanup cannot navigate. */
+                s_monitor_folder_open=false;
+                if(gui_ui_is_text_field_active(UI_TEXT_FIELD_MONITOR_SERVER_BROWSER_PATH))
+                    gui_ui_clear_text_edit();
+            }else if(Clay_PointerOver(CLAY_ID("RemoteBrowseRoot"))){
+                s_monitor_folder_page=0;
+                gui_monitor_client_browse_folders("",0);
+            }else if(Clay_PointerOver(CLAY_ID("RemoteBrowseHome"))){
+                s_monitor_folder_page=0;
+                gui_monitor_client_browse_folders("~",0);
+            }else if(Clay_PointerOver(CLAY_ID("RemoteBrowseRecordings"))){
+                s_monitor_folder_page=0;
+                gui_monitor_client_browse_folders(app->settings.output_path,0);
+            }else if(Clay_PointerOver(CLAY_ID("RemoteBrowseRefresh"))){
+                gui_monitor_client_browse_folders(s_monitor_folder_path,(unsigned)s_monitor_folder_page);
+            }else if(Clay_PointerOver(CLAY_ID("RemoteBrowseUp"))){
+                s_monitor_folder_page=0;
+                gui_monitor_client_browse_folders(s_monitor_folder_parent,0);
+            }else if(Clay_PointerOver(CLAY_ID("RemoteBrowsePrev"))){
+                if(s_monitor_folder_page>0){
+                    --s_monitor_folder_page;
+                    gui_monitor_client_browse_folders(s_monitor_folder_path,(unsigned)s_monitor_folder_page);
+                }
+            }else if(Clay_PointerOver(CLAY_ID("RemoteBrowseNext"))){
+                if(s_monitor_folder_more){
+                    ++s_monitor_folder_page;
+                    gui_monitor_client_browse_folders(s_monitor_folder_path,(unsigned)s_monitor_folder_page);
+                }
+            }else if(Clay_PointerOver(CLAY_ID("RemoteBrowseSelect"))){
+                if(gui_ui_is_text_field_active(UI_TEXT_FIELD_MONITOR_SERVER_BROWSER_PATH)){
+                    gui_ui_clear_text_edit();
+                    gui_ui_set_click_consumed();return;
+                }
+                /* Computer is virtual; cannot be used as a recording folder. */
+                if(!s_monitor_folder_computer && !s_monitor_folder_error &&
+                   gui_monitor_client_folder_count()>=0){
+                    gui_monitor_client_select_output(s_monitor_folder_path);
+                    gui_app_set_status(app,"Server Output folder change requested; awaiting server confirmation");
+                    s_monitor_folder_open=false;
+                }
+            }else{
+                int count=gui_monitor_client_folder_count();
+                for(int i=0;i<count&&i<12;i++){
+                    if(!Clay_PointerOver(CLAY_IDI("RemoteBrowseItem",i)))continue;
+                    char name[256];
+                    if(gui_monitor_client_folder_name(i,name,sizeof(name))){
+                        char selected[FILE_PATH_MAX];
+                        if(s_monitor_folder_computer){
+                            snprintf(selected,sizeof(selected),"%s",name);
+                        }else{
+                            size_t len=strlen(s_monitor_folder_path);
+                            bool trailing=len&&(s_monitor_folder_path[len-1]=='/'||s_monitor_folder_path[len-1]=='\\');
+                            const char sep=(strchr(s_monitor_folder_path,'\\')||
+                                           (len>=2&&s_monitor_folder_path[1]==':'))?'\\':'/';
+                            int written=snprintf(selected,sizeof(selected),"%s%s%s",s_monitor_folder_path,
+                                trailing?"":(sep=='\\'?"\\":"/"),name);
+                            if(written<0||(size_t)written>=sizeof(selected))break;
+                        }
+                        s_monitor_folder_page=0;
+                        gui_monitor_client_browse_folders(selected,0);
+                    }
+                    break;
+                }
+            }
+            gui_ui_set_click_consumed();
+            return;
+        }
         // Version info popup modal interactions (consume before toolbar underneath)
         if (s_version_info_window_open) {
+            // Net mode hold-press menu takes priority over everything else in
+            // the modal while it is open: an item click switches directly, any
+            // other click (toggle included) just closes the menu.
+            if (s_net_mode_menu_open) {
+                static const int menu_ids[4] = {
+                    GUI_NET_MODE_LOCAL, GUI_NET_MODE_SERVER,
+                    GUI_NET_MODE_CLIENT, GUI_NET_MODE_MONITOR_CLIENT
+                };
+                bool on_item = false;
+                for (int i = 0; i < 4 && !on_item; i++) {
+                    if (Clay_PointerOver(CLAY_IDI("VersionInfoNetModeMenuItem", i))) {
+                        on_item = true;
+                        s_net_mode_menu_open = false;
+                        gui_ui_net_mode_apply(app, menu_ids[i]);
+                    }
+                }
+                if (!on_item) s_net_mode_menu_open = false;
+                gui_ui_set_click_consumed();
+                return;
+            }
             if (Clay_PointerOver(CLAY_ID("VersionInfoCheckUpdateButton"))) {
                 gui_ui_process_update_check_result(app);
                 if (atomic_load_explicit(&s_update_check_running, memory_order_acquire)) {
@@ -8791,7 +9926,11 @@ void gui_handle_interactions(gui_app_t *app) {
                 // idle by tearing down and re-initializing the buffer manager;
                 // block the change while capturing/recording to avoid disrupting
                 // the live data path.
-                if (app->is_capturing || app->is_recording) {
+                if (app->is_capturing || app->is_recording || gui_record_is_finalizing()
+#ifdef __ANDROID__
+                    || gui_app_capture_busy()
+#endif
+                ) {
                     gui_app_set_status(app, "Stop capture/recording to change memory budget");
                     gui_ui_set_click_consumed();
                     return;
@@ -8828,7 +9967,9 @@ void gui_handle_interactions(gui_app_t *app) {
                 // so the device dropdown reflects the new setting immediately.
                 app->settings.discover_simple_capture = !app->settings.discover_simple_capture;
                 gui_settings_save(&app->settings);
-                gui_app_enumerate_devices(app);
+                if (app->settings.net_mode != GUI_NET_MODE_MONITOR_CLIENT &&
+                    app->settings.net_mode != GUI_NET_MODE_CLIENT)
+                    gui_app_enumerate_devices(app);
                 gui_app_set_status(app, app->settings.discover_simple_capture
                     ? "V4L2 device discovery enabled"
                     : "V4L2 device discovery disabled");
@@ -8862,32 +10003,27 @@ void gui_handle_interactions(gui_app_t *app) {
                 gui_ui_set_click_consumed();
                 return;
             }
-            // Network (Server/Client) mode cycle: Local -> Server -> Client -> Local.
+            // Net mode toggle: a press only ARMS the hold decision (clicks fire
+            // on press; acting here would also run the heavy apply inline).
+            // Quick release cycles, >= 450 ms hold opens the direct-select
+            // menu - both resolved per frame below the click gate.
             if (Clay_PointerOver(CLAY_ID("VersionInfoNetModeToggle"))) {
                 if (gui_playback_is_starting(app)) {
                     gui_app_set_status(app, "Network mode is locked while playback prepares");
                     gui_ui_set_click_consumed();
                     return;
                 }
-                int cur = app->settings.net_mode;
-                if (cur < GUI_NET_MODE_LOCAL || cur > GUI_NET_MODE_CLIENT) cur = GUI_NET_MODE_LOCAL;
-                int next = (cur == GUI_NET_MODE_LOCAL) ? GUI_NET_MODE_SERVER
-                         : (cur == GUI_NET_MODE_SERVER) ? GUI_NET_MODE_CLIENT
-                         : GUI_NET_MODE_LOCAL;
-                app->settings.net_mode = next;
-                gui_ui_clear_text_edit();
-                gui_settings_save(&app->settings);
-                (void)gui_net_apply_mode(app);
-                // Returning to Local restores the local hardware device list
-                // (client mode had replaced it with the server's mirrored list).
-                if (next == GUI_NET_MODE_LOCAL) {
-                    gui_app_enumerate_devices(app);
-                }
+                /* No busy gate: cycling during a running transition queues the
+                 * newest mode (the transition worker chases it). */
+                s_net_mode_press_armed = true;
+                s_net_mode_hold_fired = false;
+                s_net_mode_press_time = GetTime();
                 gui_ui_set_click_consumed();
                 return;
             }
-            // Click a discovered server to connect to it (client mode).
-            if (app->settings.net_mode == GUI_NET_MODE_CLIENT) {
+            // Select a discovered server in either client mode.
+            if (app->settings.net_mode == GUI_NET_MODE_CLIENT ||
+                app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT) {
                 int disc_n = gui_net_discovered_count();
                 int disc_visible = disc_n;
                 if (disc_visible > VERSION_INFO_NET_DISCOVERY_MAX_ROWS) {
@@ -8905,7 +10041,8 @@ void gui_handle_interactions(gui_app_t *app) {
             // Connect/Disconnect button: toggles the client worker while
             // staying in Client mode (discovery remains active when disconnected).
             if (Clay_PointerOver(CLAY_ID("VersionInfoNetConnectButton")) &&
-                app->settings.net_mode == GUI_NET_MODE_CLIENT) {
+                (app->settings.net_mode == GUI_NET_MODE_CLIENT ||
+                 app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT)) {
                 gui_ui_clear_text_edit();
                 gui_settings_save(&app->settings);
                 gui_net_client_toggle_connection(app);
@@ -8922,7 +10059,8 @@ void gui_handle_interactions(gui_app_t *app) {
             }
             // Click-to-edit the client host field.
             if (Clay_PointerOver(CLAY_ID("VersionInfoNetClientHostField")) &&
-                app->settings.net_mode == GUI_NET_MODE_CLIENT) {
+                (app->settings.net_mode == GUI_NET_MODE_CLIENT ||
+                 app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT)) {
                 gui_ui_begin_text_edit(app, UI_TEXT_FIELD_NET_CLIENT_HOST,
                                        CLAY_ID("VersionInfoNetClientHostField"), 8.0f, 8.0f);
                 gui_ui_set_click_consumed();
@@ -8930,7 +10068,8 @@ void gui_handle_interactions(gui_app_t *app) {
             }
             // Click-to-edit the client port field.
             if (Clay_PointerOver(CLAY_ID("VersionInfoNetClientPortField")) &&
-                app->settings.net_mode == GUI_NET_MODE_CLIENT) {
+                (app->settings.net_mode == GUI_NET_MODE_CLIENT ||
+                 app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT)) {
                 gui_ui_begin_text_edit(app, UI_TEXT_FIELD_NET_CLIENT_PORT,
                                        CLAY_ID("VersionInfoNetClientPortField"), 6.0f, 6.0f);
                 gui_ui_set_click_consumed();
@@ -8939,13 +10078,20 @@ void gui_handle_interactions(gui_app_t *app) {
             if (Clay_PointerOver(CLAY_ID("VersionInfoCloseButton"))) {
                 s_version_info_window_open = false;
                 s_update_install_armed = false;
-                // Commit any in-progress net field edit on close.
+                s_net_mode_menu_open = false;
+                s_net_mode_press_armed = false;
+                s_net_mode_hold_fired = false;
+                // Commit any in-progress net field edit on close. Async: the
+                // apply joins network threads with socket timeouts and must
+                // not stall the close click. Same mode (port/host edit):
+                // force the re-apply; a queued request would skip it.
                 if (s_active_text_field == UI_TEXT_FIELD_NET_SERVER_PORT ||
                     s_active_text_field == UI_TEXT_FIELD_NET_CLIENT_HOST ||
                     s_active_text_field == UI_TEXT_FIELD_NET_CLIENT_PORT) {
                     gui_ui_clear_text_edit();
                     gui_settings_save(&app->settings);
-                    (void)gui_net_apply_mode(app);
+                    gui_record_cancel_capture_confirmation(app);
+                    (void)gui_net_request_apply_mode(app, app->settings.net_mode, true);
                 }
                 gui_ui_set_click_consumed();
                 return;
@@ -8957,6 +10103,9 @@ void gui_handle_interactions(gui_app_t *app) {
             if (Clay_PointerOver(CLAY_ID("VersionInfoBackdrop"))) {
                 s_version_info_window_open = false;
                 s_update_install_armed = false;
+                s_net_mode_menu_open = false;
+                s_net_mode_press_armed = false;
+                s_net_mode_hold_fired = false;
                 gui_ui_set_click_consumed();
                 return;
             }
@@ -9164,6 +10313,9 @@ void gui_handle_interactions(gui_app_t *app) {
                 s_metadata_window_open = false;
             } else {
                 s_update_install_armed = false;
+                s_net_mode_menu_open = false;
+                s_net_mode_press_armed = false;
+                s_net_mode_hold_fired = false;
             }
             gui_ui_set_click_consumed();
             return;
@@ -9286,7 +10438,11 @@ void gui_handle_interactions(gui_app_t *app) {
         // Check connect button
         if (Clay_PointerOver(CLAY_ID("ConnectButton"))) {
             if (gui_playback_is_starting(app)) {
+#ifdef __ANDROID__
+                gui_app_stop_capture_async(app);
+#else
                 gui_app_stop_capture(app);
+#endif
                 gui_ui_set_click_consumed();
                 return;
             }
@@ -9317,6 +10473,10 @@ void gui_handle_interactions(gui_app_t *app) {
 #endif
                 app->reconnect_pending = false;
                 app->reconnect_attempts = 0;
+#ifdef __ANDROID__
+            } else if (gui_app_capture_busy()) {
+                gui_app_set_status(app, "Capture is changing. Please wait");
+#endif
             } else if (gui_ui_selected_device_is_playback(app) && !gui_net_is_client(app)) {
                 // File preparation is asynchronous; the per-frame poll commits it.
                 (void)gui_app_start_capture(app);
@@ -9326,28 +10486,34 @@ void gui_handle_interactions(gui_app_t *app) {
                 return;
             } else {
 #if defined(__ANDROID__)
-                /* Async USB permission: never block the render thread on the
-                 * system permission dialog (a separate Activity that destroys
-                 * our EGL surface mid-block). If the fd is already granted,
-                 * start capture now; otherwise launch the async permission
-                 * request and let the per-frame poll complete the connect. */
-                extern int android_usb_has_fd(void);
-                extern int android_request_usb_permission_async(void);
-                extern int android_permission_pending(void);
-                extern void android_usb_clear_fd(void);
-                if (android_usb_has_fd()) {
-                    /* fd already granted: start capture on a worker thread so
-                     * the render loop stays responsive during hsdaoh_open. */
-                    gui_app_start_capture_async(app);
+                /* Network clients do NOT own local capture hardware.  The
+                 * previous Android-only path unconditionally requested USB
+                 * permission, so Connect failed in Monitor & Remote mode if
+                 * the phone had no USB device (as intended). Keep the remote
+                 * start/stop commands distinct from local USB capture. */
+                if (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT ||
+                    app->settings.net_mode == GUI_NET_MODE_CLIENT) {
+                    bool peer_connected = app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT
+                        ? gui_monitor_client_connected() : gui_net_active(app);
+                    if (peer_connected) {
+                        /* This only queues a command to the server; it never
+                         * opens local USB (see gui_app_start_capture). */
+                        if (gui_app_start_capture(app) == 0) {
+                            app->reconnect_pending = false;
+                            app->reconnect_attempts = 0;
+                        }
+                    } else if (!gui_net_client_connection_running(app)) {
+                        /* The network connection itself was disconnected:
+                         * re-start its worker instead of asking for USB. */
+                        gui_net_client_toggle_connection(app);
+                        gui_app_set_status(app, "Connecting to remote Server...");
+                    } else {
+                        gui_app_set_status(app, "Waiting for remote Server connection...");
+                    }
+                } else {
                     app->reconnect_pending = false;
                     app->reconnect_attempts = 0;
-                } else if (!android_permission_pending()) {
-                    android_usb_clear_fd();
-                    if (android_request_usb_permission_async()) {
-                        gui_app_set_status(app, "Requesting USB permission...");
-                    } else {
-                        gui_app_set_status(app, "USB permission request failed to start");
-                    }
+                    gui_app_start_capture_async(app);
                 }
 #else
                 if (gui_app_start_capture(app) == 0) {
@@ -9409,6 +10575,12 @@ void gui_handle_interactions(gui_app_t *app) {
             return;
         }
 
+#ifdef ENABLE_RTLSDR
+        if (gui_ui_handle_rtlsdr_setting_click(app)) {
+            gui_ui_set_click_consumed();
+            return;
+        }
+#endif
         if (app->settings_panel_open &&
             (Clay_PointerOver(CLAY_ID("SettingsBackdrop")) || Clay_PointerOver(CLAY_ID("SettingsCloseButton")))) {
             app->settings_panel_open = false;
@@ -9479,7 +10651,8 @@ void gui_handle_interactions(gui_app_t *app) {
         // Check record button - UI indicates record-write to disk finialization
         // Mitigate app appearing hung
         if (Clay_PointerOver(CLAY_ID("RecordButton"))) {
-            if (gui_ui_selected_device_is_playback(app)) {
+            if (app->settings.net_mode != GUI_NET_MODE_MONITOR_CLIENT &&
+                gui_ui_selected_device_is_playback(app)) {
                 if (app->is_capturing && gui_playback_is_running(app)) {
                     gui_playback_toggle_pause(app);
                     if (gui_playback_get_state(app) == PLAYBACK_STATE_PAUSED) {
@@ -9487,6 +10660,21 @@ void gui_handle_interactions(gui_app_t *app) {
                     } else {
                         gui_app_set_status(app, "Playback resumed");
                     }
+                }
+                gui_ui_set_click_consumed();
+                return;
+            }
+            if (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT) {
+                if (!gui_monitor_client_connected()) {
+                    gui_app_set_status(app,"Monitor & Remote: connect to Server before recording");
+                } else if (gui_monitor_client_peer_state() == 2) {
+                    gui_net_client_request_record(app,false);
+                    gui_app_set_status(app,"Server: stop recording requested");
+                } else if (gui_monitor_client_peer_state() == 1) {
+                    gui_net_client_request_record(app,true);
+                    gui_app_set_status(app,"Server: start recording requested (server disk)");
+                } else {
+                    gui_app_set_status(app,"Server capture is not running");
                 }
                 gui_ui_set_click_consumed();
                 return;
@@ -9505,6 +10693,7 @@ void gui_handle_interactions(gui_app_t *app) {
         // Check settings button
         if (Clay_PointerOver(CLAY_ID("SettingsButton"))) {
             app->settings_panel_open = !app->settings_panel_open;
+            gui_dropdown_close_all();
             gui_ui_clear_text_edit();
             gui_settings_save(&app->settings);
         }
@@ -9512,12 +10701,20 @@ void gui_handle_interactions(gui_app_t *app) {
 
         // Clip reset buttons (per-channel stats)
         if (Clay_PointerOver(CLAY_IDI("ResetClipBtn", 0))) {
-            atomic_store(&app->clip_count_a_pos, 0);
-            atomic_store(&app->clip_count_a_neg, 0);
+            if(app->settings.net_mode==GUI_NET_MODE_MONITOR_CLIENT)
+                gui_monitor_client_reset_clips(0);
+            else {
+                atomic_store(&app->clip_count_a_pos, 0);
+                atomic_store(&app->clip_count_a_neg, 0);
+            }
         }
         if (Clay_PointerOver(CLAY_IDI("ResetClipBtn", 1))) {
-            atomic_store(&app->clip_count_b_pos, 0);
-            atomic_store(&app->clip_count_b_neg, 0);
+            if(app->settings.net_mode==GUI_NET_MODE_MONITOR_CLIENT)
+                gui_monitor_client_reset_clips(1);
+            else {
+                atomic_store(&app->clip_count_b_pos, 0);
+                atomic_store(&app->clip_count_b_neg, 0);
+            }
         }
         if (gui_ui_selected_device_is_cxadc(app, NULL)) {
             const int dc_step = 1;
@@ -9589,6 +10786,42 @@ void gui_handle_interactions(gui_app_t *app) {
                 }
                 gui_ui_set_click_consumed();
                 return;
+            }
+        }
+
+        // Per-channel transport buttons (Play/Pause + Loop) live at the right
+        // end of the playback timeline rows (moved out of the settings panel,
+        // user request 2026-11-03). Synced link: they drive the shared
+        // transport; Separate: the one channel only. Runs outside the
+        // settings-panel gate because the buttons render in the channel area.
+        for (int pb_ch = 0; pb_ch < 2; pb_ch++) {
+            if (Clay_PointerOver(CLAY_IDI("PlaybackPauseBtn", pb_ch))) {
+                if (app->is_capturing && gui_playback_is_running(app) &&
+                    (pb_ch == 0 ? app->settings.playback_file_a[0]
+                                : app->settings.playback_file_b[0])) {
+                    bool was_paused = gui_playback_is_channel_paused(app, pb_ch);
+                    gui_playback_toggle_pause_channel(app, pb_ch);
+                    gui_app_set_status(app, was_paused
+                        ? (pb_ch ? "CH B resumed" : "CH A resumed")
+                        : (pb_ch ? "CH B paused" : "CH A paused"));
+                } else {
+                    gui_app_set_status(app, "Playback is not running");
+                }
+                gui_ui_set_click_consumed();
+            }
+            if (Clay_PointerOver(CLAY_IDI("PlaybackLoopBtn", pb_ch))) {
+                if (app->is_capturing && gui_playback_is_running(app) &&
+                    (pb_ch == 0 ? app->settings.playback_file_a[0]
+                                : app->settings.playback_file_b[0])) {
+                    bool now_on = !gui_playback_get_channel_loop(app, pb_ch);
+                    gui_playback_set_channel_loop(app, pb_ch, now_on);
+                    gui_app_set_status(app, now_on
+                        ? (pb_ch ? "CH B loop ON" : "CH A loop ON")
+                        : (pb_ch ? "CH B loop OFF" : "CH A loop OFF"));
+                } else {
+                    gui_app_set_status(app, "Playback is not running");
+                }
+                gui_ui_set_click_consumed();
             }
         }
 
@@ -9731,6 +10964,34 @@ void gui_handle_interactions(gui_app_t *app) {
                 gui_ui_begin_text_edit(app, UI_TEXT_FIELD_FLAC_AFFINITY, CLAY_ID("FlacAffinityListField"), 8.0f, 8.0f);
                 gui_ui_set_click_consumed();
             }
+#if defined(ENABLE_DDD) && defined(ENABLE_DDD_WINUSB)
+            if (gui_ui_ddd_usb_backend_visible(app) &&
+                Clay_PointerOver(CLAY_ID("DddUsbBackendToggle"))) {
+                if (gui_ui_ddd_usb_backend_locked(app)) {
+                    gui_app_set_status(app, "Disconnect DdD before changing the USB backend");
+                } else {
+                    app->settings.ddd_use_winusb = !app->settings.ddd_use_winusb;
+                    gui_settings_save(&app->settings);
+                    gui_app_set_status(app, app->settings.ddd_use_winusb
+                        ? "DdD USB backend set to WinUSB" : "DdD USB backend set to libusb");
+                }
+                gui_ui_set_click_consumed();
+                return;
+            }
+            if (gui_ui_ddd_usb_backend_visible(app) && !app->settings.ddd_use_winusb &&
+                Clay_PointerOver(CLAY_ID("DddLibusbRawIoToggle"))) {
+                if (gui_ui_ddd_usb_backend_locked(app)) {
+                    gui_app_set_status(app, "Disconnect DdD before changing libusb RAW_IO");
+                } else {
+                    app->settings.ddd_libusb_raw_io = !app->settings.ddd_libusb_raw_io;
+                    gui_settings_save(&app->settings);
+                    gui_app_set_status(app, app->settings.ddd_libusb_raw_io
+                        ? "DdD libusb RAW_IO set to ON" : "DdD libusb RAW_IO set to OFF");
+                }
+                gui_ui_set_click_consumed();
+                return;
+            }
+#endif
             if (!settings_ddd_v1_mode &&
                 Clay_PointerOver(CLAY_ID("ToggleResampleA"))) {
                 bool enable = !app->settings.enable_resample_a;
@@ -9820,24 +11081,6 @@ void gui_handle_interactions(gui_app_t *app) {
             // SDR controls (shown for any SDR backend; today only RTL-SDR).
 #ifdef ENABLE_RTLSDR
             if (gui_ui_selected_device_is_sdr(app)) {
-                if (Clay_PointerOver(CLAY_ID("RtlsdrFreqField")) && !gui_ui_click_consumed()) {
-                    gui_ui_begin_text_edit(app, UI_TEXT_FIELD_RTLSDR_FREQ, CLAY_ID("RtlsdrFreqField"), 8.0f, 8.0f);
-                    gui_ui_set_click_consumed();
-                }
-                if (Clay_PointerOver(CLAY_ID("RtlsdrSampleRateBox"))) {
-                    // Cycle through known-stable RTL sample rates (Hz).
-                    static const uint32_t rtlsdr_rates[] = { 250000, 1024000, 1200000, 1536000, 2048000, 2400000 };
-                    static const int n = (int)(sizeof(rtlsdr_rates)/sizeof(rtlsdr_rates[0]));
-                    uint32_t cur = app->settings.rtlsdr_sample_rate_hz;
-                    int idx = 0;
-                    for (int i = 0; i < n; i++) { if (rtlsdr_rates[i] == cur) { idx = i; break; } }
-                    app->settings.rtlsdr_sample_rate_hz = rtlsdr_rates[(idx + 1) % n];
-                    gui_settings_save(&app->settings);
-                    char msg[80];
-                    snprintf(msg, sizeof(msg), "SDR sample rate set to %.2f MSPS (applies on next capture start)",
-                             (double)app->settings.rtlsdr_sample_rate_hz / 1.0e6);
-                    gui_app_set_status(app, msg);
-                }
                 if (Clay_PointerOver(CLAY_ID("RtlsdrGainModeToggle"))) {
                     // 0=auto,1=manual
                     app->settings.rtlsdr_gain_mode = app->settings.rtlsdr_gain_mode ? 0 : 1;
@@ -9898,6 +11141,8 @@ void gui_handle_interactions(gui_app_t *app) {
             }
 
             if (app->settings_panel_open &&
+                (app->settings.net_mode != GUI_NET_MODE_MONITOR_CLIENT ||
+                 !app->settings.monitor_local_save_enabled) &&
                 Clay_PointerOver(CLAY_ID("OutputPathBox")) &&
                 !gui_ui_click_consumed())
             {
@@ -10001,7 +11246,67 @@ void gui_handle_interactions(gui_app_t *app) {
                 }
             }
 
-            if (Clay_PointerOver(CLAY_ID("ChooseOutputFolderButton"))) {
+            if (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT &&
+                Clay_PointerOver(CLAY_ID("MonitorLocalSaveToggle")) &&
+                !gui_ui_click_consumed()) {
+                /* Never change destination mode during an active remote recording. */
+                if(gui_monitor_client_peer_state()==2)
+                    gui_app_set_status(app,"Stop recording before switching Local Save");
+                else {
+                    app->settings.monitor_local_save_enabled = !app->settings.monitor_local_save_enabled;
+                    // The other path field is now hidden, so close any active
+                    // text edit before switching the visible destination.
+                    gui_ui_clear_text_edit();
+                    gui_settings_save(&app->settings);
+                    gui_app_set_status(app,app->settings.monitor_local_save_enabled ?
+                        "Local Save ON: next recording goes to this computer" :
+                        "Local Save OFF: next recording goes to the Server");
+                }
+                gui_ui_set_click_consumed();return;
+            }
+            if (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT &&
+                app->settings.monitor_local_save_enabled &&
+                Clay_PointerOver(CLAY_ID("MonitorLocalSavePathBox")) &&
+                !gui_ui_click_consumed()) {
+                gui_ui_begin_text_edit(app, UI_TEXT_FIELD_MONITOR_LOCAL_SAVE_PATH,
+                                       CLAY_ID("MonitorLocalSavePathBox"), 10.0f, 10.0f);
+                gui_ui_set_click_consumed();
+            }
+            if (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT &&
+                app->settings.monitor_local_save_enabled &&
+                Clay_PointerOver(CLAY_ID("MonitorLocalSaveChooseFolder"))) {
+                gui_settings_t tmp=app->settings;
+                // Picker returns its chosen path via tmp.output_path. Start
+                // empty so selecting a folder equal to the Output folder is
+                // not incorrectly treated as a cancelled picker operation.
+                tmp.output_path[0]='\0';
+                /* Picker operates on the client computer, NOT server paths. */
+                if (gui_settings_choose_output_folder(&tmp)) {
+                    snprintf(app->settings.monitor_local_save_path,
+                             sizeof(app->settings.monitor_local_save_path),
+                             "%s",tmp.output_path);
+                    gui_settings_save(&app->settings);
+                    gui_app_set_status(app,"Monitor & Remote local recording folder saved");
+                } else gui_app_set_status(app,"Folder selection cancelled or unavailable; click local path to type it");
+                gui_ui_set_click_consumed();
+                return;
+            }
+            if ((app->settings.net_mode != GUI_NET_MODE_MONITOR_CLIENT ||
+                 !app->settings.monitor_local_save_enabled) &&
+                Clay_PointerOver(CLAY_ID("ChooseOutputFolderButton"))) {
+                if(app->settings.net_mode==GUI_NET_MODE_MONITOR_CLIENT){
+                    if(!gui_monitor_client_connected())
+                        gui_app_set_status(app,"Connect to Server before browsing its folders");
+                    else{
+                        s_monitor_folder_open=true;
+                        s_monitor_folder_page=0;
+                        s_monitor_folder_error=false;s_monitor_folder_computer=false;
+                        s_monitor_folder_recovered=false;s_monitor_folder_more=false;
+                        snprintf(s_monitor_folder_path,sizeof(s_monitor_folder_path),"%s",app->settings.output_path);
+                        gui_monitor_client_browse_folders(s_monitor_folder_path,0);
+                    }
+                    gui_ui_set_click_consumed();return;
+                }
 #if defined(__ANDROID__)
                 /* Async SAF picker: launch and return; the per-frame poll in
                  * gui_handle_interactions applies the result. Never block the
@@ -10084,6 +11389,16 @@ void gui_handle_interactions(gui_app_t *app) {
                 gui_settings_save(&app->settings);
                 gui_ui_set_click_consumed();
             }
+            // Player link mode: Synced = shared transport, Separate = per-file
+            // transport (user request 2026-11-03). Scrub stays per-timeline in
+            // both modes (the timeline rows are per channel).
+            if (Clay_PointerOver(CLAY_ID("PlaybackLinkToggle"))) {
+                bool sep = !gui_playback_get_link_separate(app);
+                gui_playback_set_link_separate(app, sep);
+                gui_app_set_status(app, sep ? "Player link: Separate (per-file transport)"
+                                            : "Player link: Synced (shared transport)");
+                gui_ui_set_click_consumed();
+            }
         }
 
         // Note: CVBS enable/disable is now handled automatically when selecting
@@ -10096,6 +11411,29 @@ void gui_handle_interactions(gui_app_t *app) {
             s_ui_consumed_click = true;
         } else if (!s_ui_consumed_click && gui_dropdown_handle_click(app)) {
             s_ui_consumed_click = true;
+        }
+    }
+
+    // Net mode hold-press resolution: a press on the Mode toggle (armed in the
+    // version-window click gate above) becomes either a quick-click cycle
+    // (released under 450 ms while still over the toggle) or opens the
+    // direct-select menu (held 450 ms). Runs outside the press gate so a
+    // press spanning many frames is detected.
+    if (s_net_mode_press_armed) {
+        bool over_toggle = s_version_info_window_open &&
+            Clay_PointerOver(CLAY_ID("VersionInfoNetModeToggle"));
+        if (!IsMouseButtonDown(MOUSE_LEFT_BUTTON)) {
+            bool quick_click = !s_net_mode_hold_fired && over_toggle;
+            s_net_mode_press_armed = false;
+            s_net_mode_hold_fired = false;
+            if (quick_click) {
+                gui_ui_net_mode_apply(app, gui_ui_net_mode_cycle_next(app->settings.net_mode));
+            }
+        } else if (!s_net_mode_hold_fired && over_toggle &&
+                   (GetTime() - s_net_mode_press_time) >= 0.45) {
+            s_net_mode_hold_fired = true;
+            s_net_mode_menu_open = true;
+            gui_dropdown_close_all();
         }
     }
 }

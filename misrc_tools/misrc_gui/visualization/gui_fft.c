@@ -1246,6 +1246,8 @@ typedef struct {
     bool log_scale;                  // Linear/Log frequency-axis toggle (false
                                      // = Linear, the stock original default)
     Rectangle scale_btn_rect;         // cached Scale-button rect for the click handler
+    uint32_t remote_last_sequence;
+    bool remote_has_frame;
 } fft_panel_state_t;
 
 // Zoom limits
@@ -1532,4 +1534,42 @@ static const panel_vtable_t s_fft_vtable = {
 
 void gui_fft_panel_register(void) {
     panel_register(PANEL_VIEW_FFT, &s_fft_vtable);
+}
+
+/* Shared original Local FFTW path; FFTW processing before GUI EMA. */
+static atomic_flag s_rd_fft_lock=ATOMIC_FLAG_INIT;
+void gui_fft_server_bins(const int16_t *samples,size_t count,uint32_t rate,float *out,size_t bins){
+    if(!out||bins!=FFT_SIZE_MAX/2+1)return;
+    memset(out,0,bins*sizeof(float));
+#if LIBFFTW_ENABLED
+    if(!samples||count<FFT_SIZE_MIN)return;
+    while(atomic_flag_test_and_set_explicit(&s_rd_fft_lock,memory_order_acquire))thrd_sleep_ms(1);
+    static fft_state_t fft;
+    static bool started=false;
+    if(!started){started=gui_fft_init(&fft);}
+    if(started){
+        gui_fft_process_raw(&fft,samples,count,rate);
+        if(fft.fft_bins==(int)bins)memcpy(out,fft.magnitude_back,bins*sizeof(float));
+    }
+    atomic_flag_clear_explicit(&s_rd_fft_lock,memory_order_release);
+#else
+    (void)samples;(void)count;(void)rate;
+#endif
+}
+void gui_fft_remote_apply_float(void *state_ptr,const float *bins,size_t n,
+                                uint32_t sample_rate,uint32_t sequence){
+#if LIBFFTW_ENABLED
+    if(!state_ptr||!bins||n!=FFT_SIZE_MAX/2+1||!sample_rate)return;
+    fft_panel_state_t *p=(fft_panel_state_t*)state_ptr;
+    fft_state_t *s=&p->fft;
+    if(!s->initialized||(p->remote_has_frame&&p->remote_last_sequence==sequence))return;
+    if(s->fft_size!=FFT_SIZE_MAX&&!fft_resize(s,FFT_SIZE_MAX))return;
+    memcpy(s->magnitude_back,bins,n*sizeof(float));
+    atomic_store(&s->sample_rate,sample_rate);
+    atomic_store(&s->magnitude_ready,1);
+    p->remote_last_sequence=sequence;
+    p->remote_has_frame=true;
+#else
+    (void)state_ptr;(void)bins;(void)n;(void)sample_rate;(void)sequence;
+#endif
 }

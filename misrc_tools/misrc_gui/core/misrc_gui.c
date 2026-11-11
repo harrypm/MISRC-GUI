@@ -30,6 +30,10 @@
 #include "../../misrc_capture/misrc_capture_cli.h"
 #endif
 #include "../ui/gui_ui.h"
+#if defined(__ANDROID__)
+#define GUI_ANDROID_VIEWPORT_IMPLEMENTATION
+#include "gui_android_viewport.h"
+#endif
 #include "../input/gui_playback.h"
 #include "../visualization/gui_text.h"
 #include "../input/gui_capture.h"
@@ -41,6 +45,8 @@
 #include "../output/gui_record.h"
 #include "../output/gui_audio.h"
 #include "../net/gui_net.h"
+#include "../net/gui_monitor_audio.h"
+#include "../net/gui_monitor_transport.h"
 #include "../../common/threading.h"
 #include "../../common/utf8_argv.h"
 #include "version.h"
@@ -52,6 +58,9 @@
 #include <string.h>
 #include <math.h>
 #include <ctype.h>
+#if defined(__linux__) && !defined(__ANDROID__)
+#include <signal.h>
+#endif
 #if defined(__APPLE__)
 #include <unistd.h>
 #include <limits.h>
@@ -119,20 +128,40 @@ static void print_usage(const char *program_name) {
             "--debug-view enables verbose runtime logs.\n"
             "--config <path> loads settings from <path> instead of the default\n"
             "           location (useful for automated GUI testing).\n"
-            "--select-device <sel> pick the capture device at launch: a device-list\n"
-            "           index, or a case-insensitive name substring (first match,\n"
-            "           e.g. \"CXADC\"). Exits 1 if nothing matches. Needed for\n"
-            "           automated runs because startup otherwise prefers\n"
-            "           hsdaoh > MISRC Clockgen > CXADC.\n"
+            "--select-device <sel> pick the capture device at launch: a\n"
+            "           device-list index, or a case-insensitive name substring\n"
+            "           (first match). Exits 1 if nothing matches. Needed for\n"
+            "           automated runs: startup otherwise prefers hsdaoh > MISRC\n"
+            "           Clockgen > CXADC.\n"
+            "--gen-system <system> preload the Test Gen system: pal|ntsc|secam|\n"
+            "           mesecam (or 0-3). Mirrors the waveform Gen button; the\n"
+            "           decoders follow at startup (MESECAM: composite decodes\n"
+            "           SECAM, RF preview starts MESECAM).\n"
+            "--gen-format <format> preload the Test Gen tape format: vhs|svhs|\n"
+            "           betamax|video8|hi8 (or 0-4). Mirrors the Fmt button on\n"
+            "           FM RF waveform panels (the RF modulation family).\n"
             "--auto-capture starts capture unattended ~1 s after launch (Local mode;\n"
             "           no --config required).\n"
             "--auto-record <seconds> runs a full unattended record cycle: start\n"
-            "           capture, settle 2 s, record <seconds> seconds, wait for\n"
-            "           the output file finalize, stop capture, exit 0 (exit 1 on\n"
+            "           capture, settle 2 s, record <seconds> seconds, wait for the\n"
+            "           output file finalize, stop capture, exit 0 (exit 1 on\n"
             "           failure). Set overwrite_files true (or timestamped\n"
             "           auto-names) in the config so the overwrite confirmation\n"
             "           popup cannot stall the run. Progress is logged with\n"
             "           [AUTO] prefixes on stderr.\n"
+            "\n"
+            "Positional playback files (no flag needed):\n"
+            "  %s <rf-file> [<file2> ...]   loads playback files at launch through\n"
+            "           the same content-classifying pipeline as drag-and-drop\n"
+            "           (RF files -> channel A by default, audio-rate file -> the\n"
+            "           monitor source) and starts playback. Works on every\n"
+            "           platform - including macOS while elevated, where Finder\n"
+            "           drag-and-drop cannot land in the root-owned window.\n"
+            "\n"
+            "Headless network server (Linux):\n"
+            "  --headless-server [--config <path>] [--select-device <selector>]\n"
+            "       One headless Server: legacy RF streams and MISRC-M/2 monitor\n"
+            "       status/control/preview on the same TCP port.\n"
             "\n"
             "Headless CLI capture mode:\n"
             "  Pass any capture option (e.g. --device-list, -a FILE) to run this\n"
@@ -140,6 +169,7 @@ static void print_usage(const char *program_name) {
             "  --device-list / --devices  list available capture devices and exit.\n"
             "\n",
             MIRSC_TOOLS_VERSION,
+            program_name ? program_name : "misrc_gui",
             program_name ? program_name : "misrc_gui");
 #if !defined(__ANDROID__)
     /* Append the full misrc_capture CLI option list (single source of truth). */
@@ -191,8 +221,13 @@ static int gui_run_update_cli(gui_update_cli_mode_t mode, const char *manifest_s
     }
     printf("latest: %s\n", latest_tag);
     printf("current: %s\n", MIRSC_TOOLS_VERSION);
+    /* Dev/unversioned builds are never comparable with a release tag: the
+     * compare returns 0 (never "older"), and the flag below tells scripts
+     * why no update is claimed for this binary. */
+    bool current_comparable = gui_updater_version_is_comparable(MIRSC_TOOLS_VERSION);
+    printf("current_comparable: %s\n", current_comparable ? "true" : "false");
     int cmp = gui_updater_compare_versions(MIRSC_TOOLS_VERSION, latest_tag);
-    printf("update_available: %s\n", (cmp < 0) ? "true" : "false");
+    printf("update_available: %s\n", (cmp < 0 && current_comparable) ? "true" : "false");
 
     if (mode == GUI_UPDATE_CLI_CHECK) {
         return 0;
@@ -301,7 +336,13 @@ typedef struct {
     ddd_device_profile_t ddd_profile;
     char ddd_usb_path[DDD_STABLE_ID_MAX];
 #endif
+#if defined(__ANDROID__) && defined(ENABLE_RTLSDR)
+    android_rtlsdr_usb_identity_t rtl_identity;
+#endif
 } gui_reconnect_target_t;
+#if defined(__ANDROID__) && defined(ENABLE_RTLSDR)
+enum { GUI_RECONNECT_CONFIRM_RTL = -2 };
+#endif
 // Portable case-insensitive substring search (POSIX strcasestr is not
 // available on every target; keeps the binary dependency-light).
 static const char *gui_strcasestr_local(const char *haystack, const char *needle) {
@@ -336,6 +377,9 @@ static void gui_set_reconnect_target_from_selected(const gui_app_t *app, gui_rec
     target->index = -1;
     target->name[0] = '\0';
     target->serial[0] = '\0';
+#if defined(__ANDROID__) && defined(ENABLE_RTLSDR)
+    target->rtl_identity = (android_rtlsdr_usb_identity_t){.usb = {.id = -1}};
+#endif
 #ifdef ENABLE_DDD
     target->ddd_profile = DDD_DEVICE_NOT_DDD;
     target->ddd_usb_path[0] = '\0';
@@ -348,6 +392,11 @@ static void gui_set_reconnect_target_from_selected(const gui_app_t *app, gui_rec
     target->index = dev->index;
     snprintf(target->name, sizeof(target->name), "%s", dev->name);
     snprintf(target->serial, sizeof(target->serial), "%s", dev->serial);
+#if defined(__ANDROID__) && defined(ENABLE_RTLSDR)
+    if (dev->type == DEVICE_TYPE_RTLSDR) {
+        (void)gui_app_rtlsdr_reconnect_identity(dev->index, &target->rtl_identity);
+    }
+#endif
 #ifdef ENABLE_DDD
     if (dev->type == DEVICE_TYPE_DDD) {
         target->ddd_profile = dev->ddd_profile;
@@ -356,8 +405,50 @@ static void gui_set_reconnect_target_from_selected(const gui_app_t *app, gui_rec
     }
 #endif
 }
+#if defined(__ANDROID__) && defined(ENABLE_RTLSDR)
+static int gui_find_android_rtl_reconnect_device(const gui_app_t *app,
+                                                const gui_reconnect_target_t *target)
+{
+    android_rtlsdr_usb_device_t attached[ANDROID_RTL_USB_MAX_DEVICES];
+    int count = android_rtlsdr_list_usb_devices(attached, ANDROID_RTL_USB_MAX_DEVICES);
+    const android_rtlsdr_usb_identity_t *identity = &target->rtl_identity;
+    int candidate = -1;
+    unsigned matches = 0;
+    for (int i = 0; i < app->device_count; ++i) {
+        const device_info_t *device = &app->devices[i];
+        if (device->type != DEVICE_TYPE_RTLSDR) continue;
+        for (int j = 0; j < count; ++j) {
+            if (attached[j].id != device->index) continue;
+            bool same_model = identity->usb.id >= 0 &&
+                              attached[j].vid == identity->usb.vid &&
+                              attached[j].pid == identity->usb.pid;
+            if (device->index == target->index && strcmp(device->name, target->name) == 0 &&
+                (identity->usb.id < 0 || same_model)) return i;
+            if (same_model) {
+                candidate = i;
+                ++matches;
+            }
+            break;
+        }
+    }
+    if (!matches) return -1;
+
+    /* getDeviceId() is attachment-scoped. A single candidate can request
+     * permission so its serial can be verified before opening its descriptor. */
+    const char *serial = identity->serial;
+    while (*serial == '0') ++serial;
+    if (matches != 1 || !*serial || strcmp(serial, "1") == 0) {
+        return GUI_RECONNECT_CONFIRM_RTL;
+    }
+    return candidate;
+}
+#endif
+
 static int gui_find_reconnect_device(const gui_app_t *app, const gui_reconnect_target_t *target) {
     if (!app || !target || !target->valid) return -1;
+#if defined(__ANDROID__) && defined(ENABLE_RTLSDR)
+    if (target->type == DEVICE_TYPE_RTLSDR) return gui_find_android_rtl_reconnect_device(app, target);
+#endif
     int fallback_same_type = -1;
     for (int i = 0; i < app->device_count; i++) {
         const device_info_t *dev = &app->devices[i];
@@ -569,6 +660,47 @@ static void gui_enable_debug_console(void) {
 }
 #endif
 
+// --gen-system / --gen-format value parsing (hard rule
+// dev/gui_automation_flags_rules.md: every user-interactable GUI element
+// carries an automation trigger). Accepts names (case-insensitive) or the
+// raw numeric value; -1 = unknown, so main() can fail fast with the exact
+// accepted list.
+static int gui_parse_gen_system(const char *text)
+{
+    char lower[16];
+    size_t n = 0;
+    if (!text || !text[0]) return -1;
+    for (; text[n] && n < sizeof(lower) - 1; n++) {
+        lower[n] = (char)tolower((unsigned char)text[n]);
+    }
+    lower[n] = '\0';
+    if (strcmp(lower, "pal") == 0     || strcmp(lower, "0") == 0) return 0;
+    if (strcmp(lower, "ntsc") == 0    || strcmp(lower, "1") == 0) return 1;
+    if (strcmp(lower, "secam") == 0   || strcmp(lower, "2") == 0) return 2;
+    if (strcmp(lower, "mesecam") == 0 || strcmp(lower, "3") == 0) return 3;
+    return -1;
+}
+
+static int gui_parse_gen_format(const char *text)
+{
+    char lower[16];
+    size_t n = 0;
+    if (!text || !text[0]) return -1;
+    for (; text[n] && n < sizeof(lower) - 1; n++) {
+        lower[n] = (char)tolower((unsigned char)text[n]);
+    }
+    lower[n] = '\0';
+    if (strcmp(lower, "vhs") == 0     || strcmp(lower, "0") == 0) return 0;
+    if (strcmp(lower, "svhs") == 0    || strcmp(lower, "s-vhs") == 0 ||
+        strcmp(lower, "1") == 0) return 1;
+    if (strcmp(lower, "betamax") == 0 || strcmp(lower, "beta") == 0 ||
+        strcmp(lower, "2") == 0) return 2;
+    if (strcmp(lower, "video8") == 0  || strcmp(lower, "8mm") == 0 ||
+        strcmp(lower, "3") == 0) return 3;
+    if (strcmp(lower, "hi8") == 0     || strcmp(lower, "4") == 0) return 4;
+    return -1;
+}
+
 // Shared Clay layout build (the main loop + the Windows modal frames).
 // Extracted so the modal-loop render driver renders the SAME layout the
 // main loop renders, from one source of truth.
@@ -610,6 +742,98 @@ static void app_modal_frame(void *ctx)
     SwapScreenBuffer();
 }
 
+#if defined(__linux__) && !defined(__ANDROID__)
+static volatile sig_atomic_t s_headless_stop = 0;
+static void gui_headless_signal(int signo) { (void)signo; s_headless_stop = 1; }
+
+/* One headless listener serves both RF and MISRC-M/2 monitor clients. */
+static int gui_run_role_headless_server(const char *config_path,
+                                        const char *selector, bool debug_view) {
+    s_headless_stop = 0;
+    gui_runtime_set_headless(true);
+    SetTraceLogLevel(debug_view ? LOG_INFO : LOG_WARNING);
+    if (config_path) {
+        FILE *f = fopen(config_path, "rb");
+        if (!f) {
+            fprintf(stderr, "[HEADLESS] Can't read configuration: %s\n", config_path);
+            gui_runtime_set_headless(false);
+            return 1;
+        }
+        fclose(f);
+    }
+    gui_app_t app = {0};
+    app.headless_server = true;
+    gui_settings_set_override_path(config_path);
+    gui_settings_load(&app.settings);
+    app.settings.net_mode = GUI_NET_MODE_SERVER;
+    app.settings.capture_limit_seconds = 0;
+    gui_app_init(&app);
+    if (!gui_net_active(&app)) {
+        fprintf(stderr, "[HEADLESS] Couldn't start unified server on %u\n",
+                (unsigned)app.settings.net_server_port);
+        gui_app_cleanup(&app);
+        gui_runtime_set_headless(false);
+        return 1;
+    }
+    struct sigaction sa = {0};
+    sa.sa_handler = gui_headless_signal;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    fprintf(stderr, "[HEADLESS] Server listening on TCP %u (RF + MISRC-M/2)\n",
+            (unsigned)app.settings.net_server_port);
+    bool started_once = false;
+    double next_probe = gui_runtime_time();
+    while (!s_headless_stop && !atomic_load(&do_exit)) {
+        gui_record_check_popup(&app);
+        gui_net_poll_commands(&app);
+        if (app.is_capturing) started_once = true;
+        gui_app_poll_capture_start(&app);
+        gui_capture_poll_hsdaoh_status(&app);
+        gui_app_update_vu_meters(&app, 0.05f);
+        /* First-start only; a remote /stop must not auto-restart capture. */
+        double now = gui_runtime_time();
+        if (!started_once && now >= next_probe) {
+            gui_app_enumerate_devices(&app);
+            int idx = -1;
+            if (selector && *selector) {
+                char *end = NULL;
+                long parsed = strtol(selector, &end, 10);
+                if (end != selector && *end == '\0') {
+                    if (parsed >= 0 && parsed < app.device_count) idx = (int)parsed;
+                } else {
+                    for (int i = 0; i < app.device_count; i++) {
+                        if (gui_strcasestr_local(app.devices[i].name, selector)) { idx = i; break; }
+                    }
+                }
+            } else {
+                const device_type_t types[] = {DEVICE_TYPE_HSDAOH, DEVICE_TYPE_MISRC_CLOCKGEN,
+                                               DEVICE_TYPE_CXADC, DEVICE_TYPE_SIMPLE_CAPTURE};
+                for (size_t j = 0; j < sizeof(types)/sizeof(types[0]); j++) {
+                    idx = gui_find_first_device_of_type(&app, types[j]);
+                    if (idx >= 0) break;
+                }
+            }
+            if (idx >= 0) {
+                app.selected_device = idx;
+                if (gui_app_start_capture(&app) == 0) {
+                    started_once = true;
+                    fprintf(stderr, "[HEADLESS] Capture started: %s\n", app.devices[idx].name);
+                }
+            }
+            next_probe = now + 3.0;
+        }
+        thrd_sleep_ms(50);
+    }
+    fprintf(stderr, "[HEADLESS] Stopping unified server\n");
+    if (app.is_recording) gui_app_stop_recording(&app);
+    if (app.is_capturing) gui_app_stop_capture(&app);
+    gui_app_cleanup(&app);
+    gui_runtime_set_headless(false);
+    return 0;
+}
+#endif
+
 int main(int argc, char **argv) {
     if (!file_init_utf8_argv(&argc, &argv)) return 1;
     bool debug_view = false;
@@ -617,9 +841,12 @@ int main(int argc, char **argv) {
     bool show_version = false;
     bool smoke_test = false;
     bool auto_connect = false;
+    bool headless_server = false;
     bool has_capture_arg = false;
     const char *config_path = NULL;  /* --config <path> override */
     const char *select_device_arg = NULL;  /* --select-device <index-or-name> */
+    const char *gen_system_arg = NULL;    /* --gen-system <pal|ntsc|secam|mesecam|0-3> */
+    const char *gen_format_arg = NULL;    /* --gen-format <vhs|svhs|betamax|video8|hi8|0-4> */
     bool auto_capture = false;             /* --auto-capture */
     bool auto_record_given = false;        /* --auto-record <seconds> seen */
     int auto_record_seconds = 0;           /* --auto-record seconds */
@@ -627,10 +854,15 @@ int main(int argc, char **argv) {
     bool update_cli_mode_error = false;   /* more than one update mode flag given */
     const char *update_manifest_source = NULL;  /* --update-manifest <url-or-path> */
     bool update_cli_yes = false;                 /* --install-update confirmation */
+    // Positional playback files (see print_usage): bare paths with no capture
+    // flags seen, collected for the launch-time drop-pipeline load.
+    const char *positional_files[8] = {0};
+    int positional_file_count = 0;
     // First pass: classify args. Any arg that isn't a pure GUI flag is treated
     // as a capture arg and routes the process into headless CLI capture mode
     // (the full misrc_capture CLI), so the GUI binary doubles as the CLI tool
-    // when invoked from a terminal with capture options.
+    // when invoked from a terminal with capture options. EXCEPTION: a bare
+    // path (not a flag, no capture flag seen) is a positional playback file.
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         if ((strcmp(a, "--help") == 0) || (strcmp(a, "-h") == 0)) {
@@ -643,6 +875,10 @@ int main(int argc, char **argv) {
         }
         if (strcmp(a, "--smoke-test") == 0) {
             smoke_test = true;
+            continue;
+        }
+        if (strcmp(a, "--headless-server") == 0) {
+            headless_server = true;
             continue;
         }
         if (strcmp(a, "--auto-connect") == 0) {
@@ -668,6 +904,29 @@ int main(int argc, char **argv) {
             // automated runs. Consumes the next arg.
             if (i + 1 < argc) {
                 select_device_arg = argv[++i];
+            }
+            continue;
+        }
+        if (strcmp(a, "--gen-system") == 0) {
+            // --gen-system <pal|ntsc|secam|mesecam|0-3>: preload the Test Gen
+            // system (hard rule dev/gui_automation_flags_rules.md). Consumes
+            // the next arg; validated after the settings load, fail fast.
+            if (i + 1 < argc) {
+                gen_system_arg = argv[++i];
+            } else {
+                fprintf(stderr, "--gen-system requires a <pal|ntsc|secam|mesecam|0-3> value\n");
+                return 1;
+            }
+            continue;
+        }
+        if (strcmp(a, "--gen-format") == 0) {
+            // --gen-format <vhs|svhs|betamax|video8|hi8|0-4>: preload the
+            // Test Gen tape format (RF modulation family). Same pattern.
+            if (i + 1 < argc) {
+                gen_format_arg = argv[++i];
+            } else {
+                fprintf(stderr, "--gen-format requires a <vhs|svhs|betamax|video8|hi8|0-4> value\n");
+                return 1;
             }
             continue;
         }
@@ -714,13 +973,27 @@ int main(int argc, char **argv) {
             update_cli_yes = true;
             continue;
         }
+        if (a[0] != '\0' && a[0] != '-' && !has_capture_arg) {
+            // Bare path with no capture flag seen: a positional playback file
+            // (misrc_gui <file> [...] / Finder "Open With"). Capture-flag
+            // values never land here (their flags set has_capture_arg first),
+            // so the headless CLI routing is unchanged.
+            if (positional_file_count <
+                (int)(sizeof(positional_files) / sizeof(positional_files[0]))) {
+                positional_files[positional_file_count++] = a;
+            } else {
+                fprintf(stderr, "Too many positional files (max %d); ignoring: %s\n",
+                        (int)(sizeof(positional_files) / sizeof(positional_files[0])), a);
+            }
+            continue;
+        }
         has_capture_arg = true;
     }
 #if !defined(__ANDROID__)
     // Headless CLI capture mode: run as the full misrc_capture CLI (no window).
     // misrc_capture_main handles --device-list/--devices, -a/-b/-r/-x, -f, -n/-t,
     // resample/audio opts, and prints full CLI usage on an incomplete combo.
-    if (has_capture_arg) {
+    if (has_capture_arg && !headless_server) {
         return misrc_capture_main(argc, argv);
     }
 #endif
@@ -742,6 +1015,19 @@ int main(int argc, char **argv) {
             return 1;
         }
         return gui_run_update_cli(update_cli_mode, update_manifest_source, update_cli_yes);
+    }
+    if (headless_server) {
+        if (has_capture_arg || auto_connect || auto_capture || auto_record_given ||
+            update_cli_mode != GUI_UPDATE_CLI_NONE) {
+            fprintf(stderr, "Headless server flags cannot be combined with capture/update/auto flags\n");
+            return 2;
+        }
+#if defined(__linux__) && !defined(__ANDROID__)
+        return gui_run_role_headless_server(config_path, select_device_arg, debug_view);
+#else
+        fprintf(stderr, "Headless server currently supported on Linux only\n");
+        return 2;
+#endif
     }
     if (auto_record_given && auto_record_seconds < 1) {
         fprintf(stderr, "--auto-record requires a positive <seconds> value\n");
@@ -791,10 +1077,51 @@ int main(int argc, char **argv) {
     // so automated tests can launch the GUI with a pre-written config.
     gui_settings_set_override_path(config_path);
     gui_settings_load(&app.settings);
+#if defined(__ANDROID__)
+    // Render the existing UI without layout zoom on Android. The touch
+    // viewport scales the whole frame, including its outer borders.
+    app.settings.ui_scale_percent = GUI_UI_SCALE_DEFAULT_PERCENT;
+#endif
     gui_ui_set_scale_percent(app.settings.ui_scale_percent);
-    // Push the persisted CVBS System selection (0=PAL/1=NTSC/2=SECAM) into
-    // the video panel decoders: every created panel starts in the user's
-    // last-selected system instead of hardcoded PAL.
+    // --gen-system / --gen-format launch overrides (hard rule
+    // dev/gui_automation_flags_rules.md: every GUI element carries an
+    // automation trigger). Applied AFTER the settings load so a flag beats
+    // both the defaults and any --config values; the startup push below and
+    // the simulated capture thread both read the final values. Note: a
+    // session that saves settings persists the overridden values.
+    if (gen_system_arg) {
+        int gen_sys = gui_parse_gen_system(gen_system_arg);
+        if (gen_sys < 0) {
+            fprintf(stderr,
+                    "--gen-system: unknown system '%s' (pal|ntsc|secam|mesecam or 0-3)\n",
+                    gen_system_arg);
+            return 1;
+        }
+        app.settings.video_system = gen_sys;
+        fprintf(stderr, "[AUTO] --gen-system: %s\n",
+                gen_sys == 3 ? "MESECAM" :
+                gen_sys == 2 ? "SECAM" :
+                gen_sys == 1 ? "NTSC" : "PAL");
+    }
+    if (gen_format_arg) {
+        int gen_fmt = gui_parse_gen_format(gen_format_arg);
+        if (gen_fmt < 0) {
+            fprintf(stderr,
+                    "--gen-format: unknown format '%s' (vhs|svhs|betamax|video8|hi8 or 0-4)\n",
+                    gen_format_arg);
+            return 1;
+        }
+        app.settings.gen_tape_format = gen_fmt;
+        fprintf(stderr, "[AUTO] --gen-format: %s\n",
+                gen_fmt == 4 ? "Hi8" :
+                gen_fmt == 3 ? "Video8" :
+                gen_fmt == 2 ? "Betamax" :
+                gen_fmt == 1 ? "S-VHS" : "VHS");
+    }
+    // Push the persisted CVBS System selection (0=PAL/1=NTSC/2=SECAM/
+    // 3=MESECAM) into the video panel decoders: every created panel starts
+    // in the user's last-selected system instead of hardcoded PAL
+    // (MESECAM: composite decoders start in SECAM, RF preview in MESECAM).
     gui_cvbs_set_default_system(app.settings.video_system);
 
     // Capture limit should not persist across relaunches.
@@ -907,6 +1234,19 @@ int main(int argc, char **argv) {
                 }
             }
         }
+    }
+
+    // Positional file arguments (misrc_gui <file> [...] / Finder "Open
+    // With"): route through the same content-classifying drop pipeline as
+    // drag-and-drop. Zone defaults to channel A (no panel bounds are rendered
+    // yet, so the drop-zone picker resolves to A). Unlike drag-and-drop this
+    // also works on macOS while elevated (root windows never receive Finder
+    // drops; the elevated relaunch forwards argv, so the file argument
+    // survives it).
+    if (positional_file_count > 0) {
+        (void)gui_playback_handle_dropped_files(&app,
+            (const char *const *)positional_files,
+            (size_t)positional_file_count, 0.0f, 0.0f);
     }
 
     // Enable auto-reconnect by default
@@ -1052,6 +1392,14 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[WIN32] modal move/size render driver unavailable\n");
     }
 
+    // Snap-maximize verification: the system can apply a Win11 snap layout
+    // slightly AFTER the drag release, overwriting the MaximizeWindow() that
+    // answered a throw. The main loop re-checks shortly after and re-applies
+    // the maximize if the window ended up un-maximized (a half/quarter snap)
+    // instead. Two retries at 250 ms spacing.
+    int snap_maximize_retries = 0;
+    double snap_maximize_verify_s = 0.0;
+
     // Main loop
     while (!WindowShouldClose() && !atomic_load(&do_exit)) {
         bool was_capturing = app.is_capturing;
@@ -1126,6 +1474,13 @@ int main(int argc, char **argv) {
         // GetMousePosition call - UI scale integration contract).
         if (IsFileDropped()) {
             FilePathList dropped_files = LoadDroppedFiles();
+            /* Diagnostic: exactly one line when the platform DELIVERS a drop.
+             * A macOS/Linux run that sees no line means the windowing layer
+             * never delivered the event (platform issue); a line plus a
+             * status/reject message means the handler ran and refused the
+             * file(s) (app issue). See dev/playback_drag_drop_audio.md. */
+            fprintf(stderr, "[PLAYBACK] Drop delivered: %d file(s)\n",
+                    (int)dropped_files.count);
             if (dropped_files.count > 0 && dropped_files.paths) {
                 Vector2 drop_point = gui_ui_get_mouse_position();
                 gui_playback_handle_dropped_files(&app,
@@ -1135,6 +1490,23 @@ int main(int argc, char **argv) {
             }
             UnloadDroppedFiles(dropped_files);
         }
+#if defined(__APPLE__)
+        /* macOS elevated (root) processes do not receive Finder drag-and-drop
+         * (the WindowServer refuses cross-session drag delivery), and this app
+         * always relaunches elevated for MS2130 hsdaoh/libusb capture. Tell
+         * playback users once where the working entry points are instead of a
+         * silent no-op drop. */
+        {
+            static bool s_macos_drop_hint_shown = false;
+            if (!s_macos_drop_hint_shown && geteuid() == 0 &&
+                app.selected_device >= 0 && app.selected_device < app.device_count &&
+                app.devices[app.selected_device].type == DEVICE_TYPE_PLAYBACK) {
+                s_macos_drop_hint_shown = true;
+                gui_app_set_status(&app,
+                    "macOS elevated: drag-and-drop is unavailable - use Browse or: misrc_gui <file>");
+            }
+        }
+#endif
 #if defined(__APPLE__) && (defined(__arm64__) || defined(__aarch64__))
         if (app.is_capturing) {
             double now = GetTime();
@@ -1157,9 +1529,6 @@ int main(int argc, char **argv) {
             last_layout_width = current_layout_width;
             last_layout_height = current_layout_height;
         }
-
-        // Check for pending popup result (for async confirmations like file overwrite)
-        gui_record_check_popup(&app);
 
         // One-time startup warning: if FLAC threads is 0 (auto), warn once.
         // Uses a local bool so it fires only once per session, on the first
@@ -1192,6 +1561,70 @@ int main(int argc, char **argv) {
                     "Only use level 1-3 if you have explicit resource\n"
                     "constraints (slow CPU, single-core, limited I/O).\n\n"
                     "You can raise it with the + button in Settings.");
+            }
+        }
+
+        // Fullscreen toggle: F11 (cross-platform) and Alt+Enter (fallback
+        // where F11 is reserved by the system, e.g. macOS Show Desktop).
+        // BORDERLESS windowed fullscreen: ToggleFullscreen() switches the
+        // monitor's video mode to the WINDOW's size - a non-native resolution
+        // the GPU driver then rescales, which glitched the user's driver at
+        // the system level (user report 2026-11-03). ToggleBorderlessWindowed()
+        // keeps the desktop's native video mode and simply makes the window
+        // undecorated at monitor size - a true borderless fullscreen with no
+        // display mode change. Window DRAG gestures never enter this path:
+        // throw-at-top maximizes normally and hold-at-top halves (the snap
+        // intents consumed below).
+        if (IsKeyPressed(KEY_F11) ||
+            (IsKeyPressed(KEY_ENTER) &&
+             (IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT)))) {
+            ToggleBorderlessWindowed();
+            gui_app_set_status(&app, IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE)
+                ? "Fullscreen (F11 / Alt+Enter to exit)"
+                : "Windowed");
+        }
+        // Windows drag-to-top snap intents, classified in the win32 modal
+        // subclass by how long the drag dwelled at the monitor's top edge
+        // (user request 2026-11-03):
+        //   QUICK THROW at the top edge -> MaximizeWindow(): a normal
+        //     maximized window - NOT borderless - which also overrides any
+        //     Win11 snap-layout arrangement a fast gesture landed in (the
+        //     round-7 "goes half mode" symptom).
+        //   HOLD at the top edge (>= 400 ms) -> the window snaps to the
+        //     TOP HALF of the monitor's work area.
+        // F11 / Alt+Enter above remains the borderless fullscreen toggle.
+        // No-op requests on non-Windows platforms.
+        {
+            // Diagnostics in the STATUS BAR (always visible): the console
+            // attach behind --debug-view did not surface output in the
+            // user's terminal (2026-11-03), so every drag release also
+            // reports its classification inputs + verdict here.
+            char drag_summary[96];
+            if (gui_win32_modal_take_drag_summary(drag_summary,
+                                                   sizeof(drag_summary))) {
+                gui_app_set_status(&app, drag_summary);
+            }
+        }
+        if (gui_win32_modal_take_maximize_request()) {
+            MaximizeWindow();
+            snap_maximize_retries = 2;
+            snap_maximize_verify_s = GetTime() + 0.25;
+        }
+        if (gui_win32_modal_take_top_half_request()) {
+            gui_win32_modal_apply_top_half();
+        }
+        if (snap_maximize_retries > 0 && GetTime() >= snap_maximize_verify_s) {
+            snap_maximize_retries--;
+            snap_maximize_verify_s = GetTime() + 0.25;
+            if (!IsWindowMaximized() &&
+                !IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE)) {
+                fprintf(stderr,
+                        "[WIN32] snap: maximize lost to a late system snap - "
+                        "re-applying (%d retries left)\n",
+                        snap_maximize_retries);
+                MaximizeWindow();
+            } else {
+                snap_maximize_retries = 0;
             }
         }
 
@@ -1236,10 +1669,18 @@ int main(int argc, char **argv) {
                     if (app.is_recording) {
                         gui_app_set_status(&app, "Stop recording before disconnecting (protects the capture file)");
                     } else {
+#ifdef __ANDROID__
+                        gui_app_stop_capture_async(&app);
+#else
                         gui_app_stop_capture(&app);
+#endif
                     }
                 } else {
+#ifdef __ANDROID__
+                    gui_app_start_capture_async(&app);
+#else
                     gui_app_start_capture(&app);
+#endif
                 }
             }
 
@@ -1291,10 +1732,8 @@ int main(int argc, char **argv) {
                 }
             } else if (auto_rec_phase == AUTO_REC_RECORDING) {
                 if (!app.is_recording) {
-                    fprintf(stderr, "[AUTO] recording stopped early; finishing\n");
-#if defined(__APPLE__)
-                    if (gui_cxadc_macos_active()) auto_rec_failed = true;
-#endif
+                    fprintf(stderr, "[AUTO] ERROR: recording stopped before the requested duration\n");
+                    auto_rec_failed = true;
                     auto_rec_phase = AUTO_REC_FINALIZING;
                 } else if (auto_now >= auto_rec_deadline) {
                     gui_app_stop_recording(&app);
@@ -1303,6 +1742,10 @@ int main(int argc, char **argv) {
                 }
             } else if (auto_rec_phase == AUTO_REC_FINALIZING) {
                 if (!app.is_recording && !gui_record_is_finalizing()) {
+                    if (gui_record_last_stop_failed()) {
+                        fprintf(stderr, "[AUTO] ERROR: recording finalization failed\n");
+                        auto_rec_failed = true;
+                    }
                     if (app.is_capturing) {
                         gui_app_stop_capture(&app);
                         fprintf(stderr, "[AUTO] capture stopped\n");
@@ -1318,10 +1761,19 @@ int main(int argc, char **argv) {
             }
         }
 
+        // Apply Android gestures before Clay hit testing. Only a verified
+        // single tap triggers controls; a pan/pinch must never click them.
+#if defined(__ANDROID__)
+        gui_android_viewport_update();
+#endif
         // Update Clay mouse state
         Vector2 mouse_pos = gui_ui_get_mouse_position();
         Clay_SetPointerState((Clay_Vector2){ mouse_pos.x, mouse_pos.y },
+#if defined(__ANDROID__)
+                             gui_android_viewport_click_pressed(MOUSE_LEFT_BUTTON));
+#else
                              IsMouseButtonDown(MOUSE_LEFT_BUTTON));
+#endif
         Clay_UpdateScrollContainers(true, (Clay_Vector2){
             ui_zoom_result.passthrough_x * 20.0f,
             ui_zoom_result.passthrough_y * 20.0f
@@ -1332,15 +1784,31 @@ int main(int argc, char **argv) {
         // are no-ops when net_mode == Local.
         gui_net_poll_commands(&app);
         gui_net_poll_mirror(&app);
+        // A queued remote Record Off can cancel an unconsumed overwrite result.
+        gui_record_check_popup(&app);
+#ifndef __ANDROID__
+        // Android completes this handoff inside gui_net_poll_mirror.
+        if (atomic_exchange(&app.net_reenumerate_pending, false)) {
+            gui_app_enumerate_devices(&app);
+        }
+#endif
 
         // stop-on-dropout requests are posted from capture callbacks and consumed here.
-        if (app.is_capturing && atomic_exchange(&app.dropout_stop_requested, false)) {
+        if (
+#ifdef __ANDROID__
+            !gui_app_capture_busy() && !gui_net_capture_controls_locked(&app) &&
+#endif
+            app.is_capturing && atomic_exchange(&app.dropout_stop_requested, false)) {
             gui_dropout_reason_t reason =
                 (gui_dropout_reason_t)atomic_exchange(&app.dropout_stop_reason, GUI_DROPOUT_NONE);
+#ifdef __ANDROID__
+            gui_app_stop_capture_on_dropout_async(&app, gui_dropout_reason_status(reason));
+#else
             gui_app_stop_capture(&app);
             app.reconnect_pending = false;
             app.reconnect_attempts = 0;
             gui_app_set_status(&app, gui_dropout_reason_status(reason));
+#endif
             continue;
         }
 
@@ -1456,16 +1924,14 @@ int main(int argc, char **argv) {
 
             // Attempt reconnection if pending
             if (app.reconnect_pending && !app.is_capturing &&
+#ifdef __ANDROID__
+                app.settings.net_mode != GUI_NET_MODE_CLIENT &&
+                app.settings.net_mode != GUI_NET_MODE_MONITOR_CLIENT &&
+                !gui_net_capture_controls_locked(&app) &&
+#endif
                 !gui_playback_is_starting(&app)) {
 #if defined(__ANDROID__)
-                /* If a USB permission request is mid-flight, the per-frame
-                 * poll in gui_handle_interactions completes the connect; just
-                 * wait and don't burn a reconnect attempt. */
-                extern int android_permission_pending(void);
-                extern int android_usb_has_fd(void);
-                extern int android_request_usb_permission_async(void);
-                extern void android_usb_clear_fd(void);
-                if (android_permission_pending() || gui_app_capture_busy()) {
+                if (gui_app_capture_busy()) {
                     /* wait for the async permission poll / in-flight start-stop
                      * worker to finish before attempting reconnect */
                 } else
@@ -1482,6 +1948,15 @@ int main(int argc, char **argv) {
                     if (app.device_count > 0) {
                         if (reconnect_target.valid) {
                             int reconnect_dev = gui_find_reconnect_device(&app, &reconnect_target);
+#if defined(__ANDROID__) && defined(ENABLE_RTLSDR)
+                            if (reconnect_dev == GUI_RECONNECT_CONFIRM_RTL) {
+                                app.reconnect_pending = false;
+                                app.reconnect_attempts = 0;
+                                gui_app_set_status(&app,
+                                    "RTL-SDR identity is ambiguous. Select a device and connect manually.");
+                                continue;
+                            }
+#endif
                             if (reconnect_dev < 0) {
                                 if (reconnect_target.type == DEVICE_TYPE_HSDAOH) {
                                     char status_waiting[128];
@@ -1502,26 +1977,12 @@ int main(int argc, char **argv) {
                         snprintf(status_buf, sizeof(status_buf), "Reconnecting (attempt %d)...", app.reconnect_attempts);
                         gui_app_set_status(&app, status_buf);
 #if defined(__ANDROID__)
-                        /* Async permission: never block the render thread on the
-                         * USB dialog. If fd is already granted, start capture
-                         * on a worker thread (gui_app_start_capture_async) so
-                         * the render loop stays responsive; otherwise request
-                         * async permission and let the per-frame poll complete
-                         * the connect. */
-                        if (app.selected_device >= 0 && app.selected_device < app.device_count &&
-                            app.devices[app.selected_device].type == DEVICE_TYPE_PLAYBACK) {
-                            (void)gui_app_start_capture(&app);
-                        } else if (android_usb_has_fd()) {
-                            gui_app_start_capture_async(&app);
-                            gui_set_reconnect_target_from_selected(&app, &reconnect_target);
-                            app.reconnect_pending = false;
-                            app.reconnect_attempts = 0;
-                            gui_app_set_status(&app, "Reconnecting...");
-                        } else {
-                            android_usb_clear_fd();
-                            android_request_usb_permission_async();
-                            gui_app_set_status(&app, "Requesting USB permission (reconnect)...");
-                        }
+#ifdef ENABLE_RTLSDR
+                        if (reconnect_target.valid && reconnect_target.type == DEVICE_TYPE_RTLSDR) {
+                            gui_app_start_rtlsdr_reconnect_async(&app, reconnect_target.rtl_identity.serial);
+                        } else
+#endif
+                        gui_app_start_capture_async(&app);
 #else
                         int reconnect_rc = gui_app_start_capture(&app);
                         if (reconnect_rc == 0 && !gui_playback_is_starting(&app)) {
@@ -1546,6 +2007,9 @@ int main(int argc, char **argv) {
         // Update VU meters
         gui_app_update_vu_meters(&app, dt);
 
+        // Monitor & Remote Opus audio is a separate client-owned output.
+        // Release it before the legacy Local/Client audio pump starts.
+        gui_monitor_audio_client_update(&app);
         // Pump audio playback monitoring (system output)
         gui_audio_update_playback(&app);
 
@@ -1573,6 +2037,9 @@ int main(int argc, char **argv) {
 
         // Render
         BeginDrawing();
+#if defined(__ANDROID__)
+        const bool android_canvas_active = gui_android_viewport_begin_canvas();
+#endif
         ClearBackground(COLOR_BG);
 
         // Render Clay UI (custom elements are handled via CLAY_RENDER_COMMAND_TYPE_CUSTOM)
@@ -1586,22 +2053,36 @@ int main(int argc, char **argv) {
 #if defined(__APPLE__)
         gui_cxadc_macos_ui_draw(&app);
 #endif
+#if defined(__ANDROID__)
+        gui_android_viewport_present_canvas(android_canvas_active);
+#endif
         EndDrawing();
+        if (app.settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT)
+            gui_monitor_client_device_frame_rendered();
     }
 
     // Restore the original window proc (Windows modal move/size driver)
     gui_win32_modal_shutdown();
 
     // Cleanup
+#ifdef __ANDROID__
+    gui_app_finish_capture_transitions(&app);
+#endif
     if (app.is_recording) {
         gui_app_stop_recording(&app);
     }
-    if (app.is_capturing) {
+    if (app.is_capturing
+#ifdef __ANDROID__
+        && !gui_net_is_client(&app)
+#endif
+    ) {
         gui_app_stop_capture(&app);
     }
 
     // Save settings before cleanup
     gui_settings_save(&app.settings);
+    // Raylib output must be destroyed on the GUI thread before net cleanup.
+    gui_monitor_audio_client_update(NULL);
     
     gui_app_cleanup(&app);
     free(clay_memory);
@@ -1615,9 +2096,14 @@ int main(int argc, char **argv) {
         UnloadFont(fonts[1]);
     }
 
+#if defined(__ANDROID__)
+    gui_android_viewport_shutdown();
+#endif
     CloseWindow();
 
     // Nonzero exit when the unattended --auto-record cycle failed (0 for
     // normal interactive exits and successful cycles).
+    if (auto_record_seconds > 0 &&
+        (auto_rec_phase != AUTO_REC_IDLE || gui_record_last_stop_failed())) auto_rec_failed = true;
     return auto_rec_failed ? 1 : 0;
 }

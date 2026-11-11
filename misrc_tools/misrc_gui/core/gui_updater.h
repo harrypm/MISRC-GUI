@@ -94,6 +94,16 @@ bool gui_updater_extract_release_tag_from_url(const char *url,
                                               char *tag_out, size_t tag_out_len);
 bool gui_updater_parse_semver_triplet(const char *version,
                                       int *major_out, int *minor_out, int *patch_out);
+
+/* True when the version string is a comparable release, (v)X.Y.Z. Dev builds
+ * (dev-YYYY-MM-DD-<sha>) and unversioned builds ("unknown_version") are NOT
+ * comparable: they are never treated as older or newer than a release tag. */
+bool gui_updater_version_is_comparable(const char *version);
+
+/* -1 current older than latest, 0 equal/not comparable, +1 current newer.
+ * A NON-comparable current (dev/unknown build) always returns 0: the old
+ * lexical fallback made every dev build report "update available" against
+ * the current release ('d' < 'v'), even when the dev build was newer. */
 int gui_updater_compare_versions(const char *current_version, const char *latest_version);
 bool gui_updater_is_release_tag_safe(const char *tag);
 bool gui_updater_fetch_latest_release_tag(const char *tag_lookup_url,

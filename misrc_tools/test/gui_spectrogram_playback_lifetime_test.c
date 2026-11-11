@@ -20,6 +20,20 @@ playback_state_t gui_playback_get_state(gui_app_t *app) {
     return test_state;
 }
 
+/* Stubs: the per-channel held gate (2026-11-03) checks the session identity
+ * before polling. Model the harness sessions: running unless stopped, and a
+ * master pause holds every track. */
+bool gui_playback_is_running(gui_app_t *app) {
+    (void)app;
+    return test_state != PLAYBACK_STATE_STOPPED;
+}
+
+bool gui_playback_is_channel_paused(gui_app_t *app, int channel) {
+    (void)app;
+    assert(channel == test_channel);
+    return test_state == PLAYBACK_STATE_PAUSED;
+}
+
 uint64_t gui_playback_get_position_samples_channel(gui_app_t *app, int channel) {
     (void)app;
     assert(channel == test_channel);

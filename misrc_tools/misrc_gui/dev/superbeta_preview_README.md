@@ -1,14 +1,15 @@
 # Ordinary NTSC SuperBeta preview
 
-Select **Decoder: RF Preview**, then **Tape: Betamax** and **SuperBeta: On**.
-Tape switches only between VHS and Betamax. SuperBeta is a separate option
-under Betamax, defaults off on a new panel and uses its own compact row.
-**BetaHiFi** independently selects optional Beta Hi-Fi RF audio for SuperBeta;
-both toggle states use the same SuperBeta video modulation and filters.
-Use **Audio Mon** to mute playback while retaining the selected tape profile.
-This is a manual format choice and does not detect the recording mode.
+Select **Decoder: RF Preview**, then **Tape: Betamax** and **Preset: SuperBeta**.
+The preset cycles through Betamax, Betamax Hi-Fi, SuperBeta and ED Beta; a new panel
+defaults to Betamax. **Audio Mon** independently enables or mutes Beta Hi-Fi
+listening, without changing the SuperBeta video profile or relocking video.
+Selecting SuperBeta does not turn Audio Mon on. Recording mode is not detected
+automatically.
 
-The profiles are `ntsc-superbeta` and `ntsc-superbeta-hifi`. They use the
+The GUI uses the Hi-Fi-capable SuperBeta worker. The command-line profiles
+`ntsc-superbeta` (video only) and `ntsc-superbeta-hifi` remain available with
+identical video parameters. Both use the
 existing normalized 20 MSPS RF input and 5 MSPS video working rate. Input
 resampling, queue limits, CPU budgets and capture RF recording retain the
 existing preview behavior. Video remains a reduced-bandwidth woven 640x480
@@ -97,12 +98,14 @@ added; normalized RF/video rates stay 20/5 MSPS.
 ## Optional Hi-Fi audio
 
 SuperBeta uses the existing NTSC Beta Hi-Fi worker, carrier calibration,
-head switching, 48 kHz stereo PCM and monitor routing. **BetaHiFi** off skips
-Hi-Fi audio DSP and PCM; **Audio Mon** off also skips audio DSP. For SuperBeta,
-the Hi-Fi toggle changes only optional audio routing. It does not shift
-video carriers or change the video filtering. Queue overflow, stream gaps,
-seeks, profile changes and stopped/restarted capture use the existing audio
-reset and stale-PCM suppression rules.
+head switching, 48 kHz stereo PCM and monitor routing. **Audio Mon** off skips
+audio DSP and PCM; turning it on enables listening without changing video
+carriers or filtering. Queue overflow, stream gaps, seeks, profile changes
+and stopped/restarted capture use the existing audio reset and stale-PCM
+suppression rules. With multiple panels, the first visible Hi-Fi-capable
+worker in A-left, A-right, B-left, B-right order supplies the monitor. A
+SuperBeta recording without Hi-Fi carriers stays silent rather than falling
+back to another audio source.
 
 See [the Betamax preview notes](betamax_preview_README.md) for the shared
 Hi-Fi signal processing, monitor ownership, queue and playback limitations.
@@ -112,10 +115,10 @@ calibration.
 ## Validation
 
 Real RF validation uses the supplied 40 MSPS SuperBeta Hi-Fi capture, with
-SuperBeta on and Hi-Fi independently on/off. Synthetic coverage also checks
-both profiles, NTSC field cadence, chroma, adaptive display levels and
-Full/Active geometry. Hi-Fi-off mode produces a picture without executing
-audio DSP; Hi-Fi-on mode additionally produces 48 kHz stereo PCM.
+the video-only and Hi-Fi-capable command-line profiles. Synthetic coverage
+also checks both profiles, NTSC field cadence, chroma, adaptive display levels
+and Full/Active geometry. GUI route tests cover the four video presets,
+independent Audio Mon control and shared-worker monitor ownership.
 
 All profiles keep the existing preview sample rates and causal filters.
 Budget 1.5 and 2 file-based checks exercise the shared video/audio scheduler;

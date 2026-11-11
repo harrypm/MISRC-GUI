@@ -297,7 +297,9 @@ static FLAC__StreamEncoderWriteStatus stream_write_callback(
     (void)encoder; (void)samples; (void)current_frame;
     flac_writer_t *writer = (flac_writer_t *)client_data;
 
-    size_t written = fwrite(buffer, 1, bytes, writer->output_file);
+    size_t written = writer->config.sink_write ?
+        writer->config.sink_write(buffer, 1, bytes, writer->output_file) :
+        fwrite(buffer, 1, bytes, writer->output_file);
     if (written != bytes) {
         return FLAC__STREAM_ENCODER_WRITE_STATUS_FATAL_ERROR;
     }
@@ -323,7 +325,9 @@ static FLAC__StreamEncoderSeekStatus stream_seek_callback(
     if (absolute_byte_offset > flac_stream_max_offset()) {
         return FLAC__STREAM_ENCODER_SEEK_STATUS_ERROR;
     }
-    if (FLAC_STREAM_FSEEK(writer->output_file, (flac_file_off_t)absolute_byte_offset, SEEK_SET) != 0) {
+    if ((writer->config.sink_seek ?
+         writer->config.sink_seek(writer->output_file, (int64_t)absolute_byte_offset, SEEK_SET) :
+         FLAC_STREAM_FSEEK(writer->output_file, (flac_file_off_t)absolute_byte_offset, SEEK_SET)) != 0) {
         return FLAC__STREAM_ENCODER_SEEK_STATUS_ERROR;
     }
     return FLAC__STREAM_ENCODER_SEEK_STATUS_OK;
@@ -337,7 +341,9 @@ static FLAC__StreamEncoderTellStatus stream_tell_callback(
 {
     (void)encoder;
     flac_writer_t *writer = (flac_writer_t *)client_data;
-    flac_file_off_t pos = FLAC_STREAM_FTELL(writer->output_file);
+    flac_file_off_t pos = writer->config.sink_tell ?
+        (flac_file_off_t)writer->config.sink_tell(writer->output_file) :
+        FLAC_STREAM_FTELL(writer->output_file);
     if (pos < 0) {
         return FLAC__STREAM_ENCODER_TELL_STATUS_ERROR;
     }

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build vendored deps into .deps/install for a local Windows (MSYS2 UCRT64) build.
 # Mirrors the deps-build block of the .github/workflows/build.yml `windows-exe` job
-# so local == CI for hsdaoh + libuvc. raylib/fftw3f/flac/soxr/libusb are reused
+# so local == CI for hsdaoh, libuvc and RTL-SDR. fftw3f/flac/soxr/libusb are reused
 # from the pacman UCRT64 install (identical versions to CI's MSYS2 setup) to
 # avoid redundant recompiles.
 #
@@ -58,6 +58,8 @@ compute_stamp() {
     fi
     find "$HSDAOH_SOURCE_DIR" -type f \( -name '*.c' -o -name '*.h' -o -name 'CMakeLists.txt' -o -name '*.in' \) \
       -exec sha256sum {} + 2>/dev/null | sort
+    sha256sum "$SCRIPT_DIR/build-rtlsdr.sh" "$SCRIPT_DIR/fetch-patched-dependency.py" \
+      "$REPO_ROOT/third_party/rtl-sdr/patches/0001-misrc.patch"
     # pacman dep versions we rely on (raylib/fftw3f/flac/libusb/soxr).
     for m in raylib fftw3f flac libusb-1.0 soxr; do
       printf '%s=%s\n' "$m" "$(pkg-config --modversion "$m" 2>/dev/null || echo missing)"
@@ -65,7 +67,7 @@ compute_stamp() {
   } | sha256sum | awk '{print $1}'
 }
 
-if [[ -f "$stamp_file" && -f "$DEPS_PREFIX/lib/pkgconfig/hsdaoh.pc" ]]; then
+if [[ -f "$stamp_file" && -f "$DEPS_PREFIX/lib/pkgconfig/hsdaoh.pc" && -f "$DEPS_PREFIX/lib/pkgconfig/librtlsdr.pc" ]]; then
   prev="$(cat "$stamp_file" 2>/dev/null || echo none)"
   cur="$(compute_stamp)"
   if [[ "$prev" == "$cur" ]]; then
@@ -161,9 +163,12 @@ cmake --build "$REPO_ROOT/.deps/raylib/build" --parallel
 cmake --install "$REPO_ROOT/.deps/raylib/build"
 log "raylib: $(pkg-config --modversion raylib) (built vendored with internal GLFW)"
 
+DEPS_PREFIX="$DEPS_PREFIX" bash "$SCRIPT_DIR/build-rtlsdr.sh" "${CMAKE_TOOLCHAIN_ARGS[@]}"
+
 # --- sanity -----------------------------------------------------------------
 pkg-config --exists hsdaoh || fail "hsdaoh.pc not resolvable after build"
 pkg-config --exists fftw3f || fail "fftw3f not found; install mingw-w64-ucrt-x86_64-fftw"
+pkg-config --exists libzstd || fail "libzstd not found; install mingw-w64-ucrt-x86_64-zstd"
 log "hsdaoh: $(pkg-config --modversion hsdaoh)"
 log "fftw3f: $(pkg-config --modversion fftw3f)"
 

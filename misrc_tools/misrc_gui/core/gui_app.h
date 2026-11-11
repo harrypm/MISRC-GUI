@@ -260,6 +260,8 @@ typedef struct {
     float resample_gain_b;                     // dB
 #ifdef ENABLE_DDD
     uint8_t ddd_decimation;                    // Firmware 3.1 only: 1=40, 2=20 MSPS
+    bool ddd_use_winusb;                        // Windows DdD v1 USB transport preference
+    bool ddd_libusb_raw_io;                     // Windows DdD v1 libusb RAW_IO preference
 #endif
 
     // FLAC compression
@@ -368,8 +370,14 @@ typedef struct {
     // (0=PAL, 1=NTSC, 2=SECAM - gui_cvbs_set_format's value space).
     // Applied to every CVBS panel decoder at create; the System dropdown
     // writes the user's selection back here (saved with the normal
-    // exit-time settings save).
+    // exit-time settings save). The generator Gen box writes 0-3 here
+    // (3 = MESECAM, RF-only; composite maps it to SECAM).
     int     video_system;
+
+    // Test Gen tape format family (0=VHS, 1=S-VHS, 2=Betamax, 3=Video8,
+    // 4=Hi8 - gui_testgen_format_t). Drives the Channel B RF modulation
+    // parameters; persisted so the generator reopens in the last pick.
+    int     gen_tape_format;
 
     // Playback settings
     char playback_file_a[FILE_PATH_MAX];   // FLAC file for channel A playback
@@ -382,13 +390,18 @@ typedef struct {
 
     // Server/Client networking (cxadc_vhs_server-style peer mode).
     // net_mode: 0=Local (default, no networking), 1=Server (host/master),
-    // 2=Client (connect to a host server, slave).
+    // 2=Client (connect to a host server, slave),
+    // 3=M-Server and 4=M-Client (separate preview-only protocol).
     int  net_mode;
     uint16_t net_server_port;                 // Port to listen on when Server.
     char net_server_port_str[16];             // Editable string mirror of net_server_port.
     char net_client_host[128];                // Host to connect to when Client.
     char net_client_port_str[16];             // Editable string mirror of net_client_port.
     uint16_t net_client_port;                 // Port to connect to when Client.
+    /* M-Client ONLY: local output selection. Does not activate file transfer.
+     * Never include this path in monitor HTTP commands or server settings. */
+    char monitor_local_save_path[FILE_PATH_MAX];
+    bool monitor_local_save_enabled;  /* M-Client only; never synced to M-Server */
 } gui_settings_t;
 
 typedef enum {
@@ -415,6 +428,20 @@ typedef struct gui_app {
 
     // Playback device state
     atomic_bool playback_running;  // Flag for playback mode
+    /* Independent mixed-rate playback mode (player only): both files loaded
+     * with DIFFERENT rates. The producer feeds BUF_CAPTURE_RF_A/B and the
+     * extraction/display pipelines consume per-channel FIFOs
+     * (BUF_DISPLAY_A/B) so each file plays at its own true rate and the RF
+     * Preview decoders run on both channels. Same-rate sets and capture
+     * devices keep the paired BUF_CAPTURE_RF/BUF_DISPLAY paths. Set once at
+     * playback commit; read by extraction/display threads. */
+    atomic_bool playback_independent_mode;
+    /* Per-channel transport (player Link: Separate mode): true pauses that
+     * channel's file while the other keeps playing. Ignored in Synced mode. */
+    atomic_bool playback_channel_paused[2];
+    /* Player link mode: false = Synced (default, one shared transport),
+     * true = Separate (per-channel transport). Session state, not persisted. */
+    atomic_bool playback_link_separate;
 
 #ifdef ENABLE_FX3
     // FX3 device state
@@ -431,7 +458,11 @@ typedef struct gui_app {
 #endif
 
     // Capture state
+#ifdef __ANDROID__
+    atomic_bool is_capturing;   // Published by the Android capture worker.
+#else
     bool is_capturing;
+#endif
     bool is_recording;
     bool user_capture_mode_misrc;      // Authoritative user-selected mode (changes only via mode toggle)
     bool capture_mode_runtime_misrc;   // Mode latched at recording start (stable for recording session)
@@ -479,9 +510,19 @@ typedef struct gui_app {
     // Zero per-channel rate falls back to the live shared rate; explicit rates
     // describe independent hardware/file clocks even when preview is gated.
     atomic_uint_fast32_t rf_source_rate_hz[2];
+    atomic_bool rf_source_is_rtlsdr;
+    atomic_uint_fast64_t rf_source_rtlsdr_tuning;  // center Hz in low word, retune generation in high word
     atomic_bool rf_preview_input_supported;
+    // Per-channel FULL SCALE of the display-sample container (the magnitude
+    // that rails the panel). Playback decode normalizes EVERY input
+    // convention into the 12-bit container (in = out at 8/12/16-bit; user
+    // rule 2026-11-03), so playback sessions keep 2048 here; capture
+    // backends with a different container (DdD 512) publish their own scale
+    // (see gui_app_level_autostop_full_scale).
+    atomic_uint_fast32_t rf_display_full_scale[2];
     atomic_uint_fast64_t rf_stream_epoch;
     atomic_uint_fast32_t audio_sample_rate;
+    atomic_bool cxadc_audio_ready;
 
     // Audio monitoring peaks (24-bit audio magnitude, per channel 1..4)
     atomic_uint_fast32_t audio_peak[4];
@@ -575,6 +616,9 @@ typedef struct gui_app {
     // between UI interactions and the display thread.
     atomic_flag panel_config_lock;
 
+    // True only for headless (no-raylib-window) legacy server launch.
+    bool headless_server;
+
     // Server/Client networking state (opaque; implemented in net/gui_net.c).
     // NULL when net_mode == Local. Owned by gui_app_t; created/destroyed by
     // gui_net_apply_mode(). Accessed from the UI/main thread only for control;
@@ -590,7 +634,13 @@ typedef struct gui_app {
     atomic_bool net_cmd_record_on;      // /record?on=1 requested
     atomic_bool net_cmd_record_off;     // /record?on=0 requested
     atomic_bool net_cmd_select_device;  // /device?N requested (arg in net_cmd_device_index)
-    atomic_int  net_cmd_device_index;   // Device index argument for select_device.
+    atomic_int  net_cmd_device_index;   // Legacy Client device argument.
+    /* The unified Server keeps monitor-specific commands separate. Otherwise
+     * a legacy /device request could restart a running capture (M behaviour),
+     * or a legacy /record could accidentally use M-Client Local Save. */
+    atomic_bool net_cmd_monitor_select_device;
+    atomic_int  net_cmd_monitor_device_index;
+    atomic_int  net_cmd_monitor_record; // 0=none, 1=server ON, 2=Local Save ON, 3=OFF
 
     // Net mirrored state snapshot (written by client mirror thread, read by UI).
     // Server mode also writes these so the local UI reflects remote-driven state.
@@ -599,7 +649,26 @@ typedef struct gui_app {
     atomic_int  net_peer_device_count;  // device count from peer /devices.
     atomic_int  net_peer_selected;      // selected_device from peer.
     atomic_bool net_connected;          // server listening / client connected.
-    atomic_bool net_error;              // last operation failed (see net_status).
+    atomic_bool net_error;               // last operation failed (see net_status).
+    /* RF transport diagnostics, published atomically by server/client threads.
+     * The two counters are deliberately separate: the client cannot know
+     * whether a stream interruption came from server queue pressure. */
+    atomic_uint_fast64_t net_rf_server_stream_drops;
+    atomic_uint_fast64_t net_rf_client_interruptions;
+    atomic_uint_fast64_t net_audio_server_stream_drops;
+    atomic_uint_fast64_t net_audio_client_interruptions;
+    atomic_size_t net_rf_server_queue_bytes;
+    atomic_size_t net_audio_server_queue_bytes;
+    atomic_bool net_rf_client_stream_live;
+    atomic_int net_rf_client_discard_state;
+    /* Set by the async net mode transition worker (gui_net_request_apply_mode)
+     * when the main loop should re-enumerate local devices once (leaving a
+     * client mode / returning to Local). Consumed on the main thread; the
+     * device array itself is main-thread-owned. */
+    atomic_bool net_reenumerate_pending;
+#ifdef __ANDROID__
+    atomic_uint net_device_catalogue_generation;  // Odd during local enumeration.
+#endif
 
     // Dedicated network status line, shown ONLY in the info window's Network
     // section. Net code writes this via gui_net_set_status() and must NEVER
@@ -623,6 +692,8 @@ static inline void gui_app_count_system_errors(gui_app_t *app, uint32_t count) {
 }
 
 // Application lifecycle
+void gui_runtime_set_headless(bool enabled);
+double gui_runtime_time(void);
 void gui_app_init(gui_app_t *app);
 void gui_app_cleanup(gui_app_t *app);
 
@@ -631,13 +702,22 @@ void gui_app_enumerate_devices(gui_app_t *app);
 int gui_app_start_capture(gui_app_t *app);
 /* Commit a prepared FLAC playback start on the UI thread. Call every frame. */
 void gui_app_poll_capture_start(gui_app_t *app);
-/* Android-only: run gui_app_start_capture() on a worker thread so the render
- * loop stays responsive during hsdaoh_open + stream start. On non-Android
- * builds this is not declared/defined. FLAC uses its own preparation worker. */
 #if defined(__ANDROID__)
+/* Main-thread control for Android USB permission and capture workers.
+ * FLAC uses its own preparation worker. */
+#ifdef ENABLE_RTLSDR
+#include "../input/android_rtlsdr_usb.h"
+bool gui_app_rtlsdr_reconnect_identity(int device_id, android_rtlsdr_usb_identity_t *identity);
+void gui_app_start_rtlsdr_reconnect_async(gui_app_t *app, const char *expected_serial);
+#endif
 void gui_app_start_capture_async(gui_app_t *app);
 void gui_app_stop_capture_async(gui_app_t *app);
-int gui_app_capture_busy(void);
+void gui_app_stop_server_capture_async(gui_app_t *app);
+void gui_app_stop_capture_on_dropout_async(gui_app_t *app, const char *status);
+void gui_app_select_capture_device_async(gui_app_t *app, int selection, bool persist, bool restart);
+bool gui_app_capture_busy(void);
+bool gui_app_defer_remote_mode(gui_app_t *app, int mode);
+void gui_app_finish_capture_transitions(gui_app_t *app);
 #endif
 void gui_app_stop_capture(gui_app_t *app);
 int gui_app_start_recording(gui_app_t *app);
@@ -656,6 +736,8 @@ void gui_app_set_status(gui_app_t *app, const char *message);
 // Settings persistence
 void gui_settings_load(gui_settings_t *settings);
 void gui_settings_save(const gui_settings_t *settings);
+/* Restore local recording profile after leaving M-Client; never touches other modes. */
+void gui_settings_restore_monitor_profile(gui_settings_t *settings);
 void gui_settings_init_defaults(gui_settings_t *settings);
 // Override the settings file path (e.g. from --config <path>). When set,
 // gui_settings_load/save use this path instead of the platform default.

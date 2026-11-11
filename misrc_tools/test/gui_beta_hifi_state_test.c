@@ -271,6 +271,106 @@ static void test_locked_carrier_loss_threshold(void) {
     gui_beta_hifi_destroy(d);
 }
 
+
+typedef enum {
+    CAL_WINDOW_VALID,
+    CAL_WINDOW_LOW_SPAN,
+    CAL_WINDOW_SEVEN_SWITCHES,
+    CAL_WINDOW_MISSING_REFERENCE,
+    CAL_WINDOW_FEW_ACTIVE_POINTS
+} calibration_window_t;
+
+/* Direct 300-point state fixtures isolate refresh acceptance from RF filters.
+ * Their 17 ms edges approximate the NTSC field period independently. Each bad
+ * candidate proposes a new midpoint and four new powers, so partial writes or
+ * unwanted resets cannot pass a cache-preservation assertion. */
+static void set_refresh_window(gui_beta_hifi_decoder_t *d,
+                                calibration_window_t kind,double midpoint,
+                                double active_power) {
+    d->iq_count=250000;d->cal_count=BETA_CAL_POINTS;d->cal_next=50;
+    d->calibration_iq_start=0;d->input_power=1;
+    for(int i=0;i<BETA_CAL_POINTS;i++) {
+        int head=((i/17)&1) ? -1 : 1;
+        if(kind==CAL_WINDOW_SEVEN_SWITCHES) {
+            /* Eight 17-point runs give exactly seven regular switches;
+             * both active groups still have 68 points and valid powers. */
+            head=i<164 ? 0 : ((((i-164)/17)&1) ? -1 : 1);
+        } else if(kind==CAL_WINDOW_FEW_ACTIVE_POINTS) {
+            /* Ten regular edges, but only 35 observations of head B. Both
+             * dominance tails still occupy more than ten percent. */
+            if(i>=187 || (head<0 && i%17>=7)) head=0;
+        }
+        int slot=(50+i)%BETA_CAL_POINTS;
+        double half_span=kind==CAL_WINDOW_LOW_SPAN ? 4.75 : 20;
+        d->calibration[slot][4]=midpoint+head*half_span;
+        for(int branch=0;branch<4;branch++) {
+            bool active=head && ((branch&1)==(head>0 ? 0 : 1));
+            double power=active ? active_power+branch*10 : 1;
+            if(kind==CAL_WINDOW_MISSING_REFERENCE && branch==3) power=1e-30;
+            d->calibration[slot][branch]=power;
+        }
+    }
+}
+
+static void test_invalid_refresh_preserves_verified_calibration(void) {
+    const calibration_window_t invalid[]={CAL_WINDOW_LOW_SPAN,
+        CAL_WINDOW_SEVEN_SWITCHES,CAL_WINDOW_MISSING_REFERENCE,
+        CAL_WINDOW_FEW_ACTIVE_POINTS};
+    const char *reasons[]={"Waiting for alternating NTSC Beta HiFi carriers",
+        "Waiting for regular NTSC Beta HiFi head cadence",
+        "Missing NTSC Beta HiFi carrier","Missing NTSC Beta HiFi carrier"};
+    for(size_t at=0;at<sizeof(invalid)/sizeof(invalid[0]);at++) {
+        gui_beta_hifi_decoder_t *d=gui_beta_hifi_create();assert(d);
+        set_refresh_window(d,CAL_WINDOW_VALID,4,100);
+        beta_calibrate(d);assert(d->status.locked && d->midpoint==4);
+        for(int branch=0;branch<4;branch++)
+            assert(d->carrier[branch].reference==100+branch*10);
+        d->gate=.625;d->audio.gain=2.5;d->bad_count=4999;
+        d->last_switch=d->last_good_switch=d->iq_count-1000;
+        set_refresh_window(d,invalid[at],17,1000);
+        unsigned char verified[sizeof(*d)];memcpy(verified,d,sizeof(*d));
+        beta_calibrate(d);
+        /* Includes gate, status/reason, recent-loss counters, head times,
+         * audio filters, circular-window cursors and every cached reference. */
+        assert(memcmp(d,verified,sizeof(*d))==0);
+
+        gui_beta_hifi_decoder_t *cold=gui_beta_hifi_create();assert(cold);
+        set_refresh_window(cold,invalid[at],17,1000);
+        beta_calibrate(cold);
+        assert(!cold->status.locked && cold->gate==0 && cold->midpoint==0);
+        assert(strcmp(cold->status.reason,reasons[at])==0);
+        for(int branch=0;branch<4;branch++) assert(cold->carrier[branch].reference==0);
+        assert(cold->cal_count==BETA_CAL_POINTS && cold->cal_next==50);
+        gui_beta_hifi_destroy(cold);
+
+        /* A rejected refresh cannot reset the 10 ms real carrier-loss run. */
+        observe_carrier_loss(d);
+        assert(!d->status.locked && d->bad_count==5000 && d->gate==0);
+        assert(strcmp(d->status.reason,"Beta HiFi carrier RF lost; muted")==0);
+        gui_beta_hifi_destroy(d);
+    }
+    puts("invalid refresh:9.5dB,seven switches,missing/undersampled carriers "
+         "retain verified state; identical cold windows reject; real loss mutes");
+}
+
+static void test_valid_refresh_commits_complete_candidate(void) {
+    gui_beta_hifi_decoder_t *d=gui_beta_hifi_create();assert(d);
+    set_refresh_window(d,CAL_WINDOW_VALID,4,100);beta_calibrate(d);
+    assert(d->status.locked);
+    d->gate=.625;d->audio.gain=2.5;d->bad_count=4999;
+    d->last_switch=d->last_good_switch=d->iq_count-1000;
+    set_refresh_window(d,CAL_WINDOW_VALID,17,1000);
+    beta_calibrate(d);
+    assert(d->status.locked && d->midpoint==17);
+    for(int branch=0;branch<4;branch++)
+        assert(d->carrier[branch].reference==1000+branch*10);
+    assert(d->gate==.625 && d->audio.gain==2.5 && d->bad_count==4999);
+    assert(d->last_switch==249000 && d->last_good_switch==249000);
+    assert(d->cal_count==BETA_CAL_POINTS && d->cal_next==50);
+    puts("valid refresh commits midpoint/all references without resetting live loss state");
+    gui_beta_hifi_destroy(d);
+}
+
 static void test_wrapped_calibration_edge_timestamp(void) {
     gui_beta_hifi_decoder_t *d=gui_beta_hifi_create();assert(d);
     d->iq_count=200000;d->cal_count=BETA_CAL_POINTS;d->cal_next=50;
@@ -469,6 +569,10 @@ int main(int argc,char **argv) {
         if(strcmp(argv[1],"--calibration-switch-cold")==0) test_calibration_switch_cold();
         else if(strcmp(argv[1],"--calibration-switch-relock")==0) test_calibration_switch_relock();
         else if(strcmp(argv[1],"--locked-carrier-loss")==0) test_locked_carrier_loss_threshold();
+        else if(strcmp(argv[1],"--calibration-refresh")==0) {
+            test_invalid_refresh_preserves_verified_calibration();
+            test_valid_refresh_commits_complete_candidate();
+        }
         else return 2;
         puts("gui_beta_hifi_state_test: scoped OK");
         return 0;
@@ -482,6 +586,8 @@ int main(int argc,char **argv) {
     test_calibration_switch_cold();
     test_calibration_switch_relock();
     test_locked_carrier_loss_threshold();
+    test_invalid_refresh_preserves_verified_calibration();
+    test_valid_refresh_commits_complete_candidate();
     test_wrapped_calibration_edge_timestamp();
     test_selected_phase_matches_all_four_oracle();
     puts("gui_beta_hifi_state_test: OK");

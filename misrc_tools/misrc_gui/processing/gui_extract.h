@@ -32,11 +32,24 @@ int gui_extract_start(gui_app_t *app);
 // Start a new stopped session: clear old RF/display tails and reset sideband.
 // Call before any capture producer starts. Recording buffers are not touched.
 void gui_extract_prepare_stream(gui_app_t *app);
+/* Poll the consumer's discard acknowledgement while the Client RF pump is paused. */
+bool gui_extract_discard_client_rf(gui_app_t *app);
 // Playback publishes one stamp for each committed 65536-sample pair block,
 // before advancing the RF FIFO. Positions refer to source files, excluding padding.
 #include "gui_rf_preview_worker.h"
 int gui_extract_start_tagged(gui_app_t *app);
 bool gui_extract_stamp_playback(const gui_rf_block_info_t info[2], const size_t counts[2]);
+// Independent mixed-rate playback: each channel writes its OWN RF FIFO
+// (BUF_CAPTURE_RF_A/B) and publishes a stamp into that channel's sideband
+// ring before the FIFO write is committed. Positions/rates are that
+// channel's own file clock (no shared axis).
+bool gui_extract_stamp_playback_channel(int channel,
+                                        const gui_rf_block_info_t *info,
+                                        size_t count);
+// Use -1 for the paired FIFO and 0/1 for independent playback. The forwarded
+// cursor counts only stamps whose RF has reached the preview worker queues.
+uint64_t gui_extract_playback_stamps_written(int channel);
+uint64_t gui_extract_playback_stamps_forwarded(int channel);
 
 // Stop the extraction thread (call before capture stops)
 void gui_extract_stop(void);
@@ -56,6 +69,13 @@ bool gui_extract_is_running(void);
 // record ringbuffer producer is the capture-side tap, not this thread), so
 // extraction skips that channel's record-buffer writes (single producer per
 // ring).
+/* Close record publication immediately. An in-flight block can still finish. */
+void gui_extract_disable_recording(void);
+/* Stop admitting samples after the producer position visible at this call. */
+void gui_extract_request_record_stop(void);
+/* Wait for pending RF publication and report whether its tail finished. */
+bool gui_extract_wait_recording_idle(void);
+void gui_extract_finish_recording(void);
 void gui_extract_set_recording(bool enabled, bool use_flac, uint8_t rf_bits_a, uint8_t rf_bits_b,
                                bool direct_a, bool direct_b);
 

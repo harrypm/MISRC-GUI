@@ -169,4 +169,9 @@ void gui_fft_swap_buffers(fft_state_t *state);
 void gui_fft_render(fft_state_t *state, float x, float y,
                     float width, float height, Color color, Font *fonts);
 
+/* CPU FFT on M-Server and original phosphor/EMA rendering on M-Client. */
+void gui_fft_server_bins(const int16_t *samples,size_t count,uint32_t sample_rate,
+                         float *out,size_t bins);
+void gui_fft_remote_apply_float(void *state,const float *bins,size_t count,
+                                uint32_t sample_rate,uint32_t sequence);
 #endif // GUI_FFT_H

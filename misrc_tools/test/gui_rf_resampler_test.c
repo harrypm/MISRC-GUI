@@ -18,9 +18,10 @@ static int failures;
     if (!(condition)) { fprintf(stderr, "FAIL: %s (%d)\n", message, __LINE__); ++failures; } \
 } while (0)
 
-static size_t convert(uint32_t rate, const int16_t *input, size_t count,
-                      bool partitioned, float *output) {
-    gui_rf_resampler_t *resampler = gui_rf_resampler_create(rate);
+static size_t convert_mode(uint32_t rate, uint32_t output_rate, const int16_t *input,
+                           size_t count, bool partitioned, float *output, bool ed_beta) {
+    gui_rf_resampler_t *resampler = ed_beta ? gui_rf_resampler_create_ed_beta(rate)
+        : gui_rf_resampler_create_rate(rate, output_rate);
     CHECK(resampler != NULL, "create supported converter");
     if (!resampler) return 0;
     size_t consumed = 0;
@@ -30,7 +31,8 @@ static size_t convert(uint32_t rate, const int16_t *input, size_t count,
     while (consumed < count) {
         size_t chunk = partitioned ? partitions[partition_index++ % 8u] : count;
         if (chunk > count - consumed) chunk = count - consumed;
-        size_t capacity = gui_rf_resampler_output_capacity(rate, chunk);
+        size_t capacity = ed_beta ? gui_rf_resampler_output_capacity_ed_beta(rate, chunk)
+            : gui_rf_resampler_output_capacity_rate(rate, output_rate, chunk);
         float *scratch = calloc(capacity ? capacity : 1u, sizeof(*scratch));
         CHECK(scratch != NULL, "allocate output");
         if (!scratch) break;
@@ -46,6 +48,16 @@ static size_t convert(uint32_t rate, const int16_t *input, size_t count,
     CHECK(isfinite(gui_rf_resampler_delay_samples(resampler)), "finite delay");
     gui_rf_resampler_destroy(resampler);
     return produced;
+}
+
+static size_t convert_rate(uint32_t rate, uint32_t output_rate, const int16_t *input,
+                           size_t count, bool partitioned, float *output) {
+    return convert_mode(rate,output_rate,input,count,partitioned,output,false);
+}
+
+static size_t convert(uint32_t rate, const int16_t *input, size_t count,
+                      bool partitioned, float *output) {
+    return convert_rate(rate, 20000000u, input, count, partitioned, output);
 }
 
 static void partition_and_reset(uint32_t rate) {
@@ -96,14 +108,14 @@ cleanup:
     free(split);
 }
 
-static double tone_gain(uint32_t rate, double frequency) {
+static double tone_gain_mode(uint32_t rate, uint32_t output_rate, double frequency, bool ed_beta) {
     int16_t *input = malloc(SAMPLE_COUNT * sizeof(*input));
     float *output = calloc(SAMPLE_COUNT * 2u, sizeof(*output));
     CHECK(input && output, "allocate tone fixture");
     if (!input || !output) { free(input); free(output); return 0.0; }
     for (size_t index = 0; index < SAMPLE_COUNT; ++index)
         input[index] = (int16_t)lrint(16384.0 * sin(2.0 * PI * frequency * index / rate));
-    size_t count = convert(rate, input, SAMPLE_COUNT, true, output);
+    size_t count = convert_mode(rate, output_rate, input, SAMPLE_COUNT, true, output, ed_beta);
     CHECK(count > 2048u, "enough settled tone samples");
     double sum = 0.0;
     size_t begin = 1024u;
@@ -113,6 +125,14 @@ static double tone_gain(uint32_t rate, double frequency) {
     free(input);
     free(output);
     return gain;
+}
+
+static double tone_gain_rate(uint32_t rate, uint32_t output_rate, double frequency) {
+    return tone_gain_mode(rate,output_rate,frequency,false);
+}
+
+static double tone_gain(uint32_t rate, double frequency) {
+    return tone_gain_rate(rate, 20000000u, frequency);
 }
 
 static void dc_and_frequency(uint32_t rate, double stop_frequency) {
@@ -166,11 +186,11 @@ static void bypass_and_contract(void) {
 #endif
 }
 
-static void impulse_delay(uint32_t rate, unsigned factor, double expected_delay) {
+static void impulse_delay_rate(uint32_t rate, uint32_t output_rate, unsigned factor, double expected_delay) {
     int16_t input[256] = {0};
     input[64] = 16384;
     float output[256] = {0};
-    gui_rf_resampler_t *resampler = gui_rf_resampler_create(rate);
+    gui_rf_resampler_t *resampler = gui_rf_resampler_create_rate(rate, output_rate);
     size_t count = 0;
     CHECK(resampler != NULL, "impulse converter");
     CHECK(gui_rf_resampler_delay_samples(resampler) == expected_delay, "reported FIR group delay");
@@ -196,8 +216,156 @@ static void impulse_delay(uint32_t rate, unsigned factor, double expected_delay)
     gui_rf_resampler_destroy(resampler);
 }
 
+static void impulse_delay(uint32_t rate, unsigned factor, double expected_delay) {
+    impulse_delay_rate(rate, 20000000u, factor, expected_delay);
+}
+
+static void wide_rate_contract(uint32_t rate) {
+    int16_t *input = malloc(SAMPLE_COUNT * sizeof(*input));
+    float *whole = calloc(SAMPLE_COUNT * 2u, sizeof(*whole));
+    float *split = calloc(SAMPLE_COUNT * 2u, sizeof(*split));
+    CHECK(input && whole && split, "allocate 40 MSPS contract");
+    if (!input || !whole || !split) goto cleanup;
+    uint32_t random = 0x76ab192du;
+    for (size_t n=0;n<SAMPLE_COUNT;n++) {
+        random=random*1664525u+1013904223u;input[n]=(int16_t)(random>>16);
+    }
+    size_t count=convert_rate(rate,40000000u,input,SAMPLE_COUNT,false,whole);
+    size_t partitioned=convert_rate(rate,40000000u,input,SAMPLE_COUNT,true,split);
+    CHECK(count==partitioned,"40 MSPS partition count is invariant");
+    double error=0;
+    if(count==partitioned) for(size_t n=0;n<count;n++) error=fmax(error,fabs(whole[n]-split[n]));
+    CHECK(count>0 && error<2e-6,"40 MSPS partitioned samples agree");
+    if(rate==40000000u) {
+        CHECK(count==SAMPLE_COUNT,"40 MSPS bypass never halves video");
+        for(size_t n=0;n<count;n++)
+            CHECK(whole[n]==(float)input[n]/32768.0f,"40 MSPS bypass preserves every normalized sample");
+    }
+    gui_rf_resampler_t *r=gui_rf_resampler_create_rate(rate,40000000u);
+    size_t capacity=gui_rf_resampler_output_capacity_rate(rate,40000000u,SAMPLE_COUNT),first=0,again=0;
+    CHECK(r!=NULL && capacity<=SAMPLE_COUNT*2u,"40 MSPS reset allocation bound");
+    if(r) {
+        CHECK(gui_rf_resampler_process(r,input,SAMPLE_COUNT,whole,capacity,&first),"40 MSPS initial reset fixture");
+        gui_rf_resampler_reset(r);
+        CHECK(gui_rf_resampler_process(r,input,SAMPLE_COUNT,split,capacity,&again),"40 MSPS process after reset");
+        CHECK(first==again && memcmp(whole,split,first*sizeof(*whole))==0,"40 MSPS reset restores state and phase");
+    }
+    gui_rf_resampler_destroy(r);
+    double gain=tone_gain_rate(rate,40000000u,9300000.0);
+    CHECK(gain>.98 && gain<1.02,"wide front-end preserves the 9.3 MHz ED white carrier");
+    if(rate>=54000000u)
+        CHECK(tone_gain_rate(rate,40000000u,25000000.0)<.025,"wide front-end rejects RF above 20 MHz Nyquist");
+cleanup:
+    free(input);free(whole);free(split);
+}
+
+static void compatibility_wrapper(uint32_t rate) {
+    const size_t n=8192;
+    int16_t *input=malloc(n*sizeof(*input));
+    size_t capacity=gui_rf_resampler_output_capacity(rate,n);
+    float *a=calloc(capacity?capacity:1,sizeof(*a)),*b=calloc(capacity?capacity:1,sizeof(*b));
+    gui_rf_resampler_t *old=gui_rf_resampler_create(rate),*explicit=gui_rf_resampler_create_rate(rate,20000000u);
+    CHECK(input && a && b && old && explicit,"allocate compatibility wrapper fixture");
+    if(input && a && b && old && explicit) {
+        for(size_t i=0;i<n;i++)input[i]=(int16_t)((i*117u)%65536u-32768);
+        CHECK(capacity==gui_rf_resampler_output_capacity_rate(rate,20000000u,n),"20 MSPS capacity wrapper unchanged");
+        size_t na=0,nb=0;
+        CHECK(gui_rf_resampler_process(old,input,n,a,capacity,&na) &&
+              gui_rf_resampler_process(explicit,input,n,b,capacity,&nb),"20 MSPS wrapper process");
+        CHECK(na==nb && memcmp(a,b,na*sizeof(*a))==0,"legacy and explicit 20 MSPS outputs are bit-identical");
+    }
+    free(input);free(a);free(b);gui_rf_resampler_destroy(old);gui_rf_resampler_destroy(explicit);
+}
+
+/* ED's preview converter must retain white-carrier RF instead of selecting
+ * the legacy halfband merely because both targets now have the same rate. */
+static void ed_beta_contract(uint32_t rate) {
+    int16_t *input=malloc(SAMPLE_COUNT*sizeof(*input));
+    float *whole=calloc(SAMPLE_COUNT*2u,sizeof(*whole));
+    float *split=calloc(SAMPLE_COUNT*2u,sizeof(*split));
+    CHECK(input && whole && split,"allocate ED20 converter fixture");
+    if(!input || !whole || !split)goto cleanup;
+    uint32_t random=0x4d70b182u;
+    for(size_t n=0;n<SAMPLE_COUNT;n++) {
+        random=random*1664525u+1013904223u;input[n]=(int16_t)(random>>16);
+    }
+    size_t count=convert_mode(rate,20000000u,input,SAMPLE_COUNT,false,whole,true);
+    size_t partitioned=convert_mode(rate,20000000u,input,SAMPLE_COUNT,true,split,true);
+    CHECK(count>0 && count==partitioned,"ED20 arbitrary partitions preserve count");
+    double error=0;
+    if(count==partitioned)for(size_t n=0;n<count;n++)error=fmax(error,fabs(whole[n]-split[n]));
+    CHECK(error<2e-6,"ED20 partitions preserve samples and buffered history");
+    if(rate==20000000u) {
+        CHECK(count==SAMPLE_COUNT,"native20 ED bypass retains every sample");
+        for(size_t n=0;n<count;n++)
+            CHECK(whole[n]==(float)input[n]/32768.0f,"native20 ED bypass is bit exact");
+    }
+    gui_rf_resampler_t *r=gui_rf_resampler_create_ed_beta(rate);
+    size_t capacity=gui_rf_resampler_output_capacity_ed_beta(rate,SAMPLE_COUNT),first=0,again=0;
+    CHECK(r && capacity<=SAMPLE_COUNT*2u,"ED20 safe allocation bound");
+    if(r) {
+        CHECK(gui_rf_resampler_process(r,input,SAMPLE_COUNT,whole,capacity,&first),"initial ED20 process");
+        gui_rf_resampler_reset(r);
+        CHECK(gui_rf_resampler_process(r,input,SAMPLE_COUNT,split,capacity,&again),"ED20 process after reset");
+        CHECK(first==again && !memcmp(whole,split,first*sizeof(*whole)),"ED20 reset restores history and phase");
+        CHECK(gui_rf_resampler_delay_samples(r)==0.0,"ED20 bypass/soxr alignment excludes availability latency");
+    }
+    gui_rf_resampler_destroy(r);
+    double gain=tone_gain_mode(rate,20000000u,9300000.0,true);
+    CHECK(gain>.98 && gain<1.02,"ED20 retains9.3MHz white carrier");
+    if(rate>20000000u)
+        CHECK(tone_gain_mode(rate,20000000u,11000000.0,true)<.025,"ED20 rejects RF above10MHz Nyquist");
+cleanup:
+    free(input);free(whole);free(split);
+}
+
+#if LIBSOXR_ENABLED
+static void test_delayed_eof_output(void) {
+    enum { input_count = 16384, expected = 10240 };
+    int16_t input[input_count] = {0};
+    float output[expected + 8192];
+    gui_rf_resampler_t *r = gui_rf_resampler_create(32000000u);
+    CHECK(r != NULL, "SOXR EOF fixture allocation");
+    if (!r) return;
+    size_t produced = 0, tail = 0;
+    CHECK(gui_rf_resampler_process(r, input, input_count, output,
+                                 sizeof(output) / sizeof(*output), &produced), "SOXR normal input");
+    CHECK(gui_rf_resampler_process(r, NULL, 0, NULL, 0, &tail) && tail == 0,
+          "empty input does not finish the stream");
+    CHECK(gui_rf_resampler_finish(r, output, sizeof(output) / sizeof(*output), &tail) &&
+          tail > 0 && produced + tail == expected, "SOXR EOF restores the exact output count");
+    CHECK(gui_rf_resampler_finish(r, output, sizeof(output) / sizeof(*output), &tail) && tail == 0,
+          "SOXR does not repeat the final samples");
+    gui_rf_resampler_reset(r);
+    size_t again = 0;
+    CHECK(gui_rf_resampler_process(r, input, input_count, output,
+                                 sizeof(output) / sizeof(*output), &again) && again == produced,
+          "SOXR reset starts a fresh stream after EOF");
+    gui_rf_resampler_destroy(r);
+}
+#endif
+
 int main(void) {
     bypass_and_contract();
+    CHECK(gui_rf_resampler_create_ed_beta(16000000u)==NULL,"ED20 rejects insufficient input bandwidth");
+    CHECK(gui_rf_resampler_output_capacity_ed_beta(16000000u,100)==0,"invalid ED input has no capacity");
+    ed_beta_contract(20000000u);
+#if LIBSOXR_ENABLED
+    size_t huge=gui_rf_resampler_output_capacity_ed_beta(40000000u,SIZE_MAX);
+    CHECK(huge>SIZE_MAX/2u && huge<SIZE_MAX,"ED20 downconversion capacity cannot wrap");
+    ed_beta_contract(40000000u);ed_beta_contract(54000000u);ed_beta_contract(80000000u);
+#else
+    CHECK(gui_rf_resampler_create_ed_beta(40000000u)==NULL,"ED20 downconversion needs soxr");
+    CHECK(gui_rf_resampler_output_capacity_ed_beta(40000000u,100)==0,"unavailable ED converter has no capacity");
+#endif
+    CHECK(gui_rf_resampler_create_rate(40000000u,30000000u)==NULL,"reject unsupported target rate");
+    CHECK(gui_rf_resampler_output_capacity_rate(40000000u,30000000u,100)==0,"invalid target has no bound");
+    CHECK(gui_rf_resampler_output_capacity_rate(16000000u,40000000u,SIZE_MAX)==0,"wide output capacity cannot overflow");
+    const uint32_t wide_exact[]={40000000u,80000000u,160000000u};
+    for(size_t n=0;n<3;n++)wide_rate_contract(wide_exact[n]);
+    impulse_delay_rate(80000000u,40000000u,2u,7.5);
+    impulse_delay_rate(160000000u,40000000u,4u,11.25);
+    compatibility_wrapper(20000000u);compatibility_wrapper(40000000u);compatibility_wrapper(80000000u);
     const uint32_t exact_rates[] = {20000000u, 40000000u, 80000000u};
     for (size_t index = 0; index < 3u; ++index) {
         partition_and_reset(exact_rates[index]);
@@ -207,6 +375,9 @@ int main(void) {
     impulse_delay(80000000u, 4u, 11.25);
     CHECK(tone_gain(80000000u, 30000000.0) < 0.025, "first 80 MSPS stage rejects high RF");
 #if LIBSOXR_ENABLED
+    test_delayed_eof_output();
+    wide_rate_contract(32000000u);wide_rate_contract(54000000u);wide_rate_contract(200000000u);
+    compatibility_wrapper(28636363u);
     const uint32_t rates[] = {16000000u, 25000000u, 28636363u, 54000000u, 160000000u, 200000000u};
     for (size_t index = 0; index < 6u; ++index) {
         partition_and_reset(rates[index]);

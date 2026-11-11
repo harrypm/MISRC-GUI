@@ -77,7 +77,7 @@ static void seek_test_channel(int channel) {
     /* Both nonzero stale buffer coordinates and unread samples must be cleared
      * before seek's internal callback; only the new target slice survives. */
     *position=73; *other_available=123; *other_position=17;
-    assert(gui_playback_seek_decoder(&ctx,channel,10000));
+    assert(gui_playback_seek_decoder(&ctx,channel,10000,10000));
     assert(*position==0 && *available==SEEK_TEST_BLOCK-(10000u%SEEK_TEST_BLOCK));
     assert(samples[*position]==seek_test_sample(10000));
     for (size_t n=0; n<*available; ++n)
@@ -90,16 +90,16 @@ static void seek_test_channel(int channel) {
     assert(FLAC__stream_decoder_process_until_end_of_stream(decoder));
     assert(FLAC__stream_decoder_get_state(decoder)==FLAC__STREAM_DECODER_END_OF_STREAM);
     *position=*available;
-    assert(gui_playback_seek_decoder(&ctx,channel,0));
+    assert(gui_playback_seek_decoder(&ctx,channel,0,0));
     assert(*position==0 && *available==SEEK_TEST_BLOCK);
     for (size_t n=0; n<*available; ++n) assert(samples[n]==seek_test_sample(n));
-    assert(gui_playback_seek_decoder(&ctx,channel,SEEK_TEST_SAMPLES-1u));
+    assert(gui_playback_seek_decoder(&ctx,channel,SEEK_TEST_SAMPLES-1u,SEEK_TEST_SAMPLES-1u));
     assert(*position==0 && *available==1 && samples[0]==seek_test_sample(SEEK_TEST_SAMPLES-1u));
 
     atomic_store(&ctx.current_sample,321);
     atomic_store(&ctx.current_sample_a,123);
     atomic_store(&ctx.current_sample_b,456);
-    assert(!gui_playback_seek_decoder(&ctx,channel,SEEK_TEST_SAMPLES+10000u));
+    assert(!gui_playback_seek_decoder(&ctx,channel,SEEK_TEST_SAMPLES+10000u,SEEK_TEST_SAMPLES+10000u));
     assert(!ctx.seek_recovery_failed[channel]);
     assert(*position==0 && *available==SEEK_TEST_BLOCK-(channel==0 ? 123u : 456u));
     assert(samples[0]==seek_test_sample(channel==0 ? 123u : 456u));
@@ -154,7 +154,7 @@ static void seek_test_unknown_recovery(int channel, bool paused, unsigned endpoi
     atomic_store(&ctx.speed,PLAYBACK_SPEED_0_5X); atomic_store(&ctx.loop_enabled,!eof);
     ctx.info_a.length_provisional=true; ctx.info_b.length_provisional=true;
     ctx.info_a.total_samples=ctx.info_b.total_samples=SEEK_TEST_SAMPLES*100u;
-    assert(!gui_playback_seek_decoder(&ctx,channel,SEEK_TEST_SAMPLES+10000u));
+    assert(!gui_playback_seek_decoder(&ctx,channel,SEEK_TEST_SAMPLES+10000u,SEEK_TEST_SAMPLES+10000u));
     assert(!ctx.seek_recovery_failed[channel]);
     assert(atomic_load(&ctx.current_sample)==previous);
     assert(atomic_load(&ctx.current_sample_a)==previous && atomic_load(&ctx.current_sample_b)==previous);

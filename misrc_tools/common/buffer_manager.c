@@ -43,6 +43,28 @@ static const buffer_config_t s_default_configs[BUF_COUNT] = {
         .size = BUFMGR_SIZE_DISPLAY,
         .lazy_init = false,
     },
+    /* Independent playback per-channel FIFOs: player mixed-rate mode only.
+     * Lazy so no other session pays for them. */
+    [BUF_CAPTURE_RF_A] = {
+        .name = "playback_rf_a",
+        .size = BUFMGR_SIZE_PLAYBACK_RF,
+        .lazy_init = true,
+    },
+    [BUF_CAPTURE_RF_B] = {
+        .name = "playback_rf_b",
+        .size = BUFMGR_SIZE_PLAYBACK_RF,
+        .lazy_init = true,
+    },
+    [BUF_DISPLAY_A] = {
+        .name = "playback_display_a",
+        .size = BUFMGR_SIZE_PLAYBACK_DISPLAY,
+        .lazy_init = true,
+    },
+    [BUF_DISPLAY_B] = {
+        .name = "playback_display_b",
+        .size = BUFMGR_SIZE_PLAYBACK_DISPLAY,
+        .lazy_init = true,
+    },
 };
 
 static const backpressure_policy_t s_default_policies[BUF_COUNT] = {
@@ -75,6 +97,32 @@ static const backpressure_policy_t s_default_policies[BUF_COUNT] = {
     },
     [BUF_DISPLAY] = {
         .max_wait_attempts = 0,    /* Preview must never hold up RF extraction. */
+        .wait_timeout_ms = 0,
+        .log_first_wait = true,
+        .log_drops = true,
+    },
+    /* Same lossy philosophy as the paired paths: a slow player consumer
+     * drops preview blocks instead of stalling the producer. */
+    [BUF_CAPTURE_RF_A] = {
+        .max_wait_attempts = 10,
+        .wait_timeout_ms = 5,
+        .log_first_wait = true,
+        .log_drops = true,
+    },
+    [BUF_CAPTURE_RF_B] = {
+        .max_wait_attempts = 10,
+        .wait_timeout_ms = 5,
+        .log_first_wait = true,
+        .log_drops = true,
+    },
+    [BUF_DISPLAY_A] = {
+        .max_wait_attempts = 0,
+        .wait_timeout_ms = 0,
+        .log_first_wait = true,
+        .log_drops = true,
+    },
+    [BUF_DISPLAY_B] = {
+        .max_wait_attempts = 0,
         .wait_timeout_ms = 0,
         .log_first_wait = true,
         .log_drops = true,
@@ -128,6 +176,16 @@ static void bufmgr_build_budget_configs(buffer_config_t *configs, uint32_t budge
     configs[BUF_RECORD_A] = (buffer_config_t){ .name = "record_a", .size = record_size, .lazy_init = true };
     configs[BUF_RECORD_B] = (buffer_config_t){ .name = "record_b", .size = record_size, .lazy_init = true };
     configs[BUF_DISPLAY] = (buffer_config_t){ .name = "display", .size = display, .lazy_init = false };
+    /* Independent playback FIFOs: lazy, capped at a quarter of the RF size
+     * so a 1 GB-budget session still gets meaningful per-channel rings. */
+    size_t playback_rf = rf / 4;
+    size_t playback_display = display / 4;
+    if (playback_rf < 16 * BUFMGR_MB) playback_rf = 16 * BUFMGR_MB;
+    if (playback_display < 4 * BUFMGR_MB) playback_display = 4 * BUFMGR_MB;
+    configs[BUF_CAPTURE_RF_A] = (buffer_config_t){ .name = "playback_rf_a", .size = playback_rf, .lazy_init = true };
+    configs[BUF_CAPTURE_RF_B] = (buffer_config_t){ .name = "playback_rf_b", .size = playback_rf, .lazy_init = true };
+    configs[BUF_DISPLAY_A] = (buffer_config_t){ .name = "playback_display_a", .size = playback_display, .lazy_init = true };
+    configs[BUF_DISPLAY_B] = (buffer_config_t){ .name = "playback_display_b", .size = playback_display, .lazy_init = true };
 }
 
 int bufmgr_init_for_budget(buffer_manager_t *mgr, uint32_t budget_gb) {
@@ -519,10 +577,7 @@ rb_event_t *bufmgr_get_space_event(buffer_manager_t *mgr, buffer_id_t id) {
 size_t bufmgr_fill_level(buffer_manager_t *mgr, buffer_id_t id) {
     if (!mgr || id >= BUF_COUNT || !mgr->initialized[id]) return 0;
 
-    ringbuffer_t *rb = &mgr->buffers[id];
-    size_t head = atomic_load(&rb->head);
-    size_t tail = atomic_load(&rb->tail);
-    return tail - head;
+    return rb_fill_level(&mgr->buffers[id]);
 }
 
 float bufmgr_fill_percent(buffer_manager_t *mgr, buffer_id_t id) {

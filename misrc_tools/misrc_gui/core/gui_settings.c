@@ -1,3 +1,4 @@
+#include "../net/gui_monitor_settings.h"
 /*
  * MISRC GUI - Settings Persistence
  * 16/02/25 - Remediate Win settings not saving - %appdata%
@@ -526,6 +527,8 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     settings->resample_gain_b = 0.0f;     // No gain
 #ifdef ENABLE_DDD
     settings->ddd_decimation = DDD_DECIMATION_FULL_RATE;
+    settings->ddd_use_winusb = false;
+    settings->ddd_libusb_raw_io = false;
 #endif
     
     // FLAC defaults
@@ -618,9 +621,12 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     // loads (0=PAL, 1=NTSC, 2=SECAM - the CVBS System selector's space).
     settings->video_system = 0;
 
+    // Test Gen default tape format: VHS (0=VHS..4=Hi8).
+    settings->gen_tape_format = 0;
+
     // Server/Client networking defaults (cxadc_vhs_server-style). Stock mode
     // is Local (no networking). Default port 8080 mirrors the reference server.
-    settings->net_mode = 0;                     // 0=Local, 1=Server, 2=Client
+    settings->net_mode = 0;                     // 0=Local, 1=unified Server, 2=Client, 3=old Server ID, 4=M-Client
     settings->net_server_port = 8080;
     snprintf(settings->net_server_port_str, sizeof(settings->net_server_port_str), "%u",
              (unsigned)settings->net_server_port);
@@ -640,10 +646,27 @@ static void gui_settings_write_string(FILE *f, const char *key, const char *valu
     fprintf(f, "\"%s\n", comma ? "," : "");
 }
 
+/* Preserve local capture preferences: remote M-Server fields must never be
+ * persisted over the Windows user's independent Local/Client profile. */
+static gui_settings_t s_monitor_local_profile;
+static bool s_monitor_local_profile_valid=false;
 // Simple JSON-like format for settings
 // 16.02.25 - Remediate Win save
+void gui_settings_restore_monitor_profile(gui_settings_t *settings){
+    if(settings && s_monitor_local_profile_valid)
+        gui_monitor_settings_copy(settings,&s_monitor_local_profile);
+}
 void gui_settings_save(const gui_settings_t *settings) {
     if (!settings) return;
+    gui_settings_t persisted;
+    if(settings->net_mode==4 && s_monitor_local_profile_valid){
+        persisted=*settings;
+        gui_monitor_settings_copy(&persisted,&s_monitor_local_profile);
+        settings=&persisted;
+    }else if(settings->net_mode!=4){
+        gui_monitor_settings_copy(&s_monitor_local_profile,settings);
+        s_monitor_local_profile_valid=true;
+    }
     
     const char* path = get_settings_file_path();
     if (!gui_settings_ensure_parent_dirs(path)) {
@@ -736,6 +759,8 @@ void gui_settings_save(const gui_settings_t *settings) {
     fprintf(f, "  \"resample_gain_b\": %.1f,\n", settings->resample_gain_b);
 #ifdef ENABLE_DDD
     fprintf(f, "  \"ddd_decimation\": %u,\n", (unsigned)settings->ddd_decimation);
+    fprintf(f, "  \"ddd_use_winusb\": %s,\n", settings->ddd_use_winusb ? "true" : "false");
+    fprintf(f, "  \"ddd_libusb_raw_io\": %s,\n", settings->ddd_libusb_raw_io ? "true" : "false");
 #endif
     fprintf(f, "  \"use_flac\": %s,\n", settings->use_flac ? "true" : "false");
     fprintf(f, "  \"flac_12bit\": %s,\n", settings->flac_12bit ? "true" : "false");
@@ -776,6 +801,7 @@ void gui_settings_save(const gui_settings_t *settings) {
     fprintf(f, "  \"demod_volume\": %.3f,\n", settings->demod_volume);
     fprintf(f, "  \"demod_output_pair\": %d,\n", settings->demod_output_pair);
     fprintf(f, "  \"video_system\": %d,\n", settings->video_system);
+    fprintf(f, "  \"gen_tape_format\": %d,\n", settings->gen_tape_format);
     // Server/Client networking (cxadc_vhs_server-style peer mode).
     fprintf(f, "  \"net_mode\": %d,\n", settings->net_mode);
     fprintf(f, "  \"net_server_port\": %u,\n", (unsigned)settings->net_server_port);
@@ -783,6 +809,8 @@ void gui_settings_save(const gui_settings_t *settings) {
     gui_settings_write_string(f, "net_client_host", settings->net_client_host, true);
     fprintf(f, "  \"net_client_port\": %u,\n", (unsigned)settings->net_client_port);
     gui_settings_write_string(f, "net_client_port_str", settings->net_client_port_str, true);
+    gui_settings_write_string(f, "monitor_local_save_path", settings->monitor_local_save_path, true);
+    fprintf(f,"  \"monitor_local_save_enabled\": %s,\n",settings->monitor_local_save_enabled?"true":"false");
     gui_settings_write_string(f, "playback_file_a", settings->playback_file_a, true);
     gui_settings_write_string(f, "playback_file_b", settings->playback_file_b, true);
     gui_settings_write_string(f, "playback_audio_file", settings->playback_audio_file, false);
@@ -984,10 +1012,18 @@ static bool gui_settings_pick_path(char *picked, size_t cap, bool folder) {
             IFileOpenDialog_GetOptions(pfd, &options);
             IFileOpenDialog_SetOptions(pfd, options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
         } else {
-            COMDLG_FILTERSPEC filter = { L"FLAC files", L"*.flac" };
-            IFileOpenDialog_SetFileTypes(pfd, 1, &filter);
+            const COMDLG_FILTERSPEC filters[] = {
+                { L"Supported playback files", L"*.flac;*.ldf;*.oga;*.ogg;*.wav;*.lds;*.u8;*.r8;*.8u;*.s8;*.8s;*.u16;*.r16;*.16u;*.s16;*.16s;*.raw;*.bin;*.pcm" },
+                { L"LDS RF captures (*.lds)", L"*.lds" },
+                { L"FLAC / LDF files", L"*.flac;*.ldf;*.oga;*.ogg" },
+                { L"WAV files (*.wav)", L"*.wav" },
+                { L"Raw RF samples", L"*.u8;*.r8;*.8u;*.s8;*.8s;*.u16;*.r16;*.16u;*.s16;*.16s;*.raw;*.bin;*.pcm" },
+                { L"All files (*.*)", L"*.*" }
+            };
+            IFileOpenDialog_SetFileTypes(pfd, (UINT)(sizeof(filters) / sizeof(filters[0])), filters);
+            IFileOpenDialog_SetFileTypeIndex(pfd, 1);
         }
-        IFileOpenDialog_SetTitle(pfd, folder ? L"Select output folder for MISRC captures" : L"Select FLAC playback file");
+        IFileOpenDialog_SetTitle(pfd, folder ? L"Select output folder for MISRC captures" : L"Select RF / audio playback file");
         if (SUCCEEDED(IFileOpenDialog_Show(pfd, NULL))) {
             IShellItem *psi = NULL;
             if (SUCCEEDED(IFileOpenDialog_GetResult(pfd, &psi))) {
@@ -1007,7 +1043,7 @@ static bool gui_settings_pick_path(char *picked, size_t cap, bool folder) {
 #ifdef __APPLE__
     const char *cmd = folder
         ? "osascript -e 'POSIX path of (choose folder with prompt \"Select output folder for MISRC captures\")'"
-        : "osascript -e 'POSIX path of (choose file with prompt \"Select FLAC playback file\")'";
+        : "osascript -e 'POSIX path of (choose file with prompt \"Select RF / audio playback file\")'";
 #else
     const char *cmd = folder
         ? "sh -c 'if command -v zenity >/dev/null 2>&1; then "
@@ -1015,9 +1051,21 @@ static bool gui_settings_pick_path(char *picked, size_t cap, bool folder) {
           "elif command -v kdialog >/dev/null 2>&1; then "
           "kdialog --getexistingdirectory \"$HOME\" \"Select output folder for MISRC captures\"; fi'"
         : "sh -c 'if command -v zenity >/dev/null 2>&1; then "
-          "zenity --file-selection --title=\"Select FLAC playback file\" --file-filter=\"*.flac\"; "
+          "zenity --file-selection --title=\"Select RF / audio playback file\" "
+          "--file-filter=\"Supported playback files | *.flac *.ldf *.oga *.ogg *.wav *.lds *.u8 *.r8 *.8u *.s8 *.8s *.u16 *.r16 *.16u *.s16 *.16s *.raw *.bin *.pcm\" "
+          "--file-filter=\"LDS RF captures | *.lds\" "
+          "--file-filter=\"FLAC / LDF files | *.flac *.ldf *.oga *.ogg\" "
+          "--file-filter=\"WAV files | *.wav\" "
+          "--file-filter=\"Raw RF samples | *.u8 *.r8 *.8u *.s8 *.8s *.u16 *.r16 *.16u *.s16 *.16s *.raw *.bin *.pcm\" "
+          "--file-filter=\"All files | *\"; "
           "elif command -v kdialog >/dev/null 2>&1; then "
-          "kdialog --getopenfilename \"$HOME\" \"*.flac|FLAC files (*.flac)\"; fi'";
+          "kdialog --getopenfilename \"$HOME\" "
+          "\"Supported playback files (*.flac *.ldf *.oga *.ogg *.wav *.lds *.u8 *.r8 *.8u *.s8 *.8s *.u16 *.r16 *.16u *.s16 *.16s *.raw *.bin *.pcm)\n"
+          "LDS RF captures (*.lds)\n"
+          "FLAC / LDF files (*.flac *.ldf *.oga *.ogg)\n"
+          "WAV files (*.wav)\n"
+          "Raw RF samples (*.u8 *.r8 *.8u *.s8 *.8s *.u16 *.r16 *.16u *.s16 *.16s *.raw *.bin *.pcm)\n"
+          "All files (*)\"; fi'";
 #endif
     FILE *fp = popen(cmd, "r");
     if (!fp) return false;
@@ -1080,6 +1128,8 @@ void gui_settings_load(gui_settings_t *settings) {
     
     // Start with defaults
     gui_settings_init_defaults(settings);
+    gui_monitor_settings_copy(&s_monitor_local_profile,settings);
+    s_monitor_local_profile_valid=true;
     
     const char* path = get_settings_file_path();
     FILE* f = file_open_utf8(path, "rb");
@@ -1257,6 +1307,12 @@ void gui_settings_load(gui_settings_t *settings) {
         if (ddd_decimation_is_supported(factor)) {
             settings->ddd_decimation = factor;
         }
+    }
+    if ((value = find_value(content, "ddd_use_winusb")) != NULL) {
+        settings->ddd_use_winusb = (strcmp(value, "true") == 0);
+    }
+    if ((value = find_value(content, "ddd_libusb_raw_io")) != NULL) {
+        settings->ddd_libusb_raw_io = (strcmp(value, "true") == 0);
     }
 #endif
 
@@ -1504,16 +1560,22 @@ void gui_settings_load(gui_settings_t *settings) {
         settings->demod_output_pair = atoi(value);
     }
     // Video panel: the CVBS System selector's persisted pick; an invalid
-    // saved value keeps the PAL default.
+    // saved value keeps the PAL default. (The generator Gen box may store
+    // 3 = MESECAM here - RF-only, composite maps it to SECAM.)
     if ((value = find_value(content, "video_system")) != NULL) {
         int sys = atoi(value);
-        if (sys >= 0 && sys <= 2) settings->video_system = sys;
+        if (sys >= 0 && sys <= 3) settings->video_system = sys;
+    }
+    // Test Gen tape format family; an invalid saved value keeps VHS.
+    if ((value = find_value(content, "gen_tape_format")) != NULL) {
+        int fmt = atoi(value);
+        if (fmt >= 0 && fmt <= 4) settings->gen_tape_format = fmt;
     }
 
     // Server/Client networking (cxadc_vhs_server-style peer mode).
     if ((value = find_value(content, "net_mode")) != NULL) {
         int mode = atoi(value);
-        if (mode < 0 || mode > 2) mode = 0;
+        if (mode < 0 || mode > 4) mode = 0;
         settings->net_mode = mode;
     }
     if ((value = find_value(content, "net_server_port")) != NULL) {
@@ -1534,6 +1596,12 @@ void gui_settings_load(gui_settings_t *settings) {
     }
     if ((value = find_value(content, "net_client_port_str")) != NULL) {
         gui_settings_load_string(settings->net_client_port_str, sizeof(settings->net_client_port_str), value);
+    }
+    if ((value = find_value(content,"monitor_local_save_enabled")) != NULL) {
+        settings->monitor_local_save_enabled = (strncmp(value,"true",4)==0 || atoi(value)==1);
+    }
+    if ((value = find_value(content, "monitor_local_save_path")) != NULL) {
+        gui_settings_load_string(settings->monitor_local_save_path, sizeof(settings->monitor_local_save_path), value);
     }
     // Re-sync port string mirrors if the numeric port was loaded but the
     // string mirror was absent/empty (older settings files).
@@ -1563,6 +1631,8 @@ void gui_settings_load(gui_settings_t *settings) {
 
     // Keep auto-derived names in sync on startup (RF prefixes are conditional on empty RF tags).
     gui_settings_refresh_auto_names(settings);
+    gui_monitor_settings_copy(&s_monitor_local_profile,settings);
+    s_monitor_local_profile_valid=true;
 
     free(content);
 }

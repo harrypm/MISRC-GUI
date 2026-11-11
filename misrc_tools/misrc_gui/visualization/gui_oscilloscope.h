@@ -28,6 +28,17 @@ void gui_waveform_panel_register(void);
 #define SCOPE_BLOOM             2.0f    // Bloom factor
 
 //-----------------------------------------------------------------------------
+// Generator Default Channel Mapping
+//-----------------------------------------------------------------------------
+
+// Default the waveform monitors to the Test Gen channel mapping (CH1 = CVBS
+// on channel A, CH2 = FM RF on channel B) when the Simulated device starts.
+// Only waveform panels still in Raw state are assigned; user selections are
+// never overwritten. Called from gui_app_start_capture after
+// gui_simulated_start() succeeds.
+void gui_waveform_apply_generator_defaults(gui_app_t *app);
+
+//-----------------------------------------------------------------------------
 // Cleanup
 //-----------------------------------------------------------------------------
 
@@ -66,5 +77,14 @@ ssize_t find_trigger_point(const int16_t *buf, size_t count,
 void gui_waveform_set_trigger_source_buffers(const int16_t *samples_ch1,
                                              const int16_t *samples_ch2,
                                              size_t count);
+
+/* M-Server uses Harry's waveform resampler/trigger CPU path. */
+#include "../net/gui_remote_display.h"
+size_t gui_waveform_server_display_points(const int16_t *src,const int16_t *a,
+    const int16_t *b,size_t count,uint32_t sample_rate,
+    const gui_rd_config_t *cfg,float out[GUI_RD_WIDTH],int32_t *trigger_pos);
+void gui_waveform_remote_apply_points(void *state,const gui_rd_channel_t *data,
+                                     uint32_t sequence);
+void gui_waveform_remote_publish_config(void *state,int channel);
 
 #endif // GUI_OSCILLOSCOPE_H

@@ -98,6 +98,24 @@ static void test_helpers(void)
 {
     char s[32];
 
+    snprintf(s, sizeof(s), "stale output");
+    assert(gui_updater_run_command(NULL, s, sizeof(s)) == -1);
+    assert(s[0] == '\0');
+#if defined(_WIN32)
+    assert(gui_updater_run_command("misrc-updater-nonexistent-tool.exe", s, sizeof(s)) == -1);
+    assert(s[0] == '\0');
+    assert(gui_updater_run_command("cmd.exe /d /c \"exit /b 7\"", NULL, 0) == 7);
+    HANDLE saved_error = GetStdHandle(STD_ERROR_HANDLE);
+    assert(SetStdHandle(STD_ERROR_HANDLE, (HANDLE)(UINT_PTR)1));
+    int no_error_handle = gui_updater_run_command("cmd.exe /d /c \"exit /b 7\"", NULL, 0);
+    assert(SetStdHandle(STD_ERROR_HANDLE, saved_error));
+    assert(no_error_handle == 7);
+    /* A short capture buffer must still drain output beyond the pipe capacity. */
+    assert(gui_updater_run_command(
+        "cmd.exe /d /c \"for /L %i in (1,1,1000) do @echo payload\"", s, 5) == 0);
+    assert(!strcmp(s, "payl"));
+#endif
+
     snprintf(s, sizeof(s), "  v1.2.6 \t\r\n");
     gui_updater_trim_ascii_whitespace_inplace(s);
     assert(!strcmp(s, "v1.2.6"));
@@ -135,10 +153,24 @@ static void test_versions_and_tags(void)
     assert(gui_updater_compare_versions("v1.2.6", "v1.2.6") == 0);
     assert(gui_updater_compare_versions("v1.3.0", "v1.2.9") > 0);
     assert(gui_updater_compare_versions("v2.0.0", "v10.0.0") < 0);
-    /* Dev builds fall back to text compare: "dev-..." < "v1.2.6" ('d' < 'v'),
-     * so a dev build still sees the release as an update. */
-    assert(gui_updater_compare_versions("dev-2026-10-21-abcdef", "v1.2.6") < 0);
-    assert(gui_updater_compare_versions("v1.2.6", "dev-2026-10-21-abcdef") > 0);
+    /* Dev/unversioned builds are NOT comparable: never older, never newer.
+     * (The old lexical fallback ('d' < 'v') made every dev build permanently
+     * report "update available" against the current release.) */
+    assert(gui_updater_compare_versions("dev-2026-10-21-abcdef", "v1.2.6") == 0);
+    assert(gui_updater_compare_versions("dev-2026-10-21-abcdef-dirty", "v1.2.6") == 0);
+    assert(gui_updater_compare_versions("unknown_version", "v1.2.6") == 0);
+    assert(gui_updater_compare_versions("dev-2026-10-21-abcdef", "v99.99.99") == 0);
+    /* A comparable current against a non-semver latest keeps the text edge. */
+    assert(gui_updater_compare_versions("v1.2.6", "weird-tag") < 0);
+    assert(gui_updater_compare_versions("v1.2.6", "aaaa") > 0);
+
+    assert(gui_updater_version_is_comparable("v1.2.6"));
+    assert(gui_updater_version_is_comparable("1.10.0"));
+    assert(!gui_updater_version_is_comparable("dev-2026-10-21-abcdef"));
+    assert(!gui_updater_version_is_comparable("dev-2026-10-21-abcdef-dirty"));
+    assert(!gui_updater_version_is_comparable("unknown_version"));
+    assert(!gui_updater_version_is_comparable(""));
+    assert(!gui_updater_version_is_comparable(NULL));
 
     assert(gui_updater_is_release_tag_safe("v1.2.6"));
     assert(gui_updater_is_release_tag_safe("v1.2.6-rc1"));

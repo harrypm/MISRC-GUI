@@ -20,6 +20,7 @@
 #include "../../common/buffer_manager.h"
 #include "../../common/file_utils.h"
 #include "../../common/threading.h"
+#include "../../common/misrc_debug.h"  // gated conv16 decision logging
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -158,20 +159,30 @@ typedef struct playback_ctx {
     atomic_int state;              // playback_state_t
     atomic_int speed;              // playback_speed_t
     atomic_bool loop_enabled;
+    // Per-channel loop (effective only in independent mixed-rate mode with
+    // Link: Separate); Synced mode uses loop_enabled for both channels.
+    atomic_bool channel_loop[2];
+    // An odd token identifies one pending endpoint and its RF stamp cursor.
+    atomic_uint_fast64_t channel_rf_end[2], channel_rf_end_cursor[2];
+    atomic_int ld_audio_channel;  // 0 when unmonitored, 1 for A, 2 for B
+    atomic_uint ld_video_channels;  // bitmask of visible LD routes
+    // Gated diagnostics (MISRC_DEBUG): one-shot on the first conv16
+    // decision, plus a line on every later PROMOTION (quiet-head fix).
+    bool conv16_logged[2];
+    int conv16_prev[2];
     // Seek-while-paused backfill: decode the window ENDING at the seek target
     // and push it through the pipeline so the panels show the real timeline at
     // the playhead (DAW-style non-linear scrub), then hold. The spectrogram
     // clears its rolling history on the position jump (gui_spectrogram.c).
     bool backfill_active_a;
+    bool backfill_resume_a;
     uint64_t backfill_target_a;
     bool backfill_active_b;
+    bool backfill_resume_b;
     uint64_t backfill_target_b;
     atomic_uint_fast64_t seek_seq_a;  // Incremented on every successful CH A seek
     atomic_uint_fast64_t seek_seq_b;  // Incremented on every successful CH B seek
-    atomic_bool seek_requested_a;
-    atomic_bool seek_requested_b;
-    atomic_uint_fast64_t seek_target_a;
-    atomic_uint_fast64_t seek_target_b;
+    atomic_uint_fast64_t pending_seek[2];
 
     // Position tracking
     atomic_uint_fast64_t current_sample;
@@ -191,8 +202,11 @@ typedef struct playback_ctx {
     gui_app_t *app;
 } playback_ctx_t;
 
-static playback_ctx_t s_idle_playback = {0};
+// A valid seek is always below the file's total sample count.
+#define PLAYBACK_NO_SEEK UINT64_MAX
+static playback_ctx_t s_idle_playback = {.pending_seek = {PLAYBACK_NO_SEEK, PLAYBACK_NO_SEEK}};
 static playback_ctx_t *s_playback = &s_idle_playback;
+static atomic_uint_fast64_t s_rf_end_sequence;
 
 // The render thread owns the job and active-context pointer. The loader only
 // writes its private prepared context; done publishes its result to UI polling.
@@ -292,9 +306,9 @@ const char* gui_playback_speed_name(playback_speed_t speed) {
 // from the first non-silent block and is sticky for the channel's session.
 #define PLAYBACK_CONV16_PENDING 0
 #define PLAYBACK_CONV16_SHIFT4 1  // recorder 12-bit << 4 restore (or full-range display downscale)
-#define PLAYBACK_CONV16_PASS   2  // direct-domain values: pass through unchanged
+#define PLAYBACK_CONV16_PASS   2  // container-domain values stored raw (incl. externally RESAMPLED captures): clamp overshoot to the container rails
 #define PLAYBACK_CONV16_DECIDE_FLOOR 16  // a block peaking below this is inconclusive (silence)
-#define PLAYBACK_CONV16_DIRECT_MAX 4096 // direct-domain peak ceiling (13-bit domain)
+#define PLAYBACK_CONV16_DIRECT_MAX 4096 // above this a non-grid file is full-range generic 16-bit
 // These constants and the unguarded ctx->conv16_state member are
 // dependency-independent (FLAC frames and raw s16/WAV16 reads share the
 // sticky detector) and gui_playback_release_context() resets the state
@@ -1067,14 +1081,26 @@ static bool gui_playback_parse_frame_header(const uint8_t *w, size_t len,
     return true;
 }
 
-// Decide (or keep) the 16-bit conversion mode from one frame/block of samples.
-// Thresholds, chosen from the measured files:
+// Decide (or keep) the 16-bit conversion mode from one frame/block of
+// samples. EVERY convention normalizes into the 12-bit display container so
+// playback always shows the capture at its live scale (user rule 2026-11-03:
+// "captures should always look like live ... 8/12/16-bit in/out should
+// match"). Thresholds, chosen from the measured files:
 //   - every sample == 0 (mod 16): the recorder's << 4 grid -> >> 4 restore
 //     (RF noise never lands on that grid by chance; a quiet recorder capture
 //     is still all-mod-16, so this decision never depends on level)
-//   - otherwise peak <= 4096: direct-domain storage (the tape file peaks at
-//     +-2190) -> pass through unchanged
-//   - otherwise: full-range generic 16-bit -> >> 4 display-container downscale
+//   - non-grid peak <= 4096: container-domain values stored raw. This is
+//     the RESAMPLED-capture class (user-confirmed 2026-11-03: "it is 8-bit
+//     data" - an 8/12-bit capture externally resampled, e.g. 40->20 msps):
+//     the resample broke the 16-grid (93.75% non-mod-16 on the measured
+//     file) and its filter ripple overshoots the capture's rails (~+9%,
+//     peak +-2216 on +-2032 rails). Pass through at container scale;
+//     apply_conv16 clamps the overshoot to the container rails exactly like
+//     the recorder's own resample path (convert_i16_to_flac_i32: "the soxr
+//     resampler can overshoot the 12-bit range on clipped input ... Clamp
+//     to the signed 12-bit range").
+//   - otherwise (peak > 4096): full-range generic 16-bit -> >> 4 display-
+//     container downscale
 // A block whose peak stays under 16 (digital silence) leaves the decision
 // pending: zero samples convert identically under every convention, so a
 // silent lead can never mislead the detector.
@@ -1094,10 +1120,19 @@ static void gui_playback_decide_conv16(int *state, const int32_t *in, uint32_t s
 }
 
 static int16_t gui_playback_apply_conv16(int state, int32_t v) {
-    // PASS keeps direct-domain values (encode_raw_sample clamps into the raw
-    // 12-bit packing domain downstream); SHIFT4 covers both the recorder
-    // restore and the full-range display downscale in one operation.
-    return state == PLAYBACK_CONV16_PASS ? (int16_t)v : (int16_t)(v >> 4);
+    // PASS: container-domain values, with resampler overshoot clamped back
+    // to the container rails - the same clamp the recorder's resample path
+    // applies when writing (so an externally-resampled capture plays back
+    // exactly as if the recorder had resampled it). SHIFT4 covers both the
+    // recorder restore and the full-range display downscale. Every branch's
+    // output lives in the 12-bit container (in = out at every bit depth),
+    // so nothing downstream needs to know the source convention.
+    if (state == PLAYBACK_CONV16_PASS) {
+        if (v > 2047) v = 2047;
+        if (v < -2048) v = -2048;
+        return (int16_t)v;
+    }
+    return (int16_t)(v >> 4);
 }
 
 // Map a signed sample of `bits` width (<= 12) into the 12-bit container by
@@ -1558,8 +1593,10 @@ static size_t gui_playback_raw_read(playback_ctx_t *ctx, int channel, int16_t *o
                 } else if (width == 2) {
                     // 16-bit signed sources (raw s16 / WAV16) share the FLAC
                     // write-callback convention detector: recorder 12-bit
-                    // << 4 grid (>> 4 restore) vs direct-domain values (pass
-                    // through) vs full-range (>> 4 display downscale).
+                    // << 4 grid (>> 4 restore) vs container-compatible
+                    // direct values (pass through) vs 13-bit domain (>> 1)
+                    // vs full-range (>> 4 display downscale). Every branch
+                    // lands in the 12-bit container.
                     int32_t wide[sizeof(buf) / 2];
                     for (size_t i = 0; i < items; i++) {
                         wide[i] = (int32_t)(int16_t)((uint16_t)buf[2 * i] | ((uint16_t)buf[2 * i + 1] << 8));
@@ -2347,6 +2384,10 @@ static bool gui_playback_ogg_remux(const char *src, uint64_t file_size,
                 carry_len += seg;
                 pos += seg;
                 if (pg.segments[s] == 255) continue;
+                // Ogg permits nil packets, including an empty EOS terminator.
+                // A zero lace also completes nonempty packets of size 255*n;
+                // only the accumulated packet length distinguishes the two.
+                if (carry_len == 0) continue;
 
                 uint16_t block_size = 0;
                 size_t header_len = 0;
@@ -3496,26 +3537,32 @@ static FLAC__StreamDecoderWriteStatus decoder_write_cb_a(
     // amplitude - the waveform-playback accuracy bug - so the convention
     // is detected from the first non-silent frame and is sticky per
     // channel per file (see gui_playback_decide_conv16):
-    //   16-bit FLAC: recorder 12-bit container << 4 -> >> 4 restore; direct-
-    //               domain values -> pass through; full-range generic ->
-    //               >> 4 display downscale
+    //   16-bit FLAC: recorder 12-bit container << 4 -> >> 4 restore;
+    //               container-domain values stored raw (incl. externally
+    //               resampled 8/12-bit captures; overshoot clamped to the
+    //               container rails); full-range generic -> >> 4
     //   12-bit FLAC: 12-bit container as-is (range -2048 to 2047)
     //   8-bit FLAC:  12-bit container >> 4 -> << 4 restore (also the correct
     //               display scaling for generic full-range 8-bit audio)
     if (bps == 16) {
+        // Every convention lands in the 12-bit container via the single
+        // shared converter (recorder >>4 restore, container-domain raw
+        // with rail clamp, full-range >>4 downscale).
         gui_playback_decide_conv16(&ctx->conv16_state[0], in, samples);
-        if (ctx->conv16_state[0] == PLAYBACK_CONV16_PASS) {
-            // Direct-domain values: pass through unchanged (encode_raw_sample
-            // clamps into the raw 12-bit packing domain downstream).
-            for (uint32_t i = 0; i < samples; i++) {
-                out[i] = (int16_t)in[i];
+        if (ctx->conv16_state[0] != ctx->conv16_prev[0]) {
+            if (misrc_debug_enabled() &&
+                (ctx->conv16_state[0] != PLAYBACK_CONV16_PENDING ||
+                 !ctx->conv16_logged[0])) {
+                fprintf(stderr, "[PLAYBACK] conv16 CH A -> %s\n",
+                        ctx->conv16_state[0] == PLAYBACK_CONV16_SHIFT4 ? "SHIFT4 (>>4)"
+                        : ctx->conv16_state[0] == PLAYBACK_CONV16_PASS ? "PASS (raw, rail-clamped)"
+                        : "PENDING");
             }
-        } else {
-            // Recorder << 4 restore, or a full-range generic file scaled
-            // down into the 12-bit display container: both >> 4.
-            for (uint32_t i = 0; i < samples; i++) {
-                out[i] = (int16_t)(in[i] >> 4);
-            }
+            ctx->conv16_prev[0] = ctx->conv16_state[0];
+            ctx->conv16_logged[0] = true;
+        }
+        for (uint32_t i = 0; i < samples; i++) {
+            out[i] = gui_playback_apply_conv16(ctx->conv16_state[0], in[i]);
         }
     } else if (bps == 12) {
         // 12-bit FLAC: already in 12-bit range, just cast
@@ -3576,19 +3623,25 @@ static FLAC__StreamDecoderWriteStatus decoder_write_cb_b(
         debug_count_b++;
     }
 
-    // Same convention detection as Channel A (see the write-callback note
-    // there): restore the 12-bit container for recorder files, pass direct-
-    // domain 16-bit values through, downscale full-range generic 16-bit.
+    // Same convention handling as Channel A (see the write-callback note
+    // there): every 16-bit convention lands in the 12-bit container via the
+    // single shared converter.
     if (bps == 16) {
         gui_playback_decide_conv16(&ctx->conv16_state[1], in, samples);
-        if (ctx->conv16_state[1] == PLAYBACK_CONV16_PASS) {
-            for (uint32_t i = 0; i < samples; i++) {
-                out[i] = (int16_t)in[i];
+        if (ctx->conv16_state[1] != ctx->conv16_prev[1]) {
+            if (misrc_debug_enabled() &&
+                (ctx->conv16_state[1] != PLAYBACK_CONV16_PENDING ||
+                 !ctx->conv16_logged[1])) {
+                fprintf(stderr, "[PLAYBACK] conv16 CH B -> %s\n",
+                        ctx->conv16_state[1] == PLAYBACK_CONV16_SHIFT4 ? "SHIFT4 (>>4)"
+                        : ctx->conv16_state[1] == PLAYBACK_CONV16_PASS ? "PASS (raw, rail-clamped)"
+                        : "PENDING");
             }
-        } else {
-            for (uint32_t i = 0; i < samples; i++) {
-                out[i] = (int16_t)(in[i] >> 4);
-            }
+            ctx->conv16_prev[1] = ctx->conv16_state[1];
+            ctx->conv16_logged[1] = true;
+        }
+        for (uint32_t i = 0; i < samples; i++) {
+            out[i] = gui_playback_apply_conv16(ctx->conv16_state[1], in[i]);
         }
     } else if (bps == 12) {
         // 12-bit FLAC: already in 12-bit range, just cast
@@ -4554,7 +4607,8 @@ static bool gui_playback_seek_attempt(playback_ctx_t *ctx, int channel, uint64_t
 // A provisional endpoint may be too long. Never leave SEEK_ERROR, an empty
 // apparent success, or a made-up target cursor behind. Flush retains immutable
 // STREAMINFO and avoids re-running metadata callbacks on active UI-owned info.
-static bool gui_playback_seek_decoder(playback_ctx_t *ctx, int channel, uint64_t target) {
+static bool gui_playback_seek_decoder(playback_ctx_t *ctx, int channel,
+                                      uint64_t target, uint64_t start) {
     FLAC__StreamDecoder *decoder = channel == 1 ? ctx->decoder_b : ctx->decoder_a;
     if (!decoder) return false;
     uint64_t previous = atomic_load(channel == 1 ? &ctx->current_sample_b : &ctx->current_sample_a);
@@ -4564,7 +4618,11 @@ static bool gui_playback_seek_decoder(playback_ctx_t *ctx, int channel, uint64_t
         (ctx->loaded_key_valid[channel] && FLAC__stream_decoder_get_decode_position(decoder, &boundary) &&
          boundary == ctx->loaded_key[channel].file_size));
     ctx->seek_recovery_failed[channel] = false;
-    if (gui_playback_seek_attempt(ctx, channel, target)) return true;
+    // Validate the exact target before an optional preroll. Restore the
+    // original cursor if either step fails, even if validation left PCM
+    // buffered where the decoder was previously at EOF.
+    if (gui_playback_seek_attempt(ctx, channel, target) &&
+        (start == target || gui_playback_seek_attempt(ctx, channel, start))) return true;
     bool restored = FLAC__stream_decoder_flush(decoder) &&
         gui_playback_seek_attempt(ctx, channel, previous_eof && previous ? previous - 1 : previous);
     if (restored && previous_eof) {
@@ -4616,6 +4674,94 @@ static void gui_playback_wait_clock(playback_ctx_t *ctx, uint64_t deadline, void
 #endif
     }
 }
+// Bound the hold if the monitor device or GUI can no longer acknowledge EOF.
+#define PLAYBACK_LD_LOOP_DRAIN_US UINT64_C(2000000)
+
+static uint_fast64_t gui_playback_next_rf_end_token(void) {
+    return (atomic_fetch_add(&s_rf_end_sequence, 1) + 1u) * 2u;
+}
+
+static void gui_playback_cancel_rf_end(playback_ctx_t *ctx, int channel) {
+    // Advance even when idle, so a producer that sampled pre-pause state
+    // cannot publish a pending marker after this control canceled it.
+    atomic_store(&ctx->channel_rf_end[channel], gui_playback_next_rf_end_token());
+}
+
+static bool gui_playback_transport_paused(const playback_ctx_t *ctx, int channel) {
+    return atomic_load(&ctx->state) != PLAYBACK_STATE_PLAYING ||
+           atomic_load(&ctx->app->playback_channel_paused[channel]);
+}
+
+static bool gui_playback_ld_tail_needed(const playback_ctx_t *ctx, int channel) {
+    return (atomic_load(&ctx->ld_video_channels) & (1u << channel)) ||
+           atomic_load(&ctx->ld_audio_channel) == channel + 1;
+}
+
+static bool gui_playback_hold_ld_loop_tail(playback_ctx_t *ctx, int channel,
+                                           uint64_t deadline) {
+    if ((atomic_load(&ctx->channel_rf_end[channel]) & 1u) &&
+        gui_playback_ld_tail_needed(ctx, channel) &&
+        atomic_load(&ctx->channel_loop[channel]) &&
+        (gui_playback_clock_us() < deadline ||
+         (atomic_load(&ctx->ld_audio_channel) == channel + 1 && gui_audio_ld_tail_pending())))
+        return true;
+    // A canceled endpoint can mean Pause, rather than an ACK to rewind.
+    // Read the current flags after reading the endpoint, before advancing.
+    return gui_playback_transport_paused(ctx, channel);
+}
+
+#if LIBFLAC_ENABLED == 1
+static bool gui_playback_publish_rf_end(playback_ctx_t *ctx, int channel,
+                                        bool independent, uint_fast64_t expected) {
+    if (gui_playback_transport_paused(ctx, channel)) return false;
+    if (expected & 1u) return atomic_load(&ctx->channel_rf_end[channel]) == expected;
+    atomic_store(&ctx->channel_rf_end_cursor[channel],
+                 gui_extract_playback_stamps_written(independent ? channel : -1));
+    uint_fast64_t token = gui_playback_next_rf_end_token() | 1u;
+    return atomic_compare_exchange_strong(&ctx->channel_rf_end[channel], &expected, token);
+}
+
+static bool gui_playback_start_ld_loop_tail(playback_ctx_t *ctx, int channel,
+                                            bool independent, uint_fast64_t expected,
+                                            uint64_t *deadline) {
+    if (!gui_playback_ld_tail_needed(ctx, channel)) return false;
+    if (gui_playback_publish_rf_end(ctx, channel, independent, expected))
+        *deadline = gui_playback_clock_us() + PLAYBACK_LD_LOOP_DRAIN_US;
+    return true;  // Hold this batch even if a concurrent control canceled publication.
+}
+
+static bool gui_playback_same_duration(uint64_t samples_a, uint64_t rate_a,
+                                       uint64_t samples_b, uint64_t rate_b) {
+    if (!rate_a || !rate_b) return false;
+    // A capture or resample can round the same time to different native
+    // samples. Allow one sample of the slower clock, including across a
+    // whole-second boundary. Scale only the fractional parts to compare.
+    uint64_t second_a = samples_a / rate_a, second_b = samples_b / rate_b;
+    uint64_t phase_a = samples_a % rate_a * rate_b;
+    uint64_t phase_b = samples_b % rate_b * rate_a;
+    uint64_t tolerance = rate_a > rate_b ? rate_a : rate_b;
+    if (second_a == second_b)
+        return (phase_a > phase_b ? phase_a - phase_b : phase_b - phase_a) <= tolerance;
+    if (second_a < second_b) {
+        uint64_t gap = rate_a * rate_b - phase_a;
+        return second_b - second_a == 1u && gap <= tolerance && phase_b <= tolerance - gap;
+    }
+    uint64_t gap = rate_a * rate_b - phase_b;
+    return second_a - second_b == 1u && gap <= tolerance && phase_a <= tolerance - gap;
+}
+#endif
+
+static void gui_playback_compact_rf_buffer(playback_ctx_t *ctx, int channel) {
+    size_t *position = channel ? &ctx->decode_pos_b : &ctx->decode_pos_a;
+    if (*position <= ctx->decode_buf_size / 2) return;
+    size_t *available = channel ? &ctx->decode_available_b : &ctx->decode_available_a;
+    int16_t *buffer = channel ? ctx->decode_buf_b : ctx->decode_buf_a;
+    size_t remaining = *available - *position;
+    if (remaining) memmove(buffer, buffer + *position, remaining * sizeof(*buffer));
+    *available = remaining;
+    *position = 0;
+}
+
 static int playback_thread_func(void *ctx_ptr) {
     playback_ctx_t *ctx = (playback_ctx_t *)ctx_ptr;
     gui_app_t *app = ctx->app;
@@ -4640,6 +4786,19 @@ static int playback_thread_func(void *ctx_ptr) {
     if (runtime_rate_hz == 0) runtime_rate_hz = PLAYBACK_SAMPLE_RATE * 1000u;
     atomic_store(&app->sample_rate, runtime_rate_hz);
 
+    // Independent mixed-rate mode: each file feeds its own RF FIFO at its
+    // own true rate (see gui_playback_commit). The batch axis is the FASTER
+    // file's clock (the pacing clock); the slower channel consumes a
+    // proportional sample count per batch via the remainder accumulators.
+    const bool independent = atomic_load(&app->playback_independent_mode);
+    const uint64_t max_rate_hz = runtime_rate_hz;
+    uint64_t rate_hz[2] = {(uint64_t)llround(ctx->channel_rate_hz[0]),
+                           (uint64_t)llround(ctx->channel_rate_hz[1])};
+    uint64_t consume_rem[2] = {0, 0};
+    uint64_t ld_loop_drain_deadline[2] = {0, 0};
+    bool ld_loop_linked = false;
+    bool rf_discontinuity[2] = {false, false};
+
     uint64_t batch_count = 0;
     uint64_t epochs[2] = {atomic_load(&app->rf_stream_epoch), atomic_load(&app->rf_stream_epoch)};
     const uint32_t raw_silence = encode_raw_sample(0, 0);
@@ -4654,17 +4813,18 @@ static int playback_thread_func(void *ctx_ptr) {
 #endif
 
     while (atomic_load(&ctx->running)) {
-        // Check for seek requests (must work even while paused)
-        if (atomic_load(&ctx->seek_requested_a)) {
-            uint64_t target = atomic_load(&ctx->seek_target_a);
+        // Seek while paused previews a preroll. Play always starts at its exact target.
+        uint64_t requested_a = atomic_exchange(&ctx->pending_seek[0], PLAYBACK_NO_SEEK);
+        bool seek_a = requested_a != PLAYBACK_NO_SEEK;
+        bool paused_a = gui_playback_transport_paused(ctx, 0);
+        bool resume_a = !seek_a && ctx->backfill_resume_a && !paused_a;
+        if (seek_a || resume_a) {
+            uint64_t target = seek_a ? requested_a : ctx->backfill_target_a;
             uint64_t total_a = atomic_load(&ctx->channel_total_samples[0]);
             if (total_a > 0 && target >= total_a) {
                 target = total_a - 1;
             }
-            atomic_store(&ctx->seek_requested_a, false);
-
-        // 08.2024 - Windows no flac output issue fix
-            bool paused = atomic_load(&ctx->state) == PLAYBACK_STATE_PAUSED;
+            bool paused = seek_a && paused_a;
             uint64_t seek_target = target;
 #if LIBFLAC_ENABLED == 1
             if (paused) {
@@ -4685,24 +4845,30 @@ static int playback_thread_func(void *ctx_ptr) {
                     ctx->decode_pos_a = 0;
                 }
             } else {
-                // Validate the requested playhead before seeking its backfill
-                // window: a provisional endpoint can exceed the real stream.
-                seek_ok = !((paused && seek_target != target &&
-                             !gui_playback_seek_decoder(ctx, 0, target)) ||
-                            !gui_playback_seek_decoder(ctx, 0, seek_target));
+                seek_ok = gui_playback_seek_decoder(ctx, 0, target, seek_target);
             }
             if (!seek_ok) {
                 fprintf(stderr,"[PLAYBACK] Channel A seek failed at sample %llu\n",(unsigned long long)target);
-                if (ctx->seek_recovery_failed[0]) atomic_store(&ctx->state,PLAYBACK_STATE_PAUSED);
+                if (resume_a || (paused && ctx->seek_recovery_failed[0])) {
+                    ctx->backfill_active_a = false;
+                    atomic_store(&app->playback_channel_paused[0], true);
+                } else if (ctx->seek_recovery_failed[0]) {
+                    atomic_store(&ctx->state, PLAYBACK_STATE_PAUSED);
+                }
                 deadline_us = 0; continue;
             }
 #endif
             fprintf(stderr, "[DBGA] seek store %llu (state=%d)\n", (unsigned long long)seek_target, (int)atomic_load(&ctx->state));
+            gui_playback_cancel_rf_end(ctx, 0);
             atomic_store(&ctx->current_sample_a, seek_target);
-            atomic_fetch_add(&ctx->seek_seq_a, 1);
-            ctx->backfill_active_a = paused;
+            if (seek_a) atomic_fetch_add(&ctx->seek_seq_a, 1);
+            ctx->backfill_active_a = ctx->backfill_resume_a = paused;
             ctx->backfill_target_a = target;
             epochs[0] = atomic_fetch_add(&app->rf_stream_epoch, 1) + 1;
+            rf_discontinuity[0] = true;
+            ld_loop_drain_deadline[0] = 0;
+            consume_rem[0] = 0;
+            ld_loop_linked = false;
             deadline_us = 0;
             if (!ctx->file_b) {
                 atomic_store(&ctx->current_sample, seek_target);
@@ -4710,15 +4876,17 @@ static int playback_thread_func(void *ctx_ptr) {
             continue;
         }
 
-        if (atomic_load(&ctx->seek_requested_b)) {
-            uint64_t target = atomic_load(&ctx->seek_target_b);
+        uint64_t requested_b = atomic_exchange(&ctx->pending_seek[1], PLAYBACK_NO_SEEK);
+        bool seek_b = requested_b != PLAYBACK_NO_SEEK;
+        bool paused_b = gui_playback_transport_paused(ctx, 1);
+        bool resume_b = !seek_b && ctx->backfill_resume_b && !paused_b;
+        if (seek_b || resume_b) {
+            uint64_t target = seek_b ? requested_b : ctx->backfill_target_b;
             uint64_t total_b = atomic_load(&ctx->channel_total_samples[1]);
             if (total_b > 0 && target >= total_b) {
                 target = total_b - 1;
             }
-            atomic_store(&ctx->seek_requested_b, false);
-
-            bool paused = atomic_load(&ctx->state) == PLAYBACK_STATE_PAUSED;
+            bool paused = seek_b && paused_b;
             uint64_t seek_target = target;
 #if LIBFLAC_ENABLED == 1
             if (paused) {
@@ -4736,21 +4904,29 @@ static int playback_thread_func(void *ctx_ptr) {
                     ctx->decode_pos_b = 0;
                 }
             } else {
-                seek_ok = !((paused && seek_target != target &&
-                             !gui_playback_seek_decoder(ctx, 1, target)) ||
-                            !gui_playback_seek_decoder(ctx, 1, seek_target));
+                seek_ok = gui_playback_seek_decoder(ctx, 1, target, seek_target);
             }
             if (!seek_ok) {
                 fprintf(stderr,"[PLAYBACK] Channel B seek failed at sample %llu\n",(unsigned long long)target);
-                if (ctx->seek_recovery_failed[1]) atomic_store(&ctx->state,PLAYBACK_STATE_PAUSED);
+                if (resume_b || (paused && ctx->seek_recovery_failed[1])) {
+                    ctx->backfill_active_b = false;
+                    atomic_store(&app->playback_channel_paused[1], true);
+                } else if (ctx->seek_recovery_failed[1]) {
+                    atomic_store(&ctx->state, PLAYBACK_STATE_PAUSED);
+                }
                 deadline_us = 0; continue;
             }
 #endif
+            gui_playback_cancel_rf_end(ctx, 1);
             atomic_store(&ctx->current_sample_b, seek_target);
-            atomic_fetch_add(&ctx->seek_seq_b, 1);
-            ctx->backfill_active_b = paused;
+            if (seek_b) atomic_fetch_add(&ctx->seek_seq_b, 1);
+            ctx->backfill_active_b = ctx->backfill_resume_b = paused;
             ctx->backfill_target_b = target;
             epochs[1] = atomic_fetch_add(&app->rf_stream_epoch, 1) + 1;
+            rf_discontinuity[1] = true;
+            ld_loop_drain_deadline[1] = 0;
+            consume_rem[1] = 0;
+            ld_loop_linked = false;
             deadline_us = 0;
             if (!ctx->file_a) {
                 atomic_store(&ctx->current_sample, seek_target);
@@ -4758,39 +4934,40 @@ static int playback_thread_func(void *ctx_ptr) {
             continue;
         }
 
-        // Check for pause state. While holding (no batches written), keep
-        // the no-data watchdog fed: gui_capture_device_timeout (2 s) would
-        // otherwise fire auto-reconnect "Connection lost" and tear the
-        // playback session down — seen as playback "crashing" and resetting
-        // a couple of seconds after pausing.
-        // A paused scrub keeps the backfill running (window -> playhead),
-        // falling through the hold until the position passes the target.
-        if (atomic_load(&ctx->state) == PLAYBACK_STATE_PAUSED) {
-            if (ctx->backfill_active_a && ctx->file_a &&
-                atomic_load(&ctx->current_sample_a) > ctx->backfill_target_a) {
-                ctx->backfill_active_a = false;
-                fprintf(stderr, "[PLAYBACK] CH A backfill complete at %" PRIu64 "\n",
-                        atomic_load(&ctx->current_sample_a));
-            }
-            if (ctx->backfill_active_b && ctx->file_b &&
-                atomic_load(&ctx->current_sample_b) > ctx->backfill_target_b) {
-                ctx->backfill_active_b = false;
-                fprintf(stderr, "[PLAYBACK] CH B backfill complete at %" PRIu64 "\n",
-                        atomic_load(&ctx->current_sample_b));
-            }
-            if (!ctx->backfill_active_a && !ctx->backfill_active_b) {
-                deadline_us = 0;
-                atomic_store(&app->last_callback_time_ms, get_time_ms());
-                thrd_sleep_ms(10);
-                continue;
-            }
+        // A scrub can backfill a paused track while its peer keeps playing.
+        // Complete each window independently; a scrub never clears pause.
+        if (ctx->backfill_active_a && atomic_load(&ctx->current_sample_a) > ctx->backfill_target_a) {
+            ctx->backfill_active_a = false;
+        }
+        if (ctx->backfill_active_b && atomic_load(&ctx->current_sample_b) > ctx->backfill_target_b) {
+            ctx->backfill_active_b = false;
         }
 
-        // A paused scrub emits only its target channel. Leave the other
-        // decoder, cursor and buffered samples untouched, including at EOF.
+#if LIBFLAC_ENABLED == 1
+        uint_fast64_t end_token_a = atomic_load(&ctx->channel_rf_end[0]);
+        uint_fast64_t end_token_b = atomic_load(&ctx->channel_rf_end[1]);
+#endif
         bool paused_output = atomic_load(&ctx->state) == PLAYBACK_STATE_PAUSED;
-        bool channel_a_active = ctx->file_a && (!paused_output || ctx->backfill_active_a);
-        bool channel_b_active = ctx->file_b && (!paused_output || ctx->backfill_active_b);
+        bool ch_pause_a = atomic_load(&app->playback_channel_paused[0]);
+        bool ch_pause_b = atomic_load(&app->playback_channel_paused[1]);
+        const bool scrub_a = ctx->backfill_active_a;
+        const bool scrub_b = ctx->backfill_active_b;
+        bool channel_a_active = ctx->file_a &&
+            (scrub_a || (!paused_output && !ch_pause_a && !ctx->backfill_resume_a));
+        bool channel_b_active = ctx->file_b &&
+            (scrub_b || (!paused_output && !ch_pause_b && !ctx->backfill_resume_b));
+        const bool loop_tail_a = channel_a_active && ld_loop_drain_deadline[0];
+        const bool loop_tail_b = channel_b_active && ld_loop_drain_deadline[1];
+        const bool hold_tail_a = loop_tail_a &&
+            gui_playback_hold_ld_loop_tail(ctx, 0, ld_loop_drain_deadline[0]);
+        const bool hold_tail_b = loop_tail_b &&
+            gui_playback_hold_ld_loop_tail(ctx, 1, ld_loop_drain_deadline[1]);
+        const bool separate = atomic_load(&app->playback_link_separate);
+        if (ld_loop_linked && (separate || !atomic_load(&ctx->channel_loop[0]) ||
+                               !atomic_load(&ctx->channel_loop[1])))
+            ld_loop_linked = false;
+        if (hold_tail_a || (ld_loop_linked && hold_tail_b)) channel_a_active = false;
+        if (hold_tail_b || (ld_loop_linked && hold_tail_a)) channel_b_active = false;
         if (!channel_a_active && !channel_b_active) {
             deadline_us = 0;
             atomic_store(&app->last_callback_time_ms, get_time_ms());
@@ -4853,31 +5030,97 @@ static int playback_thread_func(void *ctx_ptr) {
 #if LIBFLAC_ENABLED == 1
         // Raw channels end when their reader consumed the exact size-derived
         // total; FLAC channels when the decoder reached end-of-stream.
-        bool eof_a = channel_a_active && avail_a == 0 &&
-                      ((ctx->input_is_raw[0] && gui_playback_raw_eof(ctx, 0)) ||
-                       (ctx->decoder_a != NULL &&
-                        FLAC__stream_decoder_get_state(ctx->decoder_a) == FLAC__STREAM_DECODER_END_OF_STREAM));
-        bool eof_b = channel_b_active && avail_b == 0 &&
-                      ((ctx->input_is_raw[1] && gui_playback_raw_eof(ctx, 1)) ||
-                       (ctx->decoder_b != NULL &&
-                        FLAC__stream_decoder_get_state(ctx->decoder_b) == FLAC__STREAM_DECODER_END_OF_STREAM));
+        bool at_end_a = channel_a_active &&
+                        ((ctx->input_is_raw[0] && gui_playback_raw_eof(ctx, 0)) ||
+                         (ctx->decoder_a != NULL &&
+                          FLAC__stream_decoder_get_state(ctx->decoder_a) == FLAC__STREAM_DECODER_END_OF_STREAM));
+        bool at_end_b = channel_b_active &&
+                        ((ctx->input_is_raw[1] && gui_playback_raw_eof(ctx, 1)) ||
+                         (ctx->decoder_b != NULL &&
+                          FLAC__stream_decoder_get_state(ctx->decoder_b) == FLAC__STREAM_DECODER_END_OF_STREAM));
+        bool eof_a = at_end_a && avail_a == 0;
+        bool eof_b = at_end_b && avail_b == 0;
 
-        if ((eof_a || eof_b) && paused_output) {
-            // EOF terminates a paused analysis backfill; it must not loop.
-            if (eof_a) ctx->backfill_active_a = false;
-            if (eof_b) ctx->backfill_active_b = false;
-            deadline_us = 0;
+        // End a scrub at EOF without looping it or interrupting its peer.
+        if (eof_a && scrub_a) {
+            ctx->backfill_active_a = false;
+            channel_a_active = eof_a = false;
+        }
+        if (eof_b && scrub_b) {
+            ctx->backfill_active_b = false;
+            channel_b_active = eof_b = false;
+        }
+        // Per-channel loop: each channel honours its own loop flag in BOTH
+        // link modes (Synced sets both flags together, so the shared
+        // loop_enabled stays in sync; Separate drives them individually).
+        bool loop_a = atomic_load(&ctx->channel_loop[0]);
+        bool loop_b = atomic_load(&ctx->channel_loop[1]);
+        if ((eof_a && !loop_a) || (eof_b && !loop_b)) {
+            // A tape that ends pauses ONLY its own channel (DAW per-track
+            // transport, both link modes); the other file keeps rolling.
+            // Seek/replay stays available via the channel's buttons.
+            if (eof_a && !loop_a && gui_playback_publish_rf_end(ctx, 0, independent, end_token_a)) {
+                ld_loop_drain_deadline[0] = 0;
+                ctx->backfill_active_a = false;
+                atomic_store(&app->playback_channel_paused[0], true);
+                fprintf(stderr, "[PLAYBACK] CH A end of file (channel pause)\n");
+            }
+            if (eof_b && !loop_b && gui_playback_publish_rf_end(ctx, 1, independent, end_token_b)) {
+                ld_loop_drain_deadline[1] = 0;
+                ctx->backfill_active_b = false;
+                atomic_store(&app->playback_channel_paused[1], true);
+                fprintf(stderr, "[PLAYBACK] CH B end of file (channel pause)\n");
+            }
             continue;
         }
-        if ((eof_a || eof_b) && !atomic_load(&ctx->loop_enabled)) {
-            atomic_store(&ctx->state, PLAYBACK_STATE_PAUSED);
-            continue; // Seek remains available; no samples cross the EOF boundary.
+        // Rounding a seek or a fractional sample ratio can leave one final
+        // batch outstanding for an equal-duration linked peer. Let it publish
+        // that batch before either channel rewinds. Different lengths stay
+        // independent, even if one channel is draining its tail.
+        if (independent && !separate && !scrub_a && !scrub_b &&
+            loop_a && loop_b && eof_a != eof_b &&
+            at_end_a && at_end_b &&
+            (gui_playback_ld_tail_needed(ctx, 0) || gui_playback_ld_tail_needed(ctx, 1)) &&
+            gui_playback_same_duration(atomic_load(&ctx->current_sample_a) + avail_a, rate_hz[0],
+                                       atomic_load(&ctx->current_sample_b) + avail_b, rate_hz[1])) {
+            int peer = eof_a ? 1 : 0;
+            uint64_t next = ((uint64_t)RAW_BUFFER_SAMPLES * rate_hz[peer] + consume_rem[peer]) / max_rate_hz;
+            if ((eof_a ? avail_b : avail_a) <= next) {
+                if (eof_a) channel_a_active = false;
+                else channel_b_active = false;
+                eof_a = eof_b = false;
+            }
         }
-        // Loop channel A independently
-        if (eof_a) {
+
+        const bool linked_end = !separate && eof_a && eof_b;
+        bool new_tail_a = !ld_loop_linked && eof_a && !loop_tail_a &&
+            gui_playback_start_ld_loop_tail(ctx, 0, independent, end_token_a, &ld_loop_drain_deadline[0]);
+        bool new_tail_b = !ld_loop_linked && eof_b && !loop_tail_b &&
+            gui_playback_start_ld_loop_tail(ctx, 1, independent, end_token_b, &ld_loop_drain_deadline[1]);
+        if (linked_end && (new_tail_a || new_tail_b)) {
+            ld_loop_linked = ld_loop_drain_deadline[0] || ld_loop_drain_deadline[1];
+            continue;
+        }
+        if (new_tail_a) {
+            channel_a_active = false;
+            eof_a = false;
+        }
+        if (new_tail_b) {
+            channel_b_active = false;
+            eof_b = false;
+        }
+        if (!channel_a_active && !channel_b_active) continue;
+
+        const bool linked_rewind = ld_loop_linked && linked_end;
+        if (linked_rewind && (gui_playback_transport_paused(ctx, 0) ||
+                              gui_playback_transport_paused(ctx, 1)))
+            continue;
+
+        if (eof_a && (linked_rewind || !gui_playback_transport_paused(ctx, 0))) {
+            if (loop_tail_a) gui_playback_cancel_rf_end(ctx, 0);
             fprintf(stderr, "[PLAYBACK] Channel A EOF, looping\n");
             bool loop_ok = ctx->input_is_raw[0] ? gui_playback_raw_seek(ctx, 0, 0)
-                                                : gui_playback_seek_decoder(ctx, 0, 0);
+                                                : gui_playback_seek_decoder(ctx, 0, 0, 0);
             if (loop_ok && ctx->input_is_raw[0]) {
                 ctx->decode_available_a = 0;
                 ctx->decode_pos_a = 0;
@@ -4887,17 +5130,18 @@ static int playback_thread_func(void *ctx_ptr) {
                 atomic_store(&ctx->state,PLAYBACK_STATE_PAUSED); continue;
             }
             fprintf(stderr, "[DBGA] loop store 0\n");
+            ld_loop_drain_deadline[0] = 0;
             atomic_store(&ctx->current_sample_a, 0);
             epochs[0] = atomic_fetch_add(&app->rf_stream_epoch, 1) + 1;
+            rf_discontinuity[0] = true;
             deadline_us = 0;
         }
 
-        // Loop channel B independently (a paused backfill that reaches the
-        // file end just stops the backfill instead of looping).
-        if (eof_b) {
+        if (eof_b && (linked_rewind || !gui_playback_transport_paused(ctx, 1))) {
+            if (loop_tail_b) gui_playback_cancel_rf_end(ctx, 1);
             fprintf(stderr, "[PLAYBACK] Channel B EOF, looping\n");
             bool loop_ok = ctx->input_is_raw[1] ? gui_playback_raw_seek(ctx, 1, 0)
-                                                : gui_playback_seek_decoder(ctx, 1, 0);
+                                                : gui_playback_seek_decoder(ctx, 1, 0, 0);
             if (loop_ok && ctx->input_is_raw[1]) {
                 ctx->decode_available_b = 0;
                 ctx->decode_pos_b = 0;
@@ -4906,17 +5150,26 @@ static int playback_thread_func(void *ctx_ptr) {
                 fprintf(stderr,"[PLAYBACK] Channel B loop seek failed\n");
                 atomic_store(&ctx->state,PLAYBACK_STATE_PAUSED); continue;
             }
+            ld_loop_drain_deadline[1] = 0;
             atomic_store(&ctx->current_sample_b, 0);
             epochs[1] = atomic_fetch_add(&app->rf_stream_epoch, 1) + 1;
+            rf_discontinuity[1] = true;
             deadline_us = 0;
         }
 
-        // If either channel just looped, continue to refill buffers
+        // Begin a linked lap at the same phase on both native clocks.
+        if (linked_end) consume_rem[0] = consume_rem[1] = 0;
+        // If either channel just looped, continue to refill buffers.
         if (eof_a || eof_b) {
+            ld_loop_linked = false;
             continue;
         }
 #endif
 
+        const bool live_a = channel_a_active && !scrub_a;
+        const bool live_b = channel_b_active && !scrub_b;
+        const bool playing_batch = live_a || live_b;
+        const bool master_a = live_a || (channel_a_active && !live_b);
         // Limit output to available samples
         if (channel_a_active && avail_a < samples_to_output) {
             samples_to_output = avail_a;
@@ -4927,6 +5180,99 @@ static int playback_thread_func(void *ctx_ptr) {
 
         if (samples_to_output == 0) {
             thrd_sleep_ms(1);
+            continue;
+        }
+
+        //--------------------------------------------------------------------
+        // INDEPENDENT mixed-rate batch: per-channel FIFOs, no pairing.
+        //--------------------------------------------------------------------
+        if (independent) {
+            const int ch_active[2] = {channel_a_active, channel_b_active};
+            const size_t avail[2] = {avail_a, avail_b};
+            for (int ch = 0; ch < 2; ++ch) {
+                if (!ch_active[ch]) continue;
+                // Samples this channel owes on this max-axis batch:
+                // batch_ticks * rate_ch / max_rate, fraction carried over.
+                uint64_t num = (uint64_t)RAW_BUFFER_SAMPLES * rate_hz[ch] + consume_rem[ch];
+                uint64_t n_ch = num / max_rate_hz;
+                consume_rem[ch] = num % max_rate_hz;
+                size_t out = (size_t)n_ch;
+                if (out > RAW_BUFFER_SAMPLES) out = RAW_BUFFER_SAMPLES;
+                if (out > avail[ch]) out = avail[ch];
+                if (out == 0) continue;
+
+                int16_t *ch_buf = ch ? buf_b : buf_a;
+                if (ch) {
+                    memcpy(ch_buf, ctx->decode_buf_b + ctx->decode_pos_b, out * sizeof(int16_t));
+                    ctx->decode_pos_b += out;
+                } else {
+                    memcpy(ch_buf, ctx->decode_buf_a + ctx->decode_pos_a, out * sizeof(int16_t));
+                    ctx->decode_pos_a += out;
+                }
+
+                gui_playback_compact_rf_buffer(ctx, ch);
+                size_t bytes = out * sizeof(int16_t);
+                buffer_id_t rf_id = ch ? BUF_CAPTURE_RF_B : BUF_CAPTURE_RF_A;
+                void *raw = bufmgr_write_begin(&app->buffers, rf_id, bytes, NULL);
+                if (raw) {
+                    memcpy(raw, ch_buf, bytes);
+                    uint64_t pos = ch ? atomic_load(&ctx->current_sample_b)
+                                      : atomic_load(&ctx->current_sample_a);
+                    gui_rf_block_info_t info = {
+                        .sample_rate_hz = (uint32_t)rate_hz[ch],
+                        .start_sample = pos,
+                        .epoch = epochs[ch],
+                        .discontinuity = rf_discontinuity[ch],
+                        .preview_only = ch ? scrub_b : scrub_a,
+                    };
+                    if (gui_extract_stamp_playback_channel(ch, &info, out)) {
+                        bufmgr_write_end(&app->buffers, rf_id, bytes);
+                        rf_discontinuity[ch] = false;
+                    } else {
+                        fprintf(stderr, "[PLAYBACK] RF stamp queue full; CH %c block discarded\n",
+                                ch ? 'B' : 'A');
+                    }
+                } else {
+                    fprintf(stderr, "[PLAYBACK] Warning: CH %c RF FIFO full, block dropped\n",
+                            ch ? 'B' : 'A');
+                }
+
+                if (ch) {
+                    atomic_store(&ctx->current_sample_b,
+                                 atomic_load(&ctx->current_sample_b) + out);
+                } else {
+                    atomic_store(&ctx->current_sample_a,
+                                 atomic_load(&ctx->current_sample_a) + out);
+                }
+            }
+            if (master_a) {
+                atomic_store(&ctx->current_sample, atomic_load(&ctx->current_sample_a));
+            } else if (channel_b_active) {
+                atomic_store(&ctx->current_sample, atomic_load(&ctx->current_sample_b));
+            }
+            atomic_store(&app->last_callback_time_ms, get_time_ms());
+
+#if LIBFLAC_ENABLED == 1
+            // Position-synced monitor audio (unchanged: follows the playhead)
+            if (playing_batch) gui_playback_audio_feed(ctx);
+#endif
+
+            batch_count++;
+
+            // Pacing: the batch axis is RAW_BUFFER_SAMPLES ticks of the
+            // faster file's clock (the realtime rate).
+            playback_speed_t speed = atomic_load(&ctx->speed);
+            if (speed == PLAYBACK_SPEED_MAX || !playing_batch) deadline_us = 0;
+            else {
+                float multiplier = speed_multipliers[speed];
+                if (multiplier > 0) {
+                    uint64_t now = gui_playback_clock_us();
+                    if (!deadline_us || clock_speed != speed || deadline_us+100000.0 < now) deadline_us = (double)now;
+                    deadline_us += (double)RAW_BUFFER_SAMPLES*1000000.0/(double)max_rate_hz/multiplier;
+                    gui_playback_wait_clock(ctx,(uint64_t)deadline_us,pace_timer);
+                }
+            }
+            clock_speed = speed;
             continue;
         }
 
@@ -4954,25 +5300,8 @@ static int playback_thread_func(void *ctx_ptr) {
             memset(buf_b, 0, samples_to_output * sizeof(int16_t));
         }
 
-        // Compact decode buffers if needed (shift remaining data to start)
-        if (channel_a_active && ctx->decode_pos_a > ctx->decode_buf_size / 2) {
-            size_t remaining = ctx->decode_available_a - ctx->decode_pos_a;
-            if (remaining > 0) {
-                memmove(ctx->decode_buf_a, ctx->decode_buf_a + ctx->decode_pos_a,
-                        remaining * sizeof(int16_t));
-            }
-            ctx->decode_available_a = remaining;
-            ctx->decode_pos_a = 0;
-        }
-        if (channel_b_active && ctx->decode_pos_b > ctx->decode_buf_size / 2) {
-            size_t remaining = ctx->decode_available_b - ctx->decode_pos_b;
-            if (remaining > 0) {
-                memmove(ctx->decode_buf_b, ctx->decode_buf_b + ctx->decode_pos_b,
-                        remaining * sizeof(int16_t));
-            }
-            ctx->decode_available_b = remaining;
-            ctx->decode_pos_b = 0;
-        }
+        if (channel_a_active) gui_playback_compact_rf_buffer(ctx, 0);
+        if (channel_b_active) gui_playback_compact_rf_buffer(ctx, 1);
 
         // Encode decoded samples to raw 32-bit format and write to BUF_CAPTURE_RF
         // The extraction thread will read this, update statistics, display, CVBS, and recording
@@ -4988,14 +5317,20 @@ static int playback_thread_func(void *ctx_ptr) {
             }
             gui_rf_block_info_t info[2] = {
                 {.sample_rate_hz = atomic_load(&app->rf_source_rate_hz[0]),
-                 .start_sample = atomic_load(&ctx->current_sample_a), .epoch = epochs[0]},
+                 .start_sample = atomic_load(&ctx->current_sample_a), .epoch = epochs[0],
+                 .discontinuity = channel_a_active && rf_discontinuity[0],
+                  .preview_only = scrub_a},
                 {.sample_rate_hz = atomic_load(&app->rf_source_rate_hz[1]),
-                 .start_sample = atomic_load(&ctx->current_sample_b), .epoch = epochs[1]}
+                 .start_sample = atomic_load(&ctx->current_sample_b), .epoch = epochs[1],
+                 .discontinuity = channel_b_active && rf_discontinuity[1],
+                  .preview_only = scrub_b}
             };
             size_t counts[2] = {channel_a_active ? samples_to_output : 0,
                                 channel_b_active ? samples_to_output : 0};
             if (gui_extract_stamp_playback(info, counts)) {
                 bufmgr_write_end(&app->buffers, BUF_CAPTURE_RF, RAW_BUFFER_BYTES);
+                if (counts[0]) rf_discontinuity[0] = false;
+                if (counts[1]) rf_discontinuity[1] = false;
             } else {
                 fprintf(stderr, "[PLAYBACK] RF stamp queue full; uncommitted block discarded\n");
             }
@@ -5017,7 +5352,7 @@ static int playback_thread_func(void *ctx_ptr) {
             uint64_t next_b = atomic_load(&ctx->current_sample_b) + (uint64_t)samples_to_output;
             atomic_store(&ctx->current_sample_b, next_b);
         }
-        if (channel_a_active) {
+        if (master_a) {
             atomic_store(&ctx->current_sample, atomic_load(&ctx->current_sample_a));
         } else if (channel_b_active) {
             atomic_store(&ctx->current_sample, atomic_load(&ctx->current_sample_b));
@@ -5030,7 +5365,7 @@ static int playback_thread_func(void *ctx_ptr) {
         // Position-synced monitor audio (the drag-and-drop source): follows
         // the playhead through seeks/loops/speed changes; a jump flushes the
         // monitor queue (see the drag-and-drop section above).
-        gui_playback_audio_feed(ctx);
+        if (playing_batch) gui_playback_audio_feed(ctx);
 #endif
 
         batch_count++;
@@ -5038,9 +5373,7 @@ static int playback_thread_func(void *ctx_ptr) {
         // Accumulate an absolute source-sample clock. A fractional millisecond
         // block (80 MHz) retains its duration; speed/pause/seek changes re-anchor.
         playback_speed_t speed = atomic_load(&ctx->speed);
-        bool backfilling = atomic_load(&ctx->state) == PLAYBACK_STATE_PAUSED &&
-                           (ctx->backfill_active_a || ctx->backfill_active_b);
-        if (speed == PLAYBACK_SPEED_MAX || backfilling) deadline_us = 0;
+        if (speed == PLAYBACK_SPEED_MAX || !playing_batch) deadline_us = 0;
         else {
             float multiplier = speed_multipliers[speed];
             if (multiplier > 0) {
@@ -5707,8 +6040,37 @@ static int gui_playback_commit(gui_app_t *app, playback_ctx_t *prepared) {
     atomic_store(&app->sample_rate, playback_rate_hz);
     atomic_store(&app->rf_source_rate_hz[0], s_playback->file_a ? (uint32_t)llround(rate_a_hz) : 0);
     atomic_store(&app->rf_source_rate_hz[1], s_playback->file_b ? (uint32_t)llround(rate_b_hz) : 0);
+    // Display-container full scale per channel. The paired pipeline crushes
+    // every convention into the 12-bit container (2048), but the INDEPENDENT
+    // mixed-rate pipeline carries native-domain samples: a file detected as
+    // DIRECT-DOMAIN 16-bit (conv16 PASS, peak ceiling 4096) must display
+    // against a 4096 full scale or it falsely rails. The producer raises the
+    // value to 4096 once the sticky conv16 detector resolves PASS; every
+    // other convention (12-bit as-is, 8-bit <<4, 16-bit >>4, raw readers)
+    // lands in the 12-bit container.
+    atomic_store(&app->rf_display_full_scale[0], 2048);
+    atomic_store(&app->rf_display_full_scale[1], 2048);
+    // Independent mixed-rate mode (user request 2026-11-03: "Player should
+    // run files independently"): both files with RESOLVED, DIFFERENT rates
+    // run as per-channel FIFOs at their own true clocks, so the RF Preview
+    // decoders run on BOTH channels (the old gate starved them with
+    // "Mixed-rate pair: independent input reader required"). Same-rate sets
+    // and single-file loads keep the paired pipeline; an unresolved rate (0)
+    // keeps the conservative unsupported gate.
+    bool mixed_rate = s_playback->file_a && s_playback->file_b &&
+                      rate_a_hz > 0.0 && rate_b_hz > 0.0 &&
+                      llround(rate_a_hz) != llround(rate_b_hz);
+    atomic_store(&app->playback_independent_mode, mixed_rate);
+    atomic_store(&app->playback_channel_paused[0], false);
+    atomic_store(&app->playback_channel_paused[1], false);
+    atomic_store(&app->playback_link_separate, false);
+    if (mixed_rate) {
+        fprintf(stderr, "[PLAYBACK] Independent mixed-rate mode: A=%.0fHz B=%.0fHz "
+                "(per-channel FIFOs, per-channel preview)\n", rate_a_hz, rate_b_hz);
+    }
     atomic_store(&app->rf_preview_input_supported,
-                  !s_playback->file_a || !s_playback->file_b || llround(rate_a_hz) == llround(rate_b_hz));
+                  !s_playback->file_a || !s_playback->file_b ||
+                  llround(rate_a_hz) == llround(rate_b_hz) || mixed_rate);
     atomic_store(&app->last_callback_time_ms, get_time_ms());
     app->capture_backend_upstream = false;
     app->capture_has_channel_b = (s_playback->file_b != NULL);
@@ -5744,10 +6106,10 @@ static int gui_playback_commit(gui_app_t *app, playback_ctx_t *prepared) {
     atomic_store(&s_playback->state, PLAYBACK_STATE_PLAYING);
     atomic_store(&s_playback->speed, PLAYBACK_SPEED_1X);
     atomic_store(&s_playback->loop_enabled, true);  // Loop by default
-    atomic_store(&s_playback->seek_requested_a, false);
-    atomic_store(&s_playback->seek_requested_b, false);
-    atomic_store(&s_playback->seek_target_a, 0);
-    atomic_store(&s_playback->seek_target_b, 0);
+    atomic_store(&s_playback->channel_loop[0], true);
+    atomic_store(&s_playback->channel_loop[1], true);
+    atomic_store(&s_playback->pending_seek[0], PLAYBACK_NO_SEEK);
+    atomic_store(&s_playback->pending_seek[1], PLAYBACK_NO_SEEK);
     atomic_store(&s_playback->current_sample, 0);
     atomic_store(&s_playback->current_sample_a, 0);
     atomic_store(&s_playback->current_sample_b, 0);
@@ -5805,13 +6167,25 @@ commit_failed:
     return -1;
 }
 
+static void gui_playback_format_start_error(const playback_ctx_t *ctx,
+                                             char *message, size_t capacity) {
+    if (ctx && ctx->info_a.error[0])
+        snprintf(message, capacity, "Playback A failed: %s", ctx->info_a.error);
+    else if (ctx && ctx->info_b.error[0])
+        snprintf(message, capacity, "Playback B failed: %s", ctx->info_b.error);
+    else
+        snprintf(message, capacity, "Playback failed to start");
+}
+
 int gui_playback_start(gui_app_t *app, const char *file_a, const char *file_b) {
     if (!app || s_playback_start.pending || (!file_a && !file_b)) return -1;
     playback_ctx_t *prepared = calloc(1, sizeof(*prepared));
     if (!prepared) return -1;
     if (gui_playback_prepare(prepared, app, file_a, file_b, NULL) != 0) {
+        char message[256];
+        gui_playback_format_start_error(prepared, message, sizeof(message));
         gui_playback_release_context(prepared); free(prepared);
-        gui_app_set_status(app, "Playback failed to start"); return -1;
+        gui_app_set_status(app, message); return -1;
     }
     return gui_playback_commit(app, prepared);
 }
@@ -5872,8 +6246,10 @@ int gui_playback_poll_start(gui_app_t *app) {
     int result = s_playback_start.result;
     s_playback_start.pending = false; s_playback_start.prepared = NULL;
     if (cancelled || result != 0) {
+        char message[256];
+        gui_playback_format_start_error(prepared, message, sizeof(message));
         gui_playback_release_context(prepared); free(prepared);
-        gui_app_set_status(app, cancelled ? "Playback load cancelled" : "Playback failed to start");
+        gui_app_set_status(app, cancelled ? "Playback load cancelled" : message);
         return -1;
     }
     return gui_playback_commit(app, prepared) == 0 ? 1 : -1;
@@ -5919,6 +6295,13 @@ void gui_playback_stop(gui_app_t *app) {
     gui_extract_stop();
 
     gui_playback_retire_context();
+
+    // Independent mixed-rate mode is a per-session pipeline shape; make sure
+    // no later session (capture or same-rate playback) inherits it.
+    atomic_store(&app->playback_independent_mode, false);
+    atomic_store(&app->playback_channel_paused[0], false);
+    atomic_store(&app->playback_channel_paused[1], false);
+    atomic_store(&app->playback_link_separate, false);
 
     // All old producer/extraction posts have stopped before clearing flags.
     atomic_store(&app->dropout_stop_requested, false);
@@ -5973,6 +6356,8 @@ void gui_playback_pause(gui_app_t *app) {
     (void)app;
     if (atomic_load(&s_playback->state) == PLAYBACK_STATE_PLAYING) {
         atomic_store(&s_playback->state, PLAYBACK_STATE_PAUSED);
+        gui_playback_cancel_rf_end(s_playback, 0);
+        gui_playback_cancel_rf_end(s_playback, 1);
     }
 }
 
@@ -6021,13 +6406,7 @@ void gui_playback_seek_sample_channel(gui_app_t *app, int channel, uint64_t samp
     if (sample >= total_samples) {
         sample = total_samples - 1;
     }
-    if (channel_b) {
-        atomic_store(&s_playback->seek_target_b, sample);
-        atomic_store(&s_playback->seek_requested_b, true);
-    } else {
-        atomic_store(&s_playback->seek_target_a, sample);
-        atomic_store(&s_playback->seek_requested_a, true);
-    }
+    atomic_store(&s_playback->pending_seek[channel_b], sample);
 }
 
 void gui_playback_seek_sample(gui_app_t *app, uint64_t sample) {
@@ -6180,12 +6559,128 @@ bool gui_playback_get_selected_file_info(gui_app_t *app, int channel, playback_f
 
 void gui_playback_set_loop(gui_app_t *app, bool loop) {
     (void)app;
+    atomic_store(&s_playback->channel_loop[0], loop);
+    atomic_store(&s_playback->channel_loop[1], loop);
     atomic_store(&s_playback->loop_enabled, loop);
 }
 
 bool gui_playback_get_loop(gui_app_t *app) {
     (void)app;
     return atomic_load(&s_playback->loop_enabled);
+}
+
+//-----------------------------------------------------------------------------
+// Per-channel transport + link mode (player)
+//-----------------------------------------------------------------------------
+// Link: Synced (default) keeps ONE shared transport for both files (legacy
+// behaviour); Separate gives each file its own play/pause + loop. True
+// per-channel pipelines exist only in independent mixed-rate mode; in every
+// other session shape the per-channel controls drive the shared transport
+// (and the shared loop flag), so the buttons always do something coherent.
+
+void gui_playback_set_link_separate(gui_app_t *app, bool separate) {
+    if (!app) return;
+    bool current = atomic_load(&app->playback_link_separate);
+    if (current == separate) return;
+    atomic_store(&app->playback_link_separate, separate);
+    // Switching modes clears per-channel holds so both files start even.
+    gui_playback_cancel_rf_end(s_playback, 0);
+    gui_playback_cancel_rf_end(s_playback, 1);
+    atomic_store(&app->playback_channel_paused[0], false);
+    atomic_store(&app->playback_channel_paused[1], false);
+    fprintf(stderr, "[PLAYBACK] Link mode: %s\n", separate ? "SEPARATE" : "SYNCED");
+}
+
+bool gui_playback_get_link_separate(gui_app_t *app) {
+    return app ? atomic_load(&app->playback_link_separate) : false;
+}
+
+void gui_playback_toggle_pause_channel(gui_app_t *app, int channel) {
+    if (!app || channel < 0 || channel > 1) return;
+    // Master (shared) pause first: clicking a track's Play while the whole
+    // transport is paused resumes the transport (DAW behavior) instead of
+    // toggling an invisible per-channel flag.
+    if (atomic_load(&s_playback->state) == PLAYBACK_STATE_PAUSED) {
+        gui_playback_cancel_rf_end(s_playback, 0);
+        gui_playback_cancel_rf_end(s_playback, 1);
+        atomic_store(&s_playback->state, PLAYBACK_STATE_PLAYING);
+        atomic_store(&app->playback_channel_paused[0], false);
+        atomic_store(&app->playback_channel_paused[1], false);
+        return;
+    }
+    if (!atomic_load(&app->playback_link_separate)) {
+        // Synced link: the channels act as a group - pause both if either
+        // is playing, resume both when both are paused.
+        bool any_playing = !atomic_load(&app->playback_channel_paused[0]) ||
+                           !atomic_load(&app->playback_channel_paused[1]);
+        atomic_store(&app->playback_channel_paused[0], any_playing);
+        atomic_store(&app->playback_channel_paused[1], any_playing);
+        gui_playback_cancel_rf_end(s_playback, 0);
+        gui_playback_cancel_rf_end(s_playback, 1);
+        return;
+    }
+    // Separate link: toggle only this channel.
+    bool was_paused = atomic_load(&app->playback_channel_paused[channel]);
+    atomic_store(&app->playback_channel_paused[channel], !was_paused);
+    gui_playback_cancel_rf_end(s_playback, channel);
+}
+
+bool gui_playback_is_channel_paused(gui_app_t *app, int channel) {
+    if (!app || channel < 0 || channel > 1) return true;
+    // A master pause pauses every track; otherwise the channel's own flag.
+    if (gui_playback_get_state(app) != PLAYBACK_STATE_PLAYING) return true;
+    return atomic_load(&app->playback_channel_paused[channel]);
+}
+
+playback_rf_end_t gui_playback_get_channel_rf_end(gui_app_t *app, int channel, uint64_t *token) {
+    if (token) *token = 0;
+    if (!app || channel < 0 || channel > 1 || gui_playback_get_state(app) != PLAYBACK_STATE_PLAYING)
+        return PLAYBACK_RF_END_NONE;
+    uint_fast64_t end = atomic_load(&s_playback->channel_rf_end[channel]);
+    if (!(end & 1u)) return PLAYBACK_RF_END_NONE;
+    int fifo = atomic_load(&app->playback_independent_mode) ? channel : -1;
+    uint64_t cursor = atomic_load(&s_playback->channel_rf_end_cursor[channel]);
+    bool ready = gui_extract_playback_stamps_forwarded(fifo) >= cursor;
+    if (end != atomic_load(&s_playback->channel_rf_end[channel])) return PLAYBACK_RF_END_NONE;
+    if (token) *token = end;
+    return ready ? PLAYBACK_RF_END_READY : PLAYBACK_RF_END_PENDING;
+}
+
+void gui_playback_set_ld_audio_channel(gui_app_t *app, int channel) {
+    if (!app || channel < -1 || channel > 1) return;
+    int previous = atomic_exchange(&s_playback->ld_audio_channel, channel + 1);
+    if (previous && previous != channel + 1 &&
+        !(atomic_load(&s_playback->ld_video_channels) & (1u << (previous - 1))))
+        gui_playback_cancel_rf_end(s_playback, previous - 1);
+}
+
+void gui_playback_set_ld_video_channels(gui_app_t *app, unsigned channels) {
+    if (app) atomic_store(&s_playback->ld_video_channels, channels & 3u);
+}
+
+void gui_playback_finish_ld_tail(gui_app_t *app, int channel, uint64_t token) {
+    uint64_t observed;
+    if (gui_playback_get_channel_rf_end(app, channel, &observed) == PLAYBACK_RF_END_READY && observed == token) {
+        uint_fast64_t expected = token;
+        atomic_compare_exchange_strong(&s_playback->channel_rf_end[channel], &expected, token - 1u);
+    }
+}
+
+void gui_playback_set_channel_loop(gui_app_t *app, int channel, bool loop) {
+    if (!app || channel < 0 || channel > 1) return;
+    if (!atomic_load(&app->playback_link_separate)) {
+        // Synced link: both channels share the master loop setting.
+        gui_playback_set_loop(app, loop);
+        return;
+    }
+    atomic_store(&s_playback->channel_loop[channel], loop);
+}
+
+bool gui_playback_get_channel_loop(gui_app_t *app, int channel) {
+    if (!app || channel < 0 || channel > 1) return false;
+    // Per-channel flags are authoritative in both link modes (Synced keeps
+    // them equal by setting them together).
+    return atomic_load(&s_playback->channel_loop[channel]);
 }
 
 //-----------------------------------------------------------------------------

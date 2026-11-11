@@ -26,6 +26,7 @@ on:
   push:
     branches:
       - main
+      - feature/monitor-h264-video-20261101
     tags:
       - 'v*'
 
@@ -48,6 +49,22 @@ jobs:
         run: |
           set -eux
           python3 misrc_tools/test/ci_guard_tests.py
+      - name: Test missing-dependency detection
+        run: |
+          bash scripts/test-build-deps-check.sh
+  monitor-ffmpeg-codec-smoke:
+    name: FFmpeg AV1 VP9 HEVC codec smoke (Linux)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Install modern video codec development libraries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libavcodec-dev libavutil-dev libswscale-dev
+      - name: Build and exercise FFmpeg monitor codec backend
+        run: sh scripts/test-monitor-video-ffmpeg.sh
+
   preflight-cross-platform-guards:
     name: Cross-platform guard tests (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
@@ -59,7 +76,7 @@ jobs:
             guard_mode: static
           - runner: windows-2022
             guard_mode: static
-          - runner: macos-14
+          - runner: macos-15
             guard_mode: runtime
     steps:
       - name: Checkout
@@ -123,9 +140,10 @@ jobs:
             linuxdeploy_arch: aarch64
             artifact_suffix: arm64
     runs-on: ${{ matrix.runner }}
+    # Run Linux video/codec packaging after baseline preflight; macOS guards
+    # are independent and may queue on scarce macOS runners.
     needs:
       - preflight-guard-tests
-      - preflight-cross-platform-guards
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -159,11 +177,16 @@ jobs:
             git \
             imagemagick \
             libasound2-dev \
+            libavcodec-dev \
+            libavutil-dev \
+            libswscale-dev \
             libfftw3-dev \
             libgl1-mesa-dev \
             libusb-1.0-0-dev \
             libuvc-dev \
             libsoxr-dev \
+            libopenh264-dev \
+            libopus-dev \
             libx11-dev \
             libxcursor-dev \
             libxi-dev \
@@ -283,6 +306,14 @@ jobs:
           cmake --build .deps/raylib/build --parallel
           cmake --install .deps/raylib/build
 
+      - name: Verify OpenH264 encode/decode round-trip
+        run: |
+          set -eux
+          pkg-config --modversion openh264
+          sh scripts/test-monitor-video-codec.sh
+          sh scripts/test-monitor-video-stage1.sh
+          sh scripts/test-monitor-video-framebox.sh
+
       - name: Build MISRC tools (Meson)
         env:
           MISRC_TOOLS_VERSION_OVERRIDE: ${{ steps.version.outputs.version }}
@@ -291,10 +322,18 @@ jobs:
           DEPS_PREFIX="$PWD/.deps/install"
           export PKG_CONFIG_PATH="$DEPS_PREFIX/lib/pkgconfig:$DEPS_PREFIX/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
           export CMAKE_PREFIX_PATH="$DEPS_PREFIX:${CMAKE_PREFIX_PATH:-}"
+          DEPS_PREFIX="$DEPS_PREFIX" bash scripts/build-rtlsdr.sh
           pkg-config --modversion fftw3f
-          meson setup "$BUILD_DIR" misrc_tools --buildtype release
+          meson setup "$BUILD_DIR" misrc_tools --buildtype release -Drtlsdr=enabled
           meson compile -C "$BUILD_DIR" misrc_capture misrc_extract misrc_gui
           test -x "$BUILD_DIR/misrc_gui"
+          # A successful build is not sufficient: verify that the produced GUI
+          # actually links the modern codec backend rather than compiling the
+          # OpenH264-only fallback path.
+          ldd "$BUILD_DIR/misrc_gui" | tee /tmp/misrc_gui_ldd.txt
+          grep -q 'libavcodec.so' /tmp/misrc_gui_ldd.txt
+          grep -q 'libswscale.so' /tmp/misrc_gui_ldd.txt
+          grep -q 'libavutil.so' /tmp/misrc_gui_ldd.txt
 
       - name: Smoke test built binaries
         run: |
@@ -354,6 +393,21 @@ jobs:
           mv ./*.AppImage "$APPIMAGE_NAME"
           test -f "$APPIMAGE_NAME"
 
+          RTLSDR_CHECK_DIR="$(mktemp -d)"
+          (
+            APPIMAGE_PATH="$PWD/$APPIMAGE_NAME"
+            RTLSDR_CHECK="$PWD/scripts/verify-rtlsdr-build.sh"
+            cd "$RTLSDR_CHECK_DIR"
+            "$APPIMAGE_PATH" --appimage-extract usr/bin/misrc_gui
+            GUI=squashfs-root/usr/bin/misrc_gui
+            bash "$RTLSDR_CHECK" "$GUI"
+            DYNAMIC="$(readelf -d "$GUI")"
+            if grep -Fiq librtlsdr <<< "$DYNAMIC"; then
+              echo "AppImage GUI must link RTL-SDR statically" >&2
+              exit 1
+            fi
+          )
+
           APPIMAGE_EXTRACT_AND_RUN=1 "./$APPIMAGE_NAME" --smoke-test
           set +e
           APPIMAGE_EXTRACT_AND_RUN=1 "./$APPIMAGE_NAME" capture -h > /tmp/appimage_capture_help.txt 2>&1
@@ -380,9 +434,10 @@ jobs:
   android-apk:
     name: Android APK build (arm64-v8a)
     runs-on: ubuntu-22.04
+    # Build independently while macOS cross-platform guards are queued;
+    # those guards remain a separate required CI job.
     needs:
       - preflight-guard-tests
-      - preflight-cross-platform-guards
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -410,7 +465,10 @@ jobs:
           set -eux
           export ANDROID_HOME="$HOME/Android/Sdk"
           mkdir -p "$ANDROID_HOME/cmdline-tools"
-          curl -fL -o /tmp/cmdtools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          # Retry ALL errors incl. transient SSL/connect failures — mirrors the
+          # hardened download() in android/build-deps-android.sh (run 41943704989
+          # died to an unretried curl exit 35).
+          curl -fL --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 30 -o /tmp/cmdtools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
           unzip -q /tmp/cmdtools.zip -d /tmp/android-cmdtools
           mv /tmp/android-cmdtools/cmdline-tools "$ANDROID_HOME/cmdline-tools/latest"
           rm /tmp/cmdtools.zip
@@ -442,12 +500,25 @@ jobs:
           export DEPS_PREFIX="$PWD/.deps/install-android-arm64"
           bash android/gen-cross-file.sh
 
+      - name: Cross-build OpenH264 for Android
+        run: |
+          set -eux
+          export DEPS_PREFIX="$PWD/.deps/install-android-arm64"
+          bash android/build-openh264-android.sh
+
+      - name: Cross-build minimal FFmpeg AV1 VP9 HEVC libraries
+        run: |
+          set -eux
+          export DEPS_PREFIX="$PWD/.deps/install-android-arm64"
+          bash scripts/build-monitor-ffmpeg-minimal.sh android
+          DEPS_PREFIX="$DEPS_PREFIX" android/android-pkg-config --modversion libavcodec libavutil libswscale
+
       - name: Cross-compile misrc_gui (libmisrc_gui.so)
         run: |
           set -eux
           export DEPS_PREFIX="$PWD/.deps/install-android-arm64"
           export PKG_CONFIG="$PWD/android/android-pkg-config"
-          meson setup --cross-file android/aarch64-linux-android.ini -Dbuildtype=release build-android misrc_tools
+          meson setup --cross-file android/aarch64-linux-android.ini -Dbuildtype=release -Dmodern_monitor_codecs=enabled -Drtlsdr=enabled build-android misrc_tools
           meson compile -C build-android misrc_gui
           test -f build-android/libmisrc_gui.so
 
@@ -471,10 +542,17 @@ jobs:
           echo "$BADGING" | grep -q "targetSdkVersion:'34'"
           echo "$BADGING" | grep -q "package: name='dev.misrc.gui'"
           unzip -l "$APK" | grep -q "lib/arm64-v8a/libmisrc_gui.so"
-          unzip -p "$APK" lib/arm64-v8a/libmisrc_gui.so | file - | grep -q "ARM aarch64"
+          unzip -l "$APK" | grep -q "lib/arm64-v8a/libc++_shared.so"
+          APK_GUI="$RUNNER_TEMP/misrc_gui_rtlsdr.so"
+          unzip -p "$APK" lib/arm64-v8a/libmisrc_gui.so > "$APK_GUI"
+          file "$APK_GUI" | grep -q "ARM aarch64"
+          bash scripts/verify-rtlsdr-build.sh "$APK_GUI"
           NDK_TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          "${NDK_TOOLCHAIN}/llvm-readelf" -d build-android/libmisrc_gui.so | grep NEEDED | grep -iE "/usr/lib/x86_64|/usr/local/lib" && {
-            echo "ERROR: host x86_64 lib leaked into arm64 cross build"; exit 1; } || true
+          DYNAMIC="$("${NDK_TOOLCHAIN}/llvm-readelf" -d "$APK_GUI")"
+          if grep -iE 'NEEDED.*(/usr/lib/x86_64|/usr/local/lib|librtlsdr)' <<< "$DYNAMIC"; then
+            echo "APK GUI has a host library or dynamic RTL-SDR dependency" >&2
+            exit 1
+          fi
 
       - name: Upload Android APK
         uses: actions/upload-artifact@v7
@@ -486,9 +564,10 @@ jobs:
   windows-exe:
     name: Windows EXE build (x86_64)
     runs-on: windows-2022
+    # Build independently while macOS cross-platform guards are queued;
+    # those guards remain a separate required CI job.
     needs:
       - preflight-guard-tests
-      - preflight-cross-platform-guards
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -519,6 +598,7 @@ jobs:
           cache: true
           install: >-
             git
+            diffutils
             mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-fftw
             mingw-w64-ucrt-x86_64-flac
@@ -526,10 +606,13 @@ jobs:
             mingw-w64-ucrt-x86_64-libjpeg-turbo
             mingw-w64-ucrt-x86_64-libusb
             mingw-w64-ucrt-x86_64-libsoxr
+            mingw-w64-ucrt-x86_64-openh264
+            mingw-w64-ucrt-x86_64-opus
             mingw-w64-ucrt-x86_64-meson
             mingw-w64-ucrt-x86_64-nasm
             mingw-w64-ucrt-x86_64-ninja
             mingw-w64-ucrt-x86_64-pkgconf
+            make
 
       - name: Setup MSYS2 (retry no cache)
         if: steps.setup_msys2_cached.outcome == 'failure'
@@ -540,6 +623,7 @@ jobs:
           cache: false
           install: >-
             git
+            diffutils
             mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-fftw
             mingw-w64-ucrt-x86_64-flac
@@ -547,10 +631,13 @@ jobs:
             mingw-w64-ucrt-x86_64-libjpeg-turbo
             mingw-w64-ucrt-x86_64-libusb
             mingw-w64-ucrt-x86_64-libsoxr
+            mingw-w64-ucrt-x86_64-openh264
+            mingw-w64-ucrt-x86_64-opus
             mingw-w64-ucrt-x86_64-meson
             mingw-w64-ucrt-x86_64-nasm
             mingw-w64-ucrt-x86_64-ninja
             mingw-w64-ucrt-x86_64-pkgconf
+            make
 
       - name: Resolve build version
         id: version
@@ -573,6 +660,11 @@ jobs:
           set -euo pipefail
           DEPS_PREFIX="$PWD/.deps/install"
           export PKG_CONFIG_PATH="$DEPS_PREFIX/lib/pkgconfig:$DEPS_PREFIX/lib64/pkgconfig:${MINGW_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+
+          if ! pkg-config --atleast-version=1.0.30 libusb-1.0; then
+            echo "Windows DdD RAW_IO and native WinUSB require libusb 1.0.30 or newer." >&2
+            exit 1
+          fi
 
           # Cache hit guard: skip libuvc/hsdaoh/raylib rebuild if .deps/install
           # was restored from actions/cache (key includes hashFiles(hsdaoh/**)).
@@ -636,12 +728,17 @@ jobs:
 
           export PKG_CONFIG_PATH="$DEPS_PREFIX/lib/pkgconfig:$DEPS_PREFIX/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
           export CMAKE_PREFIX_PATH="$DEPS_PREFIX:${CMAKE_PREFIX_PATH:-}"
+          # Targeted FFmpeg static video decoders; no unrelated DLLs/Rust.
+          bash scripts/build-monitor-ffmpeg-minimal.sh windows
+          DEPS_PREFIX="$DEPS_PREFIX" bash scripts/build-rtlsdr.sh
           pkg-config --modversion fftw3f
-          meson setup "$BUILD_DIR" misrc_tools --buildtype release
+          pkg-config --modversion libavcodec libavutil libswscale
+          meson setup "$BUILD_DIR" misrc_tools --buildtype release -Dmodern_monitor_codecs=enabled -Drtlsdr=enabled
           meson compile -C "$BUILD_DIR" misrc_capture misrc_extract misrc_gui
 
           mkdir -p dist
           cp "$BUILD_DIR/misrc_gui.exe" dist/MISRC.exe
+          bash scripts/verify-rtlsdr-build.sh dist/MISRC.exe
           test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 1
           test "$(find dist -maxdepth 1 -name '*.exe' | wc -l)" -eq 1
           test "$(objdump -p dist/MISRC.exe | awk '/^Subsystem[[:space:]]/ {print $2; exit}')" = "00000002"
@@ -649,7 +746,7 @@ jobs:
             local target="$1"
             while IFS= read -r dll; do
               case "$(echo "$dll" | tr '[:lower:]' '[:upper:]')" in
-                API-MS-WIN-*|KERNEL32.DLL|KERNELBASE.DLL|USER32.DLL|GDI32.DLL|SHELL32.DLL|WINMM.DLL|OLE32.DLL|OLEAUT32.DLL|ADVAPI32.DLL|COMDLG32.DLL|COMCTL32.DLL|SHLWAPI.DLL|WS2_32.DLL|SETUPAPI.DLL|IMM32.DLL|VERSION.DLL|UCRTBASE.DLL|MSVCRT.DLL|MF.DLL|MFPLAT.DLL|MFREADWRITE.DLL|EVR.DLL|STRMIIDS.DLL|AVRT.DLL)
+                API-MS-WIN-*|KERNEL32.DLL|KERNELBASE.DLL|USER32.DLL|GDI32.DLL|SHELL32.DLL|WINMM.DLL|OLE32.DLL|OLEAUT32.DLL|ADVAPI32.DLL|COMDLG32.DLL|COMCTL32.DLL|SHLWAPI.DLL|WS2_32.DLL|SETUPAPI.DLL|CFGMGR32.DLL|WINUSB.DLL|IMM32.DLL|VERSION.DLL|UCRTBASE.DLL|MSVCRT.DLL|MF.DLL|MFPLAT.DLL|MFREADWRITE.DLL|EVR.DLL|STRMIIDS.DLL|AVRT.DLL|BCRYPT.DLL|BCRYPTPRIMITIVES.DLL|CRYPT32.DLL|SECUR32.DLL|NTDLL.DLL)
                   continue
                   ;;
                 *)
@@ -707,9 +804,10 @@ jobs:
   windows-exe-arm64:
     name: Windows EXE build (arm64)
     runs-on: windows-11-arm
+    # Build independently while macOS cross-platform guards are queued;
+    # those guards remain a separate required CI job.
     needs:
       - preflight-guard-tests
-      - preflight-cross-platform-guards
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -738,6 +836,7 @@ jobs:
           # omp_init_lock from libsoxr.a).
           install: >-
             git
+            diffutils
             mingw-w64-clang-aarch64-binutils
             mingw-w64-clang-aarch64-clang
             mingw-w64-clang-aarch64-cmake
@@ -746,10 +845,13 @@ jobs:
             mingw-w64-clang-aarch64-libjpeg-turbo
             mingw-w64-clang-aarch64-libusb
             mingw-w64-clang-aarch64-libsoxr
+            mingw-w64-clang-aarch64-openh264
+            mingw-w64-clang-aarch64-opus
             mingw-w64-clang-aarch64-llvm-openmp
             mingw-w64-clang-aarch64-meson
             mingw-w64-clang-aarch64-ninja
             mingw-w64-clang-aarch64-pkgconf
+            make
 
       - name: Setup MSYS2 (retry no cache)
         if: steps.setup_msys2_cached.outcome == 'failure'
@@ -760,6 +862,7 @@ jobs:
           cache: false
           install: >-
             git
+            diffutils
             mingw-w64-clang-aarch64-binutils
             mingw-w64-clang-aarch64-clang
             mingw-w64-clang-aarch64-cmake
@@ -768,10 +871,13 @@ jobs:
             mingw-w64-clang-aarch64-libjpeg-turbo
             mingw-w64-clang-aarch64-libusb
             mingw-w64-clang-aarch64-libsoxr
+            mingw-w64-clang-aarch64-openh264
+            mingw-w64-clang-aarch64-opus
             mingw-w64-clang-aarch64-llvm-openmp
             mingw-w64-clang-aarch64-meson
             mingw-w64-clang-aarch64-ninja
             mingw-w64-clang-aarch64-pkgconf
+            make
 
       - name: Resolve build version
         id: version
@@ -794,6 +900,11 @@ jobs:
           set -euo pipefail
           DEPS_PREFIX="$PWD/.deps/install"
           export PKG_CONFIG_PATH="$DEPS_PREFIX/lib/pkgconfig:$DEPS_PREFIX/lib64/pkgconfig:${MINGW_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+
+          if ! pkg-config --atleast-version=1.0.30 libusb-1.0; then
+            echo "Windows DdD RAW_IO and native WinUSB require libusb 1.0.30 or newer." >&2
+            exit 1
+          fi
 
           # Cache hit guard: skip libuvc/hsdaoh/raylib rebuild if .deps/install
           # was restored from actions/cache (key includes hashFiles(hsdaoh/**)).
@@ -857,12 +968,17 @@ jobs:
 
           export PKG_CONFIG_PATH="$DEPS_PREFIX/lib/pkgconfig:$DEPS_PREFIX/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
           export CMAKE_PREFIX_PATH="$DEPS_PREFIX:${CMAKE_PREFIX_PATH:-}"
+          # Targeted FFmpeg static video decoders; no unrelated DLLs/Rust.
+          bash scripts/build-monitor-ffmpeg-minimal.sh windows
+          DEPS_PREFIX="$DEPS_PREFIX" bash scripts/build-rtlsdr.sh
           pkg-config --modversion fftw3f
-          meson setup "$BUILD_DIR" misrc_tools --buildtype release
+          pkg-config --modversion libavcodec libavutil libswscale
+          meson setup "$BUILD_DIR" misrc_tools --buildtype release -Dmodern_monitor_codecs=enabled -Drtlsdr=enabled
           meson compile -C "$BUILD_DIR" misrc_capture misrc_extract misrc_gui
 
           mkdir -p dist
           cp "$BUILD_DIR/misrc_gui.exe" dist/MISRC.exe
+          bash scripts/verify-rtlsdr-build.sh dist/MISRC.exe
           test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 1
           test "$(find dist -maxdepth 1 -name '*.exe' | wc -l)" -eq 1
           test "$(objdump -p dist/MISRC.exe | awk '/^Subsystem[[:space:]]/ {print $2; exit}')" = "00000002"
@@ -871,7 +987,7 @@ jobs:
             local target="$1"
             while IFS= read -r dll; do
               case "$(echo "$dll" | tr '[:lower:]' '[:upper:]')" in
-                API-MS-WIN-*|KERNEL32.DLL|KERNELBASE.DLL|USER32.DLL|GDI32.DLL|SHELL32.DLL|WINMM.DLL|OLE32.DLL|OLEAUT32.DLL|ADVAPI32.DLL|COMDLG32.DLL|COMCTL32.DLL|SHLWAPI.DLL|WS2_32.DLL|SETUPAPI.DLL|IMM32.DLL|VERSION.DLL|UCRTBASE.DLL|MSVCRT.DLL|MF.DLL|MFPLAT.DLL|MFREADWRITE.DLL|EVR.DLL|STRMIIDS.DLL|AVRT.DLL)
+                API-MS-WIN-*|KERNEL32.DLL|KERNELBASE.DLL|USER32.DLL|GDI32.DLL|SHELL32.DLL|WINMM.DLL|OLE32.DLL|OLEAUT32.DLL|ADVAPI32.DLL|COMDLG32.DLL|COMCTL32.DLL|SHLWAPI.DLL|WS2_32.DLL|SETUPAPI.DLL|CFGMGR32.DLL|WINUSB.DLL|IMM32.DLL|VERSION.DLL|UCRTBASE.DLL|MSVCRT.DLL|MF.DLL|MFPLAT.DLL|MFREADWRITE.DLL|EVR.DLL|STRMIIDS.DLL|AVRT.DLL|BCRYPT.DLL|BCRYPTPRIMITIVES.DLL|CRYPT32.DLL|SECUR32.DLL|NTDLL.DLL)
                   continue
                   ;;
                 *)
@@ -922,13 +1038,14 @@ jobs:
       matrix:
         include:
           - arch: arm64
-            runner: macos-14
+            runner: macos-15
           - arch: x86_64
             runner: macos-15-intel
     runs-on: ${{ matrix.runner }}
+    # Build independently while macOS cross-platform guards are queued;
+    # those guards remain a separate required CI job.
     needs:
       - preflight-guard-tests
-      - preflight-cross-platform-guards
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -971,11 +1088,17 @@ jobs:
             /usr/local/Homebrew/Library/Taps/hashicorp/homebrew-tap; do
             rm -rf "$tap_dir"
           done
-          for formula in cmake fftw flac libusb libuvc meson nasm ninja pkgconf libsoxr; do
+          for formula in cmake fftw flac libusb libuvc meson nasm ninja pkgconf libsoxr opus; do
             if ! brew list --versions "$formula" >/dev/null 2>&1; then
               brew install "$formula"
             fi
           done
+          if ! brew list --versions openh264 >/dev/null 2>&1; then
+            brew install openh264
+          fi
+          if ! brew list --versions ffmpeg >/dev/null 2>&1; then
+            brew install ffmpeg
+          fi
 
       - name: Build and stage architecture app bundle
         env:
@@ -1027,9 +1150,15 @@ jobs:
 
           export PKG_CONFIG_PATH="$DEPS_PREFIX/lib/pkgconfig:$DEPS_PREFIX/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
           export CMAKE_PREFIX_PATH="$DEPS_PREFIX:${CMAKE_PREFIX_PATH:-}"
+          DEPS_PREFIX="$DEPS_PREFIX" bash scripts/build-rtlsdr.sh "-DCMAKE_OSX_ARCHITECTURES=$MACOS_ARCH"
           pkg-config --modversion fftw3f
-          meson setup "$BUILD_DIR" misrc_tools --buildtype release
+          # The standalone .app must contain modern codecs; never silently
+          # publish an OpenH264-only build on either macOS architecture.
+          pkg-config --modversion libavcodec libavutil libswscale
+          meson setup "$BUILD_DIR" misrc_tools --buildtype release -Dmodern_monitor_codecs=enabled -Drtlsdr=enabled
           meson compile -C "$BUILD_DIR" misrc_capture misrc_extract misrc_gui
+          otool -L "$BUILD_DIR/misrc_gui" | grep -q libavcodec
+          otool -L "$BUILD_DIR/misrc_gui" | grep -q libswscale
 
           "$BUILD_DIR/misrc_gui" --smoke-test
           set +e
@@ -1185,6 +1314,12 @@ jobs:
             patch_macho_refs "$DYLIB"
           done
 
+          # The recursive Mach-O dependency bundler above must also capture
+          # every FFmpeg dylib into the app's Frameworks directory; the
+          # app should work without the target machine having Homebrew.
+          find "$FW_DIR" -maxdepth 1 -name 'libavcodec*.dylib' | grep -q .
+          find "$FW_DIR" -maxdepth 1 -name 'libavutil*.dylib' | grep -q .
+          find "$FW_DIR" -maxdepth 1 -name 'libswscale*.dylib' | grep -q .
           if otool -L "$APP_ROOT/MacOS/MISRC" | grep -E '/opt/homebrew|/usr/local/opt'; then
             echo "Found non-portable Homebrew dylib path in MISRC binary" >&2
             exit 1
@@ -1220,7 +1355,7 @@ jobs:
 
   macos-app-universal:
     name: macOS APP build (universal)
-    runs-on: macos-14
+    runs-on: macos-15
     needs:
       - macos-app-build
     steps:
@@ -1248,16 +1383,41 @@ jobs:
           mkdir -p dist
           cp -R stage-arm64/MISRC.app dist/MISRC.app
 
+          # FFmpeg's Homebrew dependency trees can legitimately differ
+          # between arm64 and x86_64 (OpenSSL, codecs, etc). Merge the UNION
+          # of both bundles. Lipo only Mach-O libraries present for both
+          # architectures; preserve single-arch dylibs when only one needs
+          # them, and carry across x86-only symlinks as well.
           while IFS= read -r rel; do
             ARM_FILE="stage-arm64/${rel}"
             X86_FILE="stage-x86_64/${rel}"
             OUT_FILE="dist/${rel}"
-            if file "$ARM_FILE" | grep -q "Mach-O"; then
-              lipo -create "$ARM_FILE" "$X86_FILE" -output "$OUT_FILE"
-            else
+            mkdir -p "$(dirname "$OUT_FILE")"
+            if [[ -f "$ARM_FILE" && -f "$X86_FILE" ]]; then
+              if file "$ARM_FILE" | grep -q 'Mach-O' &&
+                 file "$X86_FILE" | grep -q 'Mach-O'; then
+                lipo -create "$ARM_FILE" "$X86_FILE" -output "$OUT_FILE"
+              else
+                cp "$ARM_FILE" "$OUT_FILE"
+              fi
+            elif [[ -f "$ARM_FILE" ]]; then
               cp "$ARM_FILE" "$OUT_FILE"
+            elif [[ -f "$X86_FILE" ]]; then
+              cp "$X86_FILE" "$OUT_FILE"
+            else
+              echo "Missing both source files: $rel" >&2
+              exit 1
             fi
-          done < <(cd stage-arm64 && find MISRC.app -type f | sort)
+          done < <(
+            { (cd stage-arm64 && find MISRC.app -type f)
+              (cd stage-x86_64 && find MISRC.app -type f); } | sort -u
+          )
+          while IFS= read -r rel; do
+            if [[ ! -e "dist/${rel}" && ! -L "dist/${rel}" ]]; then
+              mkdir -p "$(dirname "dist/${rel}")"
+              cp -P "stage-x86_64/${rel}" "dist/${rel}"
+            fi
+          done < <(cd stage-x86_64 && find MISRC.app -type l)
           chmod +x dist/MISRC.app/Contents/MacOS/MISRC dist/MISRC.app/Contents/MacOS/misrc_capture dist/MISRC.app/Contents/MacOS/misrc_extract
 
           codesign --force --deep --sign - dist/MISRC.app
@@ -1265,6 +1425,16 @@ jobs:
           LIPO_ARCHS="$(lipo -archs dist/MISRC.app/Contents/MacOS/MISRC)"
           echo "$LIPO_ARCHS" | grep -q 'arm64'
           echo "$LIPO_ARCHS" | grep -q 'x86_64'
+          for arch in arm64 x86_64; do
+            THIN_GUI="$RUNNER_TEMP/misrc-rtlsdr-$arch"
+            lipo dist/MISRC.app/Contents/MacOS/MISRC -thin "$arch" -output "$THIN_GUI"
+            bash scripts/verify-rtlsdr-build.sh "$THIN_GUI"
+            DYNAMIC="$(otool -L "$THIN_GUI")"
+            if grep -Fiq librtlsdr <<< "$DYNAMIC"; then
+              echo "macOS GUI ($arch) must link RTL-SDR statically" >&2
+              exit 1
+            fi
+          done
 
           dist/MISRC.app/Contents/MacOS/MISRC --smoke-test
           set +e

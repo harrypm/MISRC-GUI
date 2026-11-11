@@ -331,6 +331,11 @@ typedef struct cvbs_decoder {
     uint8_t *display_back;         // Back buffer - written by display thread
     atomic_int display_ready;      // 1 when back buffer has new frame to swap
 
+    /* Optional borrowed RGB24 frame callback; set only while decode is stopped. */
+    void (*monitor_frame_sink)(void *context, const uint8_t *rgb,
+                               unsigned width, unsigned height, uint64_t timestamp_us);
+    void *monitor_frame_sink_context;
+
     // GPU resources for video display
     Image frame_image;
     Texture2D frame_texture;
@@ -485,6 +490,13 @@ typedef struct cvbs_decoder {
 // Returns true on success, false on allocation failure
 bool gui_cvbs_init(cvbs_decoder_t *decoder);
 
+/* Callback executes synchronously on decoder worker; must not block.
+ * Set/unset only before/after decoding, never concurrently with processing.
+ * Pixel pointer is borrowed for the duration of the callback only. */
+void gui_cvbs_set_monitor_frame_sink(cvbs_decoder_t *decoder,
+    void (*callback)(void *, const uint8_t *, unsigned, unsigned, uint64_t),
+    void *context);
+
 // Cleanup decoder resources
 void gui_cvbs_cleanup(cvbs_decoder_t *decoder);
 
@@ -531,11 +543,20 @@ void gui_cvbs_render_frame(cvbs_decoder_t *decoder,
 // Uses cvbs_format_select_t from gui_app.h (CVBS_SELECT_PAL/CVBS_SELECT_NTSC)
 void gui_cvbs_set_format(cvbs_decoder_t *decoder, int format_select);
 
-// Startup default for the System selector (0=PAL, 1=NTSC, 2=SECAM), pushed
-// once from the persisted app settings after gui_settings_load; every
-// CVBS panel decoder is created in this system. The System dropdown's
-// click handler persists the user's pick back into the settings.
+// Startup default for the System selector (0=PAL, 1=NTSC, 2=SECAM,
+// 3=MESECAM), pushed once from the persisted app settings after
+// gui_settings_load; every panel decoder is created in this system
+// (MESECAM is RF-only: composite decoders start in SECAM, the RF preview
+// starts in the MESECAM profile). The System dropdown's click handler
+// persists the user's pick back into the settings.
 void gui_cvbs_set_default_system(int system_select);
+
+// Switch every Video panel's decoder previews (CVBS, Tape Decode, VHS FM
+// RF) to the Test Gen system (0=PAL, 1=NTSC, 2=SECAM, 3=MESECAM).
+// Called by the Gen box on the waveform panel after it changes
+// settings.video_system. Manual panel selections keep working between
+// generator changes; the next Gen change flips the panels again.
+void gui_video_follow_generator_system(gui_app_t *app, int system);
 
 //-----------------------------------------------------------------------------
 // Status
@@ -563,6 +584,9 @@ void gui_cvbs_get_secam_diag(cvbs_decoder_t *decoder,
 void gui_video_update_rf_routes(gui_app_t *app);
 // Continuous RF input from extraction; samples are copied into bounded workers.
 #include "../processing/gui_rf_preview_worker.h"
+void gui_video_reset_rtlsdr(gui_app_t *app);
+void gui_video_submit_rtlsdr(gui_app_t *app, const uint8_t *iq, size_t count,
+                             const gui_rf_block_info_t *info);
 void gui_video_submit_rf(gui_app_t *app, const int16_t *samples_a, const int16_t *samples_b,
                           size_t count_a, size_t count_b, const gui_rf_block_info_t info[2],
                           bool input_supported);

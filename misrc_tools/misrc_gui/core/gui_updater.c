@@ -1,6 +1,6 @@
 /* gui_updater: release update checking + confirmed self-update.
  * See gui_updater.h for the design. Everything here is plain libc + shell-out
- * to curl/unzip/tar/hdiutil via popen, matching the updater pattern the app
+ * to curl/unzip/tar/hdiutil, matching the updater pattern the app
  * has always used. Pure-logic parts (parse/build/compare) are unit-tested by
  * test/gui_updater_test.c, which #includes this file. */
 #include "gui_updater.h"
@@ -27,8 +27,6 @@
 #include <sys/types.h>
 
 #if defined(_WIN32)
-#define GUI_UPDATER_POPEN _popen
-#define GUI_UPDATER_PCLOSE _pclose
 #define GUI_UPDATER_CURL_EXE "curl.exe"
 #define GUI_UPDATER_MKDIR(path) _mkdir(path)
 #else
@@ -123,6 +121,12 @@ bool gui_updater_parse_semver_triplet(const char *version, int *major_out, int *
     return true;
 }
 
+bool gui_updater_version_is_comparable(const char *version)
+{
+    int maj = 0, min = 0, pat = 0;
+    return gui_updater_parse_semver_triplet(version, &maj, &min, &pat);
+}
+
 int gui_updater_compare_versions(const char *current_version, const char *latest_version)
 {
     int cmaj = 0, cmin = 0, cpat = 0;
@@ -135,9 +139,15 @@ int gui_updater_compare_versions(const char *current_version, const char *latest
         if (cpat != lpat) return (cpat < lpat) ? -1 : 1;
         return 0;
     }
-    /* Text fallback: dev builds ("dev-2026-10-21-abcdef") do not parse as
-     * semver; compare lexically so a dev build still sees v1.2.6 as newer
-     * ('d' < 'v') and the self-update flow stays exercisable. */
+    /* A dev/unversioned current build ("dev-2026-10-21-abcdef",
+     * "unknown_version") is NOT comparable: return 0 so no caller ever treats
+     * it as older than a release tag. The old lexical fallback ('d' < 'v')
+     * made every such build permanently report "update available" against
+     * the current release even when the dev build was newer. Callers that
+     * need to know use gui_updater_version_is_comparable(). */
+    if (!current_ok) return 0;
+    /* Weird latest (non-semver tag): keep a lexical text comparison for the
+     * release-vs-release edge only. */
     int text_cmp = strcmp(current_version ? current_version : "",
                           latest_version ? latest_version : "");
     if (text_cmp < 0) return -1;
@@ -159,12 +169,73 @@ bool gui_updater_is_release_tag_safe(const char *tag)
 }
 
 /* ------------------------------------------------------------------ */
-/* popen helper                                                        */
+/* External command helper                                             */
 /* ------------------------------------------------------------------ */
 
 static int gui_updater_run_command(const char *cmd, char *output, size_t output_size)
 {
+    if (output && output_size > 0) output[0] = '\0';
     if (!cmd) return -1;
+#if defined(_WIN32)
+    /* GUI applications must not attach helper tools to a transient console. */
+    SECURITY_ATTRIBUTES security = {sizeof(security), NULL, TRUE};
+    HANDLE read_pipe = NULL, write_pipe = NULL, null_io = INVALID_HANDLE_VALUE;
+    HANDLE child_error = NULL;
+    PROCESS_INFORMATION process = {0};
+    STARTUPINFOA startup = {0};
+    char *command_line = NULL;
+    int result = -1;
+    if (!CreatePipe(&read_pipe, &write_pipe, &security, 0) ||
+        !SetHandleInformation(read_pipe, HANDLE_FLAG_INHERIT, 0)) goto cleanup;
+    null_io = CreateFileA("NUL", GENERIC_READ | GENERIC_WRITE,
+                          FILE_SHARE_READ | FILE_SHARE_WRITE, &security,
+                          OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (null_io == INVALID_HANDLE_VALUE) goto cleanup;
+    HANDLE parent_error = GetStdHandle(STD_ERROR_HANDLE);
+    if (parent_error && parent_error != INVALID_HANDLE_VALUE &&
+        !DuplicateHandle(GetCurrentProcess(), parent_error, GetCurrentProcess(),
+                         &child_error, 0, TRUE, DUPLICATE_SAME_ACCESS)) child_error = NULL;
+    command_line = malloc(strlen(cmd) + 1);
+    if (!command_line) goto cleanup;
+    strcpy(command_line, cmd);
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdInput = null_io;
+    startup.hStdOutput = write_pipe;
+    startup.hStdError = child_error ? child_error : null_io;
+    if (!CreateProcessA(NULL, command_line, NULL, NULL, TRUE, CREATE_NO_WINDOW,
+                        NULL, NULL, &startup, &process)) goto cleanup;
+    CloseHandle(write_pipe);
+    write_pipe = NULL;
+    char buffer[512];
+    DWORD count;
+    size_t used = 0;
+    BOOL read_ok;
+    while ((read_ok = ReadFile(read_pipe, buffer, sizeof(buffer), &count, NULL)) && count) {
+        if (output && output_size > 0 && used + 1 < output_size) {
+            size_t take = count;
+            if (take > output_size - used - 1) take = output_size - used - 1;
+            memcpy(output + used, buffer, take);
+            used += take;
+            output[used] = '\0';
+        }
+    }
+    bool pipe_ok = read_ok || GetLastError() == ERROR_BROKEN_PIPE;
+    CloseHandle(read_pipe);
+    read_pipe = NULL;
+    DWORD exit_code;
+    if (WaitForSingleObject(process.hProcess, INFINITE) == WAIT_OBJECT_0 &&
+        GetExitCodeProcess(process.hProcess, &exit_code) && pipe_ok) result = (int)exit_code;
+cleanup:
+    free(command_line);
+    if (read_pipe) CloseHandle(read_pipe);
+    if (write_pipe) CloseHandle(write_pipe);
+    if (null_io != INVALID_HANDLE_VALUE) CloseHandle(null_io);
+    if (child_error) CloseHandle(child_error);
+    if (process.hThread) CloseHandle(process.hThread);
+    if (process.hProcess) CloseHandle(process.hProcess);
+    return result;
+#else
     FILE *fp = GUI_UPDATER_POPEN(cmd, "r");
     if (!fp) return -1;
     if (output && output_size > 0) {
@@ -182,6 +253,7 @@ static int gui_updater_run_command(const char *cmd, char *output, size_t output_
         }
     }
     return GUI_UPDATER_PCLOSE(fp);
+#endif
 }
 
 /* ------------------------------------------------------------------ */
@@ -437,7 +509,7 @@ bool gui_updater_fetch_latest_release_tag(const char *tag_lookup_url,
 
     if (location[0] == '\0') {
         if (rc != 0) {
-            snprintf(error_out, error_out_len, "tag lookup request failed");
+            snprintf(error_out, error_out_len, "tag lookup request failed (curl rc=%d)", rc);
         } else {
             snprintf(error_out, error_out_len, "latest release redirect header missing");
         }
@@ -605,7 +677,15 @@ static bool gui_updater_ensure_dir(const char *path)
     while (len > 1 && (tmp[len - 1] == '/' || tmp[len - 1] == '\\')) {
         tmp[--len] = '\0';
     }
-    for (char *p = tmp + 1; *p; p++) {
+    char *start = tmp + 1;
+#if defined(_WIN32)
+    /* Keep the separator in a drive root: C: alone is drive-relative. */
+    if (len >= 3 && isalpha((unsigned char)tmp[0]) && tmp[1] == ':' &&
+        (tmp[2] == '/' || tmp[2] == '\\')) {
+        start = tmp + 3;
+    }
+#endif
+    for (char *p = start; *p; p++) {
         if (*p == '/' || *p == '\\') {
             char sep = *p;
             *p = '\0';
@@ -860,9 +940,15 @@ bool gui_updater_install_asset(const char *asset_url, const char *asset_name,
         }
         char extract_cmd[GUI_UPDATER_PATH_MAX * 2 + 64];
 #if defined(_WIN32)
-        /* Windows ships bsdtar (tar.exe) since 10 1803; it reads zip. */
-        if (snprintf(extract_cmd, sizeof(extract_cmd), "tar -xf \"%s\" -C \"%s\"",
-                     download_path, payload_dir) >= (int)sizeof(extract_cmd))
+        /* Use Windows' ZIP-capable bsdtar, not a GNU tar earlier in PATH. */
+        char system_dir[GUI_UPDATER_PATH_MAX];
+        UINT system_len = GetSystemDirectoryA(system_dir, sizeof(system_dir));
+        if (!system_len || system_len >= sizeof(system_dir)) {
+            if (status_out) snprintf(status_out, status_len, "unable to locate Windows tar");
+            return false;
+        }
+        if (snprintf(extract_cmd, sizeof(extract_cmd), "\"%s\\tar.exe\" -xf \"%s\" -C \"%s\"",
+                     system_dir, download_path, payload_dir) >= (int)sizeof(extract_cmd))
 #else
         /* Linux release zips hold a single AppImage; unzip is the standard tool. */
         if (snprintf(extract_cmd, sizeof(extract_cmd), "unzip -o -j \"%s\" -d \"%s\"",

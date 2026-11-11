@@ -15,6 +15,9 @@ static atomic_bool fail_create;
 static atomic_int supplied_blocks, completed_blocks, marker;
 static atomic_int creates, clears, producer_deletes, stopped_deletes;
 static uint8_t captured_pcm[BUFFER_AUDIO_READ_SIZE];
+static FILE *record_fixture_file;
+static uint8_t record_fixture_input[(3 + 55 + 2) * 12 + 5];
+static size_t record_fixture_read;
 static int device_attempts, stream_loads, stream_unloads, processed_halves;
 static bool fail_device, fail_stream, stream_playing;
 static int stream_buffer_frames;
@@ -84,20 +87,64 @@ soxr_error_t soxr_process(soxr_t resampler, soxr_in_t in, size_t ilen,
 
 void gui_settings_save(const gui_settings_t *settings) { (void)settings; }
 void gui_app_set_status(gui_app_t *a,const char *s) { (void)a;(void)s; assert(false); }
-FILE *file_open_utf8(const char *p,const char *m) { (void)p;(void)m; assert(false);return NULL; }
+FILE *file_open_utf8(const char *p, const char *m)
+{
+    assert(record_fixture_file && strcmp(p, "quad.wav") == 0 && strcmp(m, "wbx") == 0);
+    return record_fixture_file;
+}
+/* The stub above compiles to mls_proxy_open: gui_audio.c's stdio redirects
+ * are still in effect here. Undo them, then use ordinary stdio for the
+ * isolated recording-tail fixture. */
+#undef fwrite
+#undef fclose
+#undef fflush
+#undef ferror
+#undef clearerr
+#undef file_open_utf8
+size_t mls_proxy_write(const void *d, size_t s, size_t n, FILE *f)
+{ assert(f == record_fixture_file); return fwrite(d, s, n, f); }
+int mls_proxy_close(FILE *f)
+{ assert(f == record_fixture_file); return fflush(f); }  // Keep the fixture open for readback.
+int mls_proxy_flush(FILE *f) { assert(f == record_fixture_file); return fflush(f); }
+int mls_proxy_seek(FILE *f, int64_t offset, int whence)
+{ assert(f == record_fixture_file && offset == 0); return fseek(f, 0, whence); }
+int mls_proxy_error(FILE *f) { assert(f == record_fixture_file); return ferror(f); }
+void mls_proxy_clearerr(FILE *f) { (void)f; assert(false); }
+/* gui_audio.c taps the capture stream for the M-Server monitor display only
+ * while the unified server runs; idle in this harness. */
+bool gui_monitor_server_active(void) { return false; }
 int bufmgr_ensure_init(buffer_manager_t *m,buffer_id_t id)
 { (void)m; assert(id==BUF_CAPTURE_AUDIO); return 0; }
 void *bufmgr_read_begin(buffer_manager_t *m,buffer_id_t id,size_t n,int timeout)
 {
-    (void)m;(void)timeout; assert(id==BUF_CAPTURE_AUDIO && n==BUFFER_AUDIO_READ_SIZE);
+    (void)m;(void)timeout; assert(id==BUF_CAPTURE_AUDIO);
+    if (record_fixture_file) {
+        if (n > sizeof(record_fixture_input) - record_fixture_read) return NULL;
+        return record_fixture_input + record_fixture_read;
+    }
+    assert(n==BUFFER_AUDIO_READ_SIZE);
     int available=1;
     if (atomic_compare_exchange_strong(&supplied_blocks,&available,0)) return captured_pcm;
     thrd_sleep_ms(1); return NULL;
 }
 void bufmgr_read_end(buffer_manager_t *m,buffer_id_t id,size_t n)
-{ (void)m; assert(id==BUF_CAPTURE_AUDIO && n==BUFFER_AUDIO_READ_SIZE); atomic_fetch_add(&completed_blocks,1); }
+{
+    (void)m; assert(id==BUF_CAPTURE_AUDIO);
+    if (record_fixture_file) {
+        record_fixture_read += n;
+        ringbuffer_t *ring = &m->buffers[id];
+        size_t head = atomic_load(&ring->head);
+        atomic_store(&ring->head, (head + n) % (ring->buffer_size * 2));
+        return;
+    }
+    assert(n==BUFFER_AUDIO_READ_SIZE);
+    atomic_fetch_add(&completed_blocks,1);
+}
 size_t bufmgr_fill_level(buffer_manager_t *m,buffer_id_t id)
-{ (void)m;(void)id; return 0; }
+{
+    (void)m; (void)id;
+    return record_fixture_file ? sizeof(record_fixture_input) - record_fixture_read : 0;
+}
 void extract_audio_2ch_C(uint16_t *in,size_t n,uint16_t *a,uint16_t *b)
 { (void)in;(void)n;(void)a;(void)b; assert(false); }
 void extract_audio_1ch_C(uint8_t *in,size_t n,uint8_t *a,uint8_t *b,uint8_t *c,uint8_t *d)
@@ -114,6 +161,10 @@ AudioStream LoadAudioStream(unsigned rate,unsigned bits,unsigned channels)
     return (AudioStream){.buffer=(void*)1,.sampleRate=rate,.sampleSize=bits,.channels=channels};
 }
 bool IsAudioStreamValid(AudioStream stream) { return stream.buffer!=NULL; }
+void SetAudioStreamCallback(AudioStream stream,AudioCallback callback)
+{ assert(main_thread && stream.buffer && callback); }
+void AttachAudioMixedProcessor(AudioCallback process) { (void)process; assert(false); }
+void DetachAudioMixedProcessor(AudioCallback process) { (void)process; assert(false); }
 void PlayAudioStream(AudioStream stream) { assert(main_thread && stream.buffer); stream_playing=true; }
 void StopAudioStream(AudioStream stream) { assert(main_thread && stream.buffer); stream_playing=false; }
 void UnloadAudioStream(AudioStream stream) { assert(main_thread && stream.buffer); ++stream_unloads; }
@@ -152,8 +203,55 @@ static int release_after_stop(void *unused)
     atomic_store(&release_process,true);
     return 0;
 }
+static void check_record_stop_tail(void)
+{
+    const size_t prefix_bytes = 3 * 12;
+    const size_t expected_bytes = 55 * 12;
+    for (size_t i = 0; i < sizeof(record_fixture_input); ++i)
+        record_fixture_input[i] = (uint8_t)(i * 31 + i / 12);
+    record_fixture_file = tmpfile();
+    assert(record_fixture_file);
+    audio_ctx_t recorder = {.app = &app, .bufmgr = &app.buffers};
+    const char paths[GUI_AUDIO_RECORD_OUTPUT_COUNT][GUI_AUDIO_RECORD_PATH_MAX] = {"quad.wav"};
+    ringbuffer_t *ring = &app.buffers.buffers[BUF_CAPTURE_AUDIO];
+    ring->buffer_size = 4096;
+    size_t head = ring->buffer_size * 2 - 24;
+    atomic_store(&ring->head, head);
+    atomic_store(&ring->tail, prefix_bytes - 24);
+    atomic_store(&app.buffers.stats[BUF_CAPTURE_AUDIO].write_drops, 1);
+    atomic_store(&s_audio_thread_active, true);
+    gui_audio_begin_recording(&app, paths, 0);
+    atomic_store(&ring->tail, prefix_bytes + expected_bytes - 24);
+    gui_audio_request_record_stop(&app);
+    // More PCM arrives before the worker first observes the recording.
+    atomic_store(&ring->tail, sizeof(record_fixture_input) - 24);
+    assert(audio_thread_main(&recorder) == 0);
+    assert(!recorder.f_4ch && gui_audio_wait_recording_idle());
+
+    rewind(record_fixture_file);
+    wave_header_t header;
+    uint8_t payload[sizeof(record_fixture_input)];
+    assert(fread(&header, 1, sizeof(header), record_fixture_file) == sizeof(header));
+    assert(header.dataSize == expected_bytes && header.channelCount == 4);
+    assert(fread(payload, 1, sizeof(payload), record_fixture_file) == expected_bytes);
+    assert(memcmp(payload, record_fixture_input + prefix_bytes, expected_bytes) == 0);
+    assert(!ferror(record_fixture_file));
+    assert(fclose(record_fixture_file) == 0);
+    record_fixture_file = NULL;
+
+    atomic_store(&s_audio_thread_active, true);
+    gui_audio_begin_recording(&app, paths, 0);
+    atomic_fetch_add(&app.buffers.stats[BUF_CAPTURE_AUDIO].write_drops, 1);
+    gui_audio_request_record_stop(&app);
+    atomic_store(&s_audio_record_state, AUDIO_RECORD_IDLE);
+    assert(!gui_audio_wait_recording_idle());
+    atomic_store(&s_audio_record_failed, false);
+    atomic_store(&s_audio_thread_active, false);
+}
+
 int main(void)
 {
+    check_record_stop_tail();
     main_thread=true;
     app.is_capturing=true; app.settings.audio_monitor_playback=true;
     app.device_count=1; app.selected_device=0; app.devices[0].type=DEVICE_TYPE_CXADC;

@@ -13,13 +13,14 @@
 #endif
 
 /* Rate provisions (see dev/output_stdio_buffer_and_rf_rate_provisions.md):
- * exact fast paths for 20/40/80 MSPS (80 covers the 2x40 dual-channel cards);
- * arbitrary soxr rates otherwise, up to 200 MSPS single-stream captures. */
+ * 20 MSPS output keeps its exact 20/40/80 input fast paths. The wide 40 MSPS
+ * output uses exact 40/80/160 paths; other ratios use soxr up to 200 MSPS. */
 #define RF_OUTPUT_RATE_HZ 20000000u
+#define RF_WIDE_OUTPUT_RATE_HZ 40000000u
 #define RF_MIN_INPUT_RATE_HZ 16000000u
 #define RF_MAX_INPUT_RATE_HZ 200000000u
 #define RF_SOXR_BLOCK_SAMPLES 2048u
-/* The HQ converter uses DFT blocks capped at 1024 samples. Leave room for
+/* The converters use DFT blocks capped at 4096 samples. Leave room for
  * delayed output from preceding calls as well as the current input block. */
 #define RF_SOXR_OUTPUT_HEADROOM 8192u
 
@@ -30,8 +31,9 @@ typedef struct {
 } rf_halfband_t;
 
 struct gui_rf_resampler {
-    uint32_t input_rate_hz;
+    uint32_t input_rate_hz, output_rate_hz;
     unsigned factor;
+    bool ed_beta;
     rf_halfband_t stages[2];
 #if LIBSOXR_ENABLED
     soxr_t soxr;
@@ -79,32 +81,46 @@ static bool input_rate_valid(uint32_t rate) {
     return rate >= RF_MIN_INPUT_RATE_HZ && rate <= RF_MAX_INPUT_RATE_HZ;
 }
 
+static bool output_rate_valid(uint32_t rate) {
+    return rate == RF_OUTPUT_RATE_HZ || rate == RF_WIDE_OUTPUT_RATE_HZ;
+}
+
 gui_rf_resampler_t *gui_rf_resampler_create(uint32_t input_rate_hz) {
-    if (!input_rate_valid(input_rate_hz)) return NULL;
+    return gui_rf_resampler_create_rate(input_rate_hz, RF_OUTPUT_RATE_HZ);
+}
+
+static gui_rf_resampler_t *rf_resampler_create(uint32_t input_rate_hz,
+                                               uint32_t output_rate_hz, bool ed_beta) {
+    if (!input_rate_valid(input_rate_hz) || !output_rate_valid(output_rate_hz) ||
+        (ed_beta && input_rate_hz < RF_OUTPUT_RATE_HZ)) return NULL;
     gui_rf_resampler_t *resampler = calloc(1, sizeof(*resampler));
     if (!resampler) return NULL;
     resampler->input_rate_hz = input_rate_hz;
-    if (input_rate_hz == RF_OUTPUT_RATE_HZ) {
+    resampler->output_rate_hz = output_rate_hz;
+    resampler->ed_beta = ed_beta;
+    if (input_rate_hz == output_rate_hz) {
         resampler->factor = 1u;
-    } else if (input_rate_hz == 40000000u) {
+    } else if (!ed_beta && input_rate_hz == output_rate_hz * 2u) {
         resampler->factor = 2u;
-    } else if (input_rate_hz == 80000000u) {
+    } else if (!ed_beta && input_rate_hz == output_rate_hz * 4u) {
         resampler->factor = 4u;
     } else {
 #if LIBSOXR_ENABLED
         soxr_error_t error = NULL;
         soxr_io_spec_t io = soxr_io_spec(SOXR_FLOAT32_I, SOXR_FLOAT32_I);
-        soxr_quality_spec_t quality = soxr_quality_spec(SOXR_HQ, SOXR_HI_PREC_CLOCK);
-        const double nyquist = 0.5 * fmin((double)input_rate_hz, RF_OUTPUT_RATE_HZ);
-        /* Preserve VHS RF through at least 7.5 MHz. At the lowest supported
-         * input rate, retain 95% of the 8 MHz input Nyquist band. */
-        quality.passband_end = fmin(0.95, 8000000.0 / nyquist);
+        soxr_quality_spec_t quality = soxr_quality_spec(ed_beta ? SOXR_16_BITQ : SOXR_HQ, SOXR_HI_PREC_CLOCK);
+        const double nyquist = 0.5 * fmin((double)input_rate_hz, output_rate_hz);
+        /* ED preserves its 9.3 MHz white carrier with a 9.5/10 MHz transition.
+         * Keep legacy 20 MSPS and explicit 40 MSPS responses unchanged. */
+        const double passband_hz = output_rate_hz == RF_WIDE_OUTPUT_RATE_HZ
+            ? 16000000.0 : ed_beta ? 9500000.0 : 8000000.0;
+        quality.passband_end = fmin(0.95, passband_hz / nyquist);
         quality.stopband_begin = 1.0;
         quality.phase_response = 50.0;
         soxr_runtime_spec_t runtime = soxr_runtime_spec(1);
         runtime.log2_min_dft_size = 8u;
-        runtime.log2_large_dft_size = 10u;
-        resampler->soxr = soxr_create(input_rate_hz, RF_OUTPUT_RATE_HZ, 1,
+        runtime.log2_large_dft_size = ed_beta ? 12u : 10u;
+        resampler->soxr = soxr_create(input_rate_hz, output_rate_hz, 1,
                                       &error, &io, &quality, &runtime);
         if (error || !resampler->soxr) {
             gui_rf_resampler_destroy(resampler);
@@ -116,6 +132,15 @@ gui_rf_resampler_t *gui_rf_resampler_create(uint32_t input_rate_hz) {
 #endif
     }
     return resampler;
+}
+
+gui_rf_resampler_t *gui_rf_resampler_create_rate(uint32_t input_rate_hz,
+                                               uint32_t output_rate_hz) {
+    return rf_resampler_create(input_rate_hz, output_rate_hz, false);
+}
+
+gui_rf_resampler_t *gui_rf_resampler_create_ed_beta(uint32_t input_rate_hz) {
+    return rf_resampler_create(input_rate_hz, RF_OUTPUT_RATE_HZ, true);
 }
 
 void gui_rf_resampler_destroy(gui_rf_resampler_t *resampler) {
@@ -134,25 +159,40 @@ void gui_rf_resampler_reset(gui_rf_resampler_t *resampler) {
 #endif
 }
 
-size_t gui_rf_resampler_output_capacity(uint32_t input_rate_hz, size_t input_count) {
-    if (!input_rate_valid(input_rate_hz) || input_count == 0) return 0;
-    if (input_rate_hz == RF_OUTPUT_RATE_HZ) return input_count;
-    if (input_rate_hz == 40000000u) return input_count / 2u + (input_count % 2u != 0);
-    if (input_rate_hz == 80000000u) return input_count / 4u + (input_count % 4u != 0);
+static size_t rf_output_capacity(uint32_t input_rate_hz, uint32_t output_rate_hz,
+                                 size_t input_count, bool ed_beta) {
+    if (!input_rate_valid(input_rate_hz) || !output_rate_valid(output_rate_hz) || input_count == 0 ||
+        (ed_beta && input_rate_hz < RF_OUTPUT_RATE_HZ)) return 0;
+    if (input_rate_hz == output_rate_hz) return input_count;
+    if (!ed_beta && input_rate_hz == output_rate_hz * 2u) return input_count / 2u + (input_count % 2u != 0);
+    if (!ed_beta && input_rate_hz == output_rate_hz * 4u) return input_count / 4u + (input_count % 4u != 0);
 #if LIBSOXR_ENABLED
     /* Divide before multiplying, so even a caller's oversized count cannot
      * wrap this allocation bound. All rates here are expressed in Hz. */
     const size_t whole = input_count / input_rate_hz;
     const uint64_t remainder = input_count % input_rate_hz;
-    if (whole > (SIZE_MAX - RF_SOXR_OUTPUT_HEADROOM) / RF_OUTPUT_RATE_HZ) return 0;
-    const size_t base = whole * RF_OUTPUT_RATE_HZ;
-    const size_t tail = (size_t)((remainder * RF_OUTPUT_RATE_HZ + input_rate_hz - 1u)
+    if (whole > (SIZE_MAX - RF_SOXR_OUTPUT_HEADROOM) / output_rate_hz) return 0;
+    const size_t base = whole * output_rate_hz;
+    const size_t tail = (size_t)((remainder * output_rate_hz + input_rate_hz - 1u)
                                 / input_rate_hz);
     if (tail > SIZE_MAX - RF_SOXR_OUTPUT_HEADROOM - base) return 0;
     return base + tail + RF_SOXR_OUTPUT_HEADROOM;
 #else
     return 0;
 #endif
+}
+
+size_t gui_rf_resampler_output_capacity(uint32_t input_rate_hz, size_t input_count) {
+    return rf_output_capacity(input_rate_hz, RF_OUTPUT_RATE_HZ, input_count, false);
+}
+
+size_t gui_rf_resampler_output_capacity_rate(uint32_t input_rate_hz,
+                                            uint32_t output_rate_hz, size_t input_count) {
+    return rf_output_capacity(input_rate_hz, output_rate_hz, input_count, false);
+}
+
+size_t gui_rf_resampler_output_capacity_ed_beta(uint32_t input_rate_hz, size_t input_count) {
+    return rf_output_capacity(input_rate_hz, RF_OUTPUT_RATE_HZ, input_count, true);
 }
 
 bool gui_rf_resampler_process(gui_rf_resampler_t *resampler,
@@ -163,8 +203,8 @@ bool gui_rf_resampler_process(gui_rf_resampler_t *resampler,
     *output_count = 0;
     if (!resampler || (input_count && (!input || !output))) return false;
     if (!input_count) return true; /* A capture gap is not end-of-input. */
-    const size_t capacity = gui_rf_resampler_output_capacity(resampler->input_rate_hz,
-                                                            input_count);
+    const size_t capacity = rf_output_capacity(resampler->input_rate_hz,
+        resampler->output_rate_hz, input_count, resampler->ed_beta);
     if (!capacity || output_capacity < capacity) return false;
 
     if (resampler->factor) {
@@ -208,6 +248,22 @@ bool gui_rf_resampler_process(gui_rf_resampler_t *resampler,
     }
     *output_count = produced;
     return true;
+#else
+    return false;
+#endif
+}
+
+bool gui_rf_resampler_finish(gui_rf_resampler_t *resampler, float *output,
+                             size_t output_capacity, size_t *output_count) {
+    if (!output_count) return false;
+    *output_count = 0;
+    if (!resampler || !output || !output_capacity) return false;
+    if (resampler->factor) return true;
+#if LIBSOXR_ENABLED
+    if (!resampler->soxr || resampler->failed) return false;
+    resampler->failed = soxr_process(resampler->soxr, NULL, 0, NULL, output,
+                                     output_capacity, output_count) != NULL;
+    return !resampler->failed;
 #else
     return false;
 #endif

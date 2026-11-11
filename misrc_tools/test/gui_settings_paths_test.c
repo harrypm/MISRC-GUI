@@ -48,6 +48,12 @@ int main(void) {
     CHECK(gui_settings_format(config, sizeof(config), "%s/settings.json", nested));
     gui_settings_t before, after;
     gui_settings_init_defaults(&before);
+#ifdef ENABLE_DDD
+    CHECK(!before.ddd_use_winusb);
+    CHECK(!before.ddd_libusb_raw_io);
+    before.ddd_use_winusb = true;
+    before.ddd_libusb_raw_io = true;
+#endif
     before.auto_names_enabled = false;
     CHECK(gui_settings_format(before.output_path, sizeof(before.output_path), "%s/quote\"slash\\line\nfeed\r", unicode));
     CHECK(gui_settings_format(before.playback_file_a, sizeof(before.playback_file_a), "%s/file.flac", unicode));
@@ -63,11 +69,19 @@ int main(void) {
     CHECK(!strcmp(before.playback_file_a, after.playback_file_a));
     CHECK(!strcmp(before.playback_file_b, after.playback_file_b));
     CHECK(!strcmp(before.ingest_notes, after.ingest_notes));
+#ifdef ENABLE_DDD
+    CHECK(after.ddd_use_winusb);
+    CHECK(after.ddd_libusb_raw_io);
+#endif
 
     CHECK(write_config(config, "{\n\"auto_names_enabled\": false,\n\"output_path\": \"C:\\tapes\\new\\\",\n\"playback_file_a\": \"C:\\video\\test.flac\"\n}"));
     gui_settings_load(&after);
     CHECK(!strcmp(after.output_path, "C:\\tapes\\new\\"));
     CHECK(!strcmp(after.playback_file_a, "C:\\video\\test.flac"));
+#ifdef ENABLE_DDD
+    CHECK(!after.ddd_use_winusb);
+    CHECK(!after.ddd_libusb_raw_io);
+#endif
 
     CHECK(write_config(config, "{\n\"settings_format_version\": 2,\n\"output_path\": \"\\u4e2d\\u6587\\ud83d\\udcfc\",\n\"playback_file_a\": \"C:\\\\tapes\\\\new.flac\"\n}"));
     gui_settings_load(&after);

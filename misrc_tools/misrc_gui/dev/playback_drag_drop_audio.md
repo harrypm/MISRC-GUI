@@ -75,3 +75,41 @@ silently removed.
 3. `pwsh -File scripts/build-local.ps1` — guard gate + compile + link +
    `--smoke-test` OK; `meson test -C build-local` — 34/34.
 4. Real GUI (user): drag-and-drop confirmed working.
+
+## Cross-platform entry points (2026-10-26 addendum)
+
+The drop pipeline above is platform-neutral (raylib 5.5 registers GLFW's
+drop callback on Win32/Cocoa/X11/Wayland; the classifier is plain stdio +
+libFLAC), but the EVENT DELIVERY is not:
+
+- macOS: this app always relaunches itself elevated for MS2130
+  hsdaoh/libusb capture (misrc_gui.c `gui_macos_relaunch_as_admin_if_needed`,
+  locked by the ci_guard `macos admin elevation contract`). Root-owned
+  windows NEVER receive Finder drag-and-drop (the WindowServer refuses
+  cross-security-session drag delivery) — the drop event simply never
+  arrives, `IsFileDropped()` never fires. That is an OS limitation, not an
+  app bug; it cannot be fixed while the GUI runs as root.
+- Windows: drag-and-drop confirmed working (2026-10-20 verification above).
+- Linux: raylib 5.5 + its bundled GLFW 3.4 support drops on X11 (Xdnd) and
+  native Wayland (data-device). If drops do nothing on a Linux desktop,
+  check the stderr diagnostic (below) to split the failure: no
+  `[PLAYBACK] Drop delivered:` line = the windowing layer never delivered
+  the event (session/compositor issue, e.g. XWayland under some compositors);
+  line present + a reject status = the handler refused the files (app
+  issue — see the reject reasons on stderr).
+
+Cross-platform fallbacks in force (misrc_gui.c):
+
+1. POSITIONAL FILE ARGUMENTS: `misrc_gui <rf-file> [<file2> ...]` routes
+   every bare-path argument through the SAME `gui_playback_handle_dropped_files`
+   classifier at launch (zone A default; audio-rate file becomes the monitor
+   source). Works on every platform and SURVIVES the macOS elevated relaunch
+   (argv is forwarded), so Finder "Open With" and terminal launches load
+   playback files even where drops cannot land. Bare paths are only treated
+   as playback files when no capture CLI flag was seen first (the headless
+   CLI routing is unchanged).
+2. DROP DIAGNOSTIC: one `[PLAYBACK] Drop delivered: N file(s)` stderr line
+   each time the platform delivers a drop (see above for how to read it).
+3. macOS ELEVATED HINT: when running as root with the Playback device
+   selected, a one-time status line points at Browse / the file argument
+   instead of a silent no-op drop.

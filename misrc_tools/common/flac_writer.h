@@ -75,6 +75,11 @@ typedef struct {
     flac_error_callback_t error_cb;
     flac_bytes_written_callback_t bytes_cb;
     void *callback_user_data;        // Passed to all callbacks
+
+    /* Optional client-owned file sink for M-Client Local Save. NULL = stdio. */
+    size_t (*sink_write)(const void *data, size_t size, size_t count, FILE *file);
+    int (*sink_seek)(FILE *file, int64_t offset, int whence);
+    int64_t (*sink_tell)(FILE *file);
 } flac_writer_config_t;
 
 /* ============================================================================

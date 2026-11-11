@@ -11,6 +11,8 @@ A universal cross platform GUI tool for interfacing with and visualizing monitor
 
 - [MISRC](https://misrc.org) (v1.0-v1.5a / native v2.5)
 - CXADC (single cards and Clockgen Mod with sound)
+- CXADC MacOS
+- CXADC Win
 - HSDAOH
 - FX3 (Generic tinkering firmware support)
 - DdD (Domesday Duplicator)
@@ -26,17 +28,6 @@ Downloads can be found on the [releases page](https://github.com/harrypm/MISRC-G
 - Android (arm64 APK, very alpha)
 
 x86 (AMD/Intel) and ARM64 (Apple M, Snapdragon, RockChip) are fully supported and intended for long-term support. 
-
-### In-app updates
-
-The Info window checks GitHub once a week (or on demand via "Check for Update"):
-
-- "Releases Page" always opens the [releases page](https://github.com/harrypm/MISRC-GUI/releases) in your browser.
-- When a newer release is found, "Install" (two-click confirm) downloads the update for your platform and installs it in place. Your current version is archived next to the new one (renamed, never deleted); downloads are kept in `~/.local/share/misrc/updates` (Linux), `%LOCALAPPDATA%\misrc\updates` (Windows) or `~/Library/Application Support/misrc/updates` (macOS).
-- Android downloads the APK via the browser and Android itself asks to confirm the install.
-- Installing is blocked while a capture/record session is running.
-
-Download naming is delivered by a remote manifest (`update_manifest.json` on `main`), so if a download link ever breaks, a fix reaches every installed copy without shipping a new release.
 
 Building from source? See [INSTALLATION.md](INSTALLATION.md).
 
@@ -122,12 +113,21 @@ The record timer system is self fail proof, you cannot set a time lower than you
 
 <img width="473" height="388" alt="image" src="assets/images/MISRC_GUI_Window_Info_Current.png" />
 
+
+The GUI is built with several layers of fallback and prevention measures to stop hardware issues on an OS level from interfering with your capture such as spillover if there is a slowdown in drive or encoding performance, the recommended amount of RAM ideally is 8GB DDR3 2400Mhz or better, of course on faster ARM64 chips this becomes less of a concern but production stations should have ideally no less then 16GB total. 
+
 - A/B  Swap for older V1.5a users
 - V4L2 Device discovery for Linux
 - Core Pinning (Linux Only)
 - Memory Budget (Allows you to limit/raise the buffers for higher stability on low end or high end systems) 
+- Mode Selection
 
-The GUI is built with several layers of fallback and prevention measures to stop hardware issues on an OS level from interfering with your capture such as spillover if there is a slowdown in drive or encoding performance, the recommended amount of RAM ideally is 8GB DDR3 2400Mhz or better, of course on faster ARM64 chips this becomes less of a concern but production stations should have ideally no less then 16GB total. 
+### Operation Modes
+
+Local - Entirely local capture standalone.
+Server - Broadcasts current capture and feed to network.
+Client - Takes selected remote feeds from any servers discoverable on the network.
+Remote & Monitor - Low bandwidth remote control mode for start/stop and plugin feed view and audio monitoring.
 
 
 ## Record & Audio Monitoring
@@ -165,7 +165,7 @@ Level Autostop, this allows for you to set a overall % level alongside a timer t
 - Base Name and Output
 - A/B RF Capture On/Off
 - FLAC/RAW PCM Encoding Control
-- Bit-Depth Selection Control (for MISRC/HSDAOH, CXADC)
+- Bit-Depth Selection Control
 - FLAC Level & Threads Control
 - Stereo/Mono/Quad channel record control for audio (You can select multiple options) 
 - Resampling Control for A/B (VHS config 20msps video 10msps hifi shown)
@@ -181,7 +181,8 @@ Included currently are the following viewer modes.
 
 - Stream Waveform (similar to an oscilloscope) 
 - FTT (visualizes peaks of signals carriers i.g video/hifi or your local FM radio)
-- CVBS (Basic composite video decoder Luma B/W only currently)
+- CVBS (PAL/NTSC/SECAM with hybrid mode) 
+- Tape FM (VHS, Betamax NTSC + HiFi) 
 
 <img width="140" height="132" alt="image" src="assets/images/MISRC_GUI_Window_Monitor_Plugins_Current.png" />
 
@@ -556,3 +557,4 @@ bash misrc_tools/test/capture_stability_ci.sh misrc_gui misrc_extract /tmp/ci-ar
 - August 24th 2026 - SDR Update (RTLSDR support + Waterfall/Spectro view modes) 
 - September 10th 2026 - CXADC refresh, Capture server/client/local modes integrated. 
 - September 22nd 2026 - CXADC rate/cycle modes, --auto-connect testing flag, FLAC level/threads warnings, clockgen audio cleanup.
+- October 2026 - CVBS Decoder & FM Tape Decoder plugins overhalled, true cli server mode added. 

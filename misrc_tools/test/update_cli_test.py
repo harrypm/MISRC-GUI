@@ -4,7 +4,8 @@ the headless update flags against a local test server, in an isolated HOME.
 Covers (the same gui_updater pipeline the GUI's Releases Page / Install
 buttons use):
 - --check-update: manifest ok, latest tag resolved via the manifest's
-  tag_lookup_url (302 redirect), current version + update_available printed;
+  tag_lookup_url (302 redirect), current version and update availability
+  checked for development builds and for equal/newer release tags;
 - --update-dry-run: the platform asset URL + the running exe path + updates
   dir + archive path resolved, nothing downloaded or replaced;
 - --install-update WITHOUT --yes: refused (non-zero exit, binary untouched);
@@ -34,7 +35,6 @@ import zipfile
 from pathlib import Path
 
 GUI = str(Path(sys.argv[1]).resolve())
-TAG = "v9.9.9"
 PAYLOAD_NAME = "misrc_update_cli_test_payload"
 PAYLOAD_BYTES = b"MISRC-UPDATE-CLI-TEST-PAYLOAD\x00" + bytes(range(256))
 DOWNLOAD_RE = re.compile(r"^/releases/download/([^/]+)/(.+)$")
@@ -53,6 +53,7 @@ ZIP_BYTES = build_zip()
 class Handler(http.server.BaseHTTPRequestHandler):
     base = None   # set once the ephemeral port is known
     manifest = None
+    tag = "v9.9.9"  # release tag for non-comparable development builds
 
     def log_message(self, fmt, *args):
         pass
@@ -70,12 +71,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if path == "/releases/latest":
             self.send_response(302)
-            self.send_header("Location", f"{self.base}/releases/tag/{TAG}")
+            self.send_header("Location", f"{self.base}/releases/tag/{self.tag}")
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
         match = DOWNLOAD_RE.match(path)
-        if match and match.group(1) == TAG:
+        if match and match.group(1) == self.tag:
             self.send_response(200)
             self.send_header("Content-Type", "application/zip")
             self.send_header("Content-Length", str(len(ZIP_BYTES)))
@@ -104,15 +105,30 @@ def parse_output(text):
     return out
 
 
-def expected_asset() -> str:
+def expected_asset(tag: str) -> str:
     system = platform.system()
     machine = platform.machine().lower()
     arm = machine in ("arm64", "aarch64")
     if system == "Linux":
-        return f"Linux_MISRC_GUI_{TAG}_{'arm64' if arm else 'x86'}.zip"
+        return f"Linux_MISRC_GUI_{tag}_{'arm64' if arm else 'x86'}.zip"
     if system == "Darwin":
-        return f"macOS_MISRC_GUI_{TAG}_universal.dmg"
-    return f"Windows_MISRC_GUI_{TAG}_{'arm64' if arm else 'x86'}.zip"
+        return f"macOS_MISRC_GUI_{tag}_universal.dmg"
+    return f"Windows_MISRC_GUI_{tag}_{'arm64' if arm else 'x86'}.zip"
+
+
+def check_update(exe, manifest_url, env, version, tag, comparable, available):
+    Handler.tag = tag
+    r = subprocess.run(
+        [str(exe), "--check-update", "--update-manifest", manifest_url],
+        capture_output=True, text=True, env=env)
+    out = parse_output(r.stdout)
+    assert r.returncode == 0, f"check-update failed:\n{r.stdout}\n{r.stderr}"
+    assert out["update_mode"] == "check"
+    assert out["manifest"] == "ok"
+    assert out["latest"] == tag
+    assert out["current"] == version
+    assert out["current_comparable"] == str(comparable).lower(), out
+    assert out["update_available"] == str(available).lower(), out
 
 
 def main():
@@ -147,6 +163,10 @@ def main():
             env = os.environ.copy()
             if os.name == "nt":
                 env["LOCALAPPDATA"] = str(home)
+                # A tar beside the app/on PATH must not replace Windows' system tar.
+                # where.exe rejects tar's flags, so using this shadow must fail.
+                shutil.copy2(Path(os.environ["SystemRoot"]) / "System32" / "where.exe", root / "tar.exe")
+                env["PATH"] = str(root) + os.pathsep + env.get("PATH", "")
             else:
                 env["HOME"] = str(home)
             manifest_url = f"{Handler.base}/manifest.json"
@@ -155,37 +175,59 @@ def main():
                                       text=True, env=env, check=True).stdout.strip()
             print(f"current version: {version}")
 
-            # 1. --check-update
-            r = subprocess.run(
-                [str(exe), "--check-update", "--update-manifest", manifest_url],
-                capture_output=True, text=True, env=env)
-            out = parse_output(r.stdout)
-            assert r.returncode == 0, f"check-update failed:\n{r.stdout}\n{r.stderr}"
-            assert out["update_mode"] == "check"
-            assert out["manifest"] == "ok"
-            assert out["latest"] == TAG
-            assert out["current"] == version
-            assert out["update_available"] == "true", \
-                f"{TAG} must compare as newer than the shipped {version}"
+            # 1. --check-update. Local and non-release CI builds use a dev
+            # version. Release builds, including CI tag overrides, compare
+            # their numeric version triplet with the fixture tag.
+            release = re.match(r"^[vV]?([0-9]+)\.([0-9]+)\.([0-9]+)", version)
+            tag = "v9.9.9"
+            if release:
+                major, minor, patch = map(int, release.groups())
+                check_update(exe, manifest_url, env, version,
+                             f"v{major}.{minor}.{patch}", True, False)
+                tag = f"v{major}.{minor}.{patch + 1}"
+            check_update(exe, manifest_url, env, version, tag, bool(release), bool(release))
+            asset = expected_asset(tag)
 
-            # 2. --update-dry-run: resolve-only, nothing touched.
+            # 2. --update-dry-run: resolve paths without downloading/replacing files.
+            if os.name == "nt":
+                updates = home / "misrc" / "updates"
+                assert not updates.exists()
             r = subprocess.run(
                 [str(exe), "--update-dry-run", "--update-manifest", manifest_url],
                 capture_output=True, text=True, env=env)
             out = parse_output(r.stdout)
             assert r.returncode == 0, f"update-dry-run failed:\n{r.stdout}\n{r.stderr}"
             assert out["update_mode"] == "dry-run"
-            assert out["asset_url"] == f"{Handler.base}/releases/download/{TAG}/{expected_asset()}"
+            assert out["asset_url"] == f"{Handler.base}/releases/download/{tag}/{asset}"
             assert out["exe_path"] == str(exe), out["exe_path"]
             assert out["archive_path"] == f"{exe}.archived-{version}"
+            assert not Path(out["archive_path"]).exists()
             assert exe.read_bytes() == original_bytes  # nothing replaced
+            if os.name == "nt":
+                assert Path(out["updates_dir"]) == updates
+                assert updates.is_dir()
+                assert not (updates / asset).exists()
+
+                # Also create a fresh tree from a forward-slash drive path,
+                # then resolve it again with the directories already present.
+                slash_home = home / "forward-slash"
+                slash_env = env.copy()
+                slash_env["LOCALAPPDATA"] = slash_home.as_posix()
+                for _ in range(2):
+                    r = subprocess.run(
+                        [str(exe), "--update-dry-run", "--update-manifest", manifest_url],
+                        capture_output=True, text=True, env=slash_env)
+                    assert r.returncode == 0, f"forward-slash dry-run failed:\n{r.stdout}\n{r.stderr}"
+                    assert Path(parse_output(r.stdout)["updates_dir"]) == slash_home / "misrc" / "updates"
+                assert (slash_home / "misrc" / "updates").is_dir()
+                assert exe.read_bytes() == original_bytes
 
             # 3. --install-update without --yes: refused, binary untouched.
             r = subprocess.run(
                 [str(exe), "--install-update", "--update-manifest", manifest_url],
                 capture_output=True, text=True, env=env)
             assert r.returncode != 0, "--install-update must refuse without --yes"
-            assert "--install-update requires --yes" in r.stderr, r.stderr
+            assert "--install-update requires --yes" in r.stderr, f"{r.stdout}\n{r.stderr}"
             assert exe.read_bytes() == original_bytes
 
             if platform.system() == "Darwin":
@@ -207,7 +249,7 @@ def main():
                     "the archived old binary must be preserved byte-for-byte (never deleted)"
                 assert exe.read_bytes() == PAYLOAD_BYTES, \
                     "the zip payload must replace the binary at the original path"
-                downloads = list(home.rglob(expected_asset()))
+                downloads = list(home.rglob(asset))
                 assert downloads, "the downloaded asset zip must be kept in the updates dir"
                 assert downloads[0].read_bytes() == ZIP_BYTES
                 print(f"install verified: archive={archive.name}, "

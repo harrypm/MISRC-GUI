@@ -1,21 +1,16 @@
 # NTSC Betamax preview
 
-This trial adds ordinary NTSC Betamax video and an optional NTSC Beta Hi-Fi
-profile to the existing RF Preview pipeline. Select **Decoder: RF Preview**,
-**Tape: Betamax**, then enable **BetaHiFi** for a Hi-Fi recording. This toggle
-selects both the higher video FM carriers and stereo RF audio demodulation;
-it also enables Audio Mon. Use the main **Audio Mon** control to mute playback
-without changing the video profile. Hi-Fi on/off is a recording-format choice,
-not automatic detection. With **BetaHiFi** off, the ordinary video profile does
-not run Hi-Fi audio DSP or produce Hi-Fi PCM, even when the RF contains those
-audio carriers.
+Select **Decoder: RF Preview**, **Tape: Betamax**, then cycle **Preset** through
+**Betamax**, **Betamax Hi-Fi**, **SuperBeta** and **ED Beta**. New panels default to Betamax.
+These are manual video recording presets: Betamax Hi-Fi selects the higher
+video FM carriers and matching RF filters; SuperBeta selects its own video
+calibration. See the [SuperBeta notes](superbeta_preview_README.md) for details.
 
-Under **Tape: Betamax**, **SuperBeta** is a separate optional toggle, off by
-default. It selects the SuperBeta video profile independently of **Beta Hi-Fi**.
-The ordinary Betamax and Betamax Hi-Fi calibrations described below apply with
-SuperBeta off and are unchanged. See the
-[SuperBeta preview notes](superbeta_preview_README.md) for that mode's parameters
-and validation limits.
+**Audio Mon** independently enables or mutes Hi-Fi listening for Betamax Hi-Fi,
+SuperBeta and ED Beta. Changing the video preset or Tape does not turn monitoring on.
+Muting skips audio DSP while retaining the video profile and lock. Ordinary
+Betamax does not run Hi-Fi audio DSP, even if the RF contains audio carriers.
+There is no automatic recording-format detection.
 
 Only one visible Hi-Fi worker supplies the speaker stream. Priority follows
 A-left, A-right, B-left, B-right panel order. Matching channel/profile panels
@@ -36,10 +31,10 @@ Beta synchronization uses the matched Beta de-emphasis plane. Video is woven
 640x480 at nominal 29.97 fps; it is not deinterlaced.
 
 Beta sync-level acquisition can also recover a picture from Hi-Fi-recorded RF
-with **BetaHiFi** off. The ordinary profile retains its own RF filtering and
+with the **Betamax** preset. The ordinary profile retains its own RF filtering and
 fixed black/IRE calibration, so that picture can be noisy and differ from the
 matching Hi-Fi profile. Acquisition does not detect or switch recording formats;
-the toggle still selects the video profile and optional Hi-Fi audio path.
+the preset still selects the video profile. **Audio Mon** controls listening.
 
 After a 50 ms startup grace, or 50 ms without a newly accepted field, the
 Beta-only fallback can estimate sync-tip and porch levels from the existing
@@ -55,7 +50,8 @@ The format parameters and algorithm references are the local
 `Formats/format-params.snapshot.json` and `Decode/VhsChromaDecoder.cs`.
 This remains a reduced-bandwidth streaming preview. It omits the offline
 decoder's nonlinear sub-deemphasis, RF equalization, full TBC/comb/repair and
-export pipeline. PAL Beta, ED Beta and linear audio are not supported.
+export pipeline. PAL Beta and linear audio are not supported. ED Beta has a
+separate [20 MSPS video preview](ed_beta_preview_README.md).
 Ordinary NTSC SuperBeta has separate profiles; see the
 [SuperBeta preview notes](superbeta_preview_README.md) for their parameters
 and validation limits.
@@ -71,10 +67,19 @@ bounded parallel work. Turning Audio Mon off skips Hi-Fi DSP while retaining
 the correct Hi-Fi video carriers and filtering. Unselected Hi-Fi panels also
 skip audio DSP. Enabling the monitor again starts fresh calibration.
 
+The audio device pulls Hi-Fi PCM directly from its bounded 85 ms queue, using
+its requested frame count. GUI frame timing does not drive Hi-Fi refills, and
+a device buffer larger than the requested size does not add periodic silence.
+Device creation, source changes and flushing remain on the main thread.
+
 Four carriers at 87.75, 97.25, 106.75 and 116.25 times the NTSC line frequency
 are demodulated, calibrated against the captured head cadence, switched by
 track and resampled to 48 kHz stereo. Initial calibration takes about 300 ms;
-unlocked or unusable RF produces silence. Brief losses have bounded repair;
+unlocked or unusable RF produces silence. A calibration refresh replaces the
+learned head midpoint and carrier references only after its complete window
+passes validation. A weak or transitional refresh preserves an existing valid
+lock; independent live head-cadence and carrier-loss checks still mute bad RF.
+Brief losses have bounded repair;
 longer losses mute. EQ, stereo-linked expansion and high-frequency dynamics
 follow the latest local .NET Beta Hi-Fi implementation's default settings.
 
@@ -100,8 +105,9 @@ Its accumulation grouping preserves the SSE2 PCM output. No FIR taps,
 coefficients, sample rates or sound-processing settings are reduced for speed.
 
 The playback producer never waits for the audio device. Its FIFO holds at most
-4096 stereo frames, keeping the newest audio on overflow. The device is fed in
-1024-frame halves. This bounds the software playback backlog but does not
+4096 stereo frames, keeping the newest audio on overflow. The device callback
+pulls the frame count it needs; the requested buffer size is only a hint.
+This bounds the software playback backlog but does not
 establish exact audio/video synchronization or device latency. Preview CPU
 overruns can reset both decoders and cause short audio interruptions. A lower
 shared CPU Budget can therefore prevent continuous sound. The GUI already

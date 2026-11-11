@@ -9,11 +9,16 @@
 #include "gui_panel.h"
 #include "panel_interface.h"
 #include "../core/gui_app.h"
+#include "../net/gui_monitor_video_client.h"
 #include "gui_oscilloscope.h"
 #include "gui_fft.h"
 #include "gui_spectrogram.h"
 #include "../signal/gui_demod.h"
 #include "../ui/gui_ui.h"
+#include "../net/gui_net.h"
+#include "../net/gui_monitor_transport.h"
+#include "../net/gui_remote_display.h"
+#include "gui_text.h"
 #include <stdio.h>
 
 //-----------------------------------------------------------------------------
@@ -96,6 +101,40 @@ void panel_clear_view_state(panel_view_type_t type, void *state) {
 static void render_single_panel(gui_app_t *app, int channel,
                                  panel_view_type_t type, void *state,
                                  Rectangle bounds, Color color) {
+    /* M-Client reuses the EXACT Local/Harry Waveform + FFT render vtables,
+     * phosphor accumulation, grid, trigger lines, zoom and overlays.
+     * Only reduced Zstd/float32 display data comes across the network. */
+    if(app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT) {
+        if(type == PANEL_VIEW_CVBS) {
+            gui_monitor_video_client_draw((unsigned)channel,bounds);
+            return;
+        }
+        if(type != PANEL_VIEW_WAVEFORM && type != PANEL_VIEW_FFT) {
+            DrawRectangleRec(bounds,COLOR_PANEL_BG);
+            /* gui_text_draw = the app's Inter font; raw raylib DrawText would
+             * render the built-in bitmap font (the placeholder font that was
+             * asked to be removed entirely). */
+            gui_text_draw("Monitor & Remote: only Waveform/FFT preview available",
+                     bounds.x+12,bounds.y+15,14,COLOR_TEXT_DIM);
+            return;
+        }
+        /* Static scratch: 49 KiB per snapshot, not allocated on every draw. */
+        static gui_rd_frame_t frame;
+        bool valid=gui_monitor_client_connected() && gui_rd_client_snapshot(&frame);
+        if(!valid || !state || channel >= (int)frame.channels) {
+            DrawRectangleRec(bounds,COLOR_PANEL_BG);
+            gui_text_draw("Waiting for Server preview...",
+                     bounds.x+12,bounds.y+15,14,COLOR_TEXT_DIM);
+            return;
+        }
+        if(type==PANEL_VIEW_FFT)
+            gui_fft_remote_apply_float(state,frame.ch[channel].fft,
+                GUI_RD_BINS,frame.sample_rate,frame.sequence);
+        else {
+            gui_waveform_remote_apply_points(state,&frame.ch[channel],frame.sequence);
+            gui_waveform_remote_publish_config(state,channel);
+        }
+    }
     const panel_vtable_t *vtable = panel_get_vtable(type);
 
     if (vtable && vtable->render) {
@@ -110,9 +149,9 @@ static void render_single_panel(gui_app_t *app, int channel,
         DrawRectangleRec(bounds, (Color){20, 20, 20, 255});
         DrawRectangleLinesEx(bounds, 1, (Color){60, 60, 60, 255});
         const char *name = panel_view_type_name(type);
-        int w = MeasureText(name, 14);
-        DrawText(name, (int)(bounds.x + bounds.width/2 - w/2),
-                 (int)(bounds.y + bounds.height/2 - 7), 14, COLOR_TEXT_DIM);
+        int w = gui_text_measure(name, 14);
+        gui_text_draw(name, bounds.x + bounds.width/2 - w/2,
+                 bounds.y + bounds.height/2 - 7, 14, COLOR_TEXT_DIM);
     }
 }
 

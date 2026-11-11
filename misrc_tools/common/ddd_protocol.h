@@ -297,6 +297,17 @@ typedef enum ddd_sequence_phase {
     DDD_SEQUENCE_FAILED
 } ddd_sequence_phase_t;
 
+#define DDD_SEQUENCE_HISTORY_RUNS 4u
+#define DDD_SEQUENCE_HISTORY_AFTER_MAX (3u * DDD_SEQUENCE_MAX_SAMPLES_PER_MARKER)
+
+typedef struct ddd_sequence_run {
+    uint64_t start_sample_index; /* Zero-based index in the observed stream. */
+    uint32_t sample_count;
+    uint8_t marker;
+    bool start_observed; /* Preceding marker differs. */
+    bool end_observed;   /* Following marker differs. */
+} ddd_sequence_run_t;
+
 typedef struct ddd_sequence_validator {
     ddd_sequence_phase_t phase;
     bool marker_seen;
@@ -307,10 +318,25 @@ typedef struct ddd_sequence_validator {
     uint64_t error_sample_index;
     uint8_t expected_marker;
     uint8_t actual_marker;
+    ddd_sequence_phase_t failure_phase;
+    /* Chronological runs. The last before run and first after run can share
+     * a marker if the fault was an overlong run split at the offending word. */
+    size_t before_count;
+    ddd_sequence_run_t before[DDD_SEQUENCE_HISTORY_RUNS];
+    size_t after_count;
+    ddd_sequence_run_t after[DDD_SEQUENCE_HISTORY_RUNS];
 } ddd_sequence_validator_t;
 
 void ddd_sequence_validator_init(ddd_sequence_validator_t *state);
 ddd_validation_result_t ddd_sequence_validator_feed(
+    ddd_sequence_validator_t *state,
+    const uint16_t *sample_words,
+    size_t sample_count);
+
+/* Append diagnostics from contiguous data after the faulting feed, whose
+ * offending word and available suffix are recorded by feed itself. Returns
+ * true while the bounded history can still use another contiguous block. */
+bool ddd_sequence_validator_extend_failure_history(
     ddd_sequence_validator_t *state,
     const uint16_t *sample_words,
     size_t sample_count);

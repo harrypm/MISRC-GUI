@@ -6,6 +6,19 @@
 
 #include "gui_phosphor_rt.h"
 #include "rlgl.h"
+
+#if defined(__ANDROID__)
+#include "../core/gui_android_viewport.h"
+/* Nested render textures are not a stack in raylib: EndTextureMode() always
+ * switches to the default framebuffer. Restore the Android full-UI canvas
+ * after finishing any inner phosphor/FFT texture pass. */
+#define PHOSPHOR_END_TEXTURE_MODE() do { \
+    EndTextureMode(); \
+    gui_android_viewport_restore_canvas_after_texture(); \
+} while (0)
+#else
+#define PHOSPHOR_END_TEXTURE_MODE() EndTextureMode()
+#endif
 #include <math.h>
 #include <stdlib.h>
 
@@ -31,6 +44,16 @@
     #define GLSL_FRAG_OUT "out vec4 finalColor;\n"
     #define GLSL_FRAG_COLOR "finalColor"
     #define GLSL_TEXTURE "texture"
+#elif defined(GRAPHICS_API_OPENGL_21)
+    // Desktop OpenGL 2.1: GLSL 1.20 legacy attribute/varying syntax.
+    #define GLSL_VERSION_STRING "#version 120\n"
+    #define GLSL_PRECISION ""
+    #define GLSL_IN "attribute "
+    #define GLSL_OUT "varying "
+    #define GLSL_FRAG_IN "varying "
+    #define GLSL_FRAG_OUT ""
+    #define GLSL_FRAG_COLOR "gl_FragColor"
+    #define GLSL_TEXTURE "texture2D"
 #else  // Desktop OpenGL 3.3+
     #define GLSL_VERSION_STRING "#version 330\n"
     #define GLSL_PRECISION ""
@@ -319,8 +342,8 @@ bool phosphor_rt_init(phosphor_rt_t *prt, int logical_width,
     Matrix outer_modelview = rlGetMatrixModelview();
 
     // Clear render textures
-    BeginTextureMode(prt->rt[0]); ClearBackground(BLACK); EndTextureMode();
-    BeginTextureMode(prt->rt[1]); ClearBackground(BLACK); EndTextureMode();
+    BeginTextureMode(prt->rt[0]); ClearBackground(BLACK); PHOSPHOR_END_TEXTURE_MODE();
+    BeginTextureMode(prt->rt[1]); ClearBackground(BLACK); PHOSPHOR_END_TEXTURE_MODE();
     rlSetMatrixModelview(outer_modelview);
 
     prt->width = width;
@@ -351,8 +374,8 @@ void phosphor_rt_clear(phosphor_rt_t *prt) {
     if (!prt || !prt->valid) return;
 
     Matrix outer_modelview = rlGetMatrixModelview();
-    BeginTextureMode(prt->rt[0]); ClearBackground(BLACK); EndTextureMode();
-    BeginTextureMode(prt->rt[1]); ClearBackground(BLACK); EndTextureMode();
+    BeginTextureMode(prt->rt[0]); ClearBackground(BLACK); PHOSPHOR_END_TEXTURE_MODE();
+    BeginTextureMode(prt->rt[1]); ClearBackground(BLACK); PHOSPHOR_END_TEXTURE_MODE();
     rlSetMatrixModelview(outer_modelview);
 }
 
@@ -435,7 +458,7 @@ void phosphor_rt_end_frame(phosphor_rt_t *prt) {
     if (!prt || !prt->valid) return;
 
     EndBlendMode();
-    EndTextureMode();
+    PHOSPHOR_END_TEXTURE_MODE();
     if (prt->outer_modelview_saved) {
         rlSetMatrixModelview(prt->outer_modelview);
         prt->outer_modelview_saved = false;
@@ -507,9 +530,9 @@ const float PHOSPHOR_CHANNEL_COLOR_B[3] = { 220.0f/255.0f, 200.0f/255.0f, 80.0f/
 // Waveform Drawing Helpers
 //-----------------------------------------------------------------------------
 
-void phosphor_rt_draw_waveform(phosphor_rt_t *prt,
-                               const waveform_sample_t *samples, size_t sample_count,
-                               float amplitude_scale) {
+void phosphor_rt_draw_waveform_xstep(phosphor_rt_t *prt,
+                                     const waveform_sample_t *samples, size_t sample_count,
+                                     float amplitude_scale, float x_step) {
     if (!prt || !prt->valid || !samples || sample_count < 2) return;
 
     int buf_height = prt->logical_height;
@@ -521,14 +544,23 @@ void phosphor_rt_draw_waveform(phosphor_rt_t *prt,
     // Get draw color for hit intensity
     Color waveColor = phosphor_rt_get_draw_color(prt);
 
-    // Draw waveform as connected line segments
-    for (size_t i = 0; i < sample_count - 1; i++) {
-        float y0 = center_y - samples[i].value * scale * buf_height;
-        float y1 = center_y - samples[i + 1].value * scale * buf_height;
+    // Draw waveform as connected line segments. Point i sits at
+    // x = i * x_step so a point count different from the panel width
+    // stretches across the full panel (Res selector).
+    float prev_x = 0.0f;
+    float prev_y = center_y - samples[0].value * scale * buf_height;
+    for (size_t i = 1; i < sample_count; i++) {
+        float y = center_y - samples[i].value * scale * buf_height;
+        float x_pos = (float)i * x_step;
 
-        float x0 = (float)i;
-        float x1 = (float)(i + 1);
-
-        DrawLineEx((Vector2){x0, y0}, (Vector2){x1, y1}, 1.0f, waveColor);
+        DrawLineEx((Vector2){prev_x, prev_y}, (Vector2){x_pos, y}, 1.0f, waveColor);
+        prev_x = x_pos;
+        prev_y = y;
     }
+}
+
+void phosphor_rt_draw_waveform(phosphor_rt_t *prt,
+                               const waveform_sample_t *samples, size_t sample_count,
+                               float amplitude_scale) {
+    phosphor_rt_draw_waveform_xstep(prt, samples, sample_count, amplitude_scale, 1.0f);
 }

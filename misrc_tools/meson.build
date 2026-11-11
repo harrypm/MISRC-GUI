@@ -1,9 +1,31 @@
 project('MISRC', 'c',
         default_options: ['c_std=c11', 'buildtype=release', 'b_lto=true'],
-        meson_version: '>=0.54')
+        meson_version: '>=0.55')
 
 
-version_target = vcs_tag(command: ['git-version.sh'], fallback: 'unknown_version', input: 'version.h.in', output: 'version.h')
+# Version string: git-version.py is the portable twin of git-version.sh.
+# Native-Windows meson/Python cannot execute a POSIX shell script, which left
+# local Windows builds on the 'unknown_version' fallback (v1.2.7 updater
+# false-positive class). Any Python that can run meson itself can run the
+# port; git-version.sh stays the source of truth for CI shell scripts.
+# NOTE: the interpreter path must be a plain STRING (full_path()). meson 0.61.2
+# (the ubuntu-22.04 runner's system meson: Linux AppImage + Android APK jobs)
+# does shutil.which(vcs_cmd[0]) in func_vcs_tag, which raises
+# "TypeError: expected str, bytes or os.PathLike object, not ExternalProgram"
+# when handed the program object -> meson setup dies (CI runs 40448680208+).
+# The script path must ALSO be absolute: meson converts files() to a path
+# relative to the BUILD dir, but vcstagger runs the command with
+# cwd=source_dir - the relative form only resolved by accident when the
+# build dir was a sibling of misrc_tools (build-local), never on CI.
+version_prog = find_program('python3', 'python', required: false, native: true)
+if version_prog.found()
+  version_target = vcs_tag(command: [version_prog.full_path(),
+                                     meson.current_source_dir() / 'git-version.py'],
+                           fallback: 'unknown_version', input: 'version.h.in', output: 'version.h')
+else
+  version_target = vcs_tag(command: ['git-version.sh'],
+                           fallback: 'unknown_version', input: 'version.h.in', output: 'version.h')
+endif
 
 warnings = [
   '-Wall',
@@ -278,7 +300,7 @@ else
   message('libusb-1.0 not found, building without FX3 support')
 endif
 
-# DdD (DomesdayDuplicator) support (optional, uses libusb on all platforms)
+# DdD uses libusb for enumeration and the portable capture backend.
 ddd_enabled = false
 if libusb_common_dep.found()
   if not libusb_common_dep_added
@@ -297,7 +319,7 @@ endif
 # The RTL-SDR raw I/Q backend (gui_rtlsdr.c) is only compiled when librtlsdr
 # is found; the device-agnostic Demod panel (gui_demod.c) is always compiled.
 rtlsdr_enabled = false
-rtlsdr_pc = dependency('librtlsdr', required : false, static: windows_static_deps)
+rtlsdr_pc = dependency('librtlsdr', required: get_option('rtlsdr'), static: windows_static_deps)
 if rtlsdr_pc.found()
   if not libusb_common_dep_added
     # librtlsdr needs libusb-1.0 at link time on Windows static builds.
@@ -413,14 +435,55 @@ if host_system != 'android'
                 install: true)
 endif
 
+rf_preview_sources = [
+  'misrc_gui/signal/gui_rf_preview.c',
+  'misrc_gui/signal/gui_ld_rf_demod.c',
+]
+a52_python = find_program('python3', 'python', native: true)
+dependency_fetcher = files('../scripts/fetch-patched-dependency.py')
+a52_decoder = custom_target('a52_decoder',
+  output: ['bit_allocate.c', 'bitstream.c', 'imdct.c', 'parse.c', 'downmix.c',
+           'a52.h', 'a52_internal.h', 'bitstream.h', 'config.h', 'mm_accel.h', 'tables.h'],
+  depend_files: files('../third_party/liba52/misrc.patch'),
+  command: [a52_python, dependency_fetcher, 'liba52', '@PRIVATE_DIR@', '--decoder-files', '@OUTPUT@'],
+)
+rf_audio_sources = [
+  'misrc_gui/signal/gui_vhs_hifi.c',
+  'misrc_gui/signal/gui_ld_rf_analog.c',
+  'misrc_gui/signal/gui_ld_rf_digital.c',
+  'misrc_gui/signal/gui_ld_dts.c',
+  'misrc_gui/signal/gui_ld_efm_frontend.c',
+  'misrc_gui/signal/gui_ld_rf_ac3.c',
+  'misrc_gui/signal/gui_ld_ac3_rf.c',
+  'misrc_gui/signal/gui_ld_ac3_frames.c',
+  'misrc_gui/signal/gui_ld_ac3_codec.c',
+] + [a52_decoder]
+
 # GUI application (requires raylib)
 raylib_dep = dependency('raylib', required: false, static: windows_static_deps)
+
+# LD DTS shares FFmpeg's audio codec libraries with Monitor Video. It needs
+# AVChannelLayout (FFmpeg 5.1+) but does not need libswscale.
+modern_codecs = get_option('modern_monitor_codecs')
+ffmpeg_static = windows_static_deps or host_system == 'android'
+ffmpeg_required = raylib_dep.found() and modern_codecs.enabled()
+avcodec_dep = dependency('libavcodec', required: ffmpeg_required, static: ffmpeg_static)
+avutil_dep = dependency('libavutil', required: ffmpeg_required, static: ffmpeg_static)
+ld_dts_enabled = (avcodec_dep.found() and avutil_dep.found() and
+                  avcodec_dep.version().version_compare('>=59.37.100') and
+                  avutil_dep.version().version_compare('>=57.28.100'))
+ld_dts_dep = declare_dependency(
+  compile_args: ld_dts_enabled ? ['-DMISRC_HAVE_LD_DTS=1'] : ['-DMISRC_HAVE_LD_DTS=0'],
+  dependencies: ld_dts_enabled ? [avcodec_dep, avutil_dep] : [])
+if ld_dts_enabled
+  message('MISRC LaserDisc DTS decoding enabled')
+endif
 
 if raylib_dep.found()
   if not fftw3f_dep.found()
     error('FFTW3 (fftw3f) is required for misrc_gui. Install fftw3f and reconfigure (use --wipe if reusing an existing build directory).')
   endif
-  sources_gui = [
+  sources_gui = rf_preview_sources + rf_audio_sources + [
     # Core
     'misrc_gui/core/misrc_gui.c',
     'misrc_gui/core/gui_settings.c',
@@ -441,7 +504,6 @@ if raylib_dep.found()
     'misrc_gui/signal/gui_trigger.c',
     'misrc_gui/signal/gui_cvbs.c',
     'misrc_gui/signal/gui_vhs_fm.c',
-    'misrc_gui/signal/gui_rf_preview.c',
     'misrc_gui/signal/gui_rf_resampler.c',
     'misrc_gui/processing/gui_rf_preview_worker.c', 'misrc_gui/signal/gui_beta_hifi.c',
     'misrc_gui/processing/gui_rf_preview_policy.c',
@@ -449,6 +511,8 @@ if raylib_dep.found()
     'misrc_gui/processing/gui_rf_stream_marks.c',
     'misrc_gui/signal/gui_histogram.c',
     'misrc_gui/signal/gui_demod.c',
+    # Test Gen: on-demand PAL/NTSC/SECAM test signal (hacktv values)
+    'misrc_gui/signal/gui_testgen.c',
     # Visualization
     'misrc_gui/visualization/gui_oscilloscope.c',
     'misrc_gui/visualization/gui_phosphor_rt.c',
@@ -470,6 +534,23 @@ if raylib_dep.found()
     'misrc_gui/ui/clay_renderer_raylib.c',
     # Server/Client networking (cxadc_vhs_server-style peer mode)
     'misrc_gui/net/gui_net.c',
+    'misrc_gui/net/gui_monitor_transport.c',
+    'misrc_gui/net/gui_monitor_audio.c',
+    'misrc_gui/net/gui_monitor_settings.c',
+    'misrc_gui/net/gui_monitor_local_save.c',
+    'misrc_gui/net/monitor_local_save_proxy.c',
+    'misrc_gui/net/monitor_local_save_files.c',
+    'misrc_gui/net/monitor_local_save_protocol.c',
+    'misrc_gui/net/gui_remote_fs.c',
+    'misrc_gui/net/gui_remote_display.c',
+    'misrc_gui/net/gui_monitor_video_wire.c',
+    'misrc_gui/net/gui_monitor_video_i420.c',
+    'misrc_gui/net/gui_monitor_video_framebox.c',
+    'misrc_gui/net/gui_monitor_video_codec.c',
+    'misrc_gui/net/gui_monitor_video_ffmpeg.c',
+    'misrc_gui/net/gui_monitor_video_mux.c',
+    'misrc_gui/net/gui_monitor_video_server.c',
+    'misrc_gui/net/gui_monitor_video_client.c',
     # Output
     'misrc_gui/output/gui_record.c',
     'misrc_gui/output/gui_record_direct.c',
@@ -497,6 +578,7 @@ if raylib_dep.found()
   endif
 
   # Add DdD support to GUI if available
+  ddd_winusb_enabled = false
   if ddd_enabled
     sources_gui += 'common/ddd_protocol.c'
     sources_gui += 'misrc_gui/input/gui_ddd.c'
@@ -504,6 +586,14 @@ if raylib_dep.found()
     sources_gui += 'misrc_gui/input/gui_ddd_async.c'
     sources_gui += 'misrc_gui/input/gui_ddd_clockgen.c'
     sources_gui += 'misrc_gui/ui/gui_ddd_fifo_status.c'
+    if host_system == 'windows' and libusb_common_dep.version().version_compare('>=1.0.30')
+      sources_gui += ['misrc_gui/input/gui_ddd_winusb_device.c',
+                      'misrc_gui/input/gui_ddd_winusb_io.c']
+      ddd_winusb_enabled = true
+      message('Building the native WinUSB DdD backend alongside libusb')
+    elif host_system == 'windows'
+      message('Native WinUSB DdD needs libusb 1.0.30 or newer for device identity')
+    endif
   endif
 
   # Add RTL-SDR support to GUI if available
@@ -511,14 +601,88 @@ if raylib_dep.found()
     sources_gui += 'misrc_gui/input/gui_rtlsdr.c'
   endif
 
+  # M-Server/M-Client use Zstd-1 for original phosphor/FFT preview.
+  zstd_dep = dependency('libzstd', required: true, static: windows_static_deps)
   gui_deps = deps + [ raylib_dep, fftw3f_dep ]
+  gui_deps += [ zstd_dep, ld_dts_dep ]
+  # Monitor & Remote Audio Mon streams 48 kHz / 10 ms Opus mono.
+  # Do not silently ship a client with a clickable but nonworking Audio Mon.
+  if not soxr_dep.found()
+    error('Monitor Opus audio requires libsoxr resampling (install libsoxr-dev).')
+  endif
+  opus_dep = dependency('opus', required: true,
+                        static: windows_static_deps or host_system == 'android')
+  gui_deps += [opus_dep]
+  message('MISRC Monitor & Remote Opus Audio Mon enabled')
+  # OpenH264 is mandatory for the Monitor Client's video feature. Do not
+  # silently produce an apparently successful GUI without H.264 support.
+  openh264_dep = dependency('openh264', required: false, static: windows_static_deps or host_system == 'android')
+  if openh264_dep.found()
+    gui_deps += [openh264_dep]
+    # GUI is C, while the static OpenH264 archive uses the C++ runtime.
+    # Link the runtime AFTER OpenH264 to resolve RTTI/new/delete on MinGW
+    # and libc++ on Android. Unmodified builds stay C-only.
+    if windows_static_deps
+      # MSYS2 UCRT64/GCC uses libstdc++; CLANGARM64 uses libc++.
+      if host_cpu_family == 'aarch64'
+        gui_deps += [meson.get_compiler('c').find_library('c++', required: true)]
+      else
+        gui_deps += [meson.get_compiler('c').find_library('stdc++', required: true)]
+      endif
+    elif host_system == 'android'
+      gui_deps += [meson.get_compiler('c').find_library('c++', required: true)]
+    elif host_system == 'linux' or host_system == 'darwin'
+      # The vendored in-repo openh264 (third_party/openh264, built by
+      # scripts/build-deps-unix.sh) is a STATIC archive, so the link needs
+      # the C++ runtime (undefined __vmi_class_type_info vtable otherwise).
+      # Detect static-ness from the .pc libdir: a static install ships
+      # libopenh264.a next to openh264.pc; shared distro builds (CI's
+      # libopenh264-dev) do not, and stay C-only. libc++ on macOS,
+      # libstdc++ on Linux.
+      fs = import('fs')
+      openh264_libdir = openh264_dep.get_variable(pkgconfig: 'libdir', default_value: '')
+      openh264_is_static = openh264_libdir != '' and fs.is_file(join_paths(openh264_libdir, 'libopenh264.a'))
+      if openh264_is_static
+        if host_system == 'darwin'
+          gui_deps += [meson.get_compiler('c').find_library('c++', required: true)]
+        else
+          gui_deps += [meson.get_compiler('c').find_library('stdc++', required: true)]
+        endif
+      endif
+    endif
+    message('MISRC monitor H.264 video codec enabled')
+    openh264_define = '-DMISRC_HAVE_OPENH264=1'
+  else
+    error('Missing required dependency: OpenH264 (pkg-config: openh264). Install the development library before building misrc_gui (Ubuntu/Debian: sudo apt install libopenh264-dev; macOS: brew install openh264). Monitor Client video cannot work without it.')
+  endif
 
-  gui_cflags = cflags + [
+  # Optional modern codecs: link FFmpeg when its headers/libs are available.
+  # Existing Android and static Windows builds retain OpenH264 fallback.
+  swscale_dep = dependency('libswscale', required: modern_codecs, static: ffmpeg_static)
+  # Windows and Android CI use a minimal static FFmpeg with the native
+  # AV1/VP9/HEVC and DTS decoders.
+  if not modern_codecs.disabled() and avcodec_dep.found() and avutil_dep.found() and swscale_dep.found()
+    gui_deps += [avcodec_dep, avutil_dep, swscale_dep]
+    ffmpeg_define = '-DMISRC_HAVE_FFMPEG=1'
+    message('MISRC monitor AV1/VP9/HEVC FFmpeg codecs enabled')
+  else
+    ffmpeg_define = '-DMISRC_HAVE_FFMPEG=0'
+    message('MISRC monitor modern codecs unavailable; OpenH264 fallback active')
+  endif
+  gui_cflags = cflags + [openh264_define, ffmpeg_define] + [
     '-O3',                    # Maximum optimization (should already be set by buildtype=release)
     '-funroll-loops',         # Unroll loops for better performance
     '-ftree-vectorize',       # Enable auto-vectorization
     '-ffast-math',            # Fast floating-point (safe for video/audio processing)
   ]
+  if ddd_winusb_enabled
+    gui_cflags += ['-DENABLE_DDD_WINUSB=1']
+  endif
+  # Keep rlgl.h and phosphor shader syntax consistent with the vendored raylib
+  # OpenGL 2.1 build on Linux ARM64. Other platforms retain their existing path.
+  if host_system == 'linux' and host_cpu_family == 'aarch64'
+    gui_cflags += ['-DGRAPHICS_API_OPENGL_21']
+  endif
 
   # GUI doesn't need all the ldflags_capture (e.g., onecore conflicts with raylib's CloseWindow)
   gui_ldflags = ldflags
@@ -531,6 +695,9 @@ if raylib_dep.found()
     # MSYS2 install list does not include, so the flag breaks the link with
     # "cannot find -l:libglfw3.dll.a". OpenGL/GDI/winmm are still required.
     gui_ldflags += ['-lopengl32', '-lgdi32', '-lwinmm']
+    if ddd_winusb_enabled
+      gui_ldflags += ['-lwinusb', '-lcfgmgr32']
+    endif
     # RTL-SDR: link the static archive by filename (MSYS2 names it
     # librtlsdr_static.a; the .pc -lrtlsdr resolves to the DLL import lib
     # which -static rejects), with the .pc's OWN libdir on the search path:
@@ -539,8 +706,8 @@ if raylib_dep.found()
     # while the GUI builds with the ucrt64 toolchain for CI parity) - ld's
     # default search path only covers the compiler's own environment, so
     # the by-filename archive link failed with "cannot find
-    # -l:librtlsdr_static.a". CI is unaffected (it installs no rtlsdr:
-    # RTLSDR stays disabled there).
+    # -l:librtlsdr_static.a". Release builds use the archive built for
+    # their own toolchain in the job's dependency prefix.
     if rtlsdr_enabled
       gui_ldflags += ['-l:librtlsdr_static.a']
       rtlsdr_libdir = rtlsdr_pc.get_variable(pkgconfig : 'libdir', default_value : '')
@@ -574,9 +741,13 @@ if raylib_dep.found()
     # NOTE: no -lpthread on Android — bionic's libc provides pthread (there is
     # no separate libpthread; -lpthread fails to link). -ldl is a bionic stub.
     gui_ldflags += ['-lEGL', '-lGLESv2', '-lGLESv3', '-landroid', '-llog', '-lOpenSLES', '-lm', '-ldl']
+    if ld_dts_enabled
+      # The AArch64 NEON FFT directly addresses tables in static libavutil.
+      # Keep those symbols local to the NativeActivity shared library.
+      gui_ldflags += ['-Wl,--exclude-libs,libavutil.a']
+    endif
     sources_gui += 'misrc_capture/simple_capture/simple_capture_android.c'
-    # JNI bridge: MainActivity.nativeSetUsbFd -> android_usb_get_fd() so the
-    # hsdaoh capture path can wrap the Java-granted USB fd with uvc_wrap().
+    # JNI bridge gives each hsdaoh session its own Java-granted USB descriptor.
     sources_gui += 'misrc_gui/input/android_usb_jni.c'
   elif host_system == 'darwin'
     gui_ldflags += ['-Wl,-framework,OpenGL', '-Wl,-framework,Cocoa', '-Wl,-framework,IOKit', '-Wl,-framework,CoreAudio', '-Wl,-framework,CoreVideo']
@@ -687,9 +858,12 @@ if raylib_dep.found()
     else
       settings_path_ldflags += ['-lm']
     endif
+    # gui_settings.c (included by the harness) calls gui_monitor_settings_copy
+    # since the M-Server/M-Client modes landed (bdcbb7a); link the real
+    # implementation instead of a stub. It is self-contained (libc only).
     settings_paths_test = executable('gui_settings_paths_test',
       ['test/gui_settings_paths_test.c', 'misrc_gui/ui/gui_ui_scale.c', 'common/file_utils.c',
-       'common/ddd_protocol.c'],
+       'common/ddd_protocol.c', 'misrc_gui/net/gui_monitor_settings.c'],
       dependencies: overlay_test_deps, include_directories: gui_includes,
       c_args: gui_cflags + ['-fwhole-program'], link_args: settings_path_ldflags,
       override_options: ['b_lto=true', 'optimization=2'])
@@ -721,9 +895,23 @@ if raylib_dep.found()
         depends: [misrc_gui_exe])
     endif
     if flac_dep.found()
+      # gui_record.c writes through the mls_proxy_* API since bdcbb7a; the
+      # CPU-only harnesses link the stdio-passthrough stub (never the networked
+      # local-save stack). Same rule as gui_playback_audio_stub.c.
+      record_paths_deps = overlay_test_deps + [flac_dep, dependency('threads')]
+      if soxr_dep.found()
+        record_paths_deps += [soxr_dep]
+      endif
+      if host_system == 'windows'
+        record_paths_deps += [meson.get_compiler('c').find_library('onecore')]
+      endif
       record_paths_test = executable('gui_record_paths_test',
-        ['test/gui_record_paths_test.c', 'common/file_utils.c', version_target],
-        dependencies: overlay_test_deps + [flac_dep], include_directories: gui_includes,
+        ['test/gui_record_paths_test.c', 'common/file_utils.c', version_target,
+         'test/monitor_local_save_stub.c', 'common/flac_writer.c',
+         'misrc_gui/output/gui_record_direct.c',
+         'misrc_gui/net/monitor_local_save_protocol.c',
+         'common/buffer_manager.c', 'common/ringbuffer.c', 'common/rb_event.c'],
+        dependencies: record_paths_deps, include_directories: gui_includes,
         c_args: cflags + ['-fwhole-program'], link_args: ldflags,
         override_options: ['b_lto=true', 'optimization=2'])
       test('gui_record_paths', record_paths_test)
@@ -731,9 +919,13 @@ if raylib_dep.found()
 
     # Exercise the production stats sizing with deterministic font metrics.
     # As above, LTO drops unrelated UI/backend code from the included source.
+    # gui_ui.c's timeline name budget reads the selected playback file info
+    # (gui_playback_get_selected_file_info): satisfied by the info stub TU
+    # (NOT the audio stub - the playback harnesses compile the real
+    # gui_playback.c and would collide).
     stats_layout_test = executable('gui_stats_layout_test',
       ['test/gui_stats_layout_harness.c', 'misrc_gui/ui/gui_ui_scale.c',
-       'common/file_utils.c', version_target],
+       'common/file_utils.c', 'test/gui_playback_info_stub.c', version_target],
       dependencies: overlay_test_deps,
       include_directories: gui_includes,
       c_args: gui_cflags,
@@ -743,7 +935,8 @@ if raylib_dep.found()
 
     # Check connection-button text and padding with the same CPU-only setup.
     toolbar_layout_test = executable('gui_toolbar_layout_test',
-      ['test/gui_toolbar_layout_harness.c', 'common/file_utils.c', version_target],
+      ['test/gui_toolbar_layout_harness.c', 'common/file_utils.c',
+       'test/gui_playback_info_stub.c', version_target],
       dependencies: overlay_test_deps,
       include_directories: gui_includes,
       c_args: gui_cflags,
@@ -752,7 +945,8 @@ if raylib_dep.found()
     test('gui_toolbar_layout', toolbar_layout_test)
 
     viewport_layout_test = executable('gui_viewport_layout_test',
-      ['test/gui_viewport_layout_harness.c', 'common/file_utils.c', version_target],
+      ['test/gui_viewport_layout_harness.c', 'common/file_utils.c',
+       'test/gui_playback_info_stub.c', version_target],
       dependencies: overlay_test_deps,
       include_directories: gui_includes,
       c_args: gui_cflags,
@@ -789,7 +983,8 @@ if raylib_dep.found()
       test('gui_playback_resolve', playback_resolve_test)
     endif
     rf_input_stamps_test = executable('gui_rf_input_stamps_test',
-      'test/gui_rf_input_stamps_test.c',
+      ['test/gui_rf_input_stamps_test.c', 'test/monitor_local_save_stub.c',
+       'common/file_utils.c'],
       dependencies: overlay_test_deps + [dependency('threads')],
       include_directories: gui_includes,
       c_args: gui_cflags,
@@ -797,13 +992,20 @@ if raylib_dep.found()
     )
     test('gui_rf_input_stamps', rf_input_stamps_test)
     rf_routes_test = executable('gui_rf_routes_test',
-      'test/gui_rf_routes_test.c',
+      ['test/gui_rf_routes_test.c', 'misrc_gui/signal/gui_vhs_hifi.c'],
       dependencies: overlay_test_deps + [dependency('threads')],
       include_directories: gui_includes,
       c_args: gui_cflags,
       override_options: ['b_lto=true', 'optimization=2'],
     )
     test('gui_rf_routes', rf_routes_test)
+
+    rf_geometry_test = executable('gui_rf_preview_geometry_test',
+      'test/gui_rf_preview_geometry_test.c',
+      c_args: cflags,
+      dependencies: [meson.get_compiler('c').find_library('m', required: false)],
+    )
+    test('gui_rf_preview_geometry', rf_geometry_test)
 
     # Synthetic baseband composite contracts for the ported CVBS profile +
     # VBI sync model + burst-locked colour (gui_cvbs.c included directly,
@@ -824,6 +1026,10 @@ if raylib_dep.found()
     )
     test('gui_cvbs_baseband', cvbs_baseband_test)
 
+    # gui_audio.c (included by both harnesses) redirects stdio through the
+    # mls_proxy_* macros; the harnesses already self-define those (their own
+    # file_open_utf8 stubs get renamed by the macro). The only extra symbol
+    # is gui_monitor_server_active (stubbed inside each harness).
     audio_hifi_monitor_test = executable('gui_audio_hifi_monitor_test',
       'test/gui_audio_hifi_monitor_test.c',
       dependencies: overlay_test_deps + [dependency('threads')],
@@ -878,8 +1084,9 @@ if raylib_dep.found()
 
       # Manual exact-media integration: requires one second of 20 MHz NTSC
       # s16le RF and an output directory, so it is not a default CI test.
-      rf_reconnect_sources = [
+      rf_reconnect_sources = rf_preview_sources + rf_audio_sources + [
         'test/gui_rf_playback_reconnect_test.c', 'test/gui_playback_audio_stub.c',
+        'test/monitor_local_save_stub.c',
         'common/file_utils.c',
         'misrc_gui/input/gui_playback_length_cache.c',
         'misrc_gui/visualization/gui_fft.c',
@@ -888,7 +1095,6 @@ if raylib_dep.found()
         'common/rb_event.c', 'common/buffer_manager.c',
         'misrc_gui/processing/gui_rf_stream_marks.c',
         'misrc_gui/signal/gui_vhs_fm.c',
-        'misrc_gui/signal/gui_rf_preview.c',
         'misrc_gui/signal/gui_rf_resampler.c',
         'misrc_gui/processing/gui_rf_preview_worker.c', 'misrc_gui/signal/gui_beta_hifi.c',
         'misrc_gui/processing/gui_rf_preview_policy.c',
@@ -897,7 +1103,7 @@ if raylib_dep.found()
       if host_cpu_family == 'x86_64'
         rf_reconnect_sources += nasm_genb
       endif
-      rf_reconnect_deps = overlay_test_deps + [flac_dep, fftw3f_dep, dependency('threads')]
+      rf_reconnect_deps = overlay_test_deps + [flac_dep, fftw3f_dep, dependency('threads'), ld_dts_dep]
       if soxr_dep.found()
         rf_reconnect_deps += soxr_dep
       endif
@@ -947,33 +1153,55 @@ if soxr_dep.found()
 endif
 rf_test_cflags = cflags + ['-O3', '-ffast-math', '-funroll-loops', '-ftree-vectorize']
 rf_decoder_test = executable('gui_rf_preview_test',
-  ['test/gui_rf_preview_test.c', 'misrc_gui/signal/gui_rf_preview.c'],
+  rf_preview_sources + ['test/gui_rf_preview_test.c'],
   dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
 test('gui_rf_preview', rf_decoder_test, timeout: 120)
+test('gui_rf_svhs', rf_decoder_test, args: ['--svhs-only'], timeout: 90)
+test('gui_rf_svhs_color', rf_decoder_test, args: ['--svhs-color-only'], timeout: 90)
+test('gui_rf_svhs_stripe', rf_decoder_test, args: ['--svhs-stripe-only'], timeout: 30)
+test('gui_rf_laserdisc', rf_decoder_test, args: ['--laserdisc-only'], timeout: 30)
+ld_ac3_frames_test = executable('gui_ld_ac3_frames_test',
+  ['test/gui_ld_ac3_frames_test.c', 'misrc_gui/signal/gui_ld_ac3_frames.c'],
+  c_args: cflags, link_args: ldflags)
+test('gui_ld_ac3_frames', ld_ac3_frames_test)
+rf_secam_test = executable('gui_rf_secam_test',
+  rf_preview_sources + ['test/gui_rf_secam_test.c'],
+  dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
+test('gui_rf_secam', rf_secam_test, timeout: 60)
+rf_mesecam_test = executable('gui_rf_mesecam_test',
+  rf_preview_sources + ['test/gui_rf_mesecam_test.c'],
+  dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
+test('gui_rf_mesecam', rf_mesecam_test, timeout: 180)
+rf_testgen_test = executable('gui_testgen_rf_test',
+  rf_preview_sources + ['test/gui_testgen_rf_test.c', 'misrc_gui/signal/gui_testgen.c'],
+  dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
+test('gui_testgen_rf', rf_testgen_test, timeout: 120)
 rf_resampler_test = executable('gui_rf_resampler_test',
   ['test/gui_rf_resampler_test.c', 'misrc_gui/signal/gui_rf_resampler.c'],
   dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
 test('gui_rf_resampler', rf_resampler_test)
 rf_worker_test = executable('gui_rf_preview_worker_test',
-  ['test/gui_rf_preview_worker_test.c', 'misrc_gui/processing/gui_rf_preview_worker.c',
+  rf_audio_sources + ['test/gui_rf_preview_worker_test.c', 'misrc_gui/processing/gui_rf_preview_worker.c',
    'misrc_gui/processing/gui_rf_preview_policy.c'],
-  dependencies: [dependency('threads'), meson.get_compiler('c').find_library('m', required: false)], c_args: cflags, link_args: ldflags)
+  dependencies: [dependency('threads'), meson.get_compiler('c').find_library('m', required: false), ld_dts_dep],
+  c_args: cflags, link_args: ldflags)
 test('gui_rf_preview_worker', rf_worker_test)
 if host_machine.system() == 'windows'
   rf_handoff_test = executable('gui_rf_preview_handoff_test',
-    ['test/gui_rf_preview_handoff_test.c', 'misrc_gui/processing/gui_rf_preview_policy.c'],
-    dependencies: [dependency('threads')], c_args: cflags, link_args: ldflags)
+    rf_audio_sources + ['test/gui_rf_preview_handoff_test.c', 'misrc_gui/processing/gui_rf_preview_policy.c'],
+    dependencies: [dependency('threads'), meson.get_compiler('c').find_library('m', required: false), ld_dts_dep],
+    c_args: cflags, link_args: ldflags)
   test('gui_rf_preview_handoff', rf_handoff_test)
   rf_idle_cpu_probe = executable('gui_rf_preview_idle_cpu_probe',
-    ['test/gui_rf_preview_idle_cpu_probe.c', 'misrc_gui/processing/gui_rf_preview_policy.c'],
-    dependencies: [dependency('threads')], c_args: rf_test_cflags, link_args: ldflags)
+    rf_audio_sources + ['test/gui_rf_preview_idle_cpu_probe.c', 'misrc_gui/processing/gui_rf_preview_policy.c'],
+    dependencies: [dependency('threads'), ld_dts_dep], c_args: rf_test_cflags, link_args: ldflags)
   test('gui_rf_preview_idle_cpu', rf_idle_cpu_probe)
 endif
 rf_file_harness = executable('gui_rf_preview_file',
-  ['test/gui_rf_preview_file.c', 'misrc_gui/signal/gui_rf_preview.c',
+  rf_preview_sources + rf_audio_sources + ['test/gui_rf_preview_file.c',
    'misrc_gui/signal/gui_rf_resampler.c', 'misrc_gui/processing/gui_rf_preview_worker.c', 'misrc_gui/signal/gui_beta_hifi.c',
    'misrc_gui/processing/gui_rf_preview_policy.c'],
-  dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
+  dependencies: rf_test_deps + [ld_dts_dep], c_args: rf_test_cflags, link_args: ldflags)
 rf_marks_test = executable('gui_rf_stream_marks_test',
   ['test/gui_rf_stream_marks_test.c','misrc_gui/processing/gui_rf_stream_marks.c'],
   dependencies: [dependency('threads')], c_args: cflags, link_args: ldflags)
@@ -988,15 +1216,15 @@ rf_policy_test = executable('gui_rf_preview_policy_test',
 test('gui_rf_preview_policy', rf_policy_test)
 
 if flac_dep.found()
-  rf_record_deps = rf_test_deps + [flac_dep]
+  rf_record_deps = rf_test_deps + [flac_dep, ld_dts_dep]
   if host_machine.system() == 'windows'
     rf_record_deps += [meson.get_compiler('c').find_library('psapi'),
                        meson.get_compiler('c').find_library('onecore')]
   endif
   rf_record_harness = executable('gui_rf_preview_record_load',
-    ['test/gui_rf_preview_record_load.c', 'common/buffer_manager.c',
+    rf_preview_sources + rf_audio_sources + ['test/gui_rf_preview_record_load.c', 'common/buffer_manager.c',
      'common/ringbuffer.c', 'common/rb_event.c', 'common/flac_writer.c',
-     'misrc_gui/signal/gui_rf_preview.c', 'misrc_gui/signal/gui_rf_resampler.c',
+     'misrc_gui/signal/gui_rf_resampler.c',
      'misrc_gui/processing/gui_rf_preview_worker.c', 'misrc_gui/signal/gui_beta_hifi.c',
      'misrc_gui/processing/gui_rf_preview_policy.c',
      'misrc_gui/processing/gui_rf_preview_pressure.c'],
@@ -1034,6 +1262,18 @@ ddd_async_policy_test = executable('gui_ddd_async_policy_test',
   c_args: cflags,
 )
 test('gui_ddd_async_policy', ddd_async_policy_test)
+
+ringbuffer_test_deps = []
+if host_system == 'windows'
+  ringbuffer_test_deps += [meson.get_compiler('c').find_library('onecore')]
+endif
+ringbuffer_wrap_test = executable('ringbuffer_wrap_test',
+  ['test/ringbuffer_wrap_harness.c', 'common/ringbuffer.c'],
+  include_directories: include_directories('common'),
+  dependencies: ringbuffer_test_deps,
+  c_args: cflags,
+)
+test('ringbuffer_wrap', ringbuffer_wrap_test)
 
 # Byte-exact direct RAW record path: the real tap push + writer thread
 # against the real buffer manager/ringbuffer, with an in-memory spill stub
@@ -1094,3 +1334,17 @@ endif
 
 cxadc_samples_test = executable('cxadc_samples_test', 'test/cxadc_samples_test.c', c_args: cflags)
 test('cxadc_samples', cxadc_samples_test)
+
+
+# Monitor Opus frame header: exact byte layout / length validation (no dependencies).
+monitor_audio_wire_test = executable('gui_monitor_audio_wire_test',
+  'test/gui_monitor_audio_wire_test.c', c_args: cflags)
+test('gui_monitor_audio_wire', monitor_audio_wire_test)
+
+# Monitor & Remote-only audio level metadata: exercise the production JSON
+# parser with current, legacy, incomplete and invalid status snapshots.
+if host_system != 'android'
+  monitor_audio_levels_test = executable('gui_monitor_audio_levels_test',
+    'test/gui_monitor_audio_levels_test.c', c_args: cflags)
+  test('gui_monitor_audio_levels', monitor_audio_levels_test)
+endif

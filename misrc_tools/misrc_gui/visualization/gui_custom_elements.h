@@ -25,6 +25,8 @@ typedef enum {
     CUSTOM_LAYOUT_ELEMENT_TYPE_SETTINGS_ICON,
     CUSTOM_LAYOUT_ELEMENT_TYPE_CLOCK_ICON,
     CUSTOM_LAYOUT_ELEMENT_TYPE_LOOP_ICON,
+    CUSTOM_LAYOUT_ELEMENT_TYPE_PLAY_ICON,       // Transport play glyph (filled triangle)
+    CUSTOM_LAYOUT_ELEMENT_TYPE_PAUSE_ICON,      // Transport pause glyph (two bars)
     CUSTOM_LAYOUT_ELEMENT_TYPE_VERSION_ICON,    // Fixed left-side badge showing MISRC capture state
     CUSTOM_LAYOUT_ELEMENT_TYPE_SCROLL_ICON      // Metadata page icon
 } CustomLayoutElementType;

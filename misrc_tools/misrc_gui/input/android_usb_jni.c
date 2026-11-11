@@ -6,7 +6,8 @@
  *  (A) libusb cannot open /dev/bus/usb/* on Android without root. Java's
  *      UsbManager grants permission and hands us the device file descriptor;
  *      native code wraps it with libusb_wrap_sys_device() (via libuvc
- *      uvc_wrap()). MainActivity.nativeSetUsbFd(int) stores that fd.
+ *      uvc_wrap()). JNI stages a duplicate of the Java fd, and each capture
+ *      holds its own duplicate until libuvc has closed the wrapped device.
  *
  *  (B) The native GUI's "connect" button calls hsdaoh_open() directly and does
  *      NOT go through Java, so the permission dialog was never shown when the
@@ -23,10 +24,16 @@
 #include <stdbool.h>
 #include <stdatomic.h>
 #include <pthread.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <time.h>
 #include <stdio.h>
 #include <string.h>
 #include <jni.h>
+#ifdef ENABLE_RTLSDR
+#include <rtl-sdr.h>
+#include "android_rtlsdr_usb.h"
+#endif
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -36,14 +43,27 @@
 #define LOGI(...) ((void)0)
 #define LOGE(...) ((void)0)
 #endif
-/* Optional Android hsdaoh fd setter exported by patched libhsdaoh.so. */
-extern void hsdaoh_set_android_usb_fd(int fd) __attribute__((weak));
+/* Provided by the Android build of libhsdaoh. */
+extern void hsdaoh_set_android_usb_fd_provider(int (*provider)(void));
 
 /* ---- state ---- */
-static atomic_int  s_usb_fd = -1;          /* granted fd, -1 = none */
+static pthread_mutex_t s_usb_fd_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int s_usb_fd = -1;                   /* native-owned grant, -1 = none */
 static atomic_int  s_usb_device_present = 0; /* Java-reported physical attach state */
 static JavaVM     *s_jvm = NULL;            /* cached in JNI_OnLoad */
 static jobject     s_activity_ref = NULL;  /* global ref to MainActivity */
+static pthread_mutex_t s_activity_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+#ifdef ENABLE_RTLSDR
+static pthread_mutex_t s_rtl_devices_mutex = PTHREAD_MUTEX_INITIALIZER;
+static android_rtlsdr_usb_device_t s_rtl_devices[ANDROID_RTL_USB_MAX_DEVICES];
+static int s_rtl_device_count;
+static atomic_uint s_rtl_device_revision;
+static atomic_int s_rtl_permission_device = -1;
+static atomic_int s_rtl_permission_result = -1;
+static android_rtlsdr_usb_identity_t s_rtl_permission_identity;
+static android_rtlsdr_usb_identity_t s_rtl_open_identity;
+#endif
 
 /* App-external files dir (from Java getExternalFilesDir(null)). On Android 11+
  * this is the ONLY path exempt from scoped storage — native fopen() can write
@@ -89,12 +109,33 @@ static void clear_pending_jni_exception(JNIEnv *env, const char *ctx)
     }
 }
 
+/* The capture thread acquires its descriptor while the staged grant is locked.
+ * Clearing or replacing the grant can then leave an open session alone. */
+static int android_usb_dup_fd(void)
+{
+    pthread_mutex_lock(&s_usb_fd_mutex);
+    int fd = s_usb_fd >= 0 ? fcntl(s_usb_fd, F_DUPFD_CLOEXEC, 0) : -1;
+    pthread_mutex_unlock(&s_usb_fd_mutex);
+    return fd;
+}
+
+static void android_usb_replace_fd(int fd)
+{
+    pthread_mutex_lock(&s_usb_fd_mutex);
+    int previous = s_usb_fd;
+    s_usb_fd = fd;
+    pthread_mutex_unlock(&s_usb_fd_mutex);
+    if (previous >= 0)
+        close(previous);
+}
+
 /* ---- JNI_OnLoad: cache the JavaVM so native threads can attach ---- */
 JNIEXPORT jint JNICALL
 JNI_OnLoad(JavaVM *vm, void *reserved)
 {
     (void)reserved;
     s_jvm = vm;
+    hsdaoh_set_android_usb_fd_provider(android_usb_dup_fd);
     return JNI_VERSION_1_6;
 }
 
@@ -110,6 +151,7 @@ JNIEXPORT void JNICALL
 Java_dev_misrc_gui_MainActivity_nativeRegisterActivity(JNIEnv *env, jobject thiz, jobject activity)
 {
     (void)thiz;
+    pthread_mutex_lock(&s_activity_mutex);
     if (s_activity_ref) {
         (*env)->DeleteGlobalRef(env, s_activity_ref);
         s_activity_ref = NULL;
@@ -118,18 +160,101 @@ Java_dev_misrc_gui_MainActivity_nativeRegisterActivity(JNIEnv *env, jobject thiz
         s_activity_ref = (*env)->NewGlobalRef(env, activity);
         LOGI("nativeRegisterActivity: stored activity ref");
     }
+    pthread_mutex_unlock(&s_activity_mutex);
+}
+
+JNIEXPORT jboolean JNICALL
+Java_dev_misrc_gui_MainActivity_nativeIsRtlUsbDevice(JNIEnv *env, jobject thiz,
+                                                    jint vid, jint pid)
+{
+    (void)env;
+    (void)thiz;
+#ifdef ENABLE_RTLSDR
+    return rtlsdr_get_device_name_by_usb_id((uint16_t)vid, (uint16_t)pid)
+        ? JNI_TRUE : JNI_FALSE;
+#else
+    (void)vid;
+    (void)pid;
+    return JNI_FALSE;
+#endif
+}
+
+JNIEXPORT void JNICALL
+Java_dev_misrc_gui_MainActivity_nativeSetRtlUsbDevices(JNIEnv *env, jobject thiz,
+                                                      jintArray devices)
+{
+    (void)thiz;
+#ifdef ENABLE_RTLSDR
+    jsize count = (*env)->GetArrayLength(env, devices) / 3;
+    if (count > ANDROID_RTL_USB_MAX_DEVICES) count = ANDROID_RTL_USB_MAX_DEVICES;
+    jint values[3 * ANDROID_RTL_USB_MAX_DEVICES];
+    android_rtlsdr_usb_device_t next[ANDROID_RTL_USB_MAX_DEVICES] = {0};
+    (*env)->GetIntArrayRegion(env, devices, 0, count * 3, values);
+    if ((*env)->ExceptionCheck(env)) return;
+    for (jsize i = 0; i < count; ++i) {
+        next[i].id = values[3 * i];
+        next[i].vid = (uint16_t)values[3 * i + 1];
+        next[i].pid = (uint16_t)values[3 * i + 2];
+    }
+    pthread_mutex_lock(&s_rtl_devices_mutex);
+    if (count != s_rtl_device_count || memcmp(next, s_rtl_devices, sizeof(next)) != 0) {
+        memcpy(s_rtl_devices, next, sizeof(next));
+        s_rtl_device_count = count;
+        atomic_fetch_add(&s_rtl_device_revision, 1);
+    }
+    pthread_mutex_unlock(&s_rtl_devices_mutex);
+#else
+    (void)env;
+    (void)devices;
+#endif
+}
+
+JNIEXPORT void JNICALL
+Java_dev_misrc_gui_MainActivity_nativeRtlUsbPermissionResult(JNIEnv *env, jobject thiz,
+                                                            jint device, jboolean granted,
+                                                            jstring serial)
+{
+    (void)thiz;
+#ifdef ENABLE_RTLSDR
+    pthread_mutex_lock(&s_rtl_devices_mutex);
+    if (device == atomic_load(&s_rtl_permission_device) &&
+        atomic_load(&s_rtl_permission_result) < 0) {
+        s_rtl_permission_identity.serial[0] = '\0';
+        if (granted == JNI_TRUE && serial) {
+            jsize length = (*env)->GetStringUTFLength(env, serial);
+            if (length < ANDROID_RTL_USB_SERIAL_SIZE) {
+                const char *value = (*env)->GetStringUTFChars(env, serial, NULL);
+                if (value) {
+                    memcpy(s_rtl_permission_identity.serial, value, (size_t)length + 1);
+                    (*env)->ReleaseStringUTFChars(env, serial, value);
+                } else {
+                    (*env)->ExceptionClear(env);
+                }
+            }
+        }
+        atomic_store(&s_rtl_permission_result, granted == JNI_TRUE);
+    }
+    pthread_mutex_unlock(&s_rtl_devices_mutex);
+#else
+    (void)env;
+    (void)device;
+    (void)granted;
+    (void)serial;
+#endif
 }
 
 /* MainActivity.nativeSetUsbFd(int fd) */
-JNIEXPORT void JNICALL
+JNIEXPORT jboolean JNICALL
 Java_dev_misrc_gui_MainActivity_nativeSetUsbFd(JNIEnv *env, jobject thiz, jint fd)
 {
     (void)env; (void)thiz;
-    atomic_store(&s_usb_fd, (int)fd);
-    if (hsdaoh_set_android_usb_fd) {
-        hsdaoh_set_android_usb_fd((int)fd);
+    int owned_fd = fd >= 0 ? fcntl(fd, F_DUPFD_CLOEXEC, 0) : -1;
+    if (fd >= 0 && owned_fd < 0) {
+        LOGE("nativeSetUsbFd: could not duplicate the USB descriptor");
+        return JNI_FALSE;
     }
-    LOGI("nativeSetUsbFd: fd=%d", (int)fd);
+    android_usb_replace_fd(owned_fd);
+    return JNI_TRUE;
 }
 
 /* MainActivity.nativeSetStoragePath(String path) — called from onCreate with
@@ -231,14 +356,17 @@ Java_dev_misrc_gui_MainActivity_nativePushTextInput(JNIEnv *env, jobject thiz, j
 
 /* ---- C API used by the native capture path (gui_capture.c / hsdaoh) ---- */
 
-int android_usb_get_fd(void) { return atomic_load(&s_usb_fd); }
-int android_usb_has_fd(void) { return atomic_load(&s_usb_fd) >= 0; }
+int android_usb_has_fd(void)
+{
+    pthread_mutex_lock(&s_usb_fd_mutex);
+    int present = s_usb_fd >= 0;
+    pthread_mutex_unlock(&s_usb_fd_mutex);
+    return present;
+}
+
 void android_usb_clear_fd(void)
 {
-    atomic_store(&s_usb_fd, -1);
-    if (hsdaoh_set_android_usb_fd) {
-        hsdaoh_set_android_usb_fd(-1);
-    }
+    android_usb_replace_fd(-1);
 }
 
 /* Returns the Java-provided external files dir (scoped-storage-exempt,
@@ -267,10 +395,11 @@ size_t android_drain_text_input(char *out, size_t out_len)
  * DeleteLocalRef) or NULL. */
 static jobject find_current_activity(JNIEnv *env)
 {
-    if (s_activity_ref) {
-        /* Hold a fresh local ref so callers can uniformly DeleteLocalRef. */
-        return (*env)->NewLocalRef(env, s_activity_ref);
-    }
+    /* Hold a local ref across a concurrent Java-side activity registration. */
+    pthread_mutex_lock(&s_activity_mutex);
+    jobject registered = s_activity_ref ? (*env)->NewLocalRef(env, s_activity_ref) : NULL;
+    pthread_mutex_unlock(&s_activity_mutex);
+    if (registered) return registered;
     /* android.app.ActivityThread.currentApplication().getCurrentTopResumedActivity()
          (API 31+) or a simpler older fallback. The robust, version-agnostic
          route is to enumerate the token's activity; but the simplest portable
@@ -348,6 +477,120 @@ void android_set_keyboard_visible(int visible)
     (*env)->DeleteLocalRef(env, activity);
     (*s_jvm)->DetachCurrentThread(s_jvm);
 }
+
+#ifdef ENABLE_RTLSDR
+unsigned android_rtlsdr_device_revision(void)
+{
+    return atomic_load(&s_rtl_device_revision);
+}
+
+int android_rtlsdr_list_usb_devices(android_rtlsdr_usb_device_t *devices, int capacity)
+{
+    if (!devices || capacity <= 0) return 0;
+    pthread_mutex_lock(&s_rtl_devices_mutex);
+    int count = s_rtl_device_count < capacity ? s_rtl_device_count : capacity;
+    memcpy(devices, s_rtl_devices, (size_t)count * sizeof(*devices));
+    pthread_mutex_unlock(&s_rtl_devices_mutex);
+    return count;
+}
+
+static int android_rtlsdr_call_activity(const char *method, int device_id, int fallback,
+                                       const android_rtlsdr_usb_identity_t *open)
+{
+    if (!s_jvm) return fallback;
+    JNIEnv *env = NULL;
+    jint status = (*s_jvm)->GetEnv(s_jvm, (void **)&env, JNI_VERSION_1_6);
+    bool detach = status == JNI_EDETACHED;
+    if (detach) status = (*s_jvm)->AttachCurrentThread(s_jvm, &env, NULL);
+    if (status != JNI_OK || !env) return fallback;
+
+    int result = fallback;
+    jobject activity = find_current_activity(env);
+    if (activity) {
+        jclass cls = (*env)->GetObjectClass(env, activity);
+        const char *signature = open ? "(IIILjava/lang/String;)I" : "(I)I";
+        jmethodID mid = cls ? (*env)->GetMethodID(env, cls, method, signature) : NULL;
+        if (mid && open) {
+            bool need_serial = open->serial[0] != '\0';
+            jstring serial = need_serial ? (*env)->NewStringUTF(env, open->serial) : NULL;
+            if (!need_serial || serial) {
+                result = (*env)->CallIntMethod(env, activity, mid, (jint)device_id,
+                                               (jint)open->usb.vid, (jint)open->usb.pid, serial);
+            }
+            if (serial) (*env)->DeleteLocalRef(env, serial);
+        } else if (mid) {
+            result = (*env)->CallIntMethod(env, activity, mid, (jint)device_id);
+        }
+        if ((*env)->ExceptionCheck(env)) {
+            clear_pending_jni_exception(env, method);
+            result = fallback;
+        }
+        if (cls) (*env)->DeleteLocalRef(env, cls);
+        (*env)->DeleteLocalRef(env, activity);
+    }
+    if (detach) (*s_jvm)->DetachCurrentThread(s_jvm);
+    return result;
+}
+
+void android_rtlsdr_set_open_identity(const android_rtlsdr_usb_identity_t *identity)
+{
+    pthread_mutex_lock(&s_rtl_devices_mutex);
+    s_rtl_open_identity = *identity;
+    pthread_mutex_unlock(&s_rtl_devices_mutex);
+}
+
+int android_rtlsdr_open_usb_fd(int device_id)
+{
+    pthread_mutex_lock(&s_rtl_devices_mutex);
+    android_rtlsdr_usb_identity_t identity = s_rtl_open_identity;
+    s_rtl_open_identity.usb.id = -1;
+    pthread_mutex_unlock(&s_rtl_devices_mutex);
+    if (identity.usb.id != device_id) return -1;
+    return android_rtlsdr_call_activity("openRtlUsbFdFromNative", device_id, -1, &identity);
+}
+
+int android_rtlsdr_request_permission(int device_id)
+{
+    if (device_id < 0 || android_rtlsdr_permission_pending()) return 0;
+    pthread_mutex_lock(&s_rtl_devices_mutex);
+    bool found = false;
+    for (int i = 0; i < s_rtl_device_count; ++i) {
+        if (s_rtl_devices[i].id == device_id) {
+            s_rtl_permission_identity.usb = s_rtl_devices[i];
+            found = true;
+            break;
+        }
+    }
+    if (found) {
+        atomic_store(&s_rtl_permission_result, -1);
+        atomic_store(&s_rtl_permission_device, device_id);
+    }
+    pthread_mutex_unlock(&s_rtl_devices_mutex);
+    if (!found) return 0;
+    if (android_rtlsdr_call_activity("requestRtlUsbPermissionFromNative", device_id, 0, NULL)) {
+        return 1;
+    }
+    atomic_store(&s_rtl_permission_device, -1);
+    return 0;
+}
+
+int android_rtlsdr_permission_pending(void)
+{
+    return atomic_load(&s_rtl_permission_device) >= 0;
+}
+
+int android_rtlsdr_poll_permission(android_rtlsdr_usb_identity_t *identity, int *granted)
+{
+    if (!android_rtlsdr_permission_pending() ||
+        atomic_load(&s_rtl_permission_result) < 0) return 0;
+    pthread_mutex_lock(&s_rtl_devices_mutex);
+    atomic_store(&s_rtl_permission_device, -1);
+    *identity = s_rtl_permission_identity;
+    *granted = atomic_load(&s_rtl_permission_result);
+    pthread_mutex_unlock(&s_rtl_devices_mutex);
+    return 1;
+}
+#endif
 
 /* ---- Async picker API (non-blocking; render thread polls) ----
  *
@@ -485,9 +728,6 @@ int android_request_usb_permission_async(void)
         return 0;
     }
 
-    atomic_store(&s_async_perm_result, -1);
-    atomic_store(&s_async_perm_active, 1);
-
     jclass cls = (*env)->GetObjectClass(env, activity);
     if (!cls) {
         clear_pending_jni_exception(env, "GetObjectClass(activity) for USB permission async");
@@ -504,12 +744,16 @@ int android_request_usb_permission_async(void)
         (*s_jvm)->DetachCurrentThread(s_jvm);
         return 0;
     }
+    atomic_store(&s_async_perm_result, -1);
+    atomic_store(&s_async_perm_active, 1);
     (*env)->CallVoidMethod(env, activity, mid);
+    bool failed = (*env)->ExceptionCheck(env);
     clear_pending_jni_exception(env, "CallVoidMethod(requestPermissionFromNative async)");
     (*env)->DeleteLocalRef(env, cls);
     (*env)->DeleteLocalRef(env, activity);
     (*s_jvm)->DetachCurrentThread(s_jvm);
-    return 1;
+    if (failed) atomic_store(&s_async_perm_active, 0);
+    return !failed;
 }
 
 int android_permission_pending(void)

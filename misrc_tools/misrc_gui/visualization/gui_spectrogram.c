@@ -449,7 +449,8 @@ static void spectro_palette_reload(spectro_engine_t *e, gui_app_t *app, int chan
     // buffers are released on stop, so never retain their aliases across
     // frames for a later palette click.
     bool remap = e->analysis_active &&
-        gui_playback_get_state(app) == PLAYBACK_STATE_PAUSED &&
+        gui_playback_is_running(app) &&
+        gui_playback_is_channel_paused(app, channel) &&
         gui_playback_poll_analysis_window(app, channel, &seq,
                                           &mags, &slice_count, &bins) &&
         mags && bins > 0;
@@ -667,9 +668,22 @@ static void spectro_vtable_render(void *state_ptr, gui_app_t *app, int channel,
         app && app->selected_device >= 0 &&
         app->selected_device < app->device_count &&
         app->devices[app->selected_device].type == DEVICE_TYPE_PLAYBACK;
+    // HELD = paused for THIS channel (user request 2026-11-03). The
+    // per-channel transport pauses a track WITHOUT flipping the master
+    // PLAYBACK_STATE, so the old master-state gate left the rolling feed
+    // scrolling (repeating the last frame 60x/s) and the DAW paused
+    // analysis window (direct file load around the playhead) never
+    // engaged. Covers master pause and the no-loop end-of-file hold too;
+    // the explicit state check keeps STARTING/STOPPED sessions on the
+    // rolling path exactly like before.
+    playback_state_t pb_state = gui_playback_get_state(app);
     bool playback_paused =
         playback_selected &&
-        gui_playback_get_state(app) == PLAYBACK_STATE_PAUSED;
+        gui_playback_is_running(app) &&
+        (pb_state == PLAYBACK_STATE_PAUSED ||
+         pb_state == PLAYBACK_STATE_EOF ||
+         (pb_state == PLAYBACK_STATE_PLAYING &&
+          atomic_load(&app->playback_channel_paused[channel])));
 
     if (playback_paused) {
         // --- DAW-style paused analysis window (direct file render) ---

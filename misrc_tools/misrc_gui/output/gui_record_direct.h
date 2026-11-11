@@ -72,13 +72,8 @@ typedef struct gui_record_direct_ctx {
     int channel;               // 0 = A, 1 = B
     FILE *file;                // output file (required)
 
-    // Writer exit condition: drain everything, then exit once recording
-    // stopped. Points at app->is_recording (volatile read, same cross-thread
-    // pattern as the legacy writers).
-    const volatile bool *recording_active;
-    // Global exit flag (do_exit, declared `volatile atomic_int`). Optional
-    // (NULL = unused).
-    const volatile atomic_int *exit_flag;
+    // The finalizer sets this after all record producers have stopped.
+    const atomic_bool *writer_draining;
 
     // Accounting targets (optional; NULL = skip).
     atomic_uint_fast64_t *bytes_read_total;      // producer: bytes accepted from the device

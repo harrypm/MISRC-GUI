@@ -6,6 +6,9 @@
 
 #include <stdarg.h>
 #include <stdatomic.h>
+#if defined(__linux__) && !defined(__ANDROID__)
+#include <time.h>
+#endif
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -38,12 +41,31 @@
 #include "../visualization/gui_spectrogram.h"
 #include "../signal/gui_cvbs.h"
 #include "../signal/gui_demod.h"
+#include "../signal/gui_testgen.h"
 #ifdef ENABLE_RTLSDR
 #include "gui_rtlsdr.h"
+#ifdef __ANDROID__
+#include "android_rtlsdr_usb.h"
+#endif
+#endif
+#ifdef __ANDROID__
+#include <pthread.h>
+#include "../ui/gui_ui.h"
+
+extern int android_usb_has_fd(void);
+extern void android_usb_clear_fd(void);
+extern int android_permission_pending(void);
+extern int android_poll_usb_permission_result(int *granted);
+extern int android_request_usb_permission_async(void);
+static void android_poll_capture_transition(gui_app_t *app);
 #endif
 #include "../processing/gui_display_thread.h"
 #include "../output/gui_audio.h"
 #include "../net/gui_net.h"
+#include "../net/gui_monitor_local_save.h"
+#include "../net/gui_monitor_transport.h"
+#include "../net/gui_monitor_audio.h"
+#include "../net/gui_remote_display.h"
 #include <hsdaoh.h>
 #include "../../common/hsdaoh_compat.h"
 #if defined(_WIN32)
@@ -402,7 +424,9 @@ static inline void gui_capture_update_backpressure_counters(gui_app_t *app)
 
 void gui_capture_request_dropout_stop(gui_app_t *app, gui_dropout_reason_t reason)
 {
-    if (!app || !app->settings.stop_on_dropout) return;
+    if (!app) return;
+    gui_record_mark_source_loss();
+    if (!app->settings.stop_on_dropout) return;
     atomic_store(&app->dropout_stop_reason, (uint32_t)reason);
     atomic_store(&app->dropout_stop_requested, true);
 }
@@ -416,6 +440,7 @@ void gui_capture_request_dropout_stop(gui_app_t *app, gui_dropout_reason_t reaso
 static void gui_capture_force_dropout_stop(gui_app_t *app, gui_dropout_reason_t reason)
 {
     if (!app) return;
+    gui_record_mark_source_loss();
     atomic_store(&app->dropout_stop_reason, (uint32_t)reason);
     atomic_store(&app->dropout_stop_requested, true);
 }
@@ -427,6 +452,9 @@ static void gui_capture_force_dropout_stop(gui_app_t *app, gui_dropout_reason_t 
 int gui_app_set_sdr_frequency(gui_app_t *app, uint64_t hz)
 {
     if (!app || hz == 0) return -1;
+#if defined(__ANDROID__)
+    if (gui_app_capture_busy() || gui_net_capture_controls_locked(app)) return -1;
+#endif
 #ifdef ENABLE_RTLSDR
     // Today the only SDR backend is RTL-SDR. When a second SDR backend is
     // added, dispatch on the selected device type here (and move the settings
@@ -758,6 +786,7 @@ static void gui_sync_event_cb(void *user_ctx, frame_sync_result_t result,
             }
             atomic_store(&app->stream_synced, false);
             if (was_synced) {
+                gui_record_mark_source_loss();
                 gui_record_log_capture_event(app, "ERROR", "Lost sync to HDMI input stream",
                                              GUI_ERROR_CLASS_SYSTEM, 1);
             }
@@ -765,6 +794,7 @@ static void gui_sync_event_cb(void *user_ctx, frame_sync_result_t result,
             s_capture_missed_burst_reported = false;
             break;
         case FRAME_SYNC_MISSED:
+            gui_record_mark_source_loss();
             atomic_fetch_add(&app->rf_stream_epoch, 1);
             if (misrc_debug_enabled()) {
                 // Match CLI usefulness: include framecounter. Note expected counter isn't directly
@@ -964,6 +994,8 @@ void gui_capture_callback(void *data_info_ptr) {
     buf_out = bufmgr_write_begin(&app->buffers, BUF_CAPTURE_RF, result.stream0_bytes, &s_capture_rf_write_policy);
     gui_capture_update_backpressure_counters(app);
     if (!buf_out) {
+        // This callback discards both RF and its accompanying audio.
+        gui_record_mark_source_loss();
         uint32_t total_drops = atomic_load(&app->rb_drop_count);
         uint32_t delta_drops = (total_drops > s_capture_last_logged_drop_total)
                                  ? (total_drops - s_capture_last_logged_drop_total)
@@ -1048,18 +1080,38 @@ static inline void gui_upstream_mark_synced(gui_app_t *app)
 }
 
 
+/* glfwGetTime() requires GLFW initialization. The headless server never
+ * creates a window, so use CLOCK_MONOTONIC only for that launch mode. */
+static atomic_bool s_headless_runtime = ATOMIC_VAR_INIT(false);
+void gui_runtime_set_headless(bool enabled) { atomic_store(&s_headless_runtime, enabled); }
+double gui_runtime_time(void) {
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (atomic_load(&s_headless_runtime)) {
+        struct timespec ts;
+        if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
+            return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
+    }
+#endif
+    return GetTime();
+}
+
 // Initialize application
 void gui_app_init(gui_app_t *app) {
+#ifdef __ANDROID__
+    atomic_init(&app->is_capturing, false);
+#endif
     // Initialize panel registry and register all panel types
     // This must happen before any panel state is created
-    panel_registry_init();
-    gui_waveform_panel_register();
-    gui_fft_panel_register();
-    gui_cvbs_panel_register();
-    gui_histogram_panel_register();
-    gui_waterfall_panel_register();
-    gui_spectrograph_panel_register();
-    gui_demod_panel_register();
+    if (!app->headless_server) {
+        panel_registry_init();
+        gui_waveform_panel_register();
+        gui_fft_panel_register();
+        gui_cvbs_panel_register();
+        gui_histogram_panel_register();
+        gui_waterfall_panel_register();
+        gui_spectrograph_panel_register();
+        gui_demod_panel_register();
+    }
 
     // Initialize per-channel display buffers
     memset(app->display_samples_a, 0, sizeof(app->display_samples_a));
@@ -1070,6 +1122,15 @@ void gui_app_init(gui_app_t *app) {
     // Initialize simulated device state
     app->sim_thread = NULL;
     atomic_store(&app->sim_running, false);
+
+    // Initialize RF transport diagnostics before UI and network worker access.
+    atomic_store(&app->net_rf_server_stream_drops, 0);
+    atomic_store(&app->net_rf_client_interruptions, 0);
+    atomic_store(&app->net_audio_server_stream_drops, 0);
+    atomic_store(&app->net_audio_client_interruptions, 0);
+    atomic_store(&app->net_audio_server_queue_bytes, 0);
+    atomic_store(&app->net_rf_server_queue_bytes, 0);
+    atomic_store(&app->net_rf_client_stream_live, false);
 
     // Initialize playback device state
     atomic_store(&app->playback_running, false);
@@ -1154,8 +1215,8 @@ void gui_app_init(gui_app_t *app) {
     app->trigger_b.phosphor_color = PHOSPHOR_COLOR_HEATMAP;  // Opacity mode by default
 
     // Initialize phosphor display state
-    app->phosphor_a = (phosphor_rt_t *)calloc(1, sizeof(phosphor_rt_t));
-    app->phosphor_b = (phosphor_rt_t *)calloc(1, sizeof(phosphor_rt_t));
+    if (!app->headless_server) app->phosphor_a = (phosphor_rt_t *)calloc(1, sizeof(phosphor_rt_t));
+    if (!app->headless_server) app->phosphor_b = (phosphor_rt_t *)calloc(1, sizeof(phosphor_rt_t));
 
     // Set phosphor config (render textures are created lazily on first use)
     if (app->phosphor_a) {
@@ -1178,14 +1239,14 @@ void gui_app_init(gui_app_t *app) {
     app->panel_config_a.split = true;
     app->panel_config_a.left_view = PANEL_VIEW_WAVEFORM;
     app->panel_config_a.right_view = PANEL_VIEW_FFT;
-    app->panel_config_a.left_state = panel_create_view_state(PANEL_VIEW_WAVEFORM);
-    app->panel_config_a.right_state = panel_create_view_state(PANEL_VIEW_FFT);
+    if (!app->headless_server) app->panel_config_a.left_state = panel_create_view_state(PANEL_VIEW_WAVEFORM);
+    if (!app->headless_server) app->panel_config_a.right_state = panel_create_view_state(PANEL_VIEW_FFT);
 
     app->panel_config_b.split = true;
     app->panel_config_b.left_view = PANEL_VIEW_WAVEFORM;
     app->panel_config_b.right_view = PANEL_VIEW_FFT;
-    app->panel_config_b.left_state = panel_create_view_state(PANEL_VIEW_WAVEFORM);
-    app->panel_config_b.right_state = panel_create_view_state(PANEL_VIEW_FFT);
+    if (!app->headless_server) app->panel_config_b.left_state = panel_create_view_state(PANEL_VIEW_WAVEFORM);
+    if (!app->headless_server) app->panel_config_b.right_state = panel_create_view_state(PANEL_VIEW_FFT);
 
     // Note: All buffers (BUF_CAPTURE_RF, BUF_CAPTURE_AUDIO, etc.) are initialized
     // by buffer manager automatically on first use
@@ -1205,7 +1266,7 @@ void gui_app_init(gui_app_t *app) {
     gui_extract_prepare_stream(app);
 
     // Initialize display thread (allocated, started on capture start)
-    app->display_thread = (display_thread_t *)calloc(1, sizeof(display_thread_t));
+    if (!app->headless_server) app->display_thread = (display_thread_t *)calloc(1, sizeof(display_thread_t));
     if (app->display_thread) {
         if (gui_display_thread_init(app->display_thread) != 0) {
             fprintf(stderr, "Failed to initialize display thread state\n");
@@ -1227,8 +1288,15 @@ void gui_app_init(gui_app_t *app) {
     atomic_store(&app->net_cmd_record_off, false);
     atomic_store(&app->net_cmd_select_device, false);
     atomic_store(&app->net_cmd_device_index, 0);
+    atomic_store(&app->net_cmd_monitor_select_device, false);
+    atomic_store(&app->net_cmd_monitor_device_index, -1);
+    atomic_store(&app->net_cmd_monitor_record, 0);
     atomic_store(&app->net_connected, false);
     atomic_store(&app->net_error, false);
+    atomic_store(&app->net_reenumerate_pending, false);
+#ifdef __ANDROID__
+    atomic_init(&app->net_device_catalogue_generation, 0u);
+#endif
     gui_net_init_globals();
     // Stock loadup is always Local (net_mode is a per-session setting, NOT
     // resumed from saved settings) so a restart never auto-resumes a
@@ -1236,7 +1304,7 @@ void gui_app_init(gui_app_t *app) {
     // Server/Client from the info page each session.
     // EXCEPTION: when launched with --config <path> (automated testing),
     // respect the config's net_mode instead of forcing Local.
-    if (!gui_settings_override_active()) {
+    if (!gui_settings_override_active() && !app->headless_server) {
         app->settings.net_mode = GUI_NET_MODE_LOCAL;
         gui_settings_save(&app->settings);
     }
@@ -1253,11 +1321,20 @@ void gui_app_init(gui_app_t *app) {
 
 // Cleanup application
 void gui_app_cleanup(gui_app_t *app) {
+#ifdef __ANDROID__
+    gui_app_finish_capture_transitions(app);
+#endif
     // A pending FLAC preparation owns file resources until its worker exits.
     // Join it before releasing any application, buffer or panel state.
     gui_playback_finish_start(app);
 
-    // Stop any active server/client networking first (joins worker/pump threads).
+    // Local Save sends its last writes, closes and COMMIT on the server connection.
+    // Keep that connection alive until the recording finalizer has finished.
+    if (gui_monitor_local_save_recording()) {
+        if (app->is_recording) gui_app_stop_recording(app);
+        gui_record_wait_for_finalize();
+    }
+
     gui_net_stop(app);
     gui_net_cleanup_globals();
 
@@ -1317,7 +1394,7 @@ void gui_app_cleanup(gui_app_t *app) {
     panel_config_cleanup(&app->panel_config_b);
 
     // Cleanup oscilloscope static resources
-    gui_oscilloscope_cleanup();
+    if (!app->headless_server) gui_oscilloscope_cleanup();
 
     // Cleanup display thread
     if (app->display_thread) {
@@ -1343,6 +1420,10 @@ void gui_app_cleanup(gui_app_t *app) {
 // Enumerate available capture devices
 void gui_app_enumerate_devices(gui_app_t *app) {
     if (!app || gui_playback_is_starting(app)) return;
+#ifdef __ANDROID__
+    if (app->is_capturing || gui_app_capture_busy() || gui_net_transition_busy()) return;
+    atomic_fetch_add(&app->net_device_catalogue_generation, 1u);
+#endif
     app->device_count = 0;
     fprintf(stderr, "[GUI] enumerate_devices: count=%d\n", app->device_count); //debugging
     // Use shared device enumeration (hsdaoh + simple_capture + optionally FX3)
@@ -1359,6 +1440,9 @@ void gui_app_enumerate_devices(gui_app_t *app) {
     if (count < 0) {
         gui_app_set_status(app, "Device enumeration failed");
         misrc_device_list_free(&devices);
+#ifdef __ANDROID__
+        atomic_fetch_add(&app->net_device_catalogue_generation, 1u);
+#endif
         return;
     }
 
@@ -1577,6 +1661,9 @@ void gui_app_enumerate_devices(gui_app_t *app) {
         snprintf(msg, sizeof(msg), "Found %d device(s)", app->device_count);
         gui_app_set_status(app, msg);
     }
+#ifdef __ANDROID__
+    atomic_fetch_add(&app->net_device_catalogue_generation, 1u);
+#endif
 }
 
 static void gui_capture_flush_upstream_audio_pairs(gui_app_t *app)
@@ -1604,6 +1691,7 @@ static void gui_capture_flush_upstream_audio_pairs(gui_app_t *app)
             }
             bufmgr_write_end(&app->buffers, BUF_CAPTURE_AUDIO, interleaved_len);
             bufmgr_signal_data(&app->buffers, BUF_CAPTURE_AUDIO);
+            gui_monitor_audio_server_tap(app,out,interleaved_len);
         }
 
         gui_capture_pop_upstream_audio(&s_upstream_audio1_queue);
@@ -1805,6 +1893,7 @@ static void gui_capture_upstream_callback(hsdaoh_data_info_t *data_info) //
 
             bufmgr_write_end(&app->buffers, BUF_CAPTURE_AUDIO, padded_len);
             bufmgr_signal_data(&app->buffers, BUF_CAPTURE_AUDIO);
+            gui_monitor_audio_server_tap(app,out,padded_len);
         }
         
         if (data_info->srate > 0) {
@@ -1857,6 +1946,21 @@ int gui_app_start_capture(gui_app_t *app) {
     if (!app || gui_playback_is_starting(app)) {
         return -1;
     }
+#ifdef __ANDROID__
+    if (gui_net_capture_controls_locked(app)) return -1;
+#endif
+    /* M-Server owns the local capture hardware and publishes extracted samples
+     * through the independent monitor preview transport. M-Client must not
+     * open hardware: queue a command for the verified M-Server instead.
+     * Keep Harry's existing Local/Server/Client paths unchanged. */
+    if (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT) {
+        if (!gui_net_client_request_start(app)) {
+            gui_net_set_status(app, "Check the server device list and select a device before starting capture");
+            return -1;
+        }
+        gui_net_set_status(app, "Monitor & Remote: requested capture start on Server");
+        return 0;
+    }
 
     // Client mode (network slave): forward the request to the server instead
     // of opening local hardware. The worker thread drains the flag and sends
@@ -1879,6 +1983,11 @@ int gui_app_start_capture(gui_app_t *app) {
     }
 
     device_info_t *dev = &app->devices[app->selected_device];
+#ifdef __ANDROID__
+    /* Do not carry the previous device's pending stop into a new backend. */
+    atomic_store(&app->dropout_stop_reason, GUI_DROPOUT_NONE);
+    atomic_store(&app->dropout_stop_requested, false);
+#endif
     // FLAC preparation commits and resets its stream only after it succeeds.
     if (dev->type != DEVICE_TYPE_PLAYBACK) gui_extract_prepare_stream(app);
     bool use_upstream_backend = (dev->type == DEVICE_TYPE_HSDAOH) && (!app->user_capture_mode_misrc);
@@ -1918,6 +2027,10 @@ int gui_app_start_capture(gui_app_t *app) {
         int sim_rc = gui_simulated_start(app);
         if (sim_rc == 0) {
             gui_capture_hold_power_assertions();
+            // Default the waveform monitors to the generator's channel
+            // mapping (CH1 CVBS / CH2 FM RF) without overwriting any
+            // user signal-type selections.
+            gui_waveform_apply_generator_defaults(app);
         }
         return sim_rc;
     }
@@ -1951,7 +2064,7 @@ int gui_app_start_capture(gui_app_t *app) {
                      prev_runtime_mode ? "MISRC" : "HSDAOH",
                      app->capture_mode_runtime_misrc ? "MISRC" : "HSDAOH",
                      app->user_capture_mode_misrc ? "MISRC" : "HSDAOH");
-            app->capture_start_time = GetTime();
+            app->capture_start_time = gui_runtime_time();
             app->reconnect_pending = false;
             app->reconnect_attempts = 0;
             {
@@ -1999,7 +2112,7 @@ int gui_app_start_capture(gui_app_t *app) {
             // is sent (done inside gui_fx3_start), so the 5s grace period must
             // begin here, not at app init. Without this, capture_start_time stays
             // 0 and the watchdog reaps the session within 2s -> connect loop.
-            app->capture_start_time = GetTime();
+            app->capture_start_time = gui_runtime_time();
             app->reconnect_pending = false;
             app->reconnect_attempts = 0;
             {
@@ -2039,7 +2152,7 @@ int gui_app_start_capture(gui_app_t *app) {
         }
         int rtl_rc = gui_rtlsdr_start(app);
         if (rtl_rc == 0) {
-            app->capture_start_time = GetTime();
+            app->capture_start_time = gui_runtime_time();
             app->reconnect_pending = false;
             app->reconnect_attempts = 0;
             {
@@ -2056,6 +2169,9 @@ int gui_app_start_capture(gui_app_t *app) {
             }
             gui_capture_hold_power_assertions();
         } else {
+#ifdef __ANDROID__
+            gui_rtlsdr_close(app);
+#endif
             proc_set_priority(PROC_PRIORITY_NORMAL);
         }
         return rtl_rc;
@@ -2110,7 +2226,7 @@ int gui_app_start_capture(gui_app_t *app) {
             // Same watchdog fix as FX3: capture_start_time must be set here or
             // the auto-reconnect watchdog fires within 2s (DdD streams
             // immediately on bulk submit, but the grace baseline still matters).
-            app->capture_start_time = GetTime();
+            app->capture_start_time = gui_runtime_time();
             app->reconnect_pending = false;
             app->reconnect_attempts = 0;
             {
@@ -2414,7 +2530,7 @@ windows_mf_open_hid:
         // immediate false timeout -> disconnect -> reconnect cycle.
         atomic_store(&app->last_callback_time_ms, get_time_ms());
         app->is_capturing = true;
-        app->capture_start_time = GetTime();
+        app->capture_start_time = gui_runtime_time();
         app->reconnect_pending = false;
         app->reconnect_attempts = 0;
 
@@ -2506,6 +2622,9 @@ windows_mf_open_hid:
 
 void gui_app_poll_capture_start(gui_app_t *app) {
     if (!app) return;
+#ifdef __ANDROID__
+    android_poll_capture_transition(app);
+#endif
     if (gui_playback_poll_start(app) == 1) {
         gui_capture_hold_power_assertions();
         app->reconnect_pending = false;
@@ -2514,99 +2633,385 @@ void gui_app_poll_capture_start(gui_app_t *app) {
 }
 
 #if defined(__ANDROID__)
-/* Offload gui_app_start_capture() to a worker thread so the render loop stays
- * responsive. hsdaoh_open + start_stream + extraction/display thread spawns can
- * be slow or stall on the Android fd-wrap path; running them on the render
- * thread freezes the UI (the "connect locks up" symptom). The worker sets
- * app->is_capturing / status; the render thread just observes. */
-#include <pthread.h>
-static atomic_int s_capture_starting = 0;
-static atomic_int s_capture_stopping = 0;
-static void *capture_start_thread(void *arg)
-{
-    gui_app_t *app = (gui_app_t *)arg;
-    int rc = gui_app_start_capture(app);
-    if (rc != 0) {
-        fprintf(stderr, "[GUI] Android async capture start failed: rc=%d\n", rc);
-    }
-    atomic_store(&s_capture_starting, 0);
-    return NULL;
-}
-void gui_app_start_capture_async(gui_app_t *app)
-{
-    if (!app) return;
-    if (gui_playback_is_starting(app)) return;
-    if (atomic_load(&s_capture_starting) || atomic_load(&s_capture_stopping)) return;
-    if (app->selected_device >= 0 && app->selected_device < app->device_count &&
-        app->devices[app->selected_device].type == DEVICE_TYPE_PLAYBACK) {
-        // FLAC preparation already has its own worker and UI-thread commit.
-        (void)gui_app_start_capture(app);
-        return;
-    }
-    if (atomic_load(&s_capture_stopping)) {
-        /* stop still in flight; don't start on top of it */
-        return;
-    }
-    if (atomic_exchange(&s_capture_starting, 1) != 0) {
-        /* a start is already in flight; ignore */
-        return;
-    }
-    pthread_t t;
-    if (pthread_create(&t, NULL, capture_start_thread, app) != 0) {
-        atomic_store(&s_capture_starting, 0);
-        /* fallback: run synchronously (may briefly stall UI) */
-        (void)gui_app_start_capture(app);
-    } else {
-        pthread_detach(t);
-        gui_app_set_status(app, "Starting capture...");
-    }
-}
+/* The main thread owns the worker handle, permission intent and device
+ * selection. A worker finishes before another can use or release app state. */
+static pthread_t s_capture_worker;
+static bool s_capture_worker_joinable;
+static atomic_bool s_capture_worker_running;
+static bool s_cancel_usb_start;
+static bool s_stop_after_worker;
+static int s_remote_mode_after_stop = -1;
+static const char *s_capture_stop_status;
+static int s_switch_selection = -1;
+static bool s_switch_persist;
+static bool s_switch_restart;
+static device_info_t s_switch_device;
+#ifdef ENABLE_RTLSDR
+static android_rtlsdr_usb_identity_t s_connected_rtlsdr = {.usb = {.id = -1}};
+static char s_rtlsdr_reconnect_serial[ANDROID_RTL_USB_SERIAL_SIZE];
 
-/* Offload gui_app_stop_capture() as well: hsdaoh_stop_stream/hsdaoh_close on
- * the wrapped Android fd join libusb/libuvc transfer threads and can hang for
- * seconds (or indefinitely) if the device never delivered data. Running stop
- * on the render thread is what froze the app AFTER connect: the watchdog
- * detected "no data for 2s" and called stop_capture synchronously. */
-static void *capture_stop_thread(void *arg)
+bool gui_app_rtlsdr_reconnect_identity(int device_id, android_rtlsdr_usb_identity_t *identity)
 {
-    gui_app_t *app = (gui_app_t *)arg;
-    gui_app_stop_capture(app);
-    atomic_store(&s_capture_stopping, 0);
-    return NULL;
-}
-void gui_app_stop_capture_async(gui_app_t *app)
-{
-    if (!app) return;
-    if (gui_playback_is_starting(app) || gui_playback_is_running(app)) {
-        // Active FLAC context publication and retirement belong to the UI.
-        gui_app_stop_capture(app);
-        return;
-    }
-    if (atomic_load(&s_capture_starting)) {
-        /* start still in flight; let it finish first (watchdog will retry) */
-        return;
-    }
-    if (atomic_exchange(&s_capture_stopping, 1) != 0) {
-        return;  /* stop already in flight */
-    }
-    pthread_t t;
-    if (pthread_create(&t, NULL, capture_stop_thread, app) != 0) {
-        atomic_store(&s_capture_stopping, 0);
-        gui_app_stop_capture(app);  /* fallback: sync */
-    } else {
-        pthread_detach(t);
-        gui_app_set_status(app, "Stopping capture...");
-    }
-}
-int gui_app_capture_busy(void)
-{
-    return atomic_load(&s_capture_starting) || atomic_load(&s_capture_stopping);
+    if (device_id != s_connected_rtlsdr.usb.id) return false;
+    *identity = s_connected_rtlsdr;
+    return true;
 }
 #endif
 
-// Stop capture
-void gui_app_stop_capture(gui_app_t *app) {
+static bool android_capture_usb_pending(void)
+{
+#ifdef ENABLE_RTLSDR
+    if (android_rtlsdr_permission_pending()) return true;
+#endif
+    return android_permission_pending() != 0;
+}
+
+bool gui_app_capture_busy(void)
+{
+    return atomic_load(&s_capture_worker_running) || s_stop_after_worker ||
+           s_switch_selection >= 0 || s_remote_mode_after_stop >= 0 ||
+           android_capture_usb_pending();
+}
+
+static bool android_capture_uses_remote(const gui_app_t *app)
+{
+    return app->settings.net_mode == GUI_NET_MODE_CLIENT ||
+           app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT;
+}
+
+static const device_info_t *android_capture_selected(const gui_app_t *app)
+{
+    if (app->selected_device < 0 || app->selected_device >= app->device_count) {
+        return NULL;
+    }
+    return &app->devices[app->selected_device];
+}
+
+static bool android_capture_uses_hsdaoh(const device_info_t *device)
+{
+    return device && (device->type == DEVICE_TYPE_HSDAOH ||
+                      device->type == DEVICE_TYPE_MISRC_CLOCKGEN);
+}
+
+static void android_join_capture_worker(void)
+{
+    if (!s_capture_worker_joinable) return;
+    pthread_join(s_capture_worker, NULL);
+    s_capture_worker_joinable = false;
+}
+
+void gui_app_finish_capture_transitions(gui_app_t *app)
+{
+    s_cancel_usb_start = true;
+    s_stop_after_worker = false;
+    s_switch_selection = -1;
+    s_remote_mode_after_stop = -1;
+#ifdef ENABLE_RTLSDR
+    s_connected_rtlsdr.usb.id = -1;
+    s_rtlsdr_reconnect_serial[0] = '\0';
+#endif
+    android_join_capture_worker();
+
+    /* An exiting RF Client transition may still own the ingest/display
+     * teardown. Join it before touching recording or capture resources. */
+    gui_net_join_transition();
+    atomic_store(&app->net_reenumerate_pending, false);
+    gui_record_cancel_capture_confirmation(app);
+    if (app->is_recording) gui_app_stop_recording(app);
+#ifdef ENABLE_RTLSDR
+    /* Exit stops the backend that owns the USB handle even if the UI
+     * selection or network mode no longer describes that backend. */
+    gui_rtlsdr_stop(app);
+#endif
+}
+
+static void *capture_start_thread(void *arg)
+{
+    if (gui_app_start_capture(arg) != 0) {
+        fprintf(stderr, "[GUI] Android async capture start failed\n");
+    }
+    atomic_store(&s_capture_worker_running, false);
+    return NULL;
+}
+
+static void *capture_stop_thread(void *arg)
+{
+    gui_app_t *app = arg;
+    gui_app_stop_capture(app);
+    /* Callback producers for this device have stopped. Discard late old-source
+     * requests before the main thread is allowed to select a new device. */
+    atomic_store(&app->dropout_stop_reason, GUI_DROPOUT_NONE);
+    atomic_store(&app->dropout_stop_requested, false);
+    if (s_capture_stop_status) gui_app_set_status(app, s_capture_stop_status);
+    atomic_store(&s_capture_worker_running, false);
+    return NULL;
+}
+
+static bool android_spawn_capture_worker(gui_app_t *app,
+                                         void *(*run)(void *), const char *status)
+{
+    if (atomic_load(&s_capture_worker_running)) return false;
+    android_join_capture_worker();
+    gui_app_set_status(app, status);
+    atomic_store(&s_capture_worker_running, true);
+    if (pthread_create(&s_capture_worker, NULL, run, app) != 0) {
+        atomic_store(&s_capture_worker_running, false);
+        gui_app_set_status(app, "Could not start the Android capture worker");
+        return false;
+    }
+    s_capture_worker_joinable = true;
+    return true;
+}
+
+static void android_start_capture_async(gui_app_t *app, const char *expected_serial)
+{
+#ifndef ENABLE_RTLSDR
+    (void)expected_serial;
+#endif
+    if (!app || gui_playback_is_starting(app) || gui_app_capture_busy() ||
+        gui_net_capture_controls_locked(app)) return;
+    if (android_capture_uses_remote(app)) {
+        if (gui_net_is_client(app)) (void)gui_app_start_capture(app);
+        return;
+    }
+    if (app->is_capturing) return;
+    const device_info_t *device = android_capture_selected(app);
+    if (!device) {
+        gui_app_set_status(app, "No capture device selected");
+        return;
+    }
+    if (device->type == DEVICE_TYPE_PLAYBACK) {
+        (void)gui_app_start_capture(app);
+        return;
+    }
+    s_cancel_usb_start = false;
+#ifdef ENABLE_RTLSDR
+    if (device->type == DEVICE_TYPE_RTLSDR) {
+        bool requested = android_rtlsdr_request_permission(device->index);
+        snprintf(s_rtlsdr_reconnect_serial, sizeof(s_rtlsdr_reconnect_serial),
+                 "%s", requested && expected_serial ? expected_serial : "");
+        gui_app_set_status(app, requested ? "Requesting RTL-SDR USB permission..."
+                                          : "RTL-SDR USB permission request failed to start");
+        return;
+    }
+#endif
+    if (android_capture_uses_hsdaoh(device) && !android_usb_has_fd()) {
+        android_usb_clear_fd();
+        bool requested = android_request_usb_permission_async() != 0;
+        gui_app_set_status(app, requested ? "Requesting USB permission..."
+                                          : "USB permission request failed to start");
+        return;
+    }
+    (void)android_spawn_capture_worker(app, capture_start_thread, "Starting capture...");
+}
+
+void gui_app_start_capture_async(gui_app_t *app)
+{
+    android_start_capture_async(app, NULL);
+}
+
+#ifdef ENABLE_RTLSDR
+void gui_app_start_rtlsdr_reconnect_async(gui_app_t *app, const char *expected_serial)
+{
+    if (app && !android_capture_uses_remote(app)) {
+        android_start_capture_async(app, expected_serial);
+    }
+}
+#endif
+
+static void android_stop_capture_async(gui_app_t *app, const char *status, bool keep_selection)
+{
+    if (!app || gui_net_capture_controls_locked(app)) return;
+    s_cancel_usb_start = true;
+    if (!keep_selection) s_switch_selection = -1;
+    s_switch_restart = false;
+    app->reconnect_pending = false;
+    app->reconnect_attempts = 0;
+    if (!android_capture_uses_remote(app)) gui_record_cancel_capture_confirmation(app);
+    if (atomic_load(&s_capture_worker_running)) {
+        s_stop_after_worker = true;
+        return;
+    }
+    if (android_capture_uses_remote(app)) {
+        if (gui_net_is_client(app)) gui_app_stop_capture(app);
+    } else if (gui_playback_is_starting(app) || gui_playback_is_running(app)) {
+        gui_app_stop_capture(app);
+        if (status) gui_app_set_status(app, status);
+    } else if (app->is_capturing) {
+        /* Recording control belongs to the main thread. Complete its stop
+         * handoff before the capture worker can start tearing the backend down. */
+        if (app->is_recording) gui_app_stop_recording(app);
+        s_capture_stop_status = status;
+        (void)android_spawn_capture_worker(app, capture_stop_thread,
+                                          status ? status : "Stopping capture...");
+    }
+}
+
+static void android_stop_local_capture_async(gui_app_t *app, const char *status)
+{
+    if (app && app->settings.net_mode == GUI_NET_MODE_SERVER && !gui_net_capture_controls_locked(app))
+        gui_net_cancel_pending_server_start();
+    android_stop_capture_async(app, status, false);
+}
+
+void gui_app_stop_capture_async(gui_app_t *app)
+{
+    android_stop_local_capture_async(app, NULL);
+}
+
+void gui_app_stop_server_capture_async(gui_app_t *app)
+{
+    android_stop_capture_async(app, NULL, true);
+}
+
+void gui_app_stop_capture_on_dropout_async(gui_app_t *app, const char *status)
+{
+    /* The status is a static reason string, valid through worker teardown. */
+    android_stop_local_capture_async(app, status);
+}
+
+bool gui_app_defer_remote_mode(gui_app_t *app, int mode)
+{
+    if ((mode != GUI_NET_MODE_CLIENT && mode != GUI_NET_MODE_MONITOR_CLIENT) ||
+        android_capture_uses_remote(app)) return false;
+
+    if (app->is_recording || gui_record_is_finalizing()) {
+        gui_app_set_status(app, "Stop recording before switching to a remote mode");
+        return true;
+    }
+
+    app->reconnect_pending = false;
+    app->reconnect_attempts = 0;
+    if (!app->is_capturing) {
+        gui_record_cancel_capture_confirmation(app);
+        return false;
+    }
+
+    /* The old mode and device selection are still needed by local Stop.
+     * Leave both intact until the worker releases the backend. */
+    gui_app_stop_capture_async(app);
+    s_remote_mode_after_stop = mode;
+    return true;
+}
+
+static void android_select_capture_device(gui_app_t *app, int selection, bool persist)
+{
+    app->selected_device = selection;
+    app->reconnect_pending = false;
+    app->reconnect_attempts = 0;
+    gui_ui_sync_capture_mode_state(app);
+    if (persist) {
+        app->settings.device_index = selection;
+        gui_settings_save(&app->settings);
+    }
+}
+
+void gui_app_select_capture_device_async(gui_app_t *app, int selection, bool persist, bool restart)
+{
+    if (!app || android_capture_uses_remote(app) ||
+        selection < 0 || selection >= app->device_count ||
+        selection == app->selected_device) return;
+    if (gui_app_capture_busy() || gui_net_capture_controls_locked(app) ||
+        gui_playback_is_starting(app)) {
+        gui_app_set_status(app, "Device selection is locked while capture changes");
+        return;
+    }
+    if (app->is_recording || gui_record_is_finalizing()) {
+        gui_app_set_status(app, "Stop recording before changing device");
+        return;
+    }
+    if (!app->is_capturing) {
+        android_select_capture_device(app, selection, persist);
+        return;
+    }
+
+    /* Retain the old selection until its backend has finished stopping.
+     * USB refresh and other device switches are deferred during this interval. */
+    android_stop_capture_async(app, NULL, false);
+    s_switch_selection = selection;
+    s_switch_persist = persist;
+    s_switch_restart = restart;
+    s_switch_device = app->devices[selection];
+}
+
+static void android_poll_capture_transition(gui_app_t *app)
+{
+    if (atomic_load(&s_capture_worker_running)) return;
+    android_join_capture_worker();
+    /* Permission results and queued capture actions are consumed once. */
+    if (gui_net_transition_busy()) return;
+    if (s_stop_after_worker) {
+        s_stop_after_worker = false;
+        if (app->is_capturing) {
+            android_stop_capture_async(app, NULL, s_switch_selection >= 0);
+            return;
+        }
+    }
+    if (s_remote_mode_after_stop >= 0) {
+        int mode = s_remote_mode_after_stop;
+        s_remote_mode_after_stop = -1;
+        if (!app->is_capturing) gui_ui_net_mode_apply(app, mode);
+        return;
+    }
+    if (s_switch_selection >= 0) {
+        int selection = s_switch_selection;
+        s_switch_selection = -1;
+        if (!app->is_capturing && !android_capture_uses_remote(app) &&
+            selection < app->device_count) {
+            const device_info_t *device = &app->devices[selection];
+            if (device->type == s_switch_device.type && device->index == s_switch_device.index &&
+                strcmp(device->name, s_switch_device.name) == 0 &&
+                strcmp(device->serial, s_switch_device.serial) == 0) {
+                android_select_capture_device(app, selection, s_switch_persist);
+                if (s_switch_restart) gui_app_start_capture_async(app);
+            } else {
+                gui_app_set_status(app, "Selected capture device changed before reconnect");
+            }
+        }
+    }
+
+    int granted;
+    const device_info_t *selected = android_capture_selected(app);
+    bool can_start = !atomic_load(&s_capture_worker_running) && !app->is_capturing &&
+        !gui_playback_is_starting(app) && !android_capture_uses_remote(app) &&
+        !gui_net_capture_controls_locked(app) && !s_cancel_usb_start;
+#ifdef ENABLE_RTLSDR
+    android_rtlsdr_usb_identity_t identity;
+    if (android_rtlsdr_poll_permission(&identity, &granted) && can_start &&
+        selected && selected->type == DEVICE_TYPE_RTLSDR && selected->index == identity.usb.id) {
+        if (granted && (!s_rtlsdr_reconnect_serial[0] ||
+                        strcmp(s_rtlsdr_reconnect_serial, identity.serial) == 0)) {
+            android_rtlsdr_set_open_identity(&identity);
+            if (android_spawn_capture_worker(app, capture_start_thread, "Starting RTL-SDR capture...")) {
+                s_connected_rtlsdr = identity;
+            }
+        } else {
+            app->reconnect_pending = false;
+            app->reconnect_attempts = 0;
+            gui_app_set_status(app, granted
+                ? "RTL-SDR identity changed. Select a device and connect manually."
+                : "RTL-SDR USB permission denied or device disconnected");
+        }
+    }
+#endif
+    if (android_poll_usb_permission_result(&granted) && can_start &&
+        android_capture_uses_hsdaoh(selected)) {
+        if (granted && android_usb_has_fd()) {
+            (void)android_spawn_capture_worker(app, capture_start_thread, "Starting capture...");
+        } else {
+            app->reconnect_pending = false;
+            app->reconnect_attempts = 0;
+            gui_app_set_status(app, "USB permission denied or no USB capture device found");
+        }
+    }
+}
+#endif
+
+static void gui_app_stop_capture_impl(gui_app_t *app) {
     if (!app) return;
+#ifdef __ANDROID__
+    if (gui_net_capture_controls_locked(app)) return;
+#endif
     if (gui_playback_is_starting(app)) {
         gui_playback_cancel_start(app);
         app->reconnect_pending = false;
@@ -2771,8 +3176,21 @@ void gui_app_stop_capture(gui_app_t *app) {
 // Note: Audio buffer now accessed via app->buffers (buffer_manager)
 // Use BUF_CAPTURE_AUDIO with bufmgr_read_begin/bufmgr_read_end
 
+void gui_app_stop_capture(gui_app_t *app) {
+    if (!app) return;
+    bool was_capturing = app->is_capturing;
+    gui_app_stop_capture_impl(app);
+    if (was_capturing && !app->is_capturing) gui_net_end_capture(app);
+}
+
 // Recording wrappers - delegate to gui_record module
 int gui_app_start_recording(gui_app_t *app) {
+#ifdef __ANDROID__
+    if (gui_app_capture_busy() || gui_net_capture_controls_locked(app)) {
+        gui_app_set_status(app, "Wait for capture to finish changing before recording");
+        return RECORD_ERROR;
+    }
+#endif
     // Client mode: record locally to the client's set storage directory.
     // The client receives RF+audio from the server via the network pump
     // threads, so local recording works the same as a local capture. Do NOT
@@ -2857,7 +3275,8 @@ float gui_app_level_autostop_vpp(const gui_app_t *app)
 static void update_vu_direction(float *level, float *peak, float *peak_hold_time,
                                  float target, float dt) {
     // Fast attack, slow release
-    if (target > *level) {
+    // After a long frame, release only as far as the target.
+    if (target > *level || dt >= VU_RELEASE_TIME) {
         *level = target;
     } else {
         *level += (target - *level) * dt / VU_RELEASE_TIME;
@@ -2883,6 +3302,22 @@ void gui_app_update_vu_meters(gui_app_t *app, float dt) {
     uint16_t peak_a_neg = atomic_load(&app->peak_a_neg);
     uint16_t peak_b_pos = atomic_load(&app->peak_b_pos);
     uint16_t peak_b_neg = atomic_load(&app->peak_b_neg);
+
+    /* Monitor & Remote receives no raw RF samples. The preview already
+     * carries the server's bipolar 12-bit peaks; use them instead of the
+     * local (always zero) extraction atomics. Preserve normal VU smoothing,
+     * peak hold and normalization below. If disconnected or capture is idle,
+     * the preview mailbox is invalid and the levels decay back to zero. */
+    if (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT) {
+        uint16_t remote_peaks[2][2] = {{0}};
+        if (gui_monitor_client_connected()) {
+            (void)gui_rd_client_peaks(remote_peaks);
+        }
+        peak_a_pos = remote_peaks[0][0];
+        peak_a_neg = remote_peaks[0][1];
+        peak_b_pos = remote_peaks[1][0];
+        peak_b_neg = remote_peaks[1][1];
+    }
 
     // Convert to normalized levels (0-1), using 2048 as full scale
     float level_a_pos = (float)peak_a_pos / 2048.0f;
@@ -2955,7 +3390,7 @@ void gui_app_clear_display(gui_app_t *app) {
         strncpy(app->status_message, message,
                 sizeof(app->status_message) - 1);
         app->status_message[sizeof(app->status_message) - 1] = '\0';
-        app->status_message_time = GetTime();
+        app->status_message_time = gui_runtime_time();
     }
 void gui_capture_poll_hsdaoh_status(gui_app_t *app)
 {

@@ -39,12 +39,16 @@ typedef struct {
 	atomic_size_t tail;
 } ringbuffer_t;
 
+/* One producer and one consumer own tail and head respectively.
+ * Initialize or reset only while both are stopped. */
 int   rb_init(ringbuffer_t *rb, char *name, size_t size);
 int   rb_put(ringbuffer_t *rb, void *data, size_t size);
 void* rb_read_ptr(ringbuffer_t *rb, size_t size);
 int   rb_read_finished(ringbuffer_t *rb, size_t size);
 void* rb_write_ptr(ringbuffer_t *rb, size_t size);
 int   rb_write_finished(ringbuffer_t *rb, size_t size);
+/* Best-effort observer snapshot in bytes, bounded by the capacity. */
+size_t rb_fill_level(const ringbuffer_t *rb);
 void  rb_close(ringbuffer_t *rb);
 
 #endif // RINGBUFFER_H
