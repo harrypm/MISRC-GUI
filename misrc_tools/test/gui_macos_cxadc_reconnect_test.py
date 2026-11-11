@@ -42,6 +42,14 @@ int main(void) {
     target.valid=false;
     assert(gui_find_reconnect_device(&app,&target)==-1);
     assert(gui_find_reconnect_device(0,&target)==-1);
+    app.device_count=1;app.devices[0].index=2;
+    strcpy(app.devices[0].name,"[CXADC] CXADC Clockgen");
+    strcpy(app.devices[0].serial,"CXADC_MACOS_PAIR_abc_def");
+    target.valid=true;target.index=2;
+    strcpy(target.name,app.devices[0].name);strcpy(target.serial,app.devices[0].serial);
+    assert(gui_find_reconnect_device(&app,&target)==0);
+    strcpy(target.serial,"CXADC_MACOS_PAIR_abc_replaced");
+    assert(gui_find_reconnect_device(&app,&target)==-1);
     return 0;
 }
 '''

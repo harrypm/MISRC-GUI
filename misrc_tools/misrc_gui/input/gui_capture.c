@@ -582,6 +582,9 @@ static void gui_capture_apply_cxadc_profile(gui_app_t *app, int card_count)
     if (!app) return;
     if (card_count < 1) card_count = 1;
     if (card_count > 2) card_count = 2;
+#if defined(__APPLE__)
+    gui_cxadc_macos_profile(card_count==2);
+#endif
 
     bool changed = false;
     const bool tenbit_mode_a = app->settings.cxadc_tenbit_mode_card[0];
@@ -1583,6 +1586,13 @@ void gui_app_enumerate_devices(gui_app_t *app) {
         snprintf(dst->serial,sizeof(dst->serial),"CXADC_MACOS_%d_%llx",i,
                  (unsigned long long)gui_cxadc_macos_registry_id(i));
         dst->type=DEVICE_TYPE_CXADC;dst->index=1;
+    }
+    if(cxadc_card_count>=2 && gui_cxadc_macos_clockgen_available() && app->device_count<MAX_DEVICES) {
+        device_info_t *dst=&app->devices[app->device_count++];
+        snprintf(dst->name,sizeof(dst->name),"[CXADC] CXADC Clockgen");
+        snprintf(dst->serial,sizeof(dst->serial),"CXADC_MACOS_PAIR_%llx_%llx",
+            (unsigned long long)gui_cxadc_macos_registry_id(0),(unsigned long long)gui_cxadc_macos_registry_id(1));
+        dst->type=DEVICE_TYPE_CXADC;dst->index=2;
     }
 #else
     if (cxadc_card_count > 1) {

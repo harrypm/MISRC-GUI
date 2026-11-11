@@ -421,6 +421,8 @@ if host_system != 'android'
     if host_system == 'darwin' and not meson.is_cross_build()
       test('gui_macos_cxadc_reconnect', path_test_python,
         args: [files('test/gui_macos_cxadc_reconnect_test.py')])
+      test('gui_macos_cxadc_stream', path_test_python,
+        args: [files('test/gui_macos_cxadc_stream_test.py')])
     endif
     test('path_io', path_test_python,
       args: [files('test/path_io_test.py'), path_io_test.full_path(), extract_exe.full_path()],

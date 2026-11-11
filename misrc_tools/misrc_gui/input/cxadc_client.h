@@ -45,6 +45,23 @@ typedef struct {
     const char *(*error)(void);
 } cxadc_client_api;
 const cxadc_client_api *cxadc_client_get_api_v1(void);
+/* Optional additive ABI. v1 remains available, unchanged, for existing GUIs.
+ * Rate is a declaration, never a clock measurement or hardware clock write.
+ * Set only while stopped, after independently verifying an external clock.
+ * Timestamps precede DMA enable: they are not sample-exact start markers. */
+typedef struct {
+    uint64_t registry_id, started_monotonic_ns, stopped_monotonic_ns;
+} cxadc_client_timing;
+typedef struct {
+    uint32_t abi_version, struct_bytes;
+    const cxadc_client_api *v1;
+    int32_t (*set_nominal_rate)(cxadc_client *, uint32_t rate_hz);
+    int32_t (*timing)(cxadc_client *, cxadc_client_timing *);
+    /* Concurrent preparation/start; records separate kernel timestamps.
+     * Not a shared hardware trigger or sample-phase synchronization claim. */
+    int32_t (*start_pair)(cxadc_client *, cxadc_client *);
+} cxadc_client_api_v2;
+const cxadc_client_api_v2 *cxadc_client_get_api_v2(void);
 #ifdef __cplusplus
 }
 #endif
