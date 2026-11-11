@@ -187,11 +187,17 @@ in the cxadc-macos checkout. Raw test files and logs remain private/ignored.
 
 ## Native macOS CXADC ClockGen integration — 2026-11-11
 
-This local branch extends the merged single-card backend. No PCIe/DMA/interrupt
+This integration extends the merged single-card backend. No PCIe/DMA/interrupt
 changes or replacement DriverKit extension are required: tested build 8/API 5
 is unchanged. It requires the updated cxadc-macos library with optional RF ABI
 v2 and ClockGen audio ABI v1. The existing RF ABI v1 remains compatible with
 older GUI builds. Both mirrored headers must match the driver repository.
+
+Use the [cxadc-macos ClockGen client branch](https://github.com/jlnbxn/cxadc-macos/tree/feature/macos-clockgen-client),
+`feature/macos-clockgen-client`, containing client implementation `13027de`.
+The existing installed DriverKit extension does not need replacing. Keep the
+repositories adjacent and select this GUI's `feature/macos-clockgen-backend`
+branch while the integration is under upstream review.
 
 Build the normal GUI, then run `scripts/prepare-misrc-gui.sh ../MISRC-GUI`
 from the adjacent cxadc-macos checkout. Its `scripts/launch-misrc-clockgen.sh`
