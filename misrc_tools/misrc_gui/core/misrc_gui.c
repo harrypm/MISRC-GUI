@@ -473,6 +473,14 @@ static int gui_find_reconnect_device(const gui_app_t *app, const gui_reconnect_t
                 return i;
             }
         } else if (target->type == DEVICE_TYPE_CXADC) {
+#if defined(__APPLE__)
+            // Native entries share index=1 (capture card count) and may share
+            // names. Never let those fallbacks select a different physical card.
+            if (strncmp(target->serial, "CXADC_MACOS_", 12) == 0) {
+                if (strcmp(dev->serial, target->serial) == 0) return i;
+                continue;
+            }
+#endif
             // Multiple synthetic CXADC entries can exist (e.g. CXADC Clockgen).
             // Match by marker serial/name first so reconnect preserves the
             // selected variant. (MISRC Clockgen now has its own device type.)
@@ -520,6 +528,10 @@ static int gui_find_reconnect_device(const gui_app_t *app, const gui_reconnect_t
     // DdD profiles are not interchangeable. If the selected profile/path is
     // absent, wait for it instead of falling back to another DdD device.
     if (target->type == DEVICE_TYPE_DDD) return -1;
+#endif
+#if defined(__APPLE__)
+    if (target->type == DEVICE_TYPE_CXADC &&
+        strncmp(target->serial, "CXADC_MACOS_", 12) == 0) return -1;
 #endif
     return fallback_same_type;
 }

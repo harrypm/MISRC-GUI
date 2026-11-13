@@ -12,7 +12,7 @@ Keep `MISRC-GUI` and `cxadc-macos` as adjacent checkouts. The latter must have
 its native client API (`client/cxadc_client.h`, ABI 1) and the installed/approved
 CXADC DriverKit extension, control API 5 (tested driver build 8).
 
-Follow [INSTALLATION.md](INSTALLATION.md) for the existing macOS dependencies.
+Follow [INSTALLATION.md](../INSTALLATION.md) for the existing macOS dependencies.
 The unmodified `scripts/build-local.sh` builds `build-local/misrc_gui` for arm64.
 Then, from the adjacent driver repository:
 
@@ -153,3 +153,126 @@ unsigned mapping, Darwin ring lifecycle and the new upstream updater tests pass.
 This is build/test validation of the merge; the hardware capture evidence above
 was recorded on the original integration, not repeated for this merge.
 Cross-platform hosted CI status is reported separately in the pull request.
+
+## Two-card installation validation (2026-10-29)
+
+Two CX23880 endpoints attach to driver build 8 through an ASM1184e switch.
+Each card individually recorded approximately three seconds of disconnected-input
+RAW u8 through this GUI (85,983,232 bytes each), with zero reported writer drops
+and DMA overruns and verified teardown. Distinct session registry IDs in names
+and device markers identify the selected endpoint. The native reconnect selector
+now requires an exact marker: identical names and the shared card-count index
+must not silently select another card. A regression test exercises the actual
+selector with identical cards and missing/replaced identities. Registry IDs are
+session identities, not permanent serial numbers; refresh/reselect after reattach.
+
+Independent concurrent driver-client tests passed at 3, 10 and 60 seconds outside
+the GUI. The minute test saved 1,718,353,920 bytes per card with 25 wraps each,
+zero reported DMA errors/overruns and restored PCI command state. No authoritative
+zero-loss sample count is available. Neither analog input carried a test signal.
+
+This does **not** add simultaneous macOS dual-card GUI capture or claim clock
+synchronization. ClockGen hardware and synchronized GUI integration remain pending.
+The GUI still captures one selected card per session. Driver PCIe/DMA code and
+Linux/Windows capture paths were not changed. No security settings were changed.
+
+Native build, static guards, smoke and reconnect regression pass. Meson: 38/41
+pass; existing failures are gui_settings_paths, gui_audio_hifi_monitor and
+timing-sensitive gui_rf_preview_worker, previously observed on the upstream
+baseline. The GUI recordings also ran successfully on this final build.
+
+Full transport-test reproduction and limitations: see docs/DUAL-CARD-VALIDATION.md
+in the cxadc-macos checkout. Raw test files and logs remain private/ignored.
+
+
+## Native macOS CXADC ClockGen integration — 2026-11-11
+
+This integration extends the merged single-card backend. No PCIe/DMA/interrupt
+changes or replacement DriverKit extension are required: tested build 8/API 5
+is unchanged. It requires the updated cxadc-macos library with optional RF ABI
+v2 and ClockGen audio ABI v1. The existing RF ABI v1 remains compatible with
+older GUI builds. Both mirrored headers must match the driver repository.
+
+Use the [cxadc-macos ClockGen client branch](https://github.com/jlnbxn/cxadc-macos/tree/feature/macos-clockgen-client),
+`feature/macos-clockgen-client`, containing client implementation `13027de`.
+The existing installed DriverKit extension does not need replacing. Keep the
+repositories adjacent and select this GUI's `feature/macos-clockgen-backend`
+branch while the integration is under upstream review.
+
+Build the normal GUI, then run `scripts/prepare-misrc-gui.sh ../MISRC-GUI`
+from the adjacent cxadc-macos checkout. Its `scripts/launch-misrc-clockgen.sh`
+uses separate local settings, selects `[CXADC] CXADC Clockgen`, and defaults to
+native RAW8 A+B plus the USB stereo input. It does not automatically start a
+capture. Optional `CXADC_CAPTURE_DIR` chooses the initial output folder; the
+saved config/output settings are preserved on subsequent launches. The
+original stock-card launcher/config is retained.
+
+### Operation
+
+1. Power the ClockGen, with both card clock cables attached, before reconnecting
+   the modified PCIe assembly. Supply/assembly details are hardware-specific.
+2. Select `[CXADC] CXADC Clockgen`. Both real Conexant endpoints and one
+   matching ClockGen USB input must be present; no synthetic hardware is added.
+3. Before capture, select each individual card entry and use its existing F8
+   panel to set VMUX/gain/boost/offset. Then reselect the ClockGen entry. Card
+   identities and A/B assignments are logged. Discovery order defines A/B;
+   no automatic video/Hi-Fi signal classification is performed.
+4. Start capture with the existing button. Waveform/FFT use the existing
+   pipeline. The backend checks enumerated cards are idle, sets/read-backs
+   BOTH external RF outputs at 40 MHz, and starts independent native streams.
+5. Select native 8-bit RF A/B recording without resampling or FLAC, and the
+   CH1/2 stereo WAV output. Start/stop recording normally and await finalization.
+   The existing ClockGen profile also offers the CH3 head-switch output; it
+   is not a third audio channel. CH4 has no source and is zero-filled.
+6. Stop capture before another application opens the CX cards. Setting NORM
+   on the VCR chooses linear audio for its line outputs; it does not change
+   the separate Hi-Fi RF tap. Verify the RCA outputs feed the bracket inputs.
+
+The USB audio API preserves the actual current 46,875 or 48,000 Hz device
+rate, rather than resampling or assuming 48 kHz. Only 48 kHz has been hardware
+verified after the repaired audio-module/mainboard bring-up. CoreAudio's
+native float representation is repacked exactly to signed 24-bit PCM, then
+fed into the existing GUI audio ring/writer. Native RF direct taps preserve
+unsigned bytes. The GUI's unsupported macOS conversions/resampling/FLAC modes
+fail explicitly rather than silently changing capture format.
+
+### Evidence and limits
+
+Real GUI runs passed at 3, 10 and 60 seconds. The 10-second run wrote
+400,293,888 bytes per RF channel and a 480,768-frame stereo PCM24 WAV at
+48 kHz. The minute run wrote 2,400,452,608 / 2,400,518,144 RF bytes and a
+2,880,512-frame stereo WAV. Read/write counts matched, writer drops/waits and
+reported DMA/audio overruns were zero, sample-time gaps were zero, and all
+streams stopped safely with restored PCI commands. The minute RF sizes differ
+by one 64 KiB record-boundary quantum; these are independent captures, not
+sample-exact start/stop hardware triggering. No authoritative hardware
+zero-loss counter is claimed. Private media stays outside Git.
+
+The short GUI RF output decoded as PAL VHS at 40 MHz and was exported with
+Hi-Fi and NORM tracks and dropout correction. Consult the cxadc-macos test
+report for field counts, integrity results, exported file and later user
+acceptance. This verifies real acquisition, not calibrated analog SNR or
+sample-phase synchronization. Capture-start RF and CoreAudio host timestamps
+are logged, but physical converter/USB latency and GUI record-boundary offsets
+remain uncalibrated. Do not advertise sample-exact audio/video alignment.
+
+The audio producer is a bounded SPSC queue; callbacks do not allocate or do
+file I/O. Queue overflow, sample-time discontinuity, disconnect/format changes
+and delivery timeout stop the macOS capture visibly. DriverKit retains DMA
+ownership/address validation and safe teardown. Active hot-unplug, sleep/wake,
+disk-full and multi-hour operation remain unverified. Single-card entries
+remain stock-rate profiles; with an active non-stock ClockGen they are rejected
+to prevent wrongly labelled files. Single modified-card ClockGen profiles and
+additional rates are not implemented here.
+
+Existing device/recording/FFT layouts are reused. No major GUI redesign, shared
+Linux sysfs emulation, shell capture pipeline, new decoder or external build
+dependency was added. No system-security changes, push or PR submission.
+
+Static guards, native staging/order and reconnect tests, sample packing,
+DriverKit client CPU tests and recording/ring/rate tests pass. Four failures
+reproduce on untouched upstream `526e59f`: `gui_settings_paths`,
+`gui_audio_hifi_monitor`, `gui_rf_preview`, `gui_rf_preview_worker`. The latter
+two fail ED phase/worker timing assertions. They are not silently fixed by this
+backend change. The initial complete suite had 49 passes and those four fails;
+the new native staging test is additional.

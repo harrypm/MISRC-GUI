@@ -2895,11 +2895,15 @@ static bool gui_record_capture_ready(const gui_app_t *app) {
 // Start recording - checks for file existence first
 int gui_record_start(gui_app_t *app) {
 #if defined(__APPLE__)
-    if(gui_cxadc_macos_active() && (app->settings.use_flac || app->settings.enable_resample_a ||
-        app->settings.rf_bits_a!=8 || app->settings.capture_b || app->settings.enable_audio_4ch || app->settings.enable_audio_2ch_12 ||
+    bool native_clockgen=gui_cxadc_macos_clockgen_active();
+    bool native_audio=app->settings.enable_audio_4ch || app->settings.enable_audio_2ch_12 ||
         app->settings.enable_audio_2ch_34 || app->settings.enable_audio_1ch[0] || app->settings.enable_audio_1ch[1] ||
-        app->settings.enable_audio_1ch[2] || app->settings.enable_audio_1ch[3])) {
-        gui_app_set_status(app,"macOS CXADC recording requires RAW8 channel A, no resampling or audio");return -1;
+        app->settings.enable_audio_1ch[2] || app->settings.enable_audio_1ch[3];
+    if(gui_cxadc_macos_active() && (app->settings.use_flac || app->settings.enable_resample_a ||
+        (app->settings.capture_a && app->settings.rf_bits_a!=8) ||
+        (app->settings.capture_b && (app->settings.rf_bits_b!=8 || app->settings.enable_resample_b)) ||
+        (!native_clockgen && (app->settings.capture_b || native_audio)))) {
+        gui_app_set_status(app,"macOS CXADC requires native RAW8; select Clockgen for dual RF and audio");return -1;
     }
 #endif
 

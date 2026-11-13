@@ -724,7 +724,7 @@ int gui_cxadc_get_center_offset(int card_idx, int *value_out)
     return cxadc_win_get_center_offset(card_idx, value_out);
 #else
     #if defined(__APPLE__)
-    (void)card_idx; return gui_cxadc_macos_get("center_offset", value_out);
+    return gui_cxadc_macos_get_card(card_idx,"center_offset",value_out);
 #else
     return cxadc_sysfs_read_int_param(card_idx, "center_offset", value_out);
 #endif
@@ -753,7 +753,7 @@ int gui_cxadc_set_center_offset(int card_idx, int value)
 #if defined(_WIN32)
     return cxadc_win_set_center_offset(card_idx, value);
 #elif defined(__APPLE__)
-    (void)card_idx; return gui_cxadc_macos_set("center_offset", value);
+    return gui_cxadc_macos_set_card(card_idx,"center_offset",value);
 #else
     return cxadc_sysfs_write_int_param(card_idx, "center_offset", value);
 #endif
@@ -836,7 +836,7 @@ bool gui_cxadc_get_sample_rate_hz(int card_idx, bool tenbit, uint32_t *rate_hz_o
     if (!rate_hz_out) return false;
     *rate_hz_out = 0;
 #if defined(__APPLE__)
-    if (card_idx>=0 && card_idx<CXADC_MAX_CARDS && !tenbit) {*rate_hz_out=28636363;return true;}
+    if (card_idx>=0 && card_idx<CXADC_MAX_CARDS && !tenbit) {*rate_hz_out=gui_cxadc_macos_rate();return true;}
     return false;
 #endif
     if (card_idx < 0 || card_idx >= CXADC_MAX_CARDS) return false;
@@ -1393,6 +1393,9 @@ bool gui_cxadc_get_effective_rate_hz(int card_idx, bool tenbit, uint32_t *rate_h
 
 int gui_cxadc_probe_card_rates(int card_count, const bool tenbit_modes[CXADC_MAX_CARDS])
 {
+#if defined(__APPLE__)
+    (void)card_count;(void)tenbit_modes;return 0; /* no Linux boot backlog on DriverKit */
+#endif
     if (card_count < 0) card_count = 0;
     if (card_count > CXADC_MAX_CARDS) card_count = CXADC_MAX_CARDS;
     if (card_count == 0) return 0;
@@ -2138,6 +2141,16 @@ static void cxadc_close_audio_capture(cxadc_ctx_t *ctx)
         ctx->audio_com_initialized = false;
     }
 }
+#elif defined(__APPLE__)
+static int cxadc_open_audio_capture(cxadc_ctx_t *ctx) {
+    uint32_t rate=0;
+    if(gui_cxadc_macos_audio_open(&rate))return -1;
+    ctx->audio_sample_rate_hz=rate;ctx->audio_channels=3;
+    ctx->audio_format=CXADC_AUDIO_FMT_FLOAT32;ctx->audio_sample_bytes=4;
+    snprintf(ctx->audio_device_name,sizeof(ctx->audio_device_name),"CXADC+ADC-ClockGen");return 0;
+}
+static void cxadc_abort_audio_capture(cxadc_ctx_t *ctx) {(void)ctx; /* reader is nonblocking */}
+static void cxadc_close_audio_capture(cxadc_ctx_t *ctx) {(void)ctx;gui_cxadc_macos_audio_close();}
 #else
 static int cxadc_open_audio_capture(cxadc_ctx_t *ctx) { (void)ctx; return -1; }
 static void cxadc_abort_audio_capture(cxadc_ctx_t *ctx) { (void)ctx; }
@@ -2256,6 +2269,35 @@ static int cxadc_run_audio_capture(cxadc_ctx_t *ctx)
         }
     }
     return 0;
+#elif defined(__APPLE__)
+    uint8_t *data=malloc(4096u*CXADC_AUDIO_PACKED_FRAME_BYTES);
+    if(!data)return -1;
+    uint64_t last=get_time_ms();
+    while(atomic_load(&ctx->running) && app->is_capturing && !atomic_load(&do_exit)) {
+        size_t frames=0;
+        int read_result=gui_cxadc_macos_audio_read(data,4096,&frames);
+        if(read_result || (!frames && get_time_ms()-last>2000)) {
+            gui_cxadc_macos_mark_failed();gui_record_mark_audio_source_loss();
+            gui_app_set_status(app,read_result?gui_cxadc_macos_error():"ClockGen stopped delivering audio; reconnect USB and check input access");
+            atomic_store(&app->dropout_stop_reason,GUI_DROPOUT_DEVICE_ERROR);
+            atomic_store(&app->dropout_stop_requested,true);free(data);return -1;
+        }
+        if(!frames){thrd_sleep_ms(1);continue;}
+        last=get_time_ms();size_t bytes=frames*CXADC_AUDIO_PACKED_FRAME_BYTES;
+        uint8_t *out=bufmgr_write_begin(&app->buffers,BUF_CAPTURE_AUDIO,bytes,NULL);
+        if(!out) {
+            atomic_fetch_add(&app->rb_drop_count,1);gui_record_mark_audio_source_loss();gui_cxadc_macos_mark_failed();
+            atomic_store(&app->dropout_stop_reason,GUI_DROPOUT_BACKPRESSURE);
+            atomic_store(&app->dropout_stop_requested,true);free(data);return -1;
+        }
+        memcpy(out,data,bytes);
+        gui_headswitch_lock_ingest_s24le_interleaved(out,bytes,ctx->audio_sample_rate_hz);
+        bufmgr_write_end(&app->buffers,BUF_CAPTURE_AUDIO,bytes);
+        bufmgr_signal_data(&app->buffers,BUF_CAPTURE_AUDIO);
+        gui_monitor_audio_server_tap(app,out,bytes);
+        atomic_store(&app->audio_sample_rate,ctx->audio_sample_rate_hz);
+    }
+    free(data);return 0;
 #elif !LIBASOUND_ENABLED
     (void)app;
     return -1;
@@ -2652,6 +2694,7 @@ bool gui_cxadc_detect_misrc_clockgen_audio(void)
  * near-identical per card on the same system) + the measured-rate error
  * over the skip (microseconds) - byte-exact A/B content alignment.
  */
+#if !defined(__APPLE__)
 #define CXADC_SYNC_CHUNK_BYTES       ((size_t)64 * 1024)
 #define CXADC_SYNC_RELEASE_BYTES     (2u * 1024 * 1024) /* driver 512-page boundary grid */
 #define CXADC_SYNC_LIVE_CHUNK_MIN_US 4000
@@ -2800,6 +2843,8 @@ static void cxadc_sync_card_starts(cxadc_ctx_t *ctx, int card_count)
     fprintf(stderr, " -> all streams at T_ref (byte-exact; residual ~tens of us)\n");
 }
 
+#endif
+
 int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)
 {
     if (!app) return -1;
@@ -2808,13 +2853,18 @@ int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)
     if(app->selected_device>=0 && app->selected_device<app->device_count)
         sscanf(app->devices[app->selected_device].serial,"CXADC_MACOS_%d",&native_index);
     gui_cxadc_macos_select(native_index);
-    if(card_count!=1 || misrc_clockgen_mode){gui_app_set_status(app,"macOS CXADC supports one stock RAW8 card per capture");return -1;}
-    app->settings.cxadc_tenbit_mode_card[0]=false;
-    app->settings.rf_bits_a=8;app->settings.enable_resample_a=false;
-    app->settings.capture_a=true;app->settings.capture_b=false;
-    app->settings.enable_audio_4ch=false;app->settings.enable_audio_2ch_12=false;app->settings.enable_audio_2ch_34=false;
-    for(int n=0;n<4;n++)app->settings.enable_audio_1ch[n]=false;
-    app->settings.audio_monitor_playback=false;app->settings.use_flac=false;
+    if(misrc_clockgen_mode || (card_count!=1 && card_count!=2))return -1;
+    if(gui_cxadc_macos_prepare(card_count,card_count==2)) {
+        gui_app_set_status(app,gui_cxadc_macos_error());return -1;
+    }
+    for(int i=0;i<2;i++)app->settings.cxadc_tenbit_mode_card[i]=false;
+    app->settings.rf_bits_a=8;app->settings.rf_bits_b=8;
+    app->settings.enable_resample_a=false;app->settings.enable_resample_b=false;
+    if(card_count==1) {
+        app->settings.capture_a=true;app->settings.capture_b=false;
+        app->settings.enable_audio_4ch=false;app->settings.enable_audio_2ch_12=false;app->settings.enable_audio_2ch_34=false;
+        for(int n=0;n<4;n++)app->settings.enable_audio_1ch[n]=false;
+    }
     app->settings.stop_on_dropout=true;
 #endif
     if (atomic_load(&s_cxadc.running)) return 0;
@@ -2973,6 +3023,11 @@ int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)
 #endif
     }
 
+#if defined(__APPLE__)
+    if(card_count==2 && !audio_capture_available) {
+        gui_app_set_status(app,gui_cxadc_macos_error());cxadc_close_cards(&s_cxadc);return -1;
+    }
+#endif
     app->is_capturing = true;
     int r = gui_extract_start(app);
     if (r < 0) {
@@ -2993,6 +3048,15 @@ int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)
 
     (void)gui_audio_start(app, &app->buffers);
 
+#if defined(__APPLE__)
+    if(gui_cxadc_macos_start_cards() || (audio_capture_available && gui_cxadc_macos_audio_start())) {
+        gui_app_set_status(app,gui_cxadc_macos_error());
+        gui_audio_stop(app);
+        if(app->display_thread)gui_display_thread_stop(app->display_thread);
+        gui_extract_stop();app->is_capturing=false;
+        cxadc_close_audio_capture(&s_cxadc);cxadc_close_cards(&s_cxadc);return -1;
+    }
+#endif
     atomic_store(&s_cxadc.running, true);
     // Measured feed-rate check (uses the already-open card fds): corrects
     // card_sample_rate_hz when the sysfs crystal/tenxfsc belief is stale
@@ -3021,9 +3085,11 @@ int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)
     // time, and the RF thread's lockstep preserves that offset for the whole
     // capture (measured 114 ms on 2026-10-06). Re-align both streams to a
     // common content instant before the RF thread starts (2+ cards only).
+#if !defined(__APPLE__)
     if (card_count > 1) {
         cxadc_sync_card_starts(&s_cxadc, card_count);
     }
+#endif
     // Publish the final measured rates before any RF write reaches the
     // extraction sideband; initial sysfs rates may have been corrected above.
     atomic_store(&app->rf_source_rate_hz[0], s_cxadc.card_sample_rate_hz[0]);
