@@ -151,6 +151,9 @@ gui_rf_resampler_t *gui_rf_resampler_create_ed_beta(uint32_t rate) {
     if(r)r->ed_beta=true;
     return r;
 }
+gui_rf_resampler_t *gui_rf_resampler_create_hifi(uint32_t rate) {
+    return gui_rf_resampler_create(rate);
+}
 void gui_rf_resampler_destroy(gui_rf_resampler_t *r) { free(r); }
 void gui_rf_resampler_reset(gui_rf_resampler_t *r) {
     if(!r->ed_beta) atomic_fetch_add(&narrow_reset_calls,1);
@@ -164,6 +167,9 @@ size_t gui_rf_resampler_output_capacity(uint32_t rate,size_t count) {
 }
 size_t gui_rf_resampler_output_capacity_ed_beta(uint32_t rate,size_t count) {
     return gui_rf_resampler_output_capacity_rate(rate,GUI_RF_DECODE_RATE_HZ,count);
+}
+size_t gui_rf_resampler_output_capacity_hifi(uint32_t rate,size_t count) {
+    return rate >= 8000000u && rate <= 10000000u ? gui_rf_resampler_output_capacity(rate,count) : 0;
 }
 bool gui_rf_resampler_process(gui_rf_resampler_t *r,const int16_t *input,size_t count,
                               float *output,size_t capacity,size_t *output_count) {
@@ -891,6 +897,44 @@ static void test_vhs_hifi_audio_only(void) {
         check(atomic_load(&narrow_resample_calls) == conversions &&
               atomic_load(&process_calls) == video && atomic_load(&audio_callbacks) == audio,
               "muted native audio-only worker skips audio and picture decoding");
+        check(gui_rf_preview_worker_rate_supported(GUI_RF_PROFILE_PAL_VHS_HIFI, 9123000u) &&
+              !gui_rf_preview_worker_rate_supported(GUI_RF_PROFILE_PAL_VHS, 9123000u) &&
+              !gui_rf_preview_worker_rate_supported(GUI_RF_PROFILE_PAL_VHS_HIFI, 10001000u),
+              "custom low RF rate is admitted only for the Hi-Fi preset");
+        gui_rf_preview_worker_set_audio_enabled(w, true);
+        info = (gui_rf_block_info_t){.sample_rate_hz = 9123000u, .epoch = 9, .discontinuity = true};
+        check(gui_rf_preview_worker_submit(w, input, input_count, &info) &&
+              gui_rf_preview_worker_wait_idle(w, 3000), "custom-rate VHS Hi-Fi input drains");
+        gui_rf_preview_worker_get_stats(w, &stats);
+        check(stats.source_rate_hz == 9123000u && stats.vhs_hifi_rf_rate_hz == GUI_RF_DECODE_RATE_HZ &&
+              atomic_load(&narrow_resample_calls) > conversions && atomic_load(&audio_callbacks) > audio &&
+              atomic_load(&process_calls) == video, "custom RF feeds the existing 20 MSPS Hi-Fi decoder");
+
+        gui_rf_preview_worker_set_profile(w, GUI_RF_PROFILE_PAL_VHS);
+        check(gui_rf_preview_worker_wait_idle(w, 3000), "custom-rate video profile applies");
+        conversions = atomic_load(&narrow_resample_calls);
+        audio = atomic_load(&audio_callbacks);
+        info.start_sample += input_count;
+        info.discontinuity = false;
+        check(gui_rf_preview_worker_submit(w, input, input_count, &info) &&
+              gui_rf_preview_worker_wait_idle(w, 3000), "custom-rate input drains with the video profile");
+        gui_rf_preview_worker_get_stats(w, &stats);
+        check(strstr(stats.decode.reason, "Unsupported RF rate") &&
+              atomic_load(&narrow_resample_calls) == conversions &&
+              atomic_load(&audio_callbacks) == audio && atomic_load(&process_calls) == video,
+              "switching to video rejects the same custom RF rate");
+
+        gui_rf_preview_worker_set_profile(w, GUI_RF_PROFILE_PAL_VHS_HIFI);
+        check(gui_rf_preview_worker_wait_idle(w, 3000), "custom-rate Hi-Fi profile restored");
+        info.start_sample += input_count;
+        check(gui_rf_preview_worker_submit(w, input, input_count, &info) &&
+              gui_rf_preview_worker_wait_idle(w, 3000), "custom-rate input drains after restoring Hi-Fi");
+        gui_rf_preview_worker_get_stats(w, &stats);
+        check(stats.vhs_hifi_rf_rate_hz == GUI_RF_DECODE_RATE_HZ &&
+              atomic_load(&narrow_resample_calls) > conversions &&
+              atomic_load(&audio_callbacks) > audio && atomic_load(&process_calls) == video,
+              "switching back restores the custom-rate Hi-Fi resampler without a rate change");
+
         check(gui_rf_preview_worker_set_budget(1), "VHS Hi-Fi fixture restores default budget");
     }
     gui_rf_preview_worker_destroy(w);

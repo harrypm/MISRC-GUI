@@ -94,6 +94,9 @@ bool gui_cxadc_is_running(void) { return false; }
 bool gui_cxadc_direct_record_available(int channel, uint8_t bits, size_t *bytes) {
     (void)channel; (void)bits; (void)bytes; return false;
 }
+// A previous native recording can leave a failed extraction drain behind.
+bool gui_extract_wait_recording_idle(void) { return false; }
+bool gui_audio_wait_recording_idle(void) { return true; }
 
 static int failures;
 #define CHECK(value) do { if (!(value)) { \
@@ -190,6 +193,220 @@ static void check_legacy_flac_error(const FLAC__StreamDecoder *decoder,
     (void)user_data;
     CHECK(false);
 }
+
+#if defined(ENABLE_RTLSDR) && LIBSOXR_ENABLED
+static uint32_t fixture_rtlsdr_rate;
+static uint64_t fixture_rtlsdr_tuning;
+static bool fixture_rtlsdr_running = true;
+static bool fixture_rtlsdr_settled = true;
+
+bool gui_rtlsdr_is_running(gui_app_t *app) {
+    (void)app;
+    return fixture_rtlsdr_running;
+}
+
+bool gui_rtlsdr_get_rf_source(const gui_app_t *app, uint32_t *rate, uint64_t *tuning) {
+    (void)app;
+    if (!fixture_rtlsdr_running || !fixture_rtlsdr_settled) return false;
+    *rate = fixture_rtlsdr_rate;
+    *tuning = fixture_rtlsdr_tuning;
+    return true;
+}
+
+typedef struct {
+    FILE *file;
+    size_t count;
+} fixture_rtlsdr_raw_output_t;
+
+static bool compare_rtlsdr_raw(void *opaque, const int16_t *samples, size_t count) {
+    fixture_rtlsdr_raw_output_t *output = opaque;
+    for (size_t i = 0; i < count; ++i) {
+        uint16_t sample = (uint16_t)samples[i];
+        int low = fgetc(output->file);
+        int high = fgetc(output->file);
+        if (low != (sample & 0xff) || high != (sample >> 8)) return false;
+    }
+    output->count += count;
+    return true;
+}
+
+static void check_rtlsdr_hifi_recording(const char *directory, bool flac) {
+    gui_app_t *app = calloc(1, sizeof(*app));
+    assert(app);
+    const uint32_t input_rate = 1536000;
+    const uint32_t output_rate = 8000000;
+    const uint64_t tuning = (1ULL << 32) | 1500000u;
+    app->settings.use_flac = flac;
+    app->settings.rtlsdr_hifi_rf_record = true;
+    app->settings.capture_b = true;
+    app->settings.enable_audio_2ch_12 = true;
+    app->device_count = 1;
+    app->devices[0].type = DEVICE_TYPE_RTLSDR;
+    strcpy(app->settings.output_base_name, "test_\xe4\xb8\xad");
+    snprintf(app->settings.output_path, sizeof(app->settings.output_path), "%s", directory);
+
+    static const struct {
+        uint32_t rate;
+        uint32_t center;
+        bool accepted;
+    } rate_cases[] = {
+        {250000, 1500000, false},
+        {960000, 1500000, true},
+        {960000, 1660000, true}, // Only the PAL carrier pair fits.
+        {960000, 1680000, false}, // Hardware bandwidth fits PAL, but the SoXR passband does not.
+        {1024000, 2300000, false},
+        {1536000, 1500000, true},
+        {2400000, 2300000, true},
+        {2400000, 2410000, false}, // PAL's lower sideband lies outside the SoXR passband.
+        {2560000, 1500000, true},
+        {3200000, 1500000, false},
+    };
+    uint32_t unavailable_rate = 0;
+    uint64_t unavailable_tuning = 0;
+    fixture_rtlsdr_running = false;
+    CHECK(!gui_record_rtlsdr_hifi_source(app, &unavailable_rate, &unavailable_tuning));
+    CHECK(strstr(last_status, "requires a running RTL-SDR") != NULL);
+    fixture_rtlsdr_running = true;
+    fixture_rtlsdr_settled = false;
+    CHECK(!gui_record_rtlsdr_hifi_source(app, &unavailable_rate, &unavailable_tuning));
+    CHECK(strstr(last_status, "rate or tuning is not ready") != NULL);
+    fixture_rtlsdr_settled = true;
+    for (size_t i = 0; i < sizeof(rate_cases) / sizeof(rate_cases[0]); ++i) {
+        fixture_rtlsdr_rate = rate_cases[i].rate;
+        fixture_rtlsdr_tuning = (1ULL << 32) | rate_cases[i].center;
+        uint32_t validated_rate = 0;
+        uint64_t validated_tuning = 0;
+        CHECK(gui_record_rtlsdr_hifi_source(app, &validated_rate, &validated_tuning) == rate_cases[i].accepted);
+        CHECK(validated_rate == fixture_rtlsdr_rate && validated_tuning == fixture_rtlsdr_tuning);
+    }
+
+    assert(gui_record_apply_auto_names(app));
+    gui_record_output_targets_t targets, changed;
+    assert(gui_record_check_output_paths(app, NULL, NULL, 0, &targets));
+    CHECK(strcmp(s_rtlsdr_hifi_filename, flac ? "test_\xe4\xb8\xad_hifi_rf_16-bit_8.000msps.flac"
+                                            : "test_\xe4\xb8\xad_hifi_rf_16-bit_8.000msps.s16") == 0);
+    strcpy(app->settings.rtlsdr_hifi_rf_tag, "Side A:");
+    strcpy(app->settings.rf_channel_tags[0], "Native-I");
+    strcpy(app->settings.rf_channel_tags[1], "Native-Q");
+    assert(gui_record_apply_auto_names(app));
+    CHECK(!gui_record_match_output_targets(app, &targets, &changed));
+    assert(gui_record_check_output_paths(app, NULL, NULL, 0, &targets));
+    CHECK(strcmp(s_rtlsdr_hifi_filename, flac ? "test_\xe4\xb8\xad_Side-A_hifi_rf_16-bit_8.000msps.flac"
+                                            : "test_\xe4\xb8\xad_Side-A_hifi_rf_16-bit_8.000msps.s16") == 0);
+    for (size_t i = 1; i < GUI_RECORD_OUTPUT_COUNT; ++i) CHECK(!targets.paths[i][0]);
+    CHECK(!app->settings.capture_a && app->settings.capture_b && app->settings.use_flac == flac);
+    app->settings.use_flac = !flac;
+    CHECK(!gui_record_match_output_targets(app, &targets, &changed));
+    app->settings.use_flac = flac;
+    CHECK(gui_record_match_output_targets(app, &targets, &changed));
+
+    // A RAW target can keep the same name when switching to native mode.
+    if (!flac) {
+        app->settings.rtlsdr_hifi_rf_record = false;
+        app->settings.capture_a = true;
+        app->settings.capture_b = false;
+        app->settings.enable_audio_2ch_12 = false;
+        strcpy(app->settings.output_filename_a, s_rtlsdr_hifi_filename);
+        assert(gui_record_check_output_paths(app, NULL, NULL, 0, &changed));
+        CHECK(strcmp(targets.paths[0], changed.paths[0]) == 0);
+        CHECK(!gui_record_match_output_targets(app, &targets, &changed));
+        app->settings.rtlsdr_hifi_rf_record = true;
+        app->settings.capture_a = false;
+        app->settings.capture_b = true;
+        app->settings.enable_audio_2ch_12 = true;
+    }
+
+    buffer_config_t configs[BUF_COUNT];
+    for (int id = 0; id < BUF_COUNT; ++id)
+        configs[id] = (buffer_config_t){.name = "RTL-SDR Hi-Fi test", .size = 65536, .lazy_init = true};
+    configs[BUF_RECORD_A].lazy_init = false;
+    assert(bufmgr_init_custom(&app->buffers, configs) == 0);
+    gui_record_reset_stats(app);
+    bool use_flac = !flac;
+    CHECK(!gui_record_get_rtlsdr_hifi_output(&use_flac) && use_flac == !flac);
+    atomic_store(&s_record_write_error[0], false);
+    atomic_store(&s_record_producer_lost_data, false);
+    atomic_store(&s_rtlsdr_hifi_interrupted, false);
+    s_rtlsdr_hifi_tuning = tuning;
+    s_recording_app = app;
+    app->settings.flac_threads = 1;
+    snprintf(s_record_path_a, sizeof(s_record_path_a), "%s", targets.paths[0]);
+    assert(gui_record_start_rtlsdr_hifi(app, &targets, "wbx", input_rate, tuning) == RECORD_OK);
+    char log_path[GUI_RECORD_PATH_MAX];
+    snprintf(log_path, sizeof(log_path), "%s", s_capture_log_path);
+
+    app->settings.use_flac = !flac;
+    use_flac = app->settings.use_flac;
+    CHECK(gui_record_get_rtlsdr_hifi_output(&use_flac) && use_flac == flac);
+    uint8_t iq[3073 * 2];
+    for (size_t i = 0; i < sizeof(iq); ++i) iq[i] = (uint8_t)(129u + i % 61u);
+    gui_record_rtlsdr_push(app, iq, 123, tuning);
+    gui_record_rtlsdr_push(app, iq + 246, sizeof(iq) / 2 - 123, tuning);
+    atomic_store(&s_rtlsdr_hifi_accepting, false);
+    app->is_recording = false;
+    gui_record_finalize_stop_sync(app, gui_record_clock(app));
+    if (log_path[0]) remove_path(log_path, false);
+    use_flac = app->settings.use_flac;
+    CHECK(gui_record_get_rtlsdr_hifi_output(&use_flac) && use_flac == flac);
+
+    uint64_t expected = ((sizeof(iq) / 2) * (uint64_t)output_rate + input_rate / 2) / input_rate;
+    CHECK(atomic_load(&app->recording_raw_a) == expected * sizeof(int16_t));
+    CHECK(!atomic_load(&s_record_write_error[0]));
+    CHECK(bufmgr_fill_level(&app->buffers, BUF_RECORD_A) == 0);
+    CHECK(!atomic_load(&s_record_stop_failed));
+    if (flac) {
+        FLAC__StreamMetadata info;
+        assert(FLAC__metadata_get_streaminfo(targets.paths[0], &info));
+        CHECK(info.data.stream_info.channels == 1 && info.data.stream_info.bits_per_sample == 16);
+        CHECK(info.data.stream_info.sample_rate == output_rate / 1000);
+        FLAC__StreamMetadata *tags = NULL;
+        assert(FLAC__metadata_get_tags(targets.paths[0], &tags));
+        char sample_count_tag[64];
+        snprintf(sample_count_tag, sizeof(sample_count_tag), "RF_TOTAL_SAMPLES=%" PRIu64, expected);
+        const char *keys[] = {"RF_SAMPLE_RATE", "RF_SOURCE", "SOURCE_SAMPLE_RATE", "SOURCE_CENTER_FREQUENCY",
+                              "RF_TOTAL_SAMPLES"};
+        const char *values[] = {"RF_SAMPLE_RATE=8000000", "RF_SOURCE=RTLSDR_HIFI",
+                                "SOURCE_SAMPLE_RATE=1536000", "SOURCE_CENTER_FREQUENCY=1500000", sample_count_tag};
+        for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); ++i) {
+            int entry = FLAC__metadata_object_vorbiscomment_find_entry_from(tags, 0, keys[i]);
+            CHECK(entry >= 0 && strcmp((const char *)tags->data.vorbis_comment.comments[entry].entry,
+                                      values[i]) == 0);
+        }
+        FLAC__metadata_object_delete(tags);
+    } else {
+        FILE *file = file_open_read_utf8(targets.paths[0]);
+        assert(file);
+        char error[128];
+        fixture_rtlsdr_raw_output_t output = {.file = file};
+        gui_sdr_rf_t *reference = gui_sdr_rf_create(input_rate, (uint32_t)tuning, error, sizeof(error));
+        assert(reference);
+        CHECK(gui_sdr_rf_process(reference, iq, sizeof(iq) / 2, compare_rtlsdr_raw, &output));
+        CHECK(gui_sdr_rf_finish(reference, compare_rtlsdr_raw, &output));
+        CHECK(output.count == expected);
+        CHECK(fgetc(file) == EOF && !ferror(file));
+        gui_sdr_rf_destroy(reference);
+        CHECK(fclose(file) == 0);
+    }
+    remove_path(targets.paths[0], false);
+    gui_record_reset_stats(app);
+    CHECK(atomic_load(&app->recording_raw_a) == 0);
+    use_flac = app->settings.use_flac;
+    CHECK(!gui_record_get_rtlsdr_hifi_output(&use_flac) && use_flac == !flac);
+
+    // A tuning discontinuity closes the tap instead of mixing two RF bands.
+    atomic_store(&s_rtlsdr_hifi_accepting, true);
+    gui_record_rtlsdr_push(app, iq, sizeof(iq) / 2, tuning + (1ULL << 32));
+    CHECK(!gui_record_rtlsdr_active());
+    CHECK(atomic_load(&s_rtlsdr_hifi_interrupted));
+    CHECK(atomic_load(&s_record_producer_lost_data));
+    gui_record_rtlsdr_push(app, iq, sizeof(iq) / 2, tuning);
+    CHECK(bufmgr_fill_level(&app->buffers, BUF_RECORD_A) == 0);
+    atomic_store(&s_rtlsdr_hifi_interrupted, false);
+    atomic_store(&s_record_producer_lost_data, false);
+    bufmgr_cleanup(&app->buffers);
+    free(app);
+}
+#endif
 
 static void check_legacy_writer(gui_app_t *app, const char *directory, bool flac,
                                 uint8_t bits, bool resample, size_t ring_count, size_t spill_count) {
@@ -1172,6 +1389,10 @@ int main(void) {
     }
     check_overwrite_targets(app, directory);
     check_flac_finalize(directory);
+#if defined(ENABLE_RTLSDR) && LIBSOXR_ENABLED
+    check_rtlsdr_hifi_recording(directory, true);
+    check_rtlsdr_hifi_recording(directory, false);
+#endif
     check_legacy_writer(app, directory, false, 8, false, 17, 23);
     check_legacy_writer(app, directory, false, 16, false, GUI_RECORD_WRITER_BLOCK_SAMPLES + 31, 37);
     check_legacy_writer(app, directory, true, 12, false, 17, 23);

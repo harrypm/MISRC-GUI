@@ -1,4 +1,5 @@
 #include "gui_rf_resampler.h"
+#include "gui_vhs_hifi.h"
 
 #include <limits.h>
 #include <math.h>
@@ -77,8 +78,8 @@ static bool halfband_push(rf_halfband_t *stage, float sample, float *output) {
     return true;
 }
 
-static bool input_rate_valid(uint32_t rate) {
-    return rate >= RF_MIN_INPUT_RATE_HZ && rate <= RF_MAX_INPUT_RATE_HZ;
+static bool input_rate_valid(uint32_t rate, uint32_t min_rate) {
+    return rate >= min_rate && rate <= RF_MAX_INPUT_RATE_HZ;
 }
 
 static bool output_rate_valid(uint32_t rate) {
@@ -90,8 +91,8 @@ gui_rf_resampler_t *gui_rf_resampler_create(uint32_t input_rate_hz) {
 }
 
 static gui_rf_resampler_t *rf_resampler_create(uint32_t input_rate_hz,
-                                               uint32_t output_rate_hz, bool ed_beta) {
-    if (!input_rate_valid(input_rate_hz) || !output_rate_valid(output_rate_hz) ||
+                                               uint32_t output_rate_hz, bool ed_beta, uint32_t min_rate) {
+    if (!input_rate_valid(input_rate_hz, min_rate) || !output_rate_valid(output_rate_hz) ||
         (ed_beta && input_rate_hz < RF_OUTPUT_RATE_HZ)) return NULL;
     gui_rf_resampler_t *resampler = calloc(1, sizeof(*resampler));
     if (!resampler) return NULL;
@@ -136,11 +137,16 @@ static gui_rf_resampler_t *rf_resampler_create(uint32_t input_rate_hz,
 
 gui_rf_resampler_t *gui_rf_resampler_create_rate(uint32_t input_rate_hz,
                                                uint32_t output_rate_hz) {
-    return rf_resampler_create(input_rate_hz, output_rate_hz, false);
+    return rf_resampler_create(input_rate_hz, output_rate_hz, false, RF_MIN_INPUT_RATE_HZ);
 }
 
 gui_rf_resampler_t *gui_rf_resampler_create_ed_beta(uint32_t input_rate_hz) {
-    return rf_resampler_create(input_rate_hz, RF_OUTPUT_RATE_HZ, true);
+    return rf_resampler_create(input_rate_hz, RF_OUTPUT_RATE_HZ, true, RF_MIN_INPUT_RATE_HZ);
+}
+
+gui_rf_resampler_t *gui_rf_resampler_create_hifi(uint32_t input_rate_hz) {
+    if (input_rate_hz > GUI_VHS_HIFI_LOW_RF_MAX_RATE_HZ) return NULL;
+    return rf_resampler_create(input_rate_hz, RF_OUTPUT_RATE_HZ, false, GUI_VHS_HIFI_LOW_RF_MIN_RATE_HZ);
 }
 
 void gui_rf_resampler_destroy(gui_rf_resampler_t *resampler) {
@@ -160,8 +166,8 @@ void gui_rf_resampler_reset(gui_rf_resampler_t *resampler) {
 }
 
 static size_t rf_output_capacity(uint32_t input_rate_hz, uint32_t output_rate_hz,
-                                 size_t input_count, bool ed_beta) {
-    if (!input_rate_valid(input_rate_hz) || !output_rate_valid(output_rate_hz) || input_count == 0 ||
+                                 size_t input_count, bool ed_beta, uint32_t min_rate) {
+    if (!input_rate_valid(input_rate_hz, min_rate) || !output_rate_valid(output_rate_hz) || input_count == 0 ||
         (ed_beta && input_rate_hz < RF_OUTPUT_RATE_HZ)) return 0;
     if (input_rate_hz == output_rate_hz) return input_count;
     if (!ed_beta && input_rate_hz == output_rate_hz * 2u) return input_count / 2u + (input_count % 2u != 0);
@@ -183,16 +189,22 @@ static size_t rf_output_capacity(uint32_t input_rate_hz, uint32_t output_rate_hz
 }
 
 size_t gui_rf_resampler_output_capacity(uint32_t input_rate_hz, size_t input_count) {
-    return rf_output_capacity(input_rate_hz, RF_OUTPUT_RATE_HZ, input_count, false);
+    return rf_output_capacity(input_rate_hz, RF_OUTPUT_RATE_HZ, input_count, false, RF_MIN_INPUT_RATE_HZ);
 }
 
 size_t gui_rf_resampler_output_capacity_rate(uint32_t input_rate_hz,
                                             uint32_t output_rate_hz, size_t input_count) {
-    return rf_output_capacity(input_rate_hz, output_rate_hz, input_count, false);
+    return rf_output_capacity(input_rate_hz, output_rate_hz, input_count, false, RF_MIN_INPUT_RATE_HZ);
 }
 
 size_t gui_rf_resampler_output_capacity_ed_beta(uint32_t input_rate_hz, size_t input_count) {
-    return rf_output_capacity(input_rate_hz, RF_OUTPUT_RATE_HZ, input_count, true);
+    return rf_output_capacity(input_rate_hz, RF_OUTPUT_RATE_HZ, input_count, true, RF_MIN_INPUT_RATE_HZ);
+}
+
+size_t gui_rf_resampler_output_capacity_hifi(uint32_t input_rate_hz, size_t input_count) {
+    if (input_rate_hz > GUI_VHS_HIFI_LOW_RF_MAX_RATE_HZ) return 0;
+    return rf_output_capacity(input_rate_hz, RF_OUTPUT_RATE_HZ, input_count, false,
+                              GUI_VHS_HIFI_LOW_RF_MIN_RATE_HZ);
 }
 
 bool gui_rf_resampler_process(gui_rf_resampler_t *resampler,
@@ -204,7 +216,7 @@ bool gui_rf_resampler_process(gui_rf_resampler_t *resampler,
     if (!resampler || (input_count && (!input || !output))) return false;
     if (!input_count) return true; /* A capture gap is not end-of-input. */
     const size_t capacity = rf_output_capacity(resampler->input_rate_hz,
-        resampler->output_rate_hz, input_count, resampler->ed_beta);
+        resampler->output_rate_hz, input_count, resampler->ed_beta, resampler->input_rate_hz);
     if (!capacity || output_capacity < capacity) return false;
 
     if (resampler->factor) {

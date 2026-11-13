@@ -7,6 +7,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
+import android.database.Cursor;
 import android.hardware.usb.UsbConstants;
 import android.hardware.usb.UsbDevice;
 import android.hardware.usb.UsbDeviceConnection;
@@ -16,6 +17,7 @@ import android.os.Build;
 import android.os.Environment;
 import android.os.ParcelFileDescriptor;
 import android.provider.DocumentsContract;
+import android.provider.OpenableColumns;
 import android.provider.Settings;
 import android.text.Editable;
 import android.text.InputType;
@@ -34,12 +36,15 @@ import android.widget.EditText;
 import android.widget.Toast;
 import java.io.File;
 import java.io.FileOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
 
@@ -95,7 +100,6 @@ public class MainActivity extends NativeActivity {
     private static final String EXTRA_RTL_USB_TOKEN = "dev.misrc.gui.RTL_USB_TOKEN";
     private static final int REQ_RTL_USB_PERMISSION = 0x5254;
     private static final int REQ_CAMERA = 0x5143;  // 'CA' -> CAMERA runtime request code
-    private static final int REQ_MEDIA = 0x4d45;   // 'ME' -> media runtime request code
     private static final int REQ_PICK_OUTPUT_DIR = 0x4f44;  // 'OD'
     private static final int REQ_PICK_PLAYBACK_A = 0x5041;  // 'PA'
     private static final int REQ_PICK_PLAYBACK_B = 0x5042;  // 'PB'
@@ -118,7 +122,8 @@ public class MainActivity extends NativeActivity {
     private boolean mReceiverRegistered = false;
     private UsbDevice mPendingRtlUsbDevice;
     private String mPendingRtlUsbToken;
-    private int mPendingPlaybackChannel = -1;
+    private int mActivePickerKind; // Owned by the UI thread.
+    private PlaybackImport mPlaybackImport;
     private NativeTextInputEditText mNativeTextInputView;
 
     /** Native bridge: store the granted USB device file descriptor. */
@@ -134,7 +139,7 @@ public class MainActivity extends NativeActivity {
      * logs/FLAC files to a retrievable path on Android 11+. */
     private native void nativeSetStoragePath(String path);
     /** Native bridge: resolve async Android picker responses in native code. */
-    private native void nativePickerResult(int kind, boolean accepted, String path);
+    private native boolean nativePickerResult(int kind, boolean accepted, byte[] utf8Path);
     /** Native bridge: forward Java text input into native UI text fields. */
     private native void nativePushTextInput(String text);
     /** Native bridge: report whether a known/UVC USB capture device is
@@ -219,7 +224,6 @@ public class MainActivity extends NativeActivity {
         // complete so callback paths (nativeSetUsbFd/nativeUsbPermissionResult)
         // are live when the USB dialog result arrives.
         requestCameraPermissionThenUsb();
-        requestMediaPermissionIfNeeded();
     }
 
     /** Request dangerous capture permissions at runtime before USB permission. */
@@ -255,26 +259,6 @@ public class MainActivity extends NativeActivity {
             // Whether or not all capture permissions were granted, still
             // attempt USB permission so retry behavior stays deterministic.
             requestPermissionForKnownDevices();
-        } else if (requestCode == REQ_MEDIA) {
-            boolean granted = grantResults.length > 0;
-            for (int result : grantResults) {
-                if (result != PackageManager.PERMISSION_GRANTED) {
-                    granted = false;
-                    break;
-                }
-            }
-            Log.i(TAG, "Media permission result: granted=" + granted);
-            if (!granted && mPendingPlaybackChannel >= 0) {
-                int pendingChannel = mPendingPlaybackChannel;
-                mPendingPlaybackChannel = -1;
-                signalNativePickerResult(pickerKindForPlaybackChannel(pendingChannel), false, null);
-                return;
-            }
-            if (granted && mPendingPlaybackChannel >= 0) {
-                int pendingChannel = mPendingPlaybackChannel;
-                mPendingPlaybackChannel = -1;
-                launchPlaybackFilePicker(pendingChannel);
-            }
         }
     }
 
@@ -353,12 +337,30 @@ public class MainActivity extends NativeActivity {
         }
     }
 
-    private void signalNativePickerResult(int kind, boolean accepted, String path) {
+    private boolean signalNativePickerResult(int kind, boolean accepted, String path) {
         try {
-            nativePickerResult(kind, accepted, path);
+            // JNI strings use modified UTF-8, but native filesystem paths use standard UTF-8.
+            return nativePickerResult(kind, accepted,
+                    path == null ? null : path.getBytes(StandardCharsets.UTF_8));
         } catch (UnsatisfiedLinkError e) {
             Log.e(TAG, "nativePickerResult unavailable: " + e.getMessage());
+            return false;
         }
+    }
+
+    private boolean beginPicker(int kind) {
+        if (isFinishing() || isDestroyed()) {
+            signalNativePickerResult(kind, false, null);
+            return false;
+        }
+        mActivePickerKind = kind;
+        return true;
+    }
+
+    private boolean completePicker(int kind, boolean accepted, String path) {
+        if (mActivePickerKind != kind) return false;
+        mActivePickerKind = 0;
+        return signalNativePickerResult(kind, accepted, path);
     }
 
     private void clearNativeUsbFd() {
@@ -609,11 +611,7 @@ public class MainActivity extends NativeActivity {
                     signalNativePickerResult(pickerKindForPlaybackChannel(channel), false, null);
                     return;
                 }
-                if (!hasMediaPermission()) {
-                    mPendingPlaybackChannel = channel;
-                    requestMediaPermissionIfNeeded();
-                    return;
-                }
+                // ACTION_OPEN_DOCUMENT grants read access to the selected URI.
                 launchPlaybackFilePicker(channel);
             }
         });
@@ -927,30 +925,8 @@ public class MainActivity extends NativeActivity {
         return channel == 1 ? PICKER_KIND_PLAYBACK_B : PICKER_KIND_PLAYBACK_A;
     }
 
-    private String[] mediaPermissionList() {
-        if (Build.VERSION.SDK_INT >= 33) {
-            return new String[]{android.Manifest.permission.READ_MEDIA_AUDIO};
-        }
-        return new String[]{android.Manifest.permission.READ_EXTERNAL_STORAGE};
-    }
-
-    private boolean hasMediaPermission() {
-        String[] perms = mediaPermissionList();
-        for (String perm : perms) {
-            if (checkSelfPermission(perm) != PackageManager.PERMISSION_GRANTED) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    private void requestMediaPermissionIfNeeded() {
-        if (hasMediaPermission()) return;
-        Log.i(TAG, "Requesting media read permission for Android file picker");
-        requestPermissions(mediaPermissionList(), REQ_MEDIA);
-    }
-
     private void launchOutputFolderPicker() {
+        if (!beginPicker(PICKER_KIND_OUTPUT_DIR)) return;
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
         intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
                 | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
@@ -959,15 +935,17 @@ public class MainActivity extends NativeActivity {
             startActivityForResult(intent, REQ_PICK_OUTPUT_DIR);
         } catch (Exception e) {
             Log.e(TAG, "Failed to launch output folder picker: " + e.getMessage());
-            signalNativePickerResult(PICKER_KIND_OUTPUT_DIR, false, null);
+            completePicker(PICKER_KIND_OUTPUT_DIR, false, null);
         }
     }
 
     private void launchPlaybackFilePicker(int channel) {
+        int kind = pickerKindForPlaybackChannel(channel);
+        if (!beginPicker(kind)) return;
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE);
-        intent.setType("audio/*");
-        intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"audio/flac", "audio/x-flac"});
+        // Document providers can label .s16 as arbitrary binary data.
+        intent.setType("*/*");
         intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
                 | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
         int requestCode = channel == 1 ? REQ_PICK_PLAYBACK_B : REQ_PICK_PLAYBACK_A;
@@ -975,7 +953,7 @@ public class MainActivity extends NativeActivity {
             startActivityForResult(intent, requestCode);
         } catch (Exception e) {
             Log.e(TAG, "Failed to launch playback file picker: " + e.getMessage());
-            signalNativePickerResult(pickerKindForPlaybackChannel(channel), false, null);
+            completePicker(kind, false, null);
         }
     }
 
@@ -1006,9 +984,10 @@ public class MainActivity extends NativeActivity {
     }
 
     private void handleOutputDirPickerResult(int resultCode, Intent data) {
+        if (mActivePickerKind != PICKER_KIND_OUTPUT_DIR) return;
         if (resultCode != RESULT_OK || data == null || data.getData() == null) {
             Toast.makeText(this, "Folder picker: no result (resultCode=" + resultCode + ")", Toast.LENGTH_LONG).show();
-            signalNativePickerResult(PICKER_KIND_OUTPUT_DIR, false, null);
+            completePicker(PICKER_KIND_OUTPUT_DIR, false, null);
             return;
         }
         Uri uri = data.getData();
@@ -1023,7 +1002,7 @@ public class MainActivity extends NativeActivity {
                     "Folder needs 'All files access' — enable it for MISRC, then pick the folder again",
                     Toast.LENGTH_LONG).show();
             requestAllFilesAccess();
-            signalNativePickerResult(PICKER_KIND_OUTPUT_DIR, false, null);
+            completePicker(PICKER_KIND_OUTPUT_DIR, false, null);
             return;
         }
         if (path == null) {
@@ -1036,21 +1015,57 @@ public class MainActivity extends NativeActivity {
         } else {
             Toast.makeText(this, "Folder picked: " + path, Toast.LENGTH_LONG).show();
         }
-        signalNativePickerResult(PICKER_KIND_OUTPUT_DIR, path != null && !path.isEmpty(), path);
+        completePicker(PICKER_KIND_OUTPUT_DIR, path != null && !path.isEmpty(), path);
     }
 
     private void handlePlaybackPickerResult(int channel, int resultCode, Intent data) {
         int kind = pickerKindForPlaybackChannel(channel);
+        if (mActivePickerKind != kind || mPlaybackImport != null) return;
         if (resultCode != RESULT_OK || data == null || data.getData() == null) {
             Toast.makeText(this, "File picker: no result (ch=" + channel + ")", Toast.LENGTH_LONG).show();
-            signalNativePickerResult(kind, false, null);
+            completePicker(kind, false, null);
             return;
         }
         Uri uri = data.getData();
         persistGrantedUriPermissions(data, uri);
-        String copiedPath = copyDocumentToAppPlaybackFile(uri, channel);
-        Toast.makeText(this, "File imported: " + (copiedPath != null ? copiedPath : "(failed)"), Toast.LENGTH_LONG).show();
-        signalNativePickerResult(kind, copiedPath != null && !copiedPath.isEmpty(), copiedPath);
+        mPlaybackImport = new PlaybackImport(uri, channel);
+        mPlaybackImport.start();
+    }
+
+    private final class PlaybackImport extends Thread {
+        private final Uri uri;
+        private final int channel;
+
+        PlaybackImport(Uri uri, int channel) {
+            super("MISRC playback import");
+            this.uri = uri;
+            this.channel = channel;
+        }
+
+        @Override
+        public void run() {
+            File imported = null;
+            try {
+                imported = copyDocumentToAppPlaybackFile(uri, channel);
+            } catch (RuntimeException e) {
+                Log.e(TAG, "Playback import failed", e);
+            }
+            File result = imported;
+            runOnUiThread(() -> {
+                if (mPlaybackImport != this) {
+                    if (result != null) deletePlaybackImport(result);
+                    return;
+                }
+                mPlaybackImport = null;
+                String path = result != null ? result.getAbsolutePath() : null;
+                boolean accepted = completePicker(pickerKindForPlaybackChannel(channel), path != null, path);
+                if (!accepted && result != null) deletePlaybackImport(result);
+                Toast.makeText(MainActivity.this,
+                        accepted && path != null ? "File imported: " + path :
+                                "Playback import failed. Select a FLAC or .s16 RF file.",
+                        Toast.LENGTH_LONG).show();
+            });
+        }
     }
 
     private void persistGrantedUriPermissions(Intent data, Uri uri) {
@@ -1113,8 +1128,49 @@ public class MainActivity extends NativeActivity {
         }
     }
 
-    private String copyDocumentToAppPlaybackFile(Uri uri, int channel) {
+    private String playbackDisplayName(Uri uri) {
+        try (Cursor cursor = getContentResolver().query(uri,
+                new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+            if (cursor != null && cursor.moveToFirst()) {
+                int column = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                if (column >= 0) return cursor.getString(column);
+            }
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Could not read playback document name", e);
+        }
+        return null;
+    }
+
+    private static String playbackImportName(String displayName, String mimeType, int channel) {
+        if (displayName != null && displayName.indexOf('/') < 0 && displayName.indexOf('\0') < 0) {
+            String lower = displayName.toLowerCase(Locale.ROOT);
+            if (lower.endsWith(".s16") || lower.endsWith(".flac")) return displayName;
+        }
+        if ("audio/flac".equalsIgnoreCase(mimeType) || "audio/x-flac".equalsIgnoreCase(mimeType)) {
+            return channel == 1 ? "playback_b.flac" : "playback_a.flac";
+        }
+        return null;
+    }
+
+    private static void deletePlaybackImport(File file) {
+        file.delete();
+        file.getParentFile().delete();
+    }
+
+    private File copyDocumentToAppPlaybackFile(Uri uri, int channel) {
         if (uri == null) return null;
+        String displayName = playbackDisplayName(uri);
+        String name;
+        try {
+            name = playbackImportName(displayName, getContentResolver().getType(uri), channel);
+        } catch (RuntimeException e) {
+            name = playbackImportName(displayName, null, channel);
+        }
+        if (name == null) {
+            Log.w(TAG, "Unsupported playback document; select a FLAC or .s16 file");
+            return null;
+        }
+
         File baseDir = getExternalFilesDir(null);
         if (baseDir == null) baseDir = getFilesDir();
         if (baseDir == null) return null;
@@ -1125,28 +1181,43 @@ public class MainActivity extends NativeActivity {
             return null;
         }
 
-        String name = (channel == 1 ? "playback_b_" : "playback_a_")
-                + System.currentTimeMillis() + ".flac";
-        File outFile = new File(playbackDir, name);
-        try (InputStream in = getContentResolver().openInputStream(uri);
-             OutputStream out = new FileOutputStream(outFile)) {
-            if (in == null) return null;
-            byte[] buf = new byte[64 * 1024];
-            int n;
-            while ((n = in.read(buf)) > 0) {
-                out.write(buf, 0, n);
+        // Keep the exact filename for RAW sample-rate and scaling detection.
+        // A unique parent avoids collisions without lengthening the filename.
+        File importDir = new File(playbackDir, UUID.randomUUID().toString());
+        if (!importDir.mkdir()) {
+            Log.e(TAG, "Failed to create playback import directory: " + importDir.getAbsolutePath());
+            return null;
+        }
+        File outFile = new File(importDir, name);
+        try (InputStream in = getContentResolver().openInputStream(uri)) {
+            if (in == null) throw new IOException("Document provider returned no input stream");
+            try (OutputStream out = new FileOutputStream(outFile)) {
+                byte[] buf = new byte[64 * 1024];
+                int n;
+                while (!Thread.currentThread().isInterrupted() && (n = in.read(buf)) != -1) {
+                    out.write(buf, 0, n);
+                }
+                if (Thread.currentThread().isInterrupted()) {
+                    throw new IOException("Playback import canceled");
+                }
             }
-            out.flush();
-            Log.i(TAG, "Imported playback file to " + outFile.getAbsolutePath());
-            return outFile.getAbsolutePath();
         } catch (Exception e) {
+            deletePlaybackImport(outFile);
             Log.e(TAG, "Playback import failed: " + e.getMessage());
             return null;
         }
+        Log.i(TAG, "Imported playback file to " + outFile.getAbsolutePath());
+        return outFile;
     }
 
     @Override
     protected void onDestroy() {
+        if (mPlaybackImport != null) {
+            PlaybackImport pending = mPlaybackImport;
+            mPlaybackImport = null;
+            pending.interrupt();
+        }
+        if (mActivePickerKind != 0) completePicker(mActivePickerKind, false, null);
         finishRtlUsbPermission(false);
         clearNativeUsbFd();
         if (mReceiverRegistered) {

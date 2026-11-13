@@ -18,6 +18,29 @@ diff --git a/include/rtl-sdr.h b/include/rtl-sdr.h
  
  RTLSDR_API int rtlsdr_close(rtlsdr_dev_t *dev);
  
+@@ -215,6 +225,22 @@
+  */
+ RTLSDR_API int rtlsdr_set_tuner_gain(rtlsdr_dev_t *dev, int gain);
+ 
++#define RTLSDR_HAS_BLOG_V4_VGA_INDEX 1
++
++/* Returns 1 for an opened RTL-SDR Blog V4 R828D and 0 otherwise. */
++RTLSDR_API int rtlsdr_is_blog_v4(rtlsdr_dev_t *dev);
++
++/*!
++ * Set the manual R828D VGA index on an RTL-SDR Blog V4. Enable manual
++ * tuner gain before calling. The index is retained for this device
++ * handle and applies whenever the tuner is in manual gain mode.
++ *
++ * \param dev the device handle given by rtlsdr_open()
++ * \param index hardware VGA index from 0 to 8 (default 8)
++ * \return 0 on success, a negative error otherwise
++ */
++RTLSDR_API int rtlsdr_set_blog_v4_vga_index(rtlsdr_dev_t *dev, int index);
++
+ /*!
+  * Set the bandwidth for the device.
+  *
 diff --git a/src/librtlsdr.c b/src/librtlsdr.c
 --- a/src/librtlsdr.c
 +++ b/src/librtlsdr.c
@@ -36,19 +59,45 @@ diff --git a/src/librtlsdr.c b/src/librtlsdr.c
  uint32_t rtlsdr_get_device_count(void)
  {
  	int i,r;
-@@ -1442,7 +1450,7 @@
+@@ -1442,7 +1450,30 @@
  }
  
  
 -int rtlsdr_open(rtlsdr_dev_t **out_dev, uint32_t index)
++int rtlsdr_is_blog_v4(rtlsdr_dev_t *dev)
++{
++	return dev && dev->tuner_type == RTLSDR_TUNER_R828D &&
++	       rtlsdr_check_dongle_model(dev, "RTLSDRBlog", "Blog V4");
++}
++
++int rtlsdr_set_blog_v4_vga_index(rtlsdr_dev_t *dev, int index)
++{
++	int r;
++
++	if (!dev || index < 0 || index > R82XX_DEFAULT_MANUAL_VGA_INDEX)
++		return LIBUSB_ERROR_INVALID_PARAM;
++	if (!rtlsdr_is_blog_v4(dev))
++		return LIBUSB_ERROR_NOT_SUPPORTED;
++	if (dev->direct_sampling || !dev->r82xx_p.manual_gain)
++		return LIBUSB_ERROR_INVALID_PARAM;
++
++	rtlsdr_set_i2c_repeater(dev, 1);
++	r = r82xx_set_manual_vga_index(&dev->r82xx_p, (uint8_t)index);
++	rtlsdr_set_i2c_repeater(dev, 0);
++	return r;
++}
++
 +static int rtlsdr_open_internal(rtlsdr_dev_t **out_dev, uint32_t index, int fd)
  {
  	int r;
  	int i;
-@@ -1461,6 +1469,15 @@
+@@ -1460,7 +1491,17 @@
+ 
  	memset(dev, 0, sizeof(rtlsdr_dev_t));
  	memcpy(dev->fir, fir_default, sizeof(fir_default));
- 
+-
++	dev->r82xx_p.manual_vga_index = R82XX_DEFAULT_MANUAL_VGA_INDEX;
++
 +#ifdef __ANDROID__
 +	if (fd >= 0) {
 +		const struct libusb_init_option option = {
@@ -61,7 +110,7 @@ diff --git a/src/librtlsdr.c b/src/librtlsdr.c
  	r = libusb_init(&dev->ctx);
  	if(r < 0){
  		free(dev);
-@@ -1468,6 +1485,26 @@
+@@ -1468,6 +1509,26 @@
  	}
  
  	dev->dev_lost = 1;
@@ -88,7 +137,7 @@ diff --git a/src/librtlsdr.c b/src/librtlsdr.c
  
  	cnt = libusb_get_device_list(dev->ctx, &list);
  
-@@ -1523,6 +1560,9 @@
+@@ -1523,6 +1584,9 @@
  #endif
  	}
  
@@ -98,7 +147,7 @@ diff --git a/src/librtlsdr.c b/src/librtlsdr.c
  	r = libusb_claim_interface(dev->devh, 0);
  	if (r < 0) {
  		fprintf(stderr, "usb_claim_interface error %d\n", r);
-@@ -1656,6 +1696,20 @@
+@@ -1656,6 +1720,20 @@
  	return r;
  }
  
@@ -119,7 +168,7 @@ diff --git a/src/librtlsdr.c b/src/librtlsdr.c
  int rtlsdr_close(rtlsdr_dev_t *dev)
  {
  	if (!dev)
-@@ -1705,13 +1759,30 @@
+@@ -1705,13 +1783,30 @@
  	return 0;
  }
  
@@ -155,3 +204,107 @@ diff --git a/src/librtlsdr.c b/src/librtlsdr.c
  
  static void LIBUSB_CALL _libusb_callback(struct libusb_transfer *xfer)
  {
+diff --git a/include/tuner_r82xx.h b/include/tuner_r82xx.h
+--- a/include/tuner_r82xx.h
++++ b/include/tuner_r82xx.h
+@@ -72,6 +72,8 @@
+ 	int use_predetect;
+ };
+ 
++#define R82XX_DEFAULT_MANUAL_VGA_INDEX 8
++
+ struct r82xx_priv {
+ 	struct r82xx_config		*cfg;
+ 
+@@ -84,6 +86,8 @@
+ 	uint8_t				input;
+ 	int				has_lock;
+ 	int				init_done;
++	int				manual_gain;
++	uint8_t				manual_vga_index;
+ 
+ 	/* Store current mode */
+ 	uint32_t			delsys;
+@@ -115,6 +119,7 @@
+ int r82xx_init(struct r82xx_priv *priv);
+ int r82xx_set_freq(struct r82xx_priv *priv, uint32_t freq);
+ int r82xx_set_gain(struct r82xx_priv *priv, int set_manual_gain, int gain);
++int r82xx_set_manual_vga_index(struct r82xx_priv *priv, uint8_t index);
+ int r82xx_set_bandwidth(struct r82xx_priv *priv, int bandwidth,  uint32_t rate);
+ 
+ #endif
+diff --git a/src/tuner_r82xx.c b/src/tuner_r82xx.c
+--- a/src/tuner_r82xx.c
++++ b/src/tuner_r82xx.c
+@@ -976,10 +976,32 @@
+ 	0, 5, 10, 10, 19, 9, 10, 25, 17, 10, 8, 16, 13, 6, 3, -8
+ };
+ 
++static int r82xx_write_manual_vga(struct r82xx_priv *priv, uint8_t index)
++{
++	uint8_t *shadow = &priv->regs[0x0c - REG_SHADOW_START];
++	uint8_t previous = *shadow;
++	int rc = r82xx_write_reg_mask(priv, 0x0c, index, 0x9f);
++
++	/* A failed I2C write must remain retryable despite shadow caching. */
++	if (rc < 0)
++		*shadow = previous;
++	return rc;
++}
++
++int r82xx_set_manual_vga_index(struct r82xx_priv *priv, uint8_t index)
++{
++	int rc = r82xx_write_manual_vga(priv, index);
++
++	if (rc == 0)
++		priv->manual_vga_index = index;
++	return rc;
++}
++
+ int r82xx_set_gain(struct r82xx_priv *priv, int set_manual_gain, int gain)
+ {
+ 	int rc;
+ 
++	priv->manual_gain = 0;
+ 	if (set_manual_gain) {
+ 		int i, total_gain = 0;
+ 		uint8_t mix_index = 0, lna_index = 0;
+@@ -999,8 +1021,7 @@
+ 		if (rc < 0)
+ 			return rc;
+ 
+-		/* set fixed VGA gain for now (16.3 dB) */
+-		rc = r82xx_write_reg_mask(priv, 0x0c, 0x08, 0x9f);
++		rc = r82xx_write_manual_vga(priv, priv->manual_vga_index);
+ 		if (rc < 0)
+ 			return rc;
+ 
+@@ -1025,6 +1046,8 @@
+ 		rc = r82xx_write_reg_mask(priv, 0x07, mix_index, 0x0f);
+ 		if (rc < 0)
+ 			return rc;
++
++		priv->manual_gain = 1;
+ 	} else {
+ 		/* LNA */
+ 		rc = r82xx_write_reg_mask(priv, 0x05, 0, 0x10);
+@@ -1147,7 +1170,9 @@
+ 		goto err;
+ 
+ 	rc = r82xx_set_pll(priv, lo_freq);
+-	if (rc < 0 || !priv->has_lock)
++	if (rc == 0 && !priv->has_lock)
++		rc = -1;
++	if (rc < 0)
+ 		goto err;
+ 
+ 	if (is_rtlsdr_blog_v4) {
+@@ -1335,6 +1360,8 @@
+ {
+ 	int rc;
+ 
++	priv->manual_gain = 0;
++
+ 	/* TODO: R828D might need r82xx_xtal_check() */
+ 	priv->xtal_cap_sel = XTAL_HIGH_CAP_0P;
+ 

@@ -18,6 +18,9 @@ gui_rf_resampler_t *gui_rf_resampler_create_rate(uint32_t input_rate_hz,
  * Hi-Fi converter response unchanged. Non-native rates require libsoxr. */
 gui_rf_resampler_t *gui_rf_resampler_create_ed_beta(uint32_t input_rate_hz);
 size_t gui_rf_resampler_output_capacity_ed_beta(uint32_t input_rate_hz, size_t input_count);
+/* VHS Hi-Fi real RF at custom rates from 8 to 10 MSPS. Output is 20 MSPS. */
+gui_rf_resampler_t *gui_rf_resampler_create_hifi(uint32_t input_rate_hz);
+size_t gui_rf_resampler_output_capacity_hifi(uint32_t input_rate_hz, size_t input_count);
 void gui_rf_resampler_destroy(gui_rf_resampler_t *resampler);
 void gui_rf_resampler_reset(gui_rf_resampler_t *resampler);
 size_t gui_rf_resampler_output_capacity(uint32_t input_rate_hz, size_t input_count);

@@ -1010,11 +1010,7 @@ static void cxadc_reset_stats(gui_app_t *app, uint32_t rf_sample_rate_hz)
     atomic_store(&app->last_callback_time_ms, get_time_ms());
     atomic_store(&app->dropout_stop_requested, false);
     atomic_store(&app->dropout_stop_reason, GUI_DROPOUT_NONE);
-    atomic_store(&app->recording_bytes, 0);
-    atomic_store(&app->recording_raw_a, 0);
-    atomic_store(&app->recording_raw_b, 0);
-    atomic_store(&app->recording_compressed_a, 0);
-    atomic_store(&app->recording_compressed_b, 0);
+    gui_record_reset_stats(app);
     for (int i = 0; i < 4; i++) {
         atomic_store(&app->audio_peak[i], 0);
     }

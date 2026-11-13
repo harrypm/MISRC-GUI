@@ -6,13 +6,22 @@
 
 typedef struct gui_vhs_hifi_decoder gui_vhs_hifi_decoder_t;
 
+/* Low-rate real RF file playback, including earlier RTL-SDR exports. */
+#define GUI_VHS_HIFI_LOW_RF_MIN_RATE_HZ 8000000u
+#define GUI_VHS_HIFI_LOW_RF_MAX_RATE_HZ 10000000u
+
 static inline bool gui_vhs_hifi_is_native_low_rate(uint32_t rate) {
-    return rate == 8000000u || rate == 8192000u || rate == 10000000u;
+    return rate == GUI_VHS_HIFI_LOW_RF_MIN_RATE_HZ || rate == 8192000u ||
+           rate == GUI_VHS_HIFI_LOW_RF_MAX_RATE_HZ;
 }
 
 /* The TV system and input rate are fixed for the lifetime of the decoder.
  * Supports 20 MSPS and the native low rates above. */
 gui_vhs_hifi_decoder_t *gui_vhs_hifi_create(gui_rf_format_t format, uint32_t rf_rate_hz);
+/* Check both carrier bands against the input edge guard and any narrower
+ * processing passband, measured as a frequency offset from the I/Q center. */
+bool gui_vhs_hifi_iq_band_fits_passband(gui_rf_format_t format, uint32_t iq_rate_hz,
+                                       uint64_t center_hz, double passband_hz);
 bool gui_vhs_hifi_iq_supported(gui_rf_format_t format, uint32_t iq_rate_hz,
                               uint64_t center_hz);
 gui_vhs_hifi_decoder_t *gui_vhs_hifi_create_iq(gui_rf_format_t format, uint32_t iq_rate_hz,

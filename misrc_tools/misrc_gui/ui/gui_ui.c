@@ -56,6 +56,7 @@
 #if defined(__ANDROID__)
 extern void android_set_keyboard_visible(int visible);
 extern size_t android_drain_text_input(char *out, size_t out_len);
+extern int android_picker_active(void);
 extern const char *android_get_storage_path(void);
 #include <pthread.h>
 #include <stdatomic.h>
@@ -590,7 +591,41 @@ static bool gui_ui_selected_device_is_sdr(const gui_app_t *app)
     if (app->selected_device < 0 || app->selected_device >= app->device_count) return false;
     return app->devices[app->selected_device].type == DEVICE_TYPE_RTLSDR;
 }
+
+#ifdef ENABLE_RTLSDR_BLOG_V4_VGA
+static bool gui_ui_rtlsdr_vga_visible(const gui_app_t *app)
+{
+    return gui_ui_selected_device_is_sdr(app) && app->settings.rtlsdr_gain_mode == 1 &&
+           app->devices[app->selected_device].rtlsdr_blog_v4;
+}
 #endif
+
+static bool gui_ui_sdr_hifi_rf_settings_visible(const gui_app_t *app)
+{
+    return gui_ui_selected_device_is_sdr(app) && app->settings.net_mode != GUI_NET_MODE_CLIENT &&
+           app->settings.net_mode != GUI_NET_MODE_MONITOR_CLIENT;
+}
+
+static bool gui_ui_sdr_hifi_rf_available(void)
+{
+#if LIBSOXR_ENABLED == 1
+    return true;
+#else
+    return false;
+#endif
+}
+#endif
+
+static bool gui_ui_sdr_hifi_rf_selected(const gui_app_t *app)
+{
+#ifdef ENABLE_RTLSDR
+    return gui_ui_sdr_hifi_rf_available() && gui_ui_sdr_hifi_rf_settings_visible(app) &&
+           app->settings.rtlsdr_hifi_rf_record;
+#else
+    (void)app;
+    return false;
+#endif
+}
 
 static void gui_ui_trace_capture_mode_state(gui_app_t *app, const char *source, bool force) {
     if (!app) return;
@@ -672,6 +707,7 @@ typedef enum {
     UI_TEXT_FIELD_FLAC_AFFINITY,
     UI_TEXT_FIELD_RF_TAG_A,
     UI_TEXT_FIELD_RF_TAG_B,
+    UI_TEXT_FIELD_RTLSDR_HIFI_RF_TAG,
     UI_TEXT_FIELD_AUDIO_TAG_4CH,
     UI_TEXT_FIELD_AUDIO_TAG_12,
     UI_TEXT_FIELD_AUDIO_TAG_34,
@@ -2037,7 +2073,9 @@ static uint64_t gui_ui_recording_output_total_bytes(const gui_app_t *app)
 {
     if (!app) return 0;
     uint64_t raw_total = atomic_load(&app->recording_raw_a) + atomic_load(&app->recording_raw_b);
-    if (!app->settings.use_flac) {
+    bool use_flac = app->settings.use_flac;
+    (void)gui_record_get_rtlsdr_hifi_output(&use_flac);
+    if (!use_flac) {
         return raw_total;
     }
     uint64_t encoded_total = atomic_load(&app->recording_compressed_a) + atomic_load(&app->recording_compressed_b);
@@ -2558,6 +2596,10 @@ static bool gui_ui_text_field_get_buffer(gui_app_t *app, ui_text_field_t field, 
             *dst = app->settings.rf_channel_tags[1];
             *cap = sizeof(app->settings.rf_channel_tags[1]);
             return true;
+        case UI_TEXT_FIELD_RTLSDR_HIFI_RF_TAG:
+            *dst = app->settings.rtlsdr_hifi_rf_tag;
+            *cap = sizeof(app->settings.rtlsdr_hifi_rf_tag);
+            return true;
         case UI_TEXT_FIELD_AUDIO_TAG_4CH:
             *dst = app->settings.audio_output_tags[0];
             *cap = sizeof(app->settings.audio_output_tags[0]);
@@ -2685,7 +2727,7 @@ static bool gui_ui_text_field_can_edit(gui_app_t *app, ui_text_field_t field)
     if (!app->settings_panel_open || gui_ui_settings_locked(app)) return false;
     switch (field) {
         case UI_TEXT_FIELD_OUTPUT_BASE_NAME:
-            return app->settings.auto_names_enabled;
+            return app->settings.auto_names_enabled || gui_ui_sdr_hifi_rf_selected(app);
         case UI_TEXT_FIELD_OUTPUT_PATH:
             /* Server Output path is authoritative in M-Client. Use browser. */
             return app->settings.net_mode!=GUI_NET_MODE_MONITOR_CLIENT;
@@ -2696,10 +2738,14 @@ static bool gui_ui_text_field_can_edit(gui_app_t *app, ui_text_field_t field)
         case UI_TEXT_FIELD_FLAC_AFFINITY:
             return app->settings.show_core_pinning_in_settings &&
                    app->settings.use_flac &&
+                   (!gui_ui_sdr_hifi_rf_selected(app) || LIBFLAC_ENABLED == 1) &&
                    app->settings.flac_affinity_enabled &&
                    gui_ui_flac_affinity_supported();
         case UI_TEXT_FIELD_RF_TAG_A:
         case UI_TEXT_FIELD_RF_TAG_B:
+            return app->settings.auto_names_enabled && !gui_ui_sdr_hifi_rf_selected(app);
+        case UI_TEXT_FIELD_RTLSDR_HIFI_RF_TAG:
+            return gui_ui_sdr_hifi_rf_selected(app);
         case UI_TEXT_FIELD_AUDIO_TAG_4CH:
         case UI_TEXT_FIELD_AUDIO_TAG_12:
         case UI_TEXT_FIELD_AUDIO_TAG_34:
@@ -2779,6 +2825,7 @@ static void gui_ui_text_field_font(ui_text_field_t field, int *font_size, int *f
             break;
         case UI_TEXT_FIELD_RF_TAG_A:
         case UI_TEXT_FIELD_RF_TAG_B:
+        case UI_TEXT_FIELD_RTLSDR_HIFI_RF_TAG:
         case UI_TEXT_FIELD_AUDIO_TAG_4CH:
         case UI_TEXT_FIELD_AUDIO_TAG_12:
         case UI_TEXT_FIELD_AUDIO_TAG_34:
@@ -3125,6 +3172,48 @@ static void gui_ui_render_active_text(ui_text_field_t field,
                     }));
                 }
             }
+        }
+    }
+}
+
+static void gui_ui_render_rf_bits_box(Clay_ElementId id, Clay_String label, Color bg, Color fg)
+{
+    CLAY(id, {
+        .layout = {
+            .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) },
+            .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
+        },
+        .backgroundColor = to_clay_color(bg),
+        .cornerRadius = CLAY_CORNER_RADIUS(4)
+    }) {
+        CLAY_TEXT(label, CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(fg) }));
+    }
+}
+
+static void gui_ui_render_rf_tag(Clay_ElementId id, ui_text_field_t field, const char *value, bool enabled)
+{
+    Color bg = (Color){25,25,30,255};
+    Color fg = COLOR_TEXT;
+    if (!enabled) {
+        bg = ui_disabled_color(bg);
+        fg = ui_disabled_color(fg);
+    }
+    const char *text = value[0] ? value : "(tag)";
+    CLAY(id, {
+        .layout = {
+            .sizing = { CLAY_SIZING_FIXED(120), CLAY_SIZING_FIXED(28) },
+            .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER },
+            .padding = { 6, 6, 0, 0 }
+        },
+        .backgroundColor = to_clay_color(bg),
+        .cornerRadius = CLAY_CORNER_RADIUS(4)
+    }) {
+        if (enabled && gui_ui_is_text_field_active(field)) {
+            gui_ui_render_active_text(field, text, FONT_SIZE_STATS, 1, fg);
+        } else {
+            CLAY_TEXT(make_string(text), CLAY_TEXT_CONFIG({
+                .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(fg)
+            }));
         }
     }
 }
@@ -3563,6 +3652,7 @@ static void render_settings_panel(gui_app_t *app) {
             snprintf(app->settings.output_path,sizeof(app->settings.output_path),"%s",server_path);
     }
     if (!app->settings_panel_open) return;
+    const bool hifi_rf_record = gui_ui_sdr_hifi_rf_selected(app);
     int settings_max_width = gui_ui_modal_max_extent(gui_ui_get_layout_width(), 1080);
     int settings_max_height = gui_ui_modal_max_extent(gui_ui_get_layout_height(), 780);
     int settings_min_width = gui_ui_clamp_int(settings_max_width, 1, 620);
@@ -3677,16 +3767,17 @@ static void render_settings_panel(gui_app_t *app) {
         CLAY(CLAY_ID("BaseNameRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
             CLAY_TEXT(CLAY_STRING("Capture Name:"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
 
+            const bool capture_name_enabled = app->settings.auto_names_enabled || hifi_rf_record;
             Color base_box_bg = (Color){25,25,30,255};
             Color base_box_fg = COLOR_TEXT;
-            if (!app->settings.auto_names_enabled) {
+            if (!capture_name_enabled) {
                 base_box_bg = ui_disabled_color(base_box_bg);
                 base_box_fg = ui_disabled_color(base_box_fg);
             }
 
             CLAY(CLAY_ID("OutputBaseNameField"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER }, .padding = { 8, 8, 0, 0 } }, .backgroundColor = to_clay_color(base_box_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
                 const char *base = app->settings.output_base_name[0] ? app->settings.output_base_name : "capture";
-                if (gui_ui_is_text_field_active(UI_TEXT_FIELD_OUTPUT_BASE_NAME) && app->settings.auto_names_enabled) {
+                if (gui_ui_is_text_field_active(UI_TEXT_FIELD_OUTPUT_BASE_NAME) && capture_name_enabled) {
                     gui_ui_render_active_text(UI_TEXT_FIELD_OUTPUT_BASE_NAME, base, FONT_SIZE_NORMAL, 0, base_box_fg);
                 } else {
                     CLAY_TEXT(make_string(base), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(base_box_fg) }));
@@ -3869,14 +3960,98 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                             CLAY_TEXT(CLAY_STRING("Gain mode"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
                         }
 
+                        static char gain_buf[24];
+                        snprintf(gain_buf, sizeof(gain_buf), "Gain: %.1f dB",
+                                 (double)app->settings.rtlsdr_gain_tenths_db / 10.0);
+                        const int gain_value_padding = 8;
+                        // Reserve room for the longest labels so the step buttons stay aligned.
+                        float gain_value_text_width = fmaxf(
+                            gui_ui_measure_text_width(app, gain_buf, FONT_SIZE_NORMAL, 0),
+                            gui_ui_measure_text_width(app, "Gain: 60.0 dB", FONT_SIZE_NORMAL, 0));
+#ifdef ENABLE_RTLSDR_BLOG_V4_VGA
+                        const bool show_vga = gui_ui_rtlsdr_vga_visible(app);
+                        static const char vga_default_label[] = "VGA: 0x08 (default)";
+                        if (show_vga) {
+                            gain_value_text_width = fmaxf(gain_value_text_width,
+                                gui_ui_measure_text_width(app, vga_default_label, FONT_SIZE_STATS, 0));
+                        }
+#endif
+                        const float sdr_gain_value_width = gain_value_text_width + 2 * gain_value_padding;
+
                         // Gain stepper row
                         CLAY(CLAY_ID("RtlsdrGainRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
                             CLAY(CLAY_ID("RtlsdrGainMinus"), { .layout = { .sizing = { CLAY_SIZING_FIXED(28), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) { CLAY_TEXT(CLAY_STRING("-"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) })); }
-                            static char gain_buf[24];
-                            snprintf(gain_buf, sizeof(gain_buf), "Gain: %.1f dB", (double)app->settings.rtlsdr_gain_tenths_db / 10.0);
-                            CLAY(CLAY_ID("RtlsdrGainValue"), { .layout = { .sizing = { CLAY_SIZING_FIXED(140), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER }, .padding = { 8, 8, 0, 0 } }, .backgroundColor = to_clay_color((Color){25,25,30,255}), .cornerRadius = CLAY_CORNER_RADIUS(4) }) { CLAY_TEXT(make_string(gain_buf), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) })); }
+                            CLAY(CLAY_ID("RtlsdrGainValue"), {
+                                .layout = {
+                                    .sizing = { CLAY_SIZING_FIXED(sdr_gain_value_width), CLAY_SIZING_FIXED(28) },
+                                    .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER },
+                                    .padding = { gain_value_padding, gain_value_padding, 0, 0 }
+                                },
+                                .backgroundColor = to_clay_color((Color){25,25,30,255}),
+                                .cornerRadius = CLAY_CORNER_RADIUS(4)
+                            }) {
+                                CLAY_TEXT(make_string(gain_buf), CLAY_TEXT_CONFIG({
+                                    .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT)
+                                }));
+                            }
                             CLAY(CLAY_ID("RtlsdrGainPlus"), { .layout = { .sizing = { CLAY_SIZING_FIXED(28), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) { CLAY_TEXT(CLAY_STRING("+"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) })); }
                         }
+
+#ifdef ENABLE_RTLSDR_BLOG_V4_VGA
+                        if (show_vga) {
+                            const int index = app->settings.rtlsdr_vga_index;
+                            const Color minus_bg = index > 0 ? COLOR_BUTTON : ui_disabled_color(COLOR_BUTTON);
+                            const Color plus_bg = index < 8 ? COLOR_BUTTON : ui_disabled_color(COLOR_BUTTON);
+                            static char vga_label[24];
+                            snprintf(vga_label, sizeof(vga_label), "VGA: 0x%02X", (unsigned)index);
+                            CLAY(CLAY_ID("RtlsdrVgaRow"), {
+                                .layout = {
+                                    .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) },
+                                    .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                                    .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
+                                    .childGap = 10
+                                }
+                            }) {
+                                CLAY(CLAY_ID("RtlsdrVgaMinus"), {
+                                    .layout = {
+                                        .sizing = { CLAY_SIZING_FIXED(28), CLAY_SIZING_FIXED(28) },
+                                        .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
+                                    },
+                                    .backgroundColor = to_clay_color(minus_bg),
+                                    .cornerRadius = CLAY_CORNER_RADIUS(4)
+                                }) {
+                                    CLAY_TEXT(CLAY_STRING("-"), CLAY_TEXT_CONFIG({
+                                        .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT)
+                                    }));
+                                }
+                                CLAY(CLAY_ID("RtlsdrVgaValue"), {
+                                    .layout = {
+                                        .sizing = { CLAY_SIZING_FIXED(sdr_gain_value_width), CLAY_SIZING_FIXED(28) },
+                                        .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER },
+                                        .padding = { gain_value_padding, gain_value_padding, 0, 0 }
+                                    },
+                                    .backgroundColor = to_clay_color((Color){25,25,30,255}),
+                                    .cornerRadius = CLAY_CORNER_RADIUS(4)
+                                }) {
+                                    CLAY_TEXT(make_string(index == 8 ? vga_default_label : vga_label), CLAY_TEXT_CONFIG({
+                                        .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT)
+                                    }));
+                                }
+                                CLAY(CLAY_ID("RtlsdrVgaPlus"), {
+                                    .layout = {
+                                        .sizing = { CLAY_SIZING_FIXED(28), CLAY_SIZING_FIXED(28) },
+                                        .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
+                                    },
+                                    .backgroundColor = to_clay_color(plus_bg),
+                                    .cornerRadius = CLAY_CORNER_RADIUS(4)
+                                }) {
+                                    CLAY_TEXT(CLAY_STRING("+"), CLAY_TEXT_CONFIG({
+                                        .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT)
+                                    }));
+                                }
+                            }
+                        }
+#endif
 
                         // AGC toggle row
                         CLAY(CLAY_ID("RtlsdrAgcRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
@@ -3900,69 +4075,104 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                     CLAY_TEXT(CLAY_STRING("Capture:"),
                         CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
 
-                    CLAY(CLAY_ID("ToggleRowCaptureA"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
-                        CLAY(CLAY_ID("ToggleCaptureA"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(app->settings.capture_a ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                            CLAY_TEXT(app->settings.capture_a ? CLAY_STRING("ON") : CLAY_STRING("OFF"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
-                        }
-                        CLAY_TEXT(CLAY_STRING("RF A"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
-
-                        // RF bit depth selector (moved up into Capture segment)
-                        CLAY(CLAY_ID("CaptureRowSpacerA"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(1) } } }) { }
-                        snprintf(settings_rf_bits_a_display, sizeof(settings_rf_bits_a_display), "%s-bit", rf_bits_label(app->settings.rf_bits_a));
-                        Color rf_bits_a_bg = COLOR_BUTTON;
-                        Color rf_bits_a_fg = COLOR_TEXT;
-                        CLAY(CLAY_ID("RfBitsABox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(rf_bits_a_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                            CLAY_TEXT(make_string(settings_rf_bits_a_display), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(rf_bits_a_fg) }));
-                        }
-                        Color rf_tag_a_bg = app->settings.auto_names_enabled ? (Color){25,25,30,255} : ui_disabled_color((Color){25,25,30,255});
-                        Color rf_tag_a_fg = app->settings.auto_names_enabled ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT);
-                        CLAY(CLAY_ID("RfTagAField"), { .layout = { .sizing = { CLAY_SIZING_FIXED(120), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER }, .padding = { 6, 6, 0, 0 } }, .backgroundColor = to_clay_color(rf_tag_a_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                            const char *rf_tag_a = app->settings.rf_channel_tags[0][0] ? app->settings.rf_channel_tags[0] : "(tag)";
-                            if (gui_ui_is_text_field_active(UI_TEXT_FIELD_RF_TAG_A) && app->settings.auto_names_enabled) {
-                                gui_ui_render_active_text(UI_TEXT_FIELD_RF_TAG_A, rf_tag_a, FONT_SIZE_STATS, 1, rf_tag_a_fg);
-                            } else {
-                                CLAY_TEXT(make_string(rf_tag_a), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(rf_tag_a_fg) }));
+#ifdef ENABLE_RTLSDR
+                    if (gui_ui_sdr_hifi_rf_settings_visible(app) &&
+                        (gui_ui_sdr_hifi_rf_available() || app->settings.rtlsdr_hifi_rf_record)) {
+                        CLAY(CLAY_ID("RtlsdrRecordModeRow"), {
+                            .layout = {
+                                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) },
+                                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
+                                .childGap = 10
                             }
+                        }) {
+                            CLAY(CLAY_ID("RtlsdrRecordMode"), {
+                                .layout = {
+                                    .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIXED(28) },
+                                    .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
+                                },
+                                .backgroundColor = to_clay_color(hifi_rf_record ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON),
+                                .cornerRadius = CLAY_CORNER_RADIUS(4)
+                            }) {
+                                CLAY_TEXT(app->settings.rtlsdr_hifi_rf_record ? CLAY_STRING("Hi-Fi RF") : CLAY_STRING("Native I/Q"),
+                                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
+                            }
+                            const char *format = "Recording mode";
+                            if (hifi_rf_record) {
+                                format = app->settings.use_flac ? "8 MSPS mono RF FLAC" : "8 MSPS mono RF .s16";
+                            } else if (!gui_ui_sdr_hifi_rf_available()) {
+                                format = "Requires SoXR";
+                            }
+                            CLAY_TEXT(make_string(format), CLAY_TEXT_CONFIG({
+                                .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT)
+                            }));
                         }
                     }
-
-                    CLAY(CLAY_ID("ToggleRowCaptureB"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
-                        Color cap_b_toggle_bg = settings_b_disabled ? ui_disabled_color(app->settings.capture_b ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON) : (app->settings.capture_b ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON);
-                        Color cap_b_toggle_fg = settings_b_disabled ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT;
-                        CLAY(CLAY_ID("ToggleCaptureB"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(cap_b_toggle_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                            CLAY_TEXT(app->settings.capture_b ? CLAY_STRING("ON") : CLAY_STRING("OFF"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(cap_b_toggle_fg) }));
-                        }
-                        Color rf_b_label_fg = settings_b_disabled ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT;
-                        CLAY_TEXT(CLAY_STRING("RF B"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(rf_b_label_fg) }));
-
-                        CLAY(CLAY_ID("CaptureRowSpacerB"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(1) } } }) { }
-                        snprintf(settings_rf_bits_b_display, sizeof(settings_rf_bits_b_display), "%s-bit", rf_bits_label(app->settings.rf_bits_b));
-                        Color rf_bits_b_bg = settings_b_disabled ? ui_disabled_color(COLOR_BUTTON) : COLOR_BUTTON;
-                        Color rf_bits_b_fg = settings_b_disabled ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT;
-                        CLAY(CLAY_ID("RfBitsBBox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(rf_bits_b_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                            CLAY_TEXT(make_string(settings_rf_bits_b_display), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(rf_bits_b_fg) }));
-                        }
-                        Color rf_tag_b_bg = (app->settings.auto_names_enabled && !settings_b_controls_disabled) ? (Color){25,25,30,255} : ui_disabled_color((Color){25,25,30,255});
-                        Color rf_tag_b_fg = (app->settings.auto_names_enabled && !settings_b_controls_disabled) ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT);
-                        CLAY(CLAY_ID("RfTagBField"), { .layout = { .sizing = { CLAY_SIZING_FIXED(120), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER }, .padding = { 6, 6, 0, 0 } }, .backgroundColor = to_clay_color(rf_tag_b_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                            const char *rf_tag_b = app->settings.rf_channel_tags[1][0] ? app->settings.rf_channel_tags[1] : "(tag)";
-                            if (gui_ui_is_text_field_active(UI_TEXT_FIELD_RF_TAG_B) && app->settings.auto_names_enabled && !settings_b_controls_disabled) {
-                                gui_ui_render_active_text(UI_TEXT_FIELD_RF_TAG_B, rf_tag_b, FONT_SIZE_STATS, 1, rf_tag_b_fg);
-                            } else {
-                                CLAY_TEXT(make_string(rf_tag_b), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(rf_tag_b_fg) }));
+#endif
+                    if (hifi_rf_record) {
+                        CLAY(CLAY_ID("RtlsdrHifiRfOutputRow"), {
+                            .layout = {
+                                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) },
+                                .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
+                                .childGap = 10
                             }
+                        }) {
+                            gui_ui_render_rf_bits_box(CLAY_ID("RtlsdrHifiRfBitsBox"), CLAY_STRING("16-bit"),
+                                                      ui_disabled_color(COLOR_BUTTON), COLOR_TEXT);
+                            gui_ui_render_rf_tag(CLAY_ID("RtlsdrHifiRfTagField"), UI_TEXT_FIELD_RTLSDR_HIFI_RF_TAG,
+                                                 app->settings.rtlsdr_hifi_rf_tag, true);
                         }
+                    } else {
+                        CLAY(CLAY_ID("ToggleRowCaptureA"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
+                            CLAY(CLAY_ID("ToggleCaptureA"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(app->settings.capture_a ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                                CLAY_TEXT(app->settings.capture_a ? CLAY_STRING("ON") : CLAY_STRING("OFF"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
+                            }
+                            CLAY_TEXT(CLAY_STRING("RF A"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
+
+                            // RF bit depth selector (moved up into Capture segment)
+                            CLAY(CLAY_ID("CaptureRowSpacerA"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(1) } } }) { }
+                            snprintf(settings_rf_bits_a_display, sizeof(settings_rf_bits_a_display), "%s-bit", rf_bits_label(app->settings.rf_bits_a));
+                            gui_ui_render_rf_bits_box(CLAY_ID("RfBitsABox"), make_string(settings_rf_bits_a_display),
+                                                      COLOR_BUTTON, COLOR_TEXT);
+                            gui_ui_render_rf_tag(CLAY_ID("RfTagAField"), UI_TEXT_FIELD_RF_TAG_A,
+                                                 app->settings.rf_channel_tags[0],
+                                                 app->settings.auto_names_enabled);
+                        }
+
+                        CLAY(CLAY_ID("ToggleRowCaptureB"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
+                            Color cap_b_toggle_bg = settings_b_disabled ? ui_disabled_color(app->settings.capture_b ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON) : (app->settings.capture_b ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON);
+                            Color cap_b_toggle_fg = settings_b_disabled ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT;
+                            CLAY(CLAY_ID("ToggleCaptureB"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(cap_b_toggle_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                                CLAY_TEXT(app->settings.capture_b ? CLAY_STRING("ON") : CLAY_STRING("OFF"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(cap_b_toggle_fg) }));
+                            }
+                            Color rf_b_label_fg = settings_b_disabled ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT;
+                            CLAY_TEXT(CLAY_STRING("RF B"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(rf_b_label_fg) }));
+
+                            CLAY(CLAY_ID("CaptureRowSpacerB"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(1) } } }) { }
+                            snprintf(settings_rf_bits_b_display, sizeof(settings_rf_bits_b_display), "%s-bit", rf_bits_label(app->settings.rf_bits_b));
+                            Color rf_bits_b_bg = settings_b_disabled ? ui_disabled_color(COLOR_BUTTON) : COLOR_BUTTON;
+                            Color rf_bits_b_fg = settings_b_disabled ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT;
+                            gui_ui_render_rf_bits_box(CLAY_ID("RfBitsBBox"), make_string(settings_rf_bits_b_display),
+                                                      rf_bits_b_bg, rf_bits_b_fg);
+                            gui_ui_render_rf_tag(CLAY_ID("RfTagBField"), UI_TEXT_FIELD_RF_TAG_B,
+                                                 app->settings.rf_channel_tags[1],
+                                                 app->settings.auto_names_enabled && !settings_b_controls_disabled);
+                        }
+
+
                     }
 
-
+                    const bool flac_unavailable = hifi_rf_record && LIBFLAC_ENABLED != 1;
+                    const bool flac_toggle_disabled = flac_unavailable && !app->settings.use_flac;
+                    Color flac_toggle_bg = app->settings.use_flac ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
+                    if (flac_toggle_disabled) flac_toggle_bg = ui_disabled_color(flac_toggle_bg);
                     CLAY(CLAY_ID("ToggleRowFlac"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
-                        CLAY(CLAY_ID("ToggleUseFlac"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(app->settings.use_flac ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                        CLAY(CLAY_ID("ToggleUseFlac"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(flac_toggle_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
                             CLAY_TEXT(app->settings.use_flac ? CLAY_STRING("ON") : CLAY_STRING("OFF"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
                         }
-                        CLAY_TEXT(CLAY_STRING("RF FLAC compression"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
+                        CLAY_TEXT(flac_unavailable ? CLAY_STRING("RF FLAC unavailable") : CLAY_STRING("RF FLAC compression"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
                     }
 
-                    // FLAC verify toggle (moved directly under enable)
                     CLAY(CLAY_ID("ToggleRowFlacVerify"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
                         CLAY(CLAY_ID("ToggleFlacVerify"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(app->settings.flac_verification ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
                             CLAY_TEXT(app->settings.flac_verification ? CLAY_STRING("ON") : CLAY_STRING("OFF"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
@@ -4002,11 +4212,12 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
 #else
                         bool flac_affinity_supported = false;
 #endif
-                        bool flac_affinity_editable = app->settings.use_flac && app->settings.flac_affinity_enabled && flac_affinity_supported;
-                        Color affinity_toggle_bg = (app->settings.use_flac && flac_affinity_supported)
+                        bool flac_affinity_available = app->settings.use_flac && flac_affinity_supported;
+                        bool flac_affinity_editable = flac_affinity_available && app->settings.flac_affinity_enabled;
+                        Color affinity_toggle_bg = flac_affinity_available
                             ? (app->settings.flac_affinity_enabled ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON)
                             : ui_disabled_color(COLOR_BUTTON);
-                        Color affinity_toggle_fg = (app->settings.use_flac && flac_affinity_supported)
+                        Color affinity_toggle_fg = flac_affinity_available
                             ? COLOR_TEXT
                             : ui_disabled_color(COLOR_TEXT);
                         Color affinity_list_bg = flac_affinity_editable
@@ -4068,7 +4279,7 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                             CLAY_TEXT(rate_plan.software_resample ? CLAY_STRING("from 20 MSPS HW") : CLAY_STRING("hardware"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(ddd_path_fg) }));
                         }
 #endif
-                    } else {
+                    } else if (!hifi_rf_record) {
                         CLAY_TEXT(CLAY_STRING("Resample (RF):"),
                             CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
 
@@ -4139,27 +4350,29 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                         }
                     } else
 #endif
-                    CLAY(CLAY_ID("ToggleRowResampleB"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
-                        Color resample_b_toggle_bg = settings_b_controls_disabled
-                            ? ui_disabled_color(COLOR_BUTTON)
-                            : (app->settings.enable_resample_b ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON);
-                        Color resample_b_toggle_fg = settings_b_controls_disabled ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT;
-                        CLAY(CLAY_ID("ToggleResampleB"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(resample_b_toggle_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                            CLAY_TEXT(app->settings.enable_resample_b ? CLAY_STRING("ON") : CLAY_STRING("OFF"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(resample_b_toggle_fg) }));
-                        }
-                        CLAY_TEXT(settings_ddd_v1_mode ? CLAY_STRING("RF ChB") : CLAY_STRING("Resample B"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(resample_b_toggle_fg) }));
+                    if (!hifi_rf_record) {
+                        CLAY(CLAY_ID("ToggleRowResampleB"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
+                            Color resample_b_toggle_bg = settings_b_controls_disabled
+                                ? ui_disabled_color(COLOR_BUTTON)
+                                : (app->settings.enable_resample_b ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON);
+                            Color resample_b_toggle_fg = settings_b_controls_disabled ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT;
+                            CLAY(CLAY_ID("ToggleResampleB"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(resample_b_toggle_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                                CLAY_TEXT(app->settings.enable_resample_b ? CLAY_STRING("ON") : CLAY_STRING("OFF"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(resample_b_toggle_fg) }));
+                            }
+                            CLAY_TEXT(settings_ddd_v1_mode ? CLAY_STRING("RF ChB") : CLAY_STRING("Resample B"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(resample_b_toggle_fg) }));
 
-                        bool cxadc_hw_b = (settings_cxadc_mode && !settings_b_controls_disabled) && !app->settings.enable_resample_b;
-                        if (cxadc_hw_b) {
-                            format_cxadc_hw_label(settings_resample_b_display,
-                                sizeof(settings_resample_b_display), app->settings.resample_rate_b);
-                        } else {
-                            format_msps_label(settings_resample_b_display, sizeof(settings_resample_b_display), app->settings.resample_rate_b);
-                        }
-                        Color rate_bg = (settings_b_controls_disabled || !(settings_cxadc_mode || app->settings.enable_resample_b)) ? ui_disabled_color(COLOR_BUTTON) : COLOR_BUTTON;
-                        Color rate_fg = (settings_b_controls_disabled || !(settings_cxadc_mode || app->settings.enable_resample_b)) ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT;
-                        CLAY(CLAY_ID("ResampleRateBBox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(rate_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                            CLAY_TEXT(make_string(settings_resample_b_display), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(rate_fg) }));
+                            bool cxadc_hw_b = (settings_cxadc_mode && !settings_b_controls_disabled) && !app->settings.enable_resample_b;
+                            if (cxadc_hw_b) {
+                                format_cxadc_hw_label(settings_resample_b_display,
+                                    sizeof(settings_resample_b_display), app->settings.resample_rate_b);
+                            } else {
+                                format_msps_label(settings_resample_b_display, sizeof(settings_resample_b_display), app->settings.resample_rate_b);
+                            }
+                            Color rate_bg = (settings_b_controls_disabled || !(settings_cxadc_mode || app->settings.enable_resample_b)) ? ui_disabled_color(COLOR_BUTTON) : COLOR_BUTTON;
+                            Color rate_fg = (settings_b_controls_disabled || !(settings_cxadc_mode || app->settings.enable_resample_b)) ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT;
+                            CLAY(CLAY_ID("ResampleRateBBox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(rate_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                                CLAY_TEXT(make_string(settings_resample_b_display), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(rate_fg) }));
+                            }
                         }
                     }
 
@@ -6944,9 +7157,12 @@ static void render_channel_stats(gui_app_t *app, int channel,
             bool remote_recording=m_record && gui_monitor_client_peer_state()==2;
             bool remote_active=m_record && gui_monitor_client_peer_state()>0;
             bool remote_ch_enabled=!m_record || (channel==0?m_record->capture_a:m_record->capture_b);
+            bool use_flac = app->settings.use_flac;
+            bool local_hifi = !m_record && gui_record_get_rtlsdr_hifi_output(&use_flac);
             bool show_record_stats = remote_active
                 ? (remote_ch_enabled && (remote_recording || raw_bytes>0 || comp_bytes>0 || m_record->elapsed_ms>0))
-                : (app->is_capturing && (app->is_recording || raw_bytes > 0 || comp_bytes > 0 || app->last_recording_duration_s > 0.0));
+                : ((!local_hifi || channel == 0) && app->is_capturing &&
+                   (app->is_recording || raw_bytes > 0 || comp_bytes > 0 || app->last_recording_duration_s > 0.0));
             if (show_record_stats) {
                 double shown_duration = m_record ? (double)m_record->elapsed_ms/1000.0
                     : (app->is_recording ? (GetTime() - app->recording_start_time) : app->last_recording_duration_s);
@@ -6965,7 +7181,7 @@ static void render_channel_stats(gui_app_t *app, int channel,
                     double raw_mb = (double)raw_bytes / 1000000.0;
                     snprintf(buf_rec_raw, 32, "RAW: %.2f MB", raw_mb);
                 }
-                if (comp_bytes > 0 || (m_record ? m_record->use_flac : app->settings.use_flac)) {
+                if (comp_bytes > 0 || (m_record ? m_record->use_flac : use_flac)) {
                     double ratio = (comp_bytes > 0) ? ((double)raw_bytes / (double)comp_bytes) : 0.0;
                     if (comp_bytes >= 1000000000ULL) {
                         double comp_gb = (double)comp_bytes / 1000000000.0;
@@ -7640,7 +7856,9 @@ static void render_channels_panel(gui_app_t *app, gui_ui_channel_spacing_t spaci
             s_live_file_size_last_update_s = 0.0;
         }
         if (app->is_recording) {
-            if (app->settings.use_flac) {
+            bool use_flac = app->settings.use_flac;
+            (void)gui_record_get_rtlsdr_hifi_output(&use_flac);
+            if (use_flac) {
                 // FLAC mode: "FLAC:" readout = on-disk compressed file;
                 // "RAW:" readout stays the uncompressed input atomic (for ratio).
                 if (s_live_file_size[0] > 0) stats[0].compressed_bytes = s_live_file_size[0];
@@ -9323,15 +9541,14 @@ static void gui_ui_poll_android_results(gui_app_t *app)
         /* else: retry on a later frame once capture/start/stop settles */
     }
 
-    /* Picker results -> apply to settings. */
+    /* Leave a completed picker result queued until file settings can change. */
     int pkind = 0, pok = 0;
     char ppath[FILE_PATH_MAX];
-    if (android_poll_picker_result(&pkind, &pok, ppath, sizeof(ppath))) {
+    if (!gui_playback_is_starting(app) &&
+        android_poll_picker_result(&pkind, &pok, ppath, sizeof(ppath))) {
         fprintf(stderr, "[GUI] Android picker result: kind=%d ok=%d path='%s'\n",
                 pkind, pok, ppath);
-        if (gui_playback_is_starting(app)) {
-            gui_app_set_status(app, "File settings are locked while playback prepares");
-        } else if (pkind == 1) { /* ANDROID_PICKER_KIND_OUTPUT_DIR */
+        if (pkind == 1) { /* ANDROID_PICKER_KIND_OUTPUT_DIR */
             if (pok && ppath[0]) {
                 snprintf(app->settings.output_path, sizeof(app->settings.output_path), "%s", ppath);
                 gui_settings_save(&app->settings);
@@ -10478,6 +10695,13 @@ void gui_handle_interactions(gui_app_t *app) {
                 gui_app_set_status(app, "Capture is changing. Please wait");
 #endif
             } else if (gui_ui_selected_device_is_playback(app) && !gui_net_is_client(app)) {
+#if defined(__ANDROID__)
+                if (android_picker_active()) {
+                    gui_app_set_status(app, "Wait for file selection to finish before starting playback");
+                    gui_ui_set_click_consumed();
+                    return;
+                }
+#endif
                 // File preparation is asynchronous; the per-frame poll commits it.
                 (void)gui_app_start_capture(app);
                 gui_dropdown_close_all();
@@ -10827,6 +11051,13 @@ void gui_handle_interactions(gui_app_t *app) {
 
         // Settings panel interactions
         if (app->settings_panel_open) {
+            if ((s_active_text_field == UI_TEXT_FIELD_RTLSDR_HIFI_RF_TAG ||
+                 s_active_text_field == UI_TEXT_FIELD_RF_TAG_A ||
+                 s_active_text_field == UI_TEXT_FIELD_RF_TAG_B) &&
+                !Clay_PointerOver(s_active_text_element_id)) {
+                gui_ui_clear_text_edit();
+            }
+            const bool hifi_rf_record = gui_ui_sdr_hifi_rf_selected(app);
             bool settings_cxadc_has_channel_b = false;
             bool settings_cxadc_mode = gui_ui_selected_device_is_cxadc(app, &settings_cxadc_has_channel_b);
 #ifdef ENABLE_DDD
@@ -10864,14 +11095,26 @@ void gui_handle_interactions(gui_app_t *app) {
                 return;
             }
 
-            if (Clay_PointerOver(CLAY_ID("ToggleCaptureA"))) {
+#ifdef ENABLE_RTLSDR
+            if (gui_ui_sdr_hifi_rf_settings_visible(app) && Clay_PointerOver(CLAY_ID("RtlsdrRecordMode"))) {
+                if (gui_ui_sdr_hifi_rf_available() || app->settings.rtlsdr_hifi_rf_record) {
+                    app->settings.rtlsdr_hifi_rf_record = !app->settings.rtlsdr_hifi_rf_record;
+                    gui_ui_clear_text_edit();
+                    gui_dropdown_close_all();
+                    gui_settings_save(&app->settings);
+                }
+                gui_ui_set_click_consumed();
+                return;
+            }
+#endif
+            if (!hifi_rf_record && Clay_PointerOver(CLAY_ID("ToggleCaptureA"))) {
                 app->settings.capture_a = !app->settings.capture_a;
                 gui_settings_save(&app->settings);
                 if (!gui_ui_text_field_can_edit(app, s_active_text_field)) {
                     gui_ui_clear_text_edit();
                 }
             }
-            if (Clay_PointerOver(CLAY_ID("ToggleCaptureB"))) {
+            if (!hifi_rf_record && Clay_PointerOver(CLAY_ID("ToggleCaptureB"))) {
                 if (settings_b_disabled) {
                     if (settings_ddd_mode) {
                         gui_app_set_status(app, "DdD is single-channel; channel B has no signal source");
@@ -10890,8 +11133,16 @@ void gui_handle_interactions(gui_app_t *app) {
                 }
             }
             if (Clay_PointerOver(CLAY_ID("ToggleUseFlac"))) {
-                app->settings.use_flac = !app->settings.use_flac;
-                gui_settings_save(&app->settings);
+                if (hifi_rf_record && LIBFLAC_ENABLED != 1 && !app->settings.use_flac) {
+                    gui_app_set_status(app, "This build records Hi-Fi RF as uncompressed .s16");
+                } else {
+                    app->settings.use_flac = !app->settings.use_flac;
+                    gui_settings_save(&app->settings);
+                }
+                if (hifi_rf_record) {
+                    gui_ui_set_click_consumed();
+                    return;
+                }
             }
             if (Clay_PointerOver(CLAY_ID("ToggleOverwrite"))) {
                 app->settings.overwrite_files = !app->settings.overwrite_files;
@@ -10957,8 +11208,7 @@ void gui_handle_interactions(gui_app_t *app) {
                     gui_app_set_status(app, "FLAC affinity is Linux-only");
                 }
             }
-            if (app->settings_panel_open &&
-                Clay_PointerOver(CLAY_ID("FlacAffinityListField")) &&
+            if (Clay_PointerOver(CLAY_ID("FlacAffinityListField")) &&
                 app->settings.show_core_pinning_in_settings &&
                 !gui_ui_click_consumed()) {
                 gui_ui_begin_text_edit(app, UI_TEXT_FIELD_FLAC_AFFINITY, CLAY_ID("FlacAffinityListField"), 8.0f, 8.0f);
@@ -10992,7 +11242,7 @@ void gui_handle_interactions(gui_app_t *app) {
                 return;
             }
 #endif
-            if (!settings_ddd_v1_mode &&
+            if (!hifi_rf_record && !settings_ddd_v1_mode &&
                 Clay_PointerOver(CLAY_ID("ToggleResampleA"))) {
                 bool enable = !app->settings.enable_resample_a;
                 app->settings.enable_resample_a = enable;
@@ -11001,7 +11251,7 @@ void gui_handle_interactions(gui_app_t *app) {
                 }
                 gui_settings_save(&app->settings);
             }
-            if (Clay_PointerOver(CLAY_ID("ResampleRateABox"))) {
+            if (!hifi_rf_record && Clay_PointerOver(CLAY_ID("ResampleRateABox"))) {
 #ifdef ENABLE_DDD
                 if (settings_ddd_v1_mode) {
                     ddd_v1_rate_plan_t current_plan;
@@ -11035,7 +11285,7 @@ void gui_handle_interactions(gui_app_t *app) {
                     }
                 }
             }
-            if (Clay_PointerOver(CLAY_ID("ToggleResampleB"))) {
+            if (!hifi_rf_record && Clay_PointerOver(CLAY_ID("ToggleResampleB"))) {
                 if (settings_b_controls_disabled) {
                     if (settings_ddd_mode) {
                         gui_app_set_status(app, "DdD is single-channel; channel B resample not applicable");
@@ -11055,7 +11305,7 @@ void gui_handle_interactions(gui_app_t *app) {
                     gui_settings_save(&app->settings);
                 }
             }
-            if (Clay_PointerOver(CLAY_ID("ResampleRateBBox"))) {
+            if (!hifi_rf_record && Clay_PointerOver(CLAY_ID("ResampleRateBBox"))) {
                 if (settings_b_controls_disabled) {
                     if (settings_ddd_mode) {
                         gui_app_set_status(app, "DdD is single-channel; channel B resample not applicable");
@@ -11097,6 +11347,24 @@ void gui_handle_interactions(gui_app_t *app) {
                     if (app->settings.rtlsdr_gain_tenths_db < 600) app->settings.rtlsdr_gain_tenths_db += 10;
                     gui_settings_save(&app->settings);
                 }
+#ifdef ENABLE_RTLSDR_BLOG_V4_VGA
+                if (gui_ui_rtlsdr_vga_visible(app)) {
+                    const bool minus = Clay_PointerOver(CLAY_ID("RtlsdrVgaMinus"));
+                    const bool plus = Clay_PointerOver(CLAY_ID("RtlsdrVgaPlus"));
+                    if (minus || plus) {
+                        const int index = app->settings.rtlsdr_vga_index + (minus ? -1 : 1);
+                        if (index >= 0 && index <= 8) {
+                            app->settings.rtlsdr_vga_index = index;
+                            gui_settings_save(&app->settings);
+                            gui_app_set_status(app, app->is_capturing
+                                ? "RTL-SDR VGA setting saved. Reconnect to apply."
+                                : "RTL-SDR VGA setting saved.");
+                        }
+                        gui_ui_set_click_consumed();
+                        return;
+                    }
+                }
+#endif
                 if (Clay_PointerOver(CLAY_ID("RtlsdrAgcToggle"))) {
                     app->settings.rtlsdr_agc = !app->settings.rtlsdr_agc;
                     gui_settings_save(&app->settings);
@@ -11154,12 +11422,12 @@ void gui_handle_interactions(gui_app_t *app) {
 
              // RF bit depth selection (cycle)
             // If user switches to RAW and a channel was set to 12-bit, treat it as 16-bit.
-            if (!app->settings.use_flac) {
+            if (!hifi_rf_record && !app->settings.use_flac) {
                 if (app->settings.rf_bits_a == 12) app->settings.rf_bits_a = 16;
                 if (app->settings.rf_bits_b == 12) app->settings.rf_bits_b = 16;
             }
 
-            if (Clay_PointerOver(CLAY_ID("RfBitsABox"))) {
+            if (!hifi_rf_record && Clay_PointerOver(CLAY_ID("RfBitsABox"))) {
                 if (settings_cxadc_mode) {
                     gui_ui_toggle_cxadc_bit_mode(app, 0);
                 } else {
@@ -11175,7 +11443,7 @@ void gui_handle_interactions(gui_app_t *app) {
                     gui_settings_save(&app->settings);
                 }
             }
-            if (Clay_PointerOver(CLAY_ID("RfBitsBBox"))) {
+            if (!hifi_rf_record && Clay_PointerOver(CLAY_ID("RfBitsBBox"))) {
                 if (settings_cxadc_mode && settings_b_disabled) {
                     gui_app_set_status(app, "Single-card CXADC has no RF channel B source");
                 } else if (settings_cxadc_mode) {
@@ -11199,7 +11467,12 @@ void gui_handle_interactions(gui_app_t *app) {
                     gui_settings_save(&app->settings);
                 }
             }
-            if (Clay_PointerOver(CLAY_ID("RfTagAField")) && app->settings.auto_names_enabled) {
+            if (hifi_rf_record && Clay_PointerOver(CLAY_ID("RtlsdrHifiRfTagField"))) {
+                gui_ui_begin_text_edit(app, UI_TEXT_FIELD_RTLSDR_HIFI_RF_TAG,
+                                       CLAY_ID("RtlsdrHifiRfTagField"), 6.0f, 6.0f);
+                gui_ui_set_click_consumed();
+            }
+            if (!hifi_rf_record && Clay_PointerOver(CLAY_ID("RfTagAField")) && app->settings.auto_names_enabled) {
                 gui_ui_begin_text_edit(app, UI_TEXT_FIELD_RF_TAG_A, CLAY_ID("RfTagAField"), 6.0f, 6.0f);
                 gui_ui_set_click_consumed();
             }
@@ -11216,7 +11489,7 @@ void gui_handle_interactions(gui_app_t *app) {
                 gui_ui_begin_text_edit(app, UI_TEXT_FIELD_AUDIO_TAG_34, CLAY_ID("AudioTag2ch34Field"), 6.0f, 6.0f);
                 gui_ui_set_click_consumed();
             }
-            if (Clay_PointerOver(CLAY_ID("RfTagBField")) && app->settings.auto_names_enabled && !settings_b_controls_disabled) {
+            if (!hifi_rf_record && Clay_PointerOver(CLAY_ID("RfTagBField")) && app->settings.auto_names_enabled && !settings_b_controls_disabled) {
                 gui_ui_begin_text_edit(app, UI_TEXT_FIELD_RF_TAG_B, CLAY_ID("RfTagBField"), 6.0f, 6.0f);
                 gui_ui_set_click_consumed();
             }
@@ -11312,7 +11585,6 @@ void gui_handle_interactions(gui_app_t *app) {
                  * gui_handle_interactions applies the result. Never block the
                  * render thread across the picker Activity transition. */
                 extern int android_pick_output_folder_async(void);
-                extern int android_picker_active(void);
                 if (!android_picker_active()) {
                     if (android_pick_output_folder_async()) {
                         gui_app_set_status(app, "Waiting for folder selection...");
@@ -11335,7 +11607,6 @@ void gui_handle_interactions(gui_app_t *app) {
             if (Clay_PointerOver(CLAY_ID("PlaybackFileBrowseA"))) {
 #if defined(__ANDROID__)
                 extern int android_pick_playback_file_async(int channel);
-                extern int android_picker_active(void);
                 if (!android_picker_active()) {
                     if (android_pick_playback_file_async(0)) {
                         gui_app_set_status(app, "Waiting for CH A playback file...");
@@ -11356,7 +11627,6 @@ void gui_handle_interactions(gui_app_t *app) {
             if (Clay_PointerOver(CLAY_ID("PlaybackFileBrowseB"))) {
 #if defined(__ANDROID__)
                 extern int android_pick_playback_file_async(int channel);
-                extern int android_picker_active(void);
                 if (!android_picker_active()) {
                     if (android_pick_playback_file_async(1)) {
                         gui_app_set_status(app, "Waiting for CH B playback file...");
@@ -11374,6 +11644,14 @@ void gui_handle_interactions(gui_app_t *app) {
                 gui_ui_set_click_consumed();
 #endif
             }
+#if defined(__ANDROID__)
+            if (android_picker_active() && (Clay_PointerOver(CLAY_ID("PlaybackFileClearA")) ||
+                                             Clay_PointerOver(CLAY_ID("PlaybackFileClearB")))) {
+                gui_app_set_status(app, "Wait for file selection to finish before clearing playback files");
+                gui_ui_set_click_consumed();
+                return;
+            }
+#endif
             if (Clay_PointerOver(CLAY_ID("PlaybackFileClearA"))) {
                 app->settings.playback_file_a[0] = '\0';
                 gui_settings_save(&app->settings);

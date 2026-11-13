@@ -178,6 +178,7 @@ typedef struct {
     char serial[64];
     device_type_t type;
     int index;
+    bool rtlsdr_blog_v4;
 #ifdef ENABLE_DDD
     ddd_device_profile_t ddd_profile;
     uint16_t ddd_vendor_id;
@@ -355,9 +356,12 @@ typedef struct {
     uint64_t rtlsdr_freq_hz;              // Center frequency (Hz), default 100.0 MHz
     int     rtlsdr_gain_mode;             // 0 = auto, 1 = manual
     int     rtlsdr_gain_tenths_db;        // Manual gain in tenths of dB (0 = auto when auto mode)
+    int     rtlsdr_vga_index;             // Blog V4 manual VGA register index (0 to 8)
     uint32_t rtlsdr_sample_rate_hz;       // Sample rate (Hz), default 2400000 (2.4 MSPS)
     bool    rtlsdr_agc;                   // RTL2832 AGC on/off
     bool    rtlsdr_offset_corr;           // RTL offset tuning correction on/off
+    bool    rtlsdr_hifi_rf_record;        // Record mono real RF instead of native I/Q
+    char    rtlsdr_hifi_rf_tag[32];       // Optional mono RF filename label
 
     // Demod view settings (device-agnostic; apply to the Demod panel)
     int     demod_mode;                   // 0=WFM, 1=NFM, 2=AM, 3=USB, 4=LSB

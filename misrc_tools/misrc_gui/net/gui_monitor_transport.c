@@ -918,8 +918,10 @@ bool gui_monitor_server_handle_request(uintptr_t socket_handle,
         size_t queued=0,capacity=0;
         if (gui_monitor_local_save_recording())
             gui_monitor_local_save_queue_stats(&queued,&capacity);
+        bool use_flac=app->settings.use_flac;
+        bool mono_hifi=gui_record_get_rtlsdr_hifi_output(&use_flac);
         unsigned ra=mon_record_buffer_pct(app,BUF_RECORD_A);
-        unsigned rb=mon_record_buffer_pct(app,BUF_RECORD_B);
+        unsigned rb=mono_hifi?0u:mon_record_buffer_pct(app,BUF_RECORD_B);
         unsigned rf=mon_capture_buffer_pct(app,BUF_CAPTURE_RF);
         unsigned aud=mon_capture_buffer_pct(app,BUF_CAPTURE_AUDIO);
         /* Only remote Monitor status uses these peaks. No audio samples leave
@@ -967,12 +969,12 @@ bool gui_monitor_server_handle_request(uintptr_t socket_handle,
             (uint64_t)atomic_load(&app->samples_a),ra,rb,rf,aud,
             audio_peaks[0],audio_peaks[1],audio_peaks[2],audio_peaks[3],
             (unsigned)atomic_load(&app->buffers.stats[BUF_RECORD_A].write_waits),
-            (unsigned)atomic_load(&app->buffers.stats[BUF_RECORD_B].write_waits),
+            mono_hifi?0u:(unsigned)atomic_load(&app->buffers.stats[BUF_RECORD_B].write_waits),
             (unsigned)atomic_load(&app->buffers.stats[BUF_RECORD_A].write_drops),
-            (unsigned)atomic_load(&app->buffers.stats[BUF_RECORD_B].write_drops),
+            mono_hifi?0u:(unsigned)atomic_load(&app->buffers.stats[BUF_RECORD_B].write_drops),
             (uint64_t)queued,(uint64_t)capacity,
-            app->settings.capture_a?1u:0u,app->settings.capture_b?1u:0u,
-            app->settings.use_flac?1u:0u,gui_monitor_local_save_recording()?1u:0u,
+            (mono_hifi||app->settings.capture_a)?1u:0u,(!mono_hifi&&app->settings.capture_b)?1u:0u,
+            use_flac?1u:0u,gui_monitor_local_save_recording()?1u:0u,
             atomic_load(&app->stream_synced)?1u:0u,free_cached_valid?1u:0u,free_cached_bytes,
             (unsigned)atomic_load(&app->clip_count_a_pos),(unsigned)atomic_load(&app->clip_count_a_neg),
             (unsigned)atomic_load(&app->clip_count_b_pos),(unsigned)atomic_load(&app->clip_count_b_neg),

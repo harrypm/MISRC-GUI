@@ -18,6 +18,11 @@
 #include "gui_audio.h"
 #include "../input/gui_capture.h"
 #include "../input/gui_cxadc.h"
+#ifdef ENABLE_RTLSDR
+#include "../input/gui_rtlsdr.h"
+#include "../signal/gui_vhs_hifi.h"
+#endif
+#include "../processing/gui_sdr_rf.h"
 #include "gui_record_direct.h"
 
 #include "../../common/ringbuffer.h"
@@ -434,6 +439,18 @@ static atomic_bool s_record_stop_finalize_done = ATOMIC_VAR_INIT(false);
 static atomic_bool s_record_stop_failed;
 static atomic_bool s_record_stop_commit_unconfirmed;
 static atomic_bool s_record_producer_lost_data;
+static atomic_bool s_rtlsdr_hifi_accepting;
+static atomic_bool s_rtlsdr_hifi_interrupted;
+static atomic_uint s_rtlsdr_hifi_inflight;
+static uint64_t s_rtlsdr_hifi_tuning;
+static uint32_t s_rtlsdr_hifi_source_rate;
+enum {
+    GUI_RECORD_HIFI_OUTPUT_NONE,
+    GUI_RECORD_HIFI_OUTPUT_RAW,
+    GUI_RECORD_HIFI_OUTPUT_FLAC
+};
+static atomic_uint s_rtlsdr_hifi_output;
+static char s_rtlsdr_hifi_filename[MAX_FILENAME_LEN];
 static atomic_uint_fast64_t s_capture_source_loss_count;
 static uint_fast64_t s_capture_source_loss_start;
 static atomic_uint_fast64_t s_capture_audio_loss_count;
@@ -517,6 +534,8 @@ enum { GUI_RECORD_RF_OUTPUT_COUNT = 2,
 typedef struct {
     char paths[GUI_RECORD_OUTPUT_COUNT][GUI_RECORD_PATH_MAX];
     unsigned existing_mask;
+    bool rtl_hifi;
+    bool rtl_hifi_flac;
 } gui_record_output_targets_t;
 
 // Overwrite confirmation pending state
@@ -794,7 +813,9 @@ static uint64_t gui_record_get_effective_output_total_bytes(const gui_app_t *app
                                                             uint64_t raw_total,
                                                             uint64_t encoded_total) {
     if (!app) return 0;
-    if (app->settings.use_flac) {
+    bool flac = app->settings.use_flac;
+    if (gui_record_rtlsdr_active()) gui_record_get_rtlsdr_hifi_output(&flac);
+    if (flac) {
         return (encoded_total > 0) ? encoded_total : raw_total;
     }
     return raw_total;
@@ -826,16 +847,22 @@ static uint64_t gui_record_estimate_output_bytes_from_raw_backlog(const gui_app_
                                                                   uint64_t raw_total,
                                                                   uint64_t encoded_total) {
     if (!app || backlog_raw_bytes == 0) return 0;
-    if (!app->settings.use_flac) return backlog_raw_bytes;
+    bool hifi = gui_record_rtlsdr_active();
+    bool flac = app->settings.use_flac;
+    if (hifi) gui_record_get_rtlsdr_hifi_output(&flac);
+    if (!hifi && !flac) return backlog_raw_bytes;
 
+    // The merged queue holds uint8 I/Q pairs. Each output RF sample is int16.
+    double expansion = hifi && s_rtlsdr_hifi_source_rate
+        ? (double)GUI_SDR_RF_OUTPUT_RATE_HZ / s_rtlsdr_hifi_source_rate : 1.0;
     double encoded_per_raw = 1.0;
-    if (raw_total > 0 && encoded_total > 0) {
+    if (flac && raw_total > 0 && encoded_total > 0) {
         encoded_per_raw = (double)encoded_total / (double)raw_total;
         if (encoded_per_raw < 0.10) encoded_per_raw = 0.10;
         if (encoded_per_raw > 1.00) encoded_per_raw = 1.00;
     }
 
-    double estimate = (double)backlog_raw_bytes * encoded_per_raw;
+    double estimate = (double)backlog_raw_bytes * expansion * encoded_per_raw;
     if (estimate >= (double)UINT64_MAX) {
         return UINT64_MAX;
     }
@@ -1058,6 +1085,7 @@ typedef struct {
     atomic_uint_fast64_t *compressed_bytes;
     uint8_t flac_bits_per_sample;
 #endif
+    gui_sdr_rf_t *rtl_converter;
     gui_app_t *app;  // For error reporting
 } writer_ctx_t;
 
@@ -1235,6 +1263,52 @@ static bool gui_record_finish_resampler(writer_ctx_t *wctx, int16_t *resampled,
     return true;
 }
 
+static void gui_record_rtlsdr_interrupt(void) {
+    atomic_store(&s_rtlsdr_hifi_accepting, false);
+    atomic_store(&s_record_producer_lost_data, true);
+    atomic_store(&s_rtlsdr_hifi_interrupted, true);
+}
+
+bool gui_record_rtlsdr_active(void) {
+    return atomic_load(&s_rtlsdr_hifi_accepting);
+}
+
+bool gui_record_get_rtlsdr_hifi_output(bool *use_flac) {
+    unsigned output = atomic_load(&s_rtlsdr_hifi_output);
+    if (output == GUI_RECORD_HIFI_OUTPUT_NONE) return false;
+    if (use_flac) *use_flac = output == GUI_RECORD_HIFI_OUTPUT_FLAC;
+    return true;
+}
+
+void gui_record_rtlsdr_gap(gui_app_t *app) {
+    if (!app) return;
+    atomic_fetch_add(&s_rtlsdr_hifi_inflight, 1);
+    if (gui_record_rtlsdr_active()) gui_record_rtlsdr_interrupt();
+    atomic_fetch_sub(&s_rtlsdr_hifi_inflight, 1);
+}
+
+void gui_record_rtlsdr_push(gui_app_t *app, const uint8_t *iq, size_t pairs, uint64_t tuning) {
+    if (!app || !iq || !pairs) return;
+
+    // The finalizer disables the tap and waits for in-flight pushes before
+    // the writer drains. Only this capture thread produces merged RF input.
+    atomic_fetch_add(&s_rtlsdr_hifi_inflight, 1);
+    if (atomic_load(&s_rtlsdr_hifi_accepting)) {
+        static const backpressure_policy_t no_wait = {0};
+        const size_t bytes = 2 * pairs;
+        void *dst = tuning == s_rtlsdr_hifi_tuning
+            ? bufmgr_write_begin(&app->buffers, BUF_RECORD_A, bytes, &no_wait)
+            : NULL;
+        if (dst) {
+            memcpy(dst, iq, bytes);
+            bufmgr_write_end(&app->buffers, BUF_RECORD_A, bytes);
+        } else {
+            gui_record_rtlsdr_interrupt();
+        }
+    }
+    atomic_fetch_sub(&s_rtlsdr_hifi_inflight, 1);
+}
+
 static void gui_record_writer_failed(writer_ctx_t *wctx, const char *message) {
     atomic_store(&s_record_write_error[wctx->channel], true);
     fprintf(stderr, "[REC] Channel %c: %s\n", wctx->channel == 0 ? 'A' : 'B', message);
@@ -1399,11 +1473,7 @@ static void convert_i16_to_raw_bytes(uint8_t *dst, const int16_t *src, size_t n,
     memcpy(dst, src, n * sizeof(int16_t));
 }
 
-static bool gui_record_write_raw_samples(writer_ctx_t *wctx, const int16_t *in,
-                                         size_t count, void *scratch) {
-    uint8_t *output = scratch;
-    convert_i16_to_raw_bytes(output, in, count, wctx->rf_bits);
-    size_t bytes = count * wctx->raw_bytes_per_sample;
+static bool gui_record_write_raw_bytes(writer_ctx_t *wctx, const uint8_t *output, size_t bytes) {
     size_t offset = 0;
     bool final_retry = false, retrying = false;
     for (;;) {
@@ -1439,6 +1509,76 @@ static bool gui_record_write_raw_samples(writer_ctx_t *wctx, const int16_t *in,
     // output at EOF. The FLAC path separately counts accepted input bytes.
     gui_record_account_writer_bytes(wctx, bytes);
     return true;
+}
+
+static bool gui_record_write_raw_samples(writer_ctx_t *wctx, const int16_t *in,
+                                         size_t count, void *scratch) {
+    uint8_t *output = scratch;
+    convert_i16_to_raw_bytes(output, in, count, wctx->rf_bits);
+    return gui_record_write_raw_bytes(wctx, output, count * wctx->raw_bytes_per_sample);
+}
+
+static bool gui_record_write_rtlsdr_hifi(void *opaque, const int16_t *samples, size_t count) {
+    writer_ctx_t *wctx = opaque;
+#if LIBFLAC_ENABLED == 1
+    if (wctx->writer) {
+        if (flac_writer_process_int16(wctx->writer, samples, (uint32_t)count) < 0) return false;
+        gui_record_account_writer_bytes(wctx, count * sizeof(*samples));
+        return true;
+    }
+#endif
+#if defined(_WIN32) || (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+    return gui_record_write_raw_bytes(wctx, (const uint8_t *)samples, count * sizeof(*samples));
+#else
+    uint8_t bytes[8192];
+    while (count) {
+        size_t chunk = count < sizeof(bytes) / 2 ? count : sizeof(bytes) / 2;
+        for (size_t i = 0; i < chunk; ++i) {
+            uint16_t sample = (uint16_t)samples[i];
+            bytes[2 * i] = (uint8_t)sample;
+            bytes[2 * i + 1] = (uint8_t)(sample >> 8);
+        }
+        if (!gui_record_write_raw_bytes(wctx, bytes, chunk * 2)) return false;
+        samples += chunk;
+        count -= chunk;
+    }
+    return true;
+#endif
+}
+
+static int rtlsdr_hifi_writer_thread(void *ctx) {
+    writer_ctx_t *wctx = ctx;
+#if LIBFLAC_ENABLED == 1
+    if (wctx->writer && flac_writer_apply_thread_affinity(wctx->writer) != FLAC_WRITER_OK)
+        fprintf(stderr, "[FLAC] Hi-Fi RF writer affinity warning: %s\n",
+                flac_writer_get_error_string(wctx->writer));
+#endif
+
+    bool ok = true;
+    while (ok) {
+        bool draining = atomic_load(&s_record_writer_draining);
+        size_t bytes = 65536;
+        const int16_t *input = bufmgr_read_begin(wctx->bufmgr, wctx->buf_id, bytes,
+                                                draining ? 0 : 10);
+        if (!input && draining) {
+            bytes = gui_record_read_ring_tail(wctx, &input);
+            if (!bytes) break;
+        }
+        if (!input) continue;
+
+        ok = gui_sdr_rf_process(wctx->rtl_converter, (const uint8_t *)input, bytes / 2,
+                                 gui_record_write_rtlsdr_hifi, wctx);
+        bufmgr_read_end(wctx->bufmgr, wctx->buf_id, bytes);
+    }
+    if (ok && !atomic_load(&s_rtlsdr_hifi_interrupted))
+        ok = gui_sdr_rf_finish(wctx->rtl_converter, gui_record_write_rtlsdr_hifi, wctx);
+    if (!ok) {
+        gui_record_rtlsdr_interrupt();
+        gui_record_writer_failed(wctx, gui_sdr_rf_error(wctx->rtl_converter));
+    }
+    gui_sdr_rf_destroy(wctx->rtl_converter);
+    wctx->rtl_converter = NULL;
+    return 0;
 }
 
 // RAW file writer thread
@@ -1518,6 +1658,16 @@ static atomic_uint_fast64_t s_direct_bytes_read_b;
 // Latched at record start for the end-of-recording summary.
 static bool s_direct_channel_a_active = false;
 static bool s_direct_channel_b_active = false;
+
+void gui_record_reset_stats(gui_app_t *app) {
+    atomic_store(&s_rtlsdr_hifi_output, GUI_RECORD_HIFI_OUTPUT_NONE);
+    atomic_store(&app->recording_bytes, 0);
+    atomic_store(&app->recording_raw_a, 0);
+    atomic_store(&app->recording_raw_b, 0);
+    atomic_store(&app->recording_compressed_a, 0);
+    atomic_store(&app->recording_compressed_b, 0);
+    app->last_recording_duration_s = 0.0;
+}
 
 // Initialize recording subsystem
 void gui_record_init(void) {
@@ -1888,6 +2038,14 @@ static void gui_record_finalize_flac_metadata(gui_app_t *app,
                 gui_record_flac_append_comment(vc_block, "RF_TOTAL_SAMPLES", total_samples_str) &&
                 gui_record_flac_append_comment(vc_block, "RF_SAMPLE_RATE", sample_rate_str) &&
                 gui_record_flac_append_comment(vc_block, "RF_SAMPLE_RATE_KHZ", sample_rate_khz_str);
+            if (ok && s_rtlsdr_hifi_source_rate) {
+                char source_rate[16], center[16];
+                snprintf(source_rate, sizeof(source_rate), "%" PRIu32, s_rtlsdr_hifi_source_rate);
+                snprintf(center, sizeof(center), "%" PRIu32, (uint32_t)s_rtlsdr_hifi_tuning);
+                ok = gui_record_flac_append_comment(vc_block, "RF_SOURCE", "RTLSDR_HIFI") &&
+                     gui_record_flac_append_comment(vc_block, "SOURCE_SAMPLE_RATE", source_rate) &&
+                     gui_record_flac_append_comment(vc_block, "SOURCE_CENTER_FREQUENCY", center);
+            }
             if (ok) {
                 if (!FLAC__metadata_simple_iterator_set_block(it, vc_block, /*use_padding=*/true)) {
                     if (app) {
@@ -2184,7 +2342,7 @@ static void gui_record_open_session_log(gui_app_t *app, const gui_record_output_
     char date_tag[32];
     date_tag[0] = '\0';
     bool have_date_tag = false;
-    if (app->settings.capture_a && path_a && path_a[0]) {
+    if (path_a && path_a[0]) {
         have_date_tag = gui_record_extract_timestamp_token(path_a, date_tag, sizeof(date_tag));
     }
     if (!have_date_tag && app->settings.capture_b && path_b && path_b[0]) {
@@ -2259,6 +2417,7 @@ static void gui_record_open_session_log(gui_app_t *app, const gui_record_output_
     gui_record_log_write_line_locked("INFO", msg);
     snprintf(msg, sizeof(msg), "capture_device_type: %s", gui_record_device_type_name(app));
     gui_record_log_write_line_locked("INFO", msg);
+    const bool hifi = targets->rtl_hifi;
     bool direct_raw_a = false;
     bool direct_raw_b = false;
     if (!app->settings.use_flac) {
@@ -2266,25 +2425,26 @@ static void gui_record_open_session_log(gui_app_t *app, const gui_record_output_
         direct_raw_b = gui_record_direct_channel_eligible(app, 1);
     }
     snprintf(msg, sizeof(msg), "capture_format: %s",
-             app->settings.use_flac ? "FLAC"
+             hifi ? (targets->rtl_hifi_flac ? "FLAC (RTL-SDR Hi-Fi RF)" : "RAW (RTL-SDR Hi-Fi RF)")
+             : app->settings.use_flac ? "FLAC"
              : ((direct_raw_a || direct_raw_b) ? "RAW direct native passthrough" : "RAW converted"));
     gui_record_log_write_line_locked("INFO", msg);
 
-    snprintf(msg, sizeof(msg), "Capture channels: A=%s B=%s", app->settings.capture_a ? "on" : "off", app->settings.capture_b ? "on" : "off");
+    snprintf(msg, sizeof(msg), "Capture channels: A=%s B=%s", path_a && path_a[0] ? "on" : "off", path_b && path_b[0] ? "on" : "off");
     gui_record_log_write_line_locked("INFO", msg);
     snprintf(msg, sizeof(msg), "CVBS preview state: A=%s B=%s",
              cvbs_preview_a ? "on" : "off",
              cvbs_preview_b ? "on" : "off");
     gui_record_log_write_line_locked("INFO", msg);
 
-    uint8_t bits_a = app->settings.use_flac ? clamp_rf_bits_flac(app->settings.rf_bits_a) : rf_bits_for_raw(app->settings.rf_bits_a);
+    uint8_t bits_a = hifi ? 16 : app->settings.use_flac ? clamp_rf_bits_flac(app->settings.rf_bits_a) : rf_bits_for_raw(app->settings.rf_bits_a);
     uint8_t bits_b = app->settings.use_flac ? clamp_rf_bits_flac(app->settings.rf_bits_b) : rf_bits_for_raw(app->settings.rf_bits_b);
     snprintf(msg, sizeof(msg), "RF settings: bitsA=%u bitsB=%u resampleA=%s(%.1f kHz) resampleB=%s(%.1f kHz)",
              (unsigned)bits_a, (unsigned)bits_b,
-             app->settings.enable_resample_a ? "on" : "off", app->settings.resample_rate_a,
-             app->settings.enable_resample_b ? "on" : "off", app->settings.resample_rate_b);
+             !hifi && app->settings.enable_resample_a ? "on" : "off", app->settings.resample_rate_a,
+             !hifi && app->settings.enable_resample_b ? "on" : "off", app->settings.resample_rate_b);
     gui_record_log_write_line_locked("INFO", msg);
-    if (!app->settings.use_flac) {
+    if (!hifi && !app->settings.use_flac) {
         char raw_a[40];
         char raw_b[40];
         if (!app->settings.capture_a) {
@@ -2348,7 +2508,13 @@ static void gui_record_open_session_log(gui_app_t *app, const gui_record_output_
              app->settings.ingest_notes[0] ? app->settings.ingest_notes : "(empty)");
     gui_record_log_write_line_locked("INFO", msg);
 
-    if (app->settings.use_flac) {
+    if (hifi) {
+        snprintf(msg, sizeof(msg), "RTL-SDR Hi-Fi RF: source_rate=%" PRIu32 " Hz center=%" PRIu32
+                 " Hz output_rate=%" PRIu32 " Hz signed 16-bit little-endian mono",
+                 s_rtlsdr_hifi_source_rate, (uint32_t)s_rtlsdr_hifi_tuning, (uint32_t)GUI_SDR_RF_OUTPUT_RATE_HZ);
+        gui_record_log_write_line_locked("INFO", msg);
+    }
+    if (hifi ? targets->rtl_hifi_flac : app->settings.use_flac) {
         snprintf(msg, sizeof(msg), "FLAC settings: level=%d verify=%s threads=%d",
                  app->settings.flac_level,
                  app->settings.flac_verification ? "on" : "off",
@@ -2361,38 +2527,38 @@ static void gui_record_open_session_log(gui_app_t *app, const gui_record_output_
         gui_record_log_write_line_locked("INFO", msg);
     }
 
-    if (app->settings.capture_a && path_a && path_a[0]) {
+    if (path_a && path_a[0]) {
         snprintf(msg, sizeof(msg), "FILE_PATH_A: %s", path_a);
         gui_record_log_write_line_locked("INFO", msg);
     }
-    if (app->settings.capture_b && path_b && path_b[0]) {
+    if (path_b && path_b[0]) {
         snprintf(msg, sizeof(msg), "FILE_PATH_B: %s", path_b);
         gui_record_log_write_line_locked("INFO", msg);
     }
 
     snprintf(msg, sizeof(msg), "Audio outputs: 4ch=%s 2ch12=%s 2ch34=%s",
-             app->settings.enable_audio_4ch ? "on" : "off",
-             app->settings.enable_audio_2ch_12 ? "on" : "off",
-             app->settings.enable_audio_2ch_34 ? "on" : "off");
+             !hifi && app->settings.enable_audio_4ch ? "on" : "off",
+             !hifi && app->settings.enable_audio_2ch_12 ? "on" : "off",
+             !hifi && app->settings.enable_audio_2ch_34 ? "on" : "off");
     gui_record_log_write_line_locked("INFO", msg);
 
-    if (app->settings.enable_audio_4ch && app->settings.audio_4ch_filename[0]) {
+    if (!hifi && app->settings.enable_audio_4ch && app->settings.audio_4ch_filename[0]) {
         snprintf(msg, sizeof(msg), "AUDIO_4CH_FILE_PATH: %s/%s",
                  app->settings.output_path, app->settings.audio_4ch_filename);
         gui_record_log_write_line_locked("INFO", msg);
     }
-    if (app->settings.enable_audio_2ch_12 && app->settings.audio_2ch_12_filename[0]) {
+    if (!hifi && app->settings.enable_audio_2ch_12 && app->settings.audio_2ch_12_filename[0]) {
         snprintf(msg, sizeof(msg), "AUDIO_2CH_12_FILE_PATH: %s/%s",
                  app->settings.output_path, app->settings.audio_2ch_12_filename);
         gui_record_log_write_line_locked("INFO", msg);
     }
-    if (app->settings.enable_audio_2ch_34 && app->settings.audio_2ch_34_filename[0]) {
+    if (!hifi && app->settings.enable_audio_2ch_34 && app->settings.audio_2ch_34_filename[0]) {
         snprintf(msg, sizeof(msg), "AUDIO_2CH_34_FILE_PATH: %s/%s",
                  app->settings.output_path, app->settings.audio_2ch_34_filename);
         gui_record_log_write_line_locked("INFO", msg);
     }
     for (int i = 0; i < 4; i++) {
-        if (app->settings.enable_audio_1ch[i] && app->settings.audio_1ch_filenames[i][0]) {
+        if (!hifi && app->settings.enable_audio_1ch[i] && app->settings.audio_1ch_filenames[i][0]) {
             snprintf(msg, sizeof(msg), "AUDIO_1CH_%d_FILE_PATH: %s/%s",
                      i + 1, app->settings.output_path, app->settings.audio_1ch_filenames[i]);
             gui_record_log_write_line_locked("INFO", msg);
@@ -2414,22 +2580,82 @@ static bool gui_record_format_name(char *dst, const char *format, ...) {
     return true;
 }
 
+static bool gui_record_rtlsdr_hifi_selected(const gui_app_t *app) {
+#ifdef ENABLE_RTLSDR
+    return app->settings.rtlsdr_hifi_rf_record && app->settings.net_mode != GUI_NET_MODE_CLIENT &&
+           app->selected_device >= 0 && app->selected_device < app->device_count &&
+           app->devices[app->selected_device].type == DEVICE_TYPE_RTLSDR;
+#else
+    (void)app;
+    return false;
+#endif
+}
+
+static bool gui_record_rtlsdr_hifi_source(gui_app_t *app, uint32_t *rate, uint64_t *tuning) {
+#if defined(ENABLE_RTLSDR) && LIBSOXR_ENABLED
+#if LIBFLAC_ENABLED != 1
+    if (app->settings.use_flac) {
+        gui_app_set_status(app, "Hi-Fi RF FLAC requires FLAC support; disable RF FLAC compression for RAW");
+        return false;
+    }
+#endif
+    if (gui_monitor_local_save_recording()) {
+        gui_app_set_status(app, "Hi-Fi RF requires a local recording destination");
+        return false;
+    }
+    if (!gui_rtlsdr_get_rf_source(app, rate, tuning)) {
+        gui_app_set_status(app, gui_rtlsdr_is_running(app)
+            ? "RTL-SDR rate or tuning is not ready for Hi-Fi RF recording"
+            : "Hi-Fi RF requires a running RTL-SDR");
+        return false;
+    }
+    const uint32_t center_hz = (uint32_t)*tuning;
+    char error[128];
+    if (!gui_sdr_rf_validate(*rate, center_hz, error, sizeof(error))) {
+        gui_app_set_status(app, error);
+        return false;
+    }
+    const double passband_hz = gui_sdr_rf_passband_hz(*rate);
+    if (!gui_vhs_hifi_iq_band_fits_passband(GUI_RF_NTSC, *rate, center_hz, passband_hz) &&
+        !gui_vhs_hifi_iq_band_fits_passband(GUI_RF_PAL, *rate, center_hz, passband_hz)) {
+        gui_app_set_status(app, "Hi-Fi RF bandwidth misses a VHS carrier band; adjust RTL-SDR center frequency or sample rate");
+        return false;
+    }
+    return true;
+#else
+    (void)rate;
+    (void)tuning;
+    gui_app_set_status(app, "Hi-Fi RF requires RTL-SDR and SoXR support");
+    return false;
+#endif
+}
+
 static bool gui_record_apply_auto_names(gui_app_t *app) {
     if (!app) return false;
-    if (!app->settings.auto_names_enabled) return true;
+    bool hifi = gui_record_rtlsdr_hifi_selected(app);
+    if (!app->settings.auto_names_enabled && !hifi) return true;
 
     const char *base = app->settings.output_base_name[0] ? app->settings.output_base_name : "capture";
 
     // Optionally append system timestamp sampled at record-start.
     // This does not mutate output_base_name.
     char base_with_ts[MAX_FILENAME_LEN + 32];
-    if (app->settings.append_timestamp_on_capture_start) {
+    if (app->settings.auto_names_enabled && app->settings.append_timestamp_on_capture_start) {
         char timestamp_now[32];
         gui_record_build_system_timestamp(timestamp_now, sizeof(timestamp_now));
         if (timestamp_now[0]) {
             snprintf(base_with_ts, sizeof(base_with_ts), "%s_%s", base, timestamp_now);
             base = base_with_ts;
         }
+    }
+
+    if (hifi) {
+        char tag[sizeof(app->settings.rtlsdr_hifi_rf_tag)];
+        sanitize_tag(tag, sizeof(tag), app->settings.rtlsdr_hifi_rf_tag);
+        const uint32_t khz = GUI_SDR_RF_OUTPUT_RATE_HZ / 1000u;
+        return gui_record_format_name(s_rtlsdr_hifi_filename, "%s%s%s_hifi_rf_16-bit_%" PRIu32 ".%03" PRIu32 "msps.%s",
+                                      base, tag[0] ? "_" : "", tag, khz / 1000u, khz % 1000u,
+                                      app->settings.use_flac ? "flac" : "s16");
     }
 
     // RF filenames
@@ -2571,19 +2797,20 @@ static bool gui_record_same_filename(const char *a, const char *b) {
 static bool gui_record_check_output_paths(gui_app_t *app, unsigned *existing_count,
                                           char *message, size_t message_size,
                                           gui_record_output_targets_t *targets) {
+    bool hifi = gui_record_rtlsdr_hifi_selected(app);
     const char *names[GUI_RECORD_OUTPUT_COUNT] = {
-        app->settings.output_filename_a, app->settings.output_filename_b,
+        hifi ? s_rtlsdr_hifi_filename : app->settings.output_filename_a, app->settings.output_filename_b,
         app->settings.audio_4ch_filename, app->settings.audio_2ch_12_filename,
         app->settings.audio_2ch_34_filename, app->settings.audio_1ch_filenames[0],
         app->settings.audio_1ch_filenames[1], app->settings.audio_1ch_filenames[2],
         app->settings.audio_1ch_filenames[3]
     };
     const bool enabled[GUI_RECORD_OUTPUT_COUNT] = {
-        app->settings.capture_a, app->settings.capture_b,
-        app->settings.enable_audio_4ch, app->settings.enable_audio_2ch_12,
-        app->settings.enable_audio_2ch_34, app->settings.enable_audio_1ch[0],
-        app->settings.enable_audio_1ch[1], app->settings.enable_audio_1ch[2],
-        app->settings.enable_audio_1ch[3]
+        hifi || app->settings.capture_a, !hifi && app->settings.capture_b,
+        !hifi && app->settings.enable_audio_4ch, !hifi && app->settings.enable_audio_2ch_12,
+        !hifi && app->settings.enable_audio_2ch_34, !hifi && app->settings.enable_audio_1ch[0],
+        !hifi && app->settings.enable_audio_1ch[1], !hifi && app->settings.enable_audio_1ch[2],
+        !hifi && app->settings.enable_audio_1ch[3]
     };
     const char *labels[GUI_RECORD_OUTPUT_COUNT] = { "RF A", "RF B", "Audio quad", "Audio 1/2", "Audio 3/4",
                              "Audio 1", "Audio 2", "Audio 3", "Audio 4" };
@@ -2593,7 +2820,11 @@ static bool gui_record_check_output_paths(gui_app_t *app, unsigned *existing_cou
         return false;
     }
     unsigned count = 0;
-    if (targets) memset(targets, 0, sizeof(*targets));
+    if (targets) {
+        memset(targets, 0, sizeof(*targets));
+        targets->rtl_hifi = hifi;
+        targets->rtl_hifi_flac = hifi && app->settings.use_flac;
+    }
     if (message && message_size) message[0] = '\0';
     for (size_t i = 0; i < GUI_RECORD_OUTPUT_COUNT; i++) {
         if (!enabled[i]) continue;
@@ -2642,6 +2873,8 @@ static bool gui_record_match_output_targets(gui_app_t *app,
                                             gui_record_output_targets_t *current) {
     if (!gui_record_check_output_paths(app, NULL, NULL, 0, current)) return false;
     if (!confirmed || (current->existing_mask == confirmed->existing_mask &&
+        current->rtl_hifi == confirmed->rtl_hifi &&
+        current->rtl_hifi_flac == confirmed->rtl_hifi_flac &&
         memcmp(current->paths, confirmed->paths, sizeof(current->paths)) == 0))
         return true;
     gui_app_set_status(app, "Recording outputs changed. Start recording again to confirm.");
@@ -2690,6 +2923,11 @@ int gui_record_start(gui_app_t *app) {
     if (s_overwrite_pending) {
         return RECORD_PENDING;
     }
+
+    uint32_t source_rate;
+    uint64_t tuning;
+    if (gui_record_rtlsdr_hifi_selected(app) && !gui_record_rtlsdr_hifi_source(app, &source_rate, &tuning))
+        return RECORD_ERROR;
 
     // Apply auto naming before any file can be opened or overwritten.
     if (!gui_record_apply_auto_names(app)) {
@@ -2749,6 +2987,17 @@ void gui_record_check_popup(gui_app_t *app) {
         gui_app_set_status(app, gui_record_stop_status());
     }
 
+    if (app->is_recording && gui_record_rtlsdr_active() &&
+        gui_record_check_disk_space_guard(app, 0, NULL, 0)) {
+        atomic_store(&app->dropout_stop_reason, GUI_DROPOUT_DISK_SPACE);
+        atomic_store(&app->dropout_stop_requested, true);
+        gui_record_stop(app);
+    }
+    if (app->is_recording && atomic_load(&s_rtlsdr_hifi_interrupted)) {
+        gui_record_log_capture_event(app, "ERROR", "RTL-SDR Hi-Fi RF input interrupted",
+                                     GUI_ERROR_CLASS_SYSTEM, 1);
+        gui_record_stop(app);
+    }
     if (!s_overwrite_pending) {
         return;
     }
@@ -2791,12 +3040,114 @@ void gui_record_check_popup(gui_app_t *app) {
 }
 
 // Internal: Start recording after confirmation
+#if LIBFLAC_ENABLED == 1
+static flac_writer_config_t gui_record_flac_config(const gui_app_t *app) {
+    flac_writer_config_t config = flac_writer_default_config();
+    config.bits_per_sample = 16;
+    config.compression_level = app->settings.flac_level;
+    config.verify = app->settings.flac_verification;
+    // Auto resolves to parallel encoding so level 8 keeps up without relying on spill.
+    config.num_threads = gui_record_resolve_flac_threads(app->settings.flac_threads);
+    config.affinity_enabled = app->settings.flac_affinity_enabled;
+    snprintf(config.affinity_cpu_list, sizeof(config.affinity_cpu_list), "%s", app->settings.flac_affinity_cpu_list);
+    config.enable_seektable = true;
+    config.error_cb = gui_flac_error_callback;
+    config.bytes_cb = gui_flac_bytes_callback;
+    return config;
+}
+#endif
+
+static int gui_record_start_rtlsdr_hifi(gui_app_t *app, const gui_record_output_targets_t *targets,
+                                       const char *mode, uint32_t source_rate, uint64_t tuning) {
+    char error[128];
+    gui_sdr_rf_t *converter = gui_sdr_rf_create(source_rate, (uint32_t)tuning, error, sizeof(error));
+    if (!converter) {
+        gui_app_set_status(app, error);
+        goto fail;
+    }
+    s_file_a = file_open_utf8(targets->paths[0], mode);
+    if (!s_file_a) {
+        gui_app_set_status(app, "Failed to open Hi-Fi RF output file");
+        goto fail;
+    }
+    gui_record_set_output_buffer(s_file_a);
+    s_ctx_a = (writer_ctx_t){
+        .bufmgr = &app->buffers, .buf_id = BUF_RECORD_A, .file = s_file_a,
+        .channel = 0, .rtl_converter = converter, .app = app
+    };
+    s_rtlsdr_hifi_source_rate = source_rate;
+    gui_record_open_session_log(app, targets);
+    proc_set_priority(PROC_PRIORITY_ABOVE);
+#if LIBFLAC_ENABLED == 1
+    if (targets->rtl_hifi_flac) {
+        flac_writer_config_t config = gui_record_flac_config(app);
+        // The shared FLAC encoder stores RF sample rate in kHz.
+        config.sample_rate = GUI_SDR_RF_OUTPUT_RATE_HZ / 1000u;
+        config.callback_user_data = &s_ctx_a;
+        s_ctx_a.compressed_bytes = &app->recording_compressed_a;
+        s_flac_writer_a = flac_writer_create_stream(s_file_a, &config);
+        if (!s_flac_writer_a) {
+            gui_app_set_status(app, "Failed to create Hi-Fi RF FLAC encoder");
+            goto fail;
+        }
+        s_ctx_a.writer = s_flac_writer_a;
+        s_record_sample_rate_a = config.sample_rate;
+    }
+#endif
+    s_start_rec_a_wait_count = atomic_load(&app->buffers.stats[BUF_RECORD_A].write_waits);
+    s_start_rec_a_drop_count = atomic_load(&app->buffers.stats[BUF_RECORD_A].write_drops);
+    s_start_rec_b_wait_count = atomic_load(&app->buffers.stats[BUF_RECORD_B].write_waits);
+    s_start_rec_b_drop_count = atomic_load(&app->buffers.stats[BUF_RECORD_B].write_drops);
+    atomic_store(&s_record_writer_draining, false);
+    if (thrd_create_with_priority(&s_writer_thread_a, rtlsdr_hifi_writer_thread,
+                                  &s_ctx_a, THRD_PRIORITY_CRITICAL) != thrd_success) {
+        gui_app_set_status(app, "Failed to start Hi-Fi RF writer");
+        goto fail;
+    }
+    s_writer_started[0] = true;
+#if defined(__APPLE__)
+    macos_promote_all_task_threads();
+#endif
+    app->recording_start_time = gui_record_clock(app);
+    gui_record_start_source_tracking(app, targets, true, true);
+    atomic_store(&s_rtlsdr_hifi_output, targets->rtl_hifi_flac
+                 ? GUI_RECORD_HIFI_OUTPUT_FLAC : GUI_RECORD_HIFI_OUTPUT_RAW);
+    app->is_recording = true;
+    atomic_store(&s_rtlsdr_hifi_accepting, true);
+    gui_app_set_status(app, targets->rtl_hifi_flac
+        ? "Recording (RTL-SDR Hi-Fi RF FLAC)..." : "Recording (RTL-SDR Hi-Fi RF RAW)...");
+    return RECORD_OK;
+
+fail:
+#if LIBFLAC_ENABLED == 1
+    if (s_flac_writer_a) { flac_writer_abort(s_flac_writer_a); s_flac_writer_a = NULL; }
+#endif
+    if (s_file_a) {
+        proc_set_priority(PROC_PRIORITY_NORMAL);
+        fclose(s_file_a);
+        s_file_a = NULL;
+    }
+    gui_sdr_rf_destroy(converter);
+    s_ctx_a = (writer_ctx_t){0};
+    s_recording_app = NULL;
+    s_rtlsdr_hifi_source_rate = 0;
+    atomic_store(&s_record_writer_draining, true);
+    gui_record_close_session_log();
+    return RECORD_ERROR;
+}
+
 static int gui_record_start_confirmed(gui_app_t *app,
                                       const gui_record_output_targets_t *confirmed) {
     if (!gui_record_capture_ready(app) || app->is_recording || gui_record_is_finalizing())
         return RECORD_ERROR;
     gui_record_output_targets_t targets;
     if (!gui_record_match_output_targets(app, confirmed, &targets)) return RECORD_ERROR;
+    const bool hifi = targets.rtl_hifi;
+    const bool record_a = targets.paths[0][0] != '\0';
+    const bool record_b = targets.paths[1][0] != '\0';
+    uint32_t source_rate = 0;
+    uint64_t tuning = 0;
+    if (hifi && !gui_record_rtlsdr_hifi_source(app, &source_rate, &tuning)) return RECORD_ERROR;
     if (app->settings.net_mode != GUI_NET_MODE_CLIENT && app->capture_has_channel_b &&
         app->selected_device >= 0 && app->selected_device < app->device_count &&
         app->devices[app->selected_device].type == DEVICE_TYPE_CXADC &&
@@ -2819,10 +3170,10 @@ static int gui_record_start_confirmed(gui_app_t *app,
     gui_record_reset_disk_guard_state();
 #if !LIBSOXR_ENABLED
     float input_khz = (float)atomic_load(&app->sample_rate) / 1000.0f;
-    if ((app->settings.capture_a && gui_record_resample_requested(
+    if (!hifi && ((record_a && gui_record_resample_requested(
              app->settings.enable_resample_a, input_khz, app->settings.resample_rate_a)) ||
-        (app->settings.capture_b && gui_record_resample_requested(
-             app->settings.enable_resample_b, input_khz, app->settings.resample_rate_b))) {
+        (record_b && gui_record_resample_requested(
+             app->settings.enable_resample_b, input_khz, app->settings.resample_rate_b)))) {
         gui_app_set_status(app, "RF resampling requires SoXR");
         return RECORD_ERROR;
     }
@@ -2842,10 +3193,10 @@ static int gui_record_start_confirmed(gui_app_t *app,
     s_record_sample_rate_a = 0;
     s_record_sample_rate_b = 0;
 #endif
-    if (app->settings.capture_a) {
+    if (record_a) {
         snprintf(s_record_path_a, sizeof(s_record_path_a), "%s", path_a);
     }
-    if (app->settings.capture_b) {
+    if (record_b) {
         snprintf(s_record_path_b, sizeof(s_record_path_b), "%s", path_b);
     }
 
@@ -2866,8 +3217,8 @@ static int gui_record_start_confirmed(gui_app_t *app,
         gui_extract_init_record_rbs(app);
     }
     // Ensure record buffers are initialized in buffer manager for enabled channels
-    if ((app->settings.capture_a && bufmgr_ensure_init(&app->buffers, BUF_RECORD_A) < 0) ||
-        (app->settings.capture_b && bufmgr_ensure_init(&app->buffers, BUF_RECORD_B) < 0)) {
+    if ((record_a && bufmgr_ensure_init(&app->buffers, BUF_RECORD_A) < 0) ||
+        (record_b && bufmgr_ensure_init(&app->buffers, BUF_RECORD_B) < 0)) {
         gui_app_set_status(app, "Record buffers not initialized");
         return RECORD_ERROR;
     }
@@ -2899,12 +3250,7 @@ static int gui_record_start_confirmed(gui_app_t *app,
 #endif
 
     s_recording_app = app;
-    atomic_store(&app->recording_bytes, 0);
-    atomic_store(&app->recording_raw_a, 0);
-    atomic_store(&app->recording_raw_b, 0);
-    atomic_store(&app->recording_compressed_a, 0);
-    atomic_store(&app->recording_compressed_b, 0);
-    app->last_recording_duration_s = 0.0;
+    gui_record_reset_stats(app);
     gui_record_spill_reset_all();
     atomic_store(&s_record_producer_lost_data, false);
     // Clear per-channel write-error flags for the new recording session.
@@ -2912,18 +3258,23 @@ static int gui_record_start_confirmed(gui_app_t *app,
         atomic_store(&s_record_write_error[i], false);
     }
 
+    atomic_store(&s_rtlsdr_hifi_interrupted, false);
+    s_rtlsdr_hifi_tuning = tuning;
+
     // Reset record buffers before starting
     gui_extract_reset_record_rbs(app);
+
+    if (hifi) return gui_record_start_rtlsdr_hifi(app, &targets, mode_a, source_rate, tuning);
 
 #if LIBFLAC_ENABLED == 1
     if (app->settings.use_flac) {
         // Open FLAC files (respect per-channel enable)
-        s_file_a = app->settings.capture_a ? file_open_utf8(path_a, mode_a) : NULL;
-        s_file_b = app->settings.capture_b ? file_open_utf8(path_b, mode_b) : NULL;
+        s_file_a = record_a ? file_open_utf8(path_a, mode_a) : NULL;
+        s_file_b = record_b ? file_open_utf8(path_b, mode_b) : NULL;
         gui_record_set_output_buffer(s_file_a);
         gui_record_set_output_buffer(s_file_b);
 
-        if ((app->settings.capture_a && !s_file_a) || (app->settings.capture_b && !s_file_b)) {
+        if ((record_a && !s_file_a) || (record_b && !s_file_b)) {
             gui_app_set_status(app, "Failed to open output files");
             if (s_file_a) fclose(s_file_a);
             if (s_file_b) fclose(s_file_b);
@@ -2991,8 +3342,8 @@ static int gui_record_start_confirmed(gui_app_t *app,
         s_ctx_b.app = app;
 
         // Configure FLAC writers using shared library
-        flac_writer_config_t config_a = flac_writer_default_config();
-        flac_writer_config_t config_b = flac_writer_default_config();
+        flac_writer_config_t config_a = gui_record_flac_config(app);
+        flac_writer_config_t config_b = config_a;
 
         // Sample rate is stored in kHz for RF capture.
         bool use_resample_a = gui_record_resample_requested(
@@ -3008,31 +3359,7 @@ static int gui_record_start_confirmed(gui_app_t *app,
         s_record_sample_rate_a = config_a.sample_rate;
         s_record_sample_rate_b = config_b.sample_rate;
 
-        // bits_per_sample is set per-channel below
-        config_a.bits_per_sample = 16;
-        config_b.bits_per_sample = 16;
-        config_a.compression_level = app->settings.flac_level;
-        config_b.compression_level = app->settings.flac_level;
-        config_a.verify = app->settings.flac_verification;
-        config_b.verify = app->settings.flac_verification;
-        // Auto (flac_threads == 0) resolves to a real parallel count (4-core
-        // base, up to 8) so level-8 encode keeps up with 40 MSPS without forcing
-        // the record spill file. A user override (>0) is honored verbatim.
-        uint32_t resolved_flac_threads = gui_record_resolve_flac_threads(app->settings.flac_threads);
-        config_a.num_threads = resolved_flac_threads;
-        config_b.num_threads = resolved_flac_threads;
-        config_a.affinity_enabled = app->settings.flac_affinity_enabled;
-        config_b.affinity_enabled = app->settings.flac_affinity_enabled;
-        snprintf(config_a.affinity_cpu_list, sizeof(config_a.affinity_cpu_list), "%s", app->settings.flac_affinity_cpu_list);
-        snprintf(config_b.affinity_cpu_list, sizeof(config_b.affinity_cpu_list), "%s", app->settings.flac_affinity_cpu_list);
-        config_a.enable_seektable = true;
-        config_b.enable_seektable = true;
-
-        // Create writer for channel A
-        config_a.error_cb = gui_flac_error_callback;
-        config_a.bytes_cb = gui_flac_bytes_callback;
-
-        if (app->settings.capture_a) {
+        if (record_a) {
             config_a.bits_per_sample = s_ctx_a.flac_bits_per_sample;
             config_a.callback_user_data = &s_ctx_a;
             if(gui_monitor_local_save_recording()){
@@ -3060,9 +3387,7 @@ static int gui_record_start_confirmed(gui_app_t *app,
         }
 
         // Create writer for channel B
-        if (app->settings.capture_b) {
-            config_b.error_cb = gui_flac_error_callback;
-            config_b.bytes_cb = gui_flac_bytes_callback;
+        if (record_b) {
             config_b.bits_per_sample = s_ctx_b.flac_bits_per_sample;
             config_b.callback_user_data = &s_ctx_b;
             if(gui_monitor_local_save_recording()){
@@ -3106,7 +3431,7 @@ static int gui_record_start_confirmed(gui_app_t *app,
 
         // Start writer threads BEFORE enabling recording in extraction thread
         // This ensures consumers are ready before producer starts filling buffers
-        if (app->settings.capture_a) {
+        if (record_a) {
             if (thrd_create_with_priority(&s_writer_thread_a,
                                           flac_writer_thread,
                                           &s_ctx_a,
@@ -3128,7 +3453,7 @@ static int gui_record_start_confirmed(gui_app_t *app,
             }
             started_a = true;
         }
-        if (app->settings.capture_b) {
+        if (record_b) {
             if (thrd_create_with_priority(&s_writer_thread_b,
                                           flac_writer_thread,
                                           &s_ctx_b,
@@ -3166,12 +3491,9 @@ static int gui_record_start_confirmed(gui_app_t *app,
         // (FLAC mode has no direct channels)
         gui_record_start_source_tracking(app, &targets, false, false);
         gui_extract_set_recording(true, true, bits_a, bits_b, false, false);
-
-        // Start audio output/monitoring (if enabled)
         gui_audio_start(app, &app->buffers);
         gui_audio_begin_recording(app, targets.paths + GUI_RECORD_RF_OUTPUT_COUNT,
                                   overwrite_mask >> GUI_RECORD_RF_OUTPUT_COUNT);
-
         gui_app_set_status(app, "Recording (FLAC)...");
     } else
 #endif
@@ -3406,11 +3728,13 @@ static void gui_record_check_writer_drained(gui_app_t *app, int channel) {
 
 // Heavy finalization runs outside the UI thread.
 static void gui_record_finalize_stop_sync(gui_app_t *app, double stop_request_time) {
+    const bool hifi = s_rtlsdr_hifi_source_rate != 0;
     // The UI has already disarmed the taps and converted producer. Wait for
     // their in-flight blocks before telling any file writer to exit.
     gui_record_direct_tap_wait_idle(&s_direct_ctx_a);
     gui_record_direct_tap_wait_idle(&s_direct_ctx_b);
-    if (!gui_extract_wait_recording_idle())
+    while (atomic_load(&s_rtlsdr_hifi_inflight)) thrd_sleep_ms(1);
+    if (!hifi && !gui_extract_wait_recording_idle())
         atomic_store(&s_record_producer_lost_data, true);
     atomic_store(&s_record_writer_draining, true);
     for (int channel = 0; channel < 2; ++channel) {
@@ -3420,7 +3744,7 @@ static void gui_record_finalize_stop_sync(gui_app_t *app, double stop_request_ti
         s_writer_started[channel] = false;
     }
     gui_record_spill_reset_all();
-    bool audio_ok = gui_audio_wait_recording_idle();
+    bool audio_ok = hifi || gui_audio_wait_recording_idle();
 
 #if LIBFLAC_ENABLED == 1
     bool flac_a = s_flac_writer_a != NULL;
@@ -3446,7 +3770,8 @@ static void gui_record_finalize_stop_sync(gui_app_t *app, double stop_request_ti
 #if LIBFLAC_ENABLED == 1
     if (!gui_monitor_local_save_recording()) {
         if (flac_a && !atomic_load(&s_record_write_error[0])) {
-            gui_record_finalize_flac_metadata(app, s_record_path_a, "CH A",
+            gui_record_finalize_flac_metadata(app, s_record_path_a,
+                                               hifi ? "Hi-Fi RF" : "CH A",
                                               flac_samples_a, s_record_sample_rate_a);
         }
         if (flac_b && !atomic_load(&s_record_write_error[1])) {
@@ -3471,6 +3796,8 @@ static void gui_record_finalize_stop_sync(gui_app_t *app, double stop_request_ti
     app->last_recording_duration_s = capture_duration;
     uint64_t raw_a = atomic_load(&app->recording_raw_a);
     uint64_t raw_b = atomic_load(&app->recording_raw_b);
+    if (hifi)
+        gui_record_log_writef("INFO", "RTL-SDR Hi-Fi RF samples written: %" PRIu64, raw_a / sizeof(int16_t));
     uint64_t comp_a = atomic_load(&app->recording_compressed_a);
     uint64_t comp_b = atomic_load(&app->recording_compressed_b);
     uint64_t raw_total = raw_a + raw_b;
@@ -3573,6 +3900,7 @@ static void gui_record_finalize_stop_sync(gui_app_t *app, double stop_request_ti
     s_record_sample_rate_a = 0;
     s_record_sample_rate_b = 0;
 #endif
+    s_rtlsdr_hifi_source_rate = 0;
 
     bool unconfirmed = false;
     if (local_save) {
@@ -3621,6 +3949,7 @@ void gui_record_stop(gui_app_t *app) {
     // finalizer waits for the in-flight disk writes and drains both paths.
     gui_record_direct_tap_disable(&s_direct_ctx_a);
     gui_record_direct_tap_disable(&s_direct_ctx_b);
+    atomic_store(&s_rtlsdr_hifi_accepting, false);
     gui_extract_request_record_stop();
     app->is_recording = false;
     gui_audio_request_record_stop(app);

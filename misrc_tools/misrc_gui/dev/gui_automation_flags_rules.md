@@ -50,6 +50,13 @@ GUI autoload trigger flag.**
 - Capture start: `--auto-capture`; record cycle: `--auto-record <seconds>`.
 - Whole settings panel: `--config <file>` — every `gui_settings_t` key
   (capture A/B, FLAC, resample, audio outputs, UI scale, net mode, ...).
+- RTL-SDR recording mode: `rtlsdr_hifi_rf_record` (`false` for Native I/Q,
+  `true` for Hi-Fi RF on builds with SoXR).
+- RTL-SDR Hi-Fi RF filename tag: `rtlsdr_hifi_rf_tag` (string, empty by
+  default, used in Hi-Fi RF mode).
+- RTL-SDR Blog V4 manual VGA: `rtlsdr_vga_index` (integer `0`–`8`, default
+  `8`). Select the Blog V4 on a desktop build with the patched librtlsdr
+  and set `rtlsdr_gain_mode` to `1` (Manual) to apply the index on connect.
 - Playback: positional files / `playback_file_a|b` config keys.
 - Overwrite confirmation popup: `overwrite_files` config key (documented in
   `--auto-record` usage as the unattended-run requirement).
