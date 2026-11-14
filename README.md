@@ -7,25 +7,30 @@
 
 A universal cross platform GUI tool for interfacing with and visualizing monitoring and control of FM RF archival focused, capture device workflows.
 
+
 ### Current Supported Hardware
 
 - [MISRC](https://misrc.org) (v1.0-v1.5a / native v2.5)
-- CXADC (single cards and Clockgen Mod with sound)
-- CXADC MacOS
+- CXADC Linux (single cards and Clockgen Mod with sound)
+- CXADC MacOS (single cards and Clockgen Mod with sound)
 - CXADC Win
 - HSDAOH
 - FX3 (Generic tinkering firmware support)
 - DdD (Domesday Duplicator)
 - FX3ADC (100mhz MUSE capture device)
 
+
 ## Downloads
 
 
 Downloads can be found on the [releases page](https://github.com/harrypm/MISRC-GUI/releases).
+
 - Windows
 - MacOS
 - Linux
-- Android (arm64 APK, very alpha)
+- Android
+- IOS (Client, Player & Test Gen*)
+- Web (Remote & Monitor)
 
 x86 (AMD/Intel) and ARM64 (Apple M, Snapdragon, RockChip) are fully supported and intended for long-term support. 
 
