@@ -12,7 +12,8 @@
  *   vid_init() level scaling -> 16-bit level computation + RGB->YUV
  *   _burstwin()              -> raised-cosine burst envelope
  *   vid_config_pal/ntsc      -> the composite config structs (verbatim values)
- *   av_test.c bars           -> 75% colour bar pattern
+ *   av_test.c bars           -> 75% colour bar pattern (PAL / SECAM)
+ *   NTSC composite           -> SMPTE SD colour bars (ht_smpte_px)
  *
  * ALTERED for integration:
  *   - Generates a whole frame at once into a flat int16 buffer
@@ -291,6 +292,71 @@ static void ht_rgb_to_yuv(const ht_config_t *c, double r, double g, double b,
     *y = 0.299 * r + 0.587 * g + 0.114 * b;
     *u = (b - *y) * c->eu_co;
     *v = (r - *y) * c->ev_co;
+}
+
+/* --- SMPTE SD colour bars (NTSC composite) -------------------------------
+ * SMPTE EG 1-1990 / ECR 1-1978 layout, the standard NTSC SD bar signal:
+ *   top 67%:     75% bars  gray, yellow, cyan, green, magenta, red, blue
+ *   middle 8%:   reverse-blue castellations
+ *                blue, black, magenta, black, cyan, black, gray
+ *   bottom 25%:  -I (5/4 bar), 100% white (5/4), +Q (5/4), black (5/4),
+ *                PLUGE 3.5 / 7.5 / 11.5 IRE (1/3 bar each), black (1 bar)
+ * Bar chroma is scaled to the (white - black) span (92.5 IRE with the 7.5 IRE
+ * setup: 75% yellow = 31 IRE amplitude, the standard NTSC values); -I and +Q
+ * are 20 IRE amplitude (40 IRE p-p, the burst's amplitude) on black.
+ * Output: y relative to black..white, u/v in units of the (white - blank)
+ * span (the caller's chroma scale), in this generator's U = sin / V = cos
+ * QAM frame where the NTSC burst sits on -U (180 deg): I is at 123 deg and
+ * Q at 33 deg. */
+static const ht_rgb_t SMPTE_TOP[7] = {
+    { 0.75, 0.75, 0.75 }, { 0.75, 0.75, 0.00 }, { 0.00, 0.75, 0.75 },
+    { 0.00, 0.75, 0.00 }, { 0.75, 0.00, 0.75 }, { 0.75, 0.00, 0.00 },
+    { 0.00, 0.00, 0.75 },
+};
+static const ht_rgb_t SMPTE_MID[7] = {
+    { 0.00, 0.00, 0.75 }, { 0.00, 0.00, 0.00 }, { 0.75, 0.00, 0.75 },
+    { 0.00, 0.00, 0.00 }, { 0.00, 0.75, 0.75 }, { 0.00, 0.00, 0.00 },
+    { 0.75, 0.75, 0.75 },
+};
+
+static void ht_smpte_px(const ht_config_t *c, int row, int rows, int ax, int width,
+                        double *y, double *u, double *v) {
+    const double span = c->white_level - c->black_level;        /* 92.5 IRE */
+    const double chroma_span = span / (c->white_level - c->blanking_level);
+    double pos = 7.0 * (double)ax / (double)width;               /* in bar widths */
+    if (pos < 0.0) pos = 0.0;
+    if (pos >= 7.0) pos = 6.999999;
+    *y = *u = *v = 0.0;
+
+    if (row * 100 < rows * 75) {            /* bars + castellations */
+        const ht_rgb_t *bars = (row * 100 < rows * 67) ? SMPTE_TOP : SMPTE_MID;
+        ht_rgb_t px = bars[(int)pos];
+        double uu, vv;
+        ht_rgb_to_yuv(c, px.r, px.g, px.b, y, &uu, &vv);
+        *u = uu * chroma_span;
+        *v = vv * chroma_span;
+        return;
+    }
+
+    /* Bottom row. 20 IRE of chroma in units of the white-blank span. */
+    const double iq_amp = 20.0 / 140.0 / (c->white_level - c->blanking_level);
+    const double ire = 1.0 / (140.0 * span);   /* y units per IRE */
+    const double i_deg = 123.0 * M_PI / 180.0, q_deg = 33.0 * M_PI / 180.0;
+    if (pos < 1.25) {                       /* -I */
+        *u = -iq_amp * cos(i_deg);
+        *v = -iq_amp * sin(i_deg);
+    } else if (pos < 2.5) {                 /* 100% white */
+        *y = 1.0;
+    } else if (pos < 3.75) {                /* +Q */
+        *u = iq_amp * cos(q_deg);
+        *v = iq_amp * sin(q_deg);
+    } else if (pos < 5.0) {                 /* black */
+    } else if (pos < 5.0 + 1.0 / 3.0) {     /* PLUGE 3.5 IRE (super-black) */
+        *y = -4.0 * ire;
+    } else if (pos < 5.0 + 2.0 / 3.0) {     /* PLUGE 7.5 IRE (black) */
+    } else if (pos < 6.0) {                 /* PLUGE 11.5 IRE */
+        *y = 4.0 * ire;
+    }                                       /* last bar: black */
 }
 
 /* --- Public API ----------------------------------------------------------- */
@@ -575,13 +641,18 @@ size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
                     if (active) {
                         int ax = (int)x - active_left;
                         if (ax >= 0 && ax < active_width) {
-                            int bar = (ax * 8) / active_width;
-                            if (bar > 7) bar = 7;
-                            if (bar < 0) bar = 0;
-
                             double y, u, v;
-                            ht_rgb_to_yuv(c, HT_BARS[bar].r, HT_BARS[bar].g,
-                                          HT_BARS[bar].b, &y, &u, &v);
+                            if (c->colour_mode == HT_NTSC) {
+                                /* NTSC: SMPTE SD colour bars */
+                                ht_smpte_px(c, (s - a0) / 2, c->act_lines,
+                                            ax, active_width, &y, &u, &v);
+                            } else {
+                                int bar = (ax * 8) / active_width;
+                                if (bar > 7) bar = 7;
+                                if (bar < 0) bar = 0;
+                                ht_rgb_to_yuv(c, HT_BARS[bar].r, HT_BARS[bar].g,
+                                              HT_BARS[bar].b, &y, &u, &v);
+                            }
 
                             /* hacktv yuv_level_lookup: y in black..white */
                             signal = black16 + y * (white16 - black16);

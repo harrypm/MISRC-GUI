@@ -86,6 +86,52 @@ Monitor endpoint handlers and Local Save are separate from the legacy RF
 handlers, but use the same TCP listener. The attached Local Save socket
 transfers ownership to the dedicated recording worker after the HTTP request.
 
+## Web Monitor & Remote (browser)
+
+The Server also serves a self-contained browser version of Monitor & Remote
+**on the same port**, so any phone, tablet or PC on the LAN can monitor and
+control a capture without installing MISRC-GUI:
+
+```
+http://<server-ip>:8080/web
+```
+
+Opening `http://<server-ip>:8080/` in a browser also shows the page; non-browser
+clients (no `Accept: text/html`) still receive the legacy `MISRC <version>` text.
+The page is embedded in the binary and uses only the existing `/monitor/...`
+endpoints:
+
+| Feature | Endpoint | Notes |
+|---|---|---|
+| Status, buffers, peaks, clips | `/monitor/status` | polled every 500 ms |
+| Start/Stop capture, Record | `/monitor/start`, `/stop`, `/record?on=1\|0` | server-side recording only |
+| Waveform + FFT scopes | `/monitor/preview?raw=1&…` | same MRD5 frame, **uncompressed** (~48 KiB/frame, up to 10 fps) because browsers cannot decode Zstd |
+| Device selection | `/monitor/devices`, `/monitor/device` | refused while recording |
+| Recording settings | `/monitor/settings`, `/monitor/settings/set` | same allowlist as the native client |
+| Output folder browser | `/monitor/fs/browse`, `/fs/output`, `/fs/select` | server filesystem |
+| Audio monitor | `/monitor/audio?pair=0\|1` | Opus decoded with WebCodecs `AudioDecoder` |
+| Video monitor | `/monitor/video`, `/monitor/video/osd` | MVD1 frames decoded with WebCodecs `VideoDecoder`; offers only codecs the browser reports as supported |
+
+Local Save (recording to the viewer's own disk) is native-client only.
+Audio and video need WebCodecs, which browsers expose only in a secure
+context: `http://localhost` works, but a LAN IP over plain HTTP generally
+does not (Chrome can allow it via
+`chrome://flags/#unsafely-treat-insecure-origin-as-secure`). Scopes, status,
+controls and settings work everywhere.
+
+**CSRF guard:** because a browser can be tricked by another web site into
+requesting `http://<server>:8080/monitor/record?on=1`, the shared listener now
+refuses (HTTP 403) any request a browser marks as cross-site (`Sec-Fetch-Site`
+other than `same-origin`/`none`, or an `Origin` that does not match `Host`).
+Native MISRC clients send neither header and are unaffected.
+
+**Editing the page:** edit `misrc_tools/misrc_gui/web/index.html`, then run
+`python3 misrc_tools/misrc_gui/web/embed_web_ui.py` to regenerate
+`net/gui_web_ui_assets.c` (committed so no build step needs Python). The meson
+test `web_ui_embed` fails if they drift. For live iteration set
+`MISRC_WEB_ROOT=<dir containing index.html>` before starting the Server; the
+page is then read from disk on every request.
+
 ## Build and usage
 
 Linux prerequisites include `libzstd-dev` (Debian/Ubuntu). Windows MSYS2

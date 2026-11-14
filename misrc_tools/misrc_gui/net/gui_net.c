@@ -8,6 +8,7 @@
 #include "gui_monitor_transport.h"
 #include "gui_monitor_audio.h"
 #include "gui_monitor_local_save.h"
+#include "gui_web_ui.h"
 #include "../output/gui_record.h"
 #include "../input/gui_playback.h"
 #include "../core/gui_app.h"
@@ -1279,6 +1280,20 @@ static int server_client_thread(void *arg) {
     char buf[16384];
     int len = net_read_headers(fd, buf, sizeof(buf));
     if (len <= 0) {
+        net_close(fd);
+        goto done;
+    }
+    /* Browsers on the LAN may be steered by other web sites into issuing
+     * GETs to this port (CSRF). Refuse anything a browser marks cross-site;
+     * native MISRC clients send no Origin / Sec-Fetch-Site headers. */
+    if (gui_web_request_cross_site(buf)) {
+        net_send_str(fd, "HTTP/1.0 403 Forbidden\r\nContent-Type: text/plain\r\n"
+                         "Connection: close\r\n\r\ncross-site request refused\n");
+        net_close(fd);
+        goto done;
+    }
+    if (gui_web_ui_is_request(buf)) {
+        gui_web_ui_serve((uintptr_t)fd, gui_monitor_server_active());
         net_close(fd);
         goto done;
     }

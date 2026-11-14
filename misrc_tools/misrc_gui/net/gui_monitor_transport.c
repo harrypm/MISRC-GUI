@@ -713,6 +713,22 @@ static void mon_answer_preview(mon_sock_t fd,const char *query){
         cfg[c].trigger_mode=mon_arg(query,c?"mb":"ma",0);
         cfg[c].trigger_source=mon_arg(query,c?"sb":"sa",c);
     }
+    if(mon_arg(query,"raw",0)==1){
+        /* Browser web UI: identical MRD5 frame, uncompressed. */
+        gui_rd_frame_t *frame=NULL;
+        if(!gui_rd_server_build_raw(cfg,&frame)){
+            mon_answer(fd,404,"text/plain","no current preview\n");return;
+        }
+        char hdr[256];
+        int hn=snprintf(hdr,sizeof(hdr),
+            "HTTP/1.0 200 OK\r\nContent-Type: application/octet-stream\r\n"
+            "Cache-Control: no-store\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
+            sizeof(*frame));
+        if(hn>0&&(size_t)hn<sizeof(hdr)&&mon_send(fd,hdr,(size_t)hn)==0)
+            (void)mon_send(fd,(const char*)frame,sizeof(*frame));
+        free(frame);
+        return;
+    }
     void *wire=NULL;size_t bytes=0,raw=0;
     if(!gui_rd_server_build(cfg,&wire,&bytes,&raw)){
         mon_answer(fd,404,"text/plain","no current preview\n");return;

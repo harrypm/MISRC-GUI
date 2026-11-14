@@ -39,6 +39,7 @@ Use lowercase with underscores:
 | `gui_ux_change_approval_rules.md` | HARD rule: no UX/GUI layout changes of any kind without direct sign-off from harrypm (Harry Munday) |
 | `readme_hands_off_rules.md` | HARD rule: root `README.md` is hands-off — no edits of any kind without a direct instruction from harrypm |
 | `self_contained_deps_rules.md` | HARD rule: all build deps self-contained from committed pinned `third_party/` trees; no build-time downloads; dep changes only via human-approved commits |
+| `prompt_vectorscope_smpte_readme.md` | Composite vectorscope panel + NTSC SMPTE SD bars Test Gen prompt log (UX sign-off record) |
 | `docs_folder_rules.md` | HARD rule: user-facing sub-docs live in `docs/` (root keeps only README/CONTRIBUTING/INSTALLATION/TECHNICAL/UPDATE/LICENSE*); enforced by the docs layout CI guard |
 
 ### When starting a new prompt

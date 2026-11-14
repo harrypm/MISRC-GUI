@@ -1,0 +1,666 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>MISRC Web Remote</title>
+<style>
+:root{
+  --bg:#0f1114;--panel:#171a1f;--panel2:#1d2127;--line:#2a2f37;--text:#e6e8eb;--muted:#8b939e;
+  --accent:#4fb3ff;--ok:#3ecf8e;--warn:#f5b13d;--bad:#ff5a5f;--rec:#ff3b46;
+  --cha:#5ad1ff;--chb:#ffb84d;--grid:#232831;--fft:#7ee787;
+  --radius:8px;--mono:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;
+}
+@media (prefers-color-scheme: light){
+  :root:not([data-theme="dark"]){
+    --bg:#f2f4f7;--panel:#ffffff;--panel2:#f7f8fa;--line:#d9dde3;--text:#16191d;--muted:#5d6672;
+    --grid:#e7eaee;--cha:#0b84c6;--chb:#c46a00;--fft:#1f883d;
+  }
+}
+:root[data-theme="light"]{
+  --bg:#f2f4f7;--panel:#ffffff;--panel2:#f7f8fa;--line:#d9dde3;--text:#16191d;--muted:#5d6672;
+  --grid:#e7eaee;--cha:#0b84c6;--chb:#c46a00;--fft:#1f883d;
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--text);font:14px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+button,select,input{font:inherit;color:inherit}
+header{position:sticky;top:0;z-index:5;display:flex;flex-wrap:wrap;gap:10px;align-items:center;
+  padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--line)}
+header h1{font-size:16px;margin:0 8px 0 0;font-weight:650;letter-spacing:.2px}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;
+  background:var(--panel2);border:1px solid var(--line);font-size:12px;font-weight:600;white-space:nowrap}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--muted)}
+.pill.ok .dot{background:var(--ok)} .pill.bad .dot{background:var(--bad)} .pill.warn .dot{background:var(--warn)}
+.pill.rec{background:var(--rec);border-color:var(--rec);color:#fff} .pill.rec .dot{background:#fff;animation:blink 1s infinite}
+@keyframes blink{50%{opacity:.25}}
+.spacer{flex:1}
+.btn{border:1px solid var(--line);background:var(--panel2);padding:6px 12px;border-radius:6px;cursor:pointer;font-weight:600}
+.btn:hover:not(:disabled){border-color:var(--accent)}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#061019}
+.btn.rec{background:var(--rec);border-color:var(--rec);color:#fff}
+.btn.small{padding:3px 8px;font-size:12px}
+.time{font-family:var(--mono);font-size:15px;min-width:86px;text-align:right}
+main{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:16px;padding:16px;max-width:1700px;margin:0 auto}
+@media (max-width:980px){main{grid-template-columns:minmax(0,1fr)}}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:12px;min-width:0}
+.card h2{font-size:12px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);margin:0 0 10px;font-weight:700}
+.stack{display:flex;flex-direction:column;gap:16px;min-width:0}
+.tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin-bottom:12px;overflow-x:auto}
+.tab{background:none;border:0;border-bottom:2px solid transparent;padding:8px 12px;cursor:pointer;color:var(--muted);font-weight:600}
+.tab[aria-selected="true"]{color:var(--text);border-bottom-color:var(--accent)}
+.hidden{display:none!important}
+.toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:10px;font-size:13px}
+.toolbar label{display:inline-flex;gap:6px;align-items:center;color:var(--muted)}
+select,input[type=text],input[type=number]{background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:4px 6px;min-width:0}
+.scope{display:grid;grid-template-columns:minmax(0,3fr) minmax(0,2fr);gap:10px;margin-bottom:12px}
+@media (max-width:700px){.scope{grid-template-columns:minmax(0,1fr)}}
+.chan-label{display:flex;justify-content:space-between;align-items:baseline;font-size:12px;color:var(--muted);margin:0 0 4px;font-family:var(--mono)}
+.chan-label b{font-family:system-ui,sans-serif;font-size:13px}
+canvas{display:block;width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:6px}
+canvas.wave,canvas.fft{height:200px}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:13px}
+.kv dt{color:var(--muted)} .kv dd{margin:0;text-align:right;font-family:var(--mono)}
+.meter{display:grid;grid-template-columns:52px 1fr 64px;align-items:center;gap:8px;font-size:12px;margin:5px 0}
+.meter .bar{height:10px;background:var(--panel2);border:1px solid var(--line);border-radius:3px;overflow:hidden;position:relative}
+.meter .fill{position:absolute;inset:0 auto 0 0;width:0;background:var(--ok);transition:width .12s linear}
+.meter .val{font-family:var(--mono);text-align:right;color:var(--muted)}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.muted{color:var(--muted)} .mono{font-family:var(--mono)}
+.note{font-size:12px;color:var(--muted)}
+.banner{padding:8px 12px;border-radius:6px;background:color-mix(in srgb,var(--warn) 18%,transparent);border:1px solid var(--warn);font-size:13px;margin-bottom:12px}
+.settings-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px}
+fieldset{border:1px solid var(--line);border-radius:6px;padding:8px 10px;margin:0;min-width:0}
+legend{color:var(--muted);font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;padding:0 4px}
+.field{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.1fr);gap:8px;align-items:center;padding:3px 0;font-size:13px}
+.field input[type=text],.field input[type=number],.field select{width:100%}
+.field.changed label{color:var(--accent)}
+.video-wrap{position:relative;background:#000;border-radius:6px;overflow:hidden;aspect-ratio:4/3;max-height:70vh;display:flex;align-items:center;justify-content:center}
+.video-wrap canvas{border:0;border-radius:0;background:#000;width:100%;height:100%;object-fit:contain}
+.osd{position:absolute;left:8px;bottom:8px;right:8px;font:12px/1.35 var(--mono);color:#ffe678;white-space:pre-wrap;
+  text-shadow:0 1px 2px #000;pointer-events:none}
+.vmsg{position:absolute;inset:auto 0 50% 0;text-align:center;color:#aaa;font-size:13px}
+.path{font-family:var(--mono);font-size:12px;word-break:break-all;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:6px 8px}
+dialog{background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:10px;padding:0;width:min(560px,calc(100vw - 32px))}
+dialog::backdrop{background:rgba(0,0,0,.55)}
+.dlg-h{padding:12px 14px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center}
+.dlg-b{padding:10px 14px;max-height:55vh;overflow:auto}
+.dlg-f{padding:10px 14px;border-top:1px solid var(--line);display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap}
+.dir{display:block;width:100%;text-align:left;background:none;border:0;padding:6px 8px;border-radius:5px;cursor:pointer}
+.dir:hover{background:var(--panel2)}
+.dir::before{content:"\1F4C1  "}
+#toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:var(--panel);border:1px solid var(--line);
+  padding:8px 14px;border-radius:8px;box-shadow:0 6px 24px rgba(0,0,0,.35);font-size:13px;opacity:0;transition:opacity .2s;pointer-events:none;max-width:calc(100vw - 32px)}
+#toast.show{opacity:1}
+</style>
+</head>
+<body>
+<header>
+  <h1>MISRC Web Remote</h1>
+  <span id="conn" class="pill"><span class="dot"></span><span>Connecting…</span></span>
+  <span id="state" class="pill"><span class="dot"></span><span>—</span></span>
+  <span id="sync" class="pill hidden"><span class="dot"></span><span>Sync</span></span>
+  <span class="spacer"></span>
+  <span id="elapsed" class="time" title="Recording time">00:00:00</span>
+  <button id="btnCapture" class="btn primary" disabled>Start capture</button>
+  <button id="btnRecord" class="btn rec" disabled>● Record</button>
+  <button id="btnTheme" class="btn small" title="Toggle light/dark">◐</button>
+</header>
+
+<main>
+  <section class="stack">
+    <div class="card">
+      <div class="tabs" role="tablist">
+        <button class="tab" role="tab" data-tab="scope" aria-selected="true">Scope</button>
+        <button class="tab" role="tab" data-tab="video" aria-selected="false">Video</button>
+        <button class="tab" role="tab" data-tab="settings" aria-selected="false">Settings</button>
+      </div>
+
+      <div id="tab-scope">
+        <div class="toolbar">
+          <label>Timebase
+            <select id="zoom">
+              <option value="1">1×</option><option value="2">2×</option><option value="4">4×</option>
+              <option value="8">8×</option><option value="16">16×</option><option value="32" selected>32×</option>
+              <option value="64">64×</option><option value="128">128×</option>
+            </select></label>
+          <label><input type="checkbox" id="trig"> Trigger</label>
+          <label>Level <input type="number" id="trigLevel" value="0" step="64" style="width:80px"></label>
+          <label>Edge <select id="trigMode"><option value="0">Rising</option><option value="1">Falling</option></select></label>
+          <label>FFT avg <select id="fftAvg"><option value="0">Off</option><option value="0.6" selected>Light</option><option value="0.85">Heavy</option></select></label>
+          <label><input type="checkbox" id="previewOn" checked> Live</label>
+          <span id="previewInfo" class="note mono"></span>
+        </div>
+        <div id="noPreview" class="banner hidden">No live preview: start capture on the server.</div>
+        <div class="scope">
+          <div><div class="chan-label"><b style="color:var(--cha)">RF A · waveform</b><span id="waInfo"></span></div><canvas id="waveA" class="wave"></canvas></div>
+          <div><div class="chan-label"><b style="color:var(--cha)">RF A · spectrum</b><span id="faInfo"></span></div><canvas id="fftA" class="fft"></canvas></div>
+        </div>
+        <div class="scope" id="scopeB">
+          <div><div class="chan-label"><b style="color:var(--chb)">RF B · waveform</b><span id="wbInfo"></span></div><canvas id="waveB" class="wave"></canvas></div>
+          <div><div class="chan-label"><b style="color:var(--chb)">RF B · spectrum</b><span id="fbInfo"></span></div><canvas id="fftB" class="fft"></canvas></div>
+        </div>
+      </div>
+
+      <div id="tab-video" class="hidden">
+        <div id="videoUnsupported" class="banner hidden">This browser has no WebCodecs video decoder. Use a current Chrome, Edge, Safari or Firefox.</div>
+        <div class="toolbar">
+          <label>Channel <select id="vChan"><option value="0">RF A</option><option value="1">RF B</option></select></label>
+          <label>Decoder <select id="vMode"><option value="0">CVBS</option><option value="2">RF preview</option></select></label>
+          <label>System <select id="vSys"><option value="0">PAL</option><option value="1">NTSC</option><option value="2">SECAM</option></select></label>
+          <span id="vCvbsOpts" class="row">
+            <label>Frame <select id="vFrame"><option value="0">Active</option><option value="1">Full</option></select></label>
+            <label>Levels <select id="vLevels"><option value="0">Auto</option><option value="1">Fixed</option></select></label>
+            <label>Sync <select id="vSync"><option value="1">Fixed</option><option value="0">Auto</option></select></label>
+            <label>Colour <select id="vColour"><option value="1">Auto</option><option value="0">Off</option></select></label>
+            <label>OSD <select id="vOsd"><option value="0">Off</option><option value="1" selected>Minimal</option><option value="2">Stats</option></select></label>
+          </span>
+          <span id="vRfOpts" class="row hidden">
+            <label>Tape <select id="vTape"><option value="0">VHS</option><option value="1">Betamax</option></select></label>
+            <label id="vBetaWrap" class="hidden">Preset <select id="vBeta"><option value="0">Betamax</option><option value="1">Betamax Hi-Fi</option><option value="2">SuperBeta</option><option value="3">ED Beta</option></select></label>
+            <label id="vMesecamWrap" class="hidden"><input type="checkbox" id="vMesecam"> MESECAM</label>
+            <label>Frame <select id="vRfFrame"><option value="0">Active</option><option value="1">Full</option></select></label>
+            <label>Budget <select id="vBudget"><option value="0">0.5 core</option><option value="1">0.75</option><option value="2" selected>1</option><option value="3">1.5</option><option value="4">2</option><option value="5">3</option></select></label>
+            <label>Stats <select id="vStats"><option value="2">Off</option><option value="1" selected>Basic</option><option value="0">All</option></select></label>
+          </span>
+          <button id="vStart" class="btn primary small">Start video</button>
+          <span id="vInfo" class="note mono"></span>
+        </div>
+        <div class="video-wrap"><canvas id="vCanvas" width="720" height="576"></canvas><div id="vMsg" class="vmsg">Video stopped</div><div id="vOsd" class="osd"></div></div>
+        <p class="note">One viewer per channel: a native Monitor &amp; Remote client already watching a channel makes it busy here.</p>
+      </div>
+
+      <div id="tab-settings" class="hidden">
+        <div class="toolbar">
+          <button id="setReload" class="btn small">Reload from server</button>
+          <span id="setStatus" class="note"></span>
+        </div>
+        <div id="setLocked" class="banner hidden">Recording in progress: the server refuses setting changes until it stops.</div>
+        <div id="settingsForm" class="settings-grid"></div>
+      </div>
+    </div>
+  </section>
+
+  <aside class="stack">
+    <div class="card">
+      <h2>Capture device</h2>
+      <div class="row"><select id="devSel" style="flex:1"></select><button id="devApply" class="btn small">Select</button></div>
+      <p id="devNote" class="note" style="margin:6px 0 0"></p>
+    </div>
+
+    <div class="card">
+      <h2>RF levels</h2>
+      <div class="meter"><span style="color:var(--cha)">RF A</span><span class="bar"><span id="mRfA" class="fill"></span></span><span id="vRfA" class="val">—</span></div>
+      <div class="meter"><span style="color:var(--chb)">RF B</span><span class="bar"><span id="mRfB" class="fill"></span></span><span id="vRfB" class="val">—</span></div>
+      <dl class="kv" style="margin-top:8px">
+        <dt>Clips A (+/−)</dt><dd><span id="clipA">0 / 0</span> <button class="btn small" data-reset="0">Reset</button></dd>
+        <dt>Clips B (+/−)</dt><dd><span id="clipB">0 / 0</span> <button class="btn small" data-reset="1">Reset</button></dd>
+      </dl>
+    </div>
+
+    <div class="card">
+      <h2>Audio</h2>
+      <div class="meter"><span>CH1</span><span class="bar"><span id="mAu0" class="fill"></span></span><span id="vAu0" class="val">—</span></div>
+      <div class="meter"><span>CH2</span><span class="bar"><span id="mAu1" class="fill"></span></span><span id="vAu1" class="val">—</span></div>
+      <div class="meter"><span>CH3</span><span class="bar"><span id="mAu2" class="fill"></span></span><span id="vAu2" class="val">—</span></div>
+      <div class="meter"><span>CH4</span><span class="bar"><span id="mAu3" class="fill"></span></span><span id="vAu3" class="val">—</span></div>
+      <div class="row" style="margin-top:8px">
+        <select id="auPair"><option value="0">Listen CH1/2</option><option value="1">Listen CH3/4</option></select>
+        <button id="auBtn" class="btn small">▶ Listen</button>
+        <input id="auVol" type="range" min="0" max="1.5" step="0.05" value="1" style="flex:1;min-width:60px" title="Volume">
+      </div>
+      <p id="auNote" class="note" style="margin:6px 0 0">Mono 48 kHz Opus from the server's captured audio.</p>
+    </div>
+
+    <div class="card">
+      <h2>Buffers</h2>
+      <div class="meter"><span>RF in</span><span class="bar"><span id="bRf" class="fill"></span></span><span id="tRf" class="val">—</span></div>
+      <div class="meter"><span>Audio</span><span class="bar"><span id="bAud" class="fill"></span></span><span id="tAud" class="val">—</span></div>
+      <div class="meter"><span>Rec A</span><span class="bar"><span id="bRa" class="fill"></span></span><span id="tRa" class="val">—</span></div>
+      <div class="meter"><span>Rec B</span><span class="bar"><span id="bRb" class="fill"></span></span><span id="tRb" class="val">—</span></div>
+    </div>
+
+    <div class="card">
+      <h2>Recording</h2>
+      <dl class="kv">
+        <dt>Sample rate</dt><dd id="sRate">—</dd>
+        <dt>Frames</dt><dd id="sFrames">—</dd>
+        <dt>Errors / missed</dt><dd id="sErr">—</dd>
+        <dt>Format</dt><dd id="sFmt">—</dd>
+        <dt>Written A</dt><dd id="sA">—</dd>
+        <dt>Written B</dt><dd id="sB">—</dd>
+        <dt>Waits / drops</dt><dd id="sWd">—</dd>
+        <dt>Free space</dt><dd id="sFree">—</dd>
+      </dl>
+      <p id="sResult" class="note" style="margin:8px 0 0"></p>
+    </div>
+
+    <div class="card">
+      <h2>Server output folder</h2>
+      <div id="outPath" class="path">—</div>
+      <div class="row" style="margin-top:8px"><button id="outBrowse" class="btn small">Browse…</button></div>
+    </div>
+    <p class="note">Unencrypted, unauthenticated LAN interface. Do not expose this port to the Internet.</p>
+  </aside>
+</main>
+
+<dialog id="fsDlg">
+  <div class="dlg-h"><b>Choose server folder</b><button class="btn small" id="fsClose">✕</button></div>
+  <div class="dlg-b">
+    <div id="fsPath" class="path" style="margin-bottom:8px"></div>
+    <div class="row" style="margin-bottom:8px">
+      <button class="btn small" id="fsHome">Home</button>
+      <button class="btn small" id="fsUp">Up</button>
+      <span id="fsMore" class="note"></span>
+    </div>
+    <div id="fsList"></div>
+  </div>
+  <div class="dlg-f"><button class="btn" id="fsCancel">Cancel</button><button class="btn primary" id="fsSelect">Use this folder</button></div>
+</dialog>
+<div id="toast"></div>
+
+<script>
+"use strict";
+const $=id=>document.getElementById(id);
+const S={status:null,online:false,failures:0,lastResultId:null,recording:false,capturing:false,devices:[],selected:-1,
+  settings:{},fftSmooth:[null,null],previewBusy:false,lastSeq:-1,fps:0,fpsCount:0,fpsT:performance.now()};
+
+/* ---------- utilities ---------- */
+function toast(msg,ms=3200){const t=$("toast");t.textContent=msg;t.classList.add("show");clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove("show"),ms);}
+async function get(path,opts={}){
+  const ctl=new AbortController();const tm=setTimeout(()=>ctl.abort(),opts.timeout||4000);
+  try{const r=await fetch(path,{cache:"no-store",signal:ctl.signal});
+    if(opts.binary){if(!r.ok)return {ok:false,status:r.status};return {ok:true,status:r.status,data:await r.arrayBuffer()};}
+    return {ok:r.ok,status:r.status,text:await r.text()};
+  }finally{clearTimeout(tm);}
+}
+function fmtBytes(n){if(!isFinite(n))return"—";const u=["B","KiB","MiB","GiB","TiB"];let i=0;while(n>=1024&&i<u.length-1){n/=1024;i++;}return (i?n.toFixed(n<10?2:1):n)+" "+u[i];}
+function fmtTime(ms){const s=Math.floor(ms/1000),h=Math.floor(s/3600),m=Math.floor(s/60)%60,x=s%60;return [h,m,x].map(v=>String(v).padStart(2,"0")).join(":");}
+function fmtRate(hz){return hz>=1e6?(hz/1e6).toFixed(hz%1e6?3:0)+" MSPS":hz>=1e3?(hz/1e3).toFixed(1)+" kSPS":hz+" SPS";}
+function setPill(el,cls,text){el.className="pill "+cls;el.lastElementChild.textContent=text;}
+function setMeter(fillId,valId,frac,text,color){const f=$(fillId);const p=Math.max(0,Math.min(1,frac));f.style.width=(p*100).toFixed(1)+"%";
+  f.style.background=color||(p>0.97?"var(--bad)":p>0.8?"var(--warn)":"var(--ok)");if(valId)$(valId).textContent=text;}
+function dbfs(peak,fs){if(!peak)return"-∞ dB";return (20*Math.log10(peak/fs)).toFixed(1)+" dB";}
+function css(name){return getComputedStyle(document.documentElement).getPropertyValue(name).trim();}
+
+/* ---------- theme ---------- */
+(function(){let t=null;try{t=localStorage.getItem("misrc-theme");}catch(e){}if(t)document.documentElement.dataset.theme=t;
+  $("btnTheme").onclick=()=>{const cur=document.documentElement.dataset.theme||(matchMedia("(prefers-color-scheme: light)").matches?"light":"dark");
+    const next=cur==="light"?"dark":"light";document.documentElement.dataset.theme=next;try{localStorage.setItem("misrc-theme",next);}catch(e){}};})();
+
+/* ---------- tabs ---------- */
+function showTab(name){
+  const b=document.querySelector(`.tab[data-tab="${name}"]`);if(!b)return;
+  document.querySelectorAll(".tab").forEach(x=>x.setAttribute("aria-selected",x===b?"true":"false"));
+  ["scope","video","settings"].forEach(n=>$("tab-"+n).classList.toggle("hidden",n!==name));
+  if(name==="settings")loadSettings();
+  if(location.hash!=="#"+name)history.replaceState(null,"","#"+name);
+}
+document.querySelectorAll(".tab").forEach(b=>b.onclick=()=>showTab(b.dataset.tab));
+addEventListener("hashchange",()=>showTab(location.hash.slice(1)));
+if(location.hash.length>1)showTab(location.hash.slice(1));
+
+/* ---------- status ---------- */
+async function pollStatus(){
+  try{
+    const r=await get("/monitor/status",{timeout:2500});
+    if(!r.ok)throw new Error("HTTP "+r.status);
+    const s=JSON.parse(r.text);if(s.protocol!=="MISRC-M/2")throw new Error("protocol");
+    S.status=s;S.failures=0;
+    if(!S.online){S.online=true;setPill($("conn"),"ok",location.host);loadDevices();loadOutput();}
+    renderStatus(s);
+  }catch(e){
+    if(++S.failures>=2){S.online=false;setPill($("conn"),"bad","Offline");$("btnCapture").disabled=$("btnRecord").disabled=true;}
+  }
+}
+function renderStatus(s){
+  S.capturing=s.state>=1;S.recording=s.state===2;
+  setPill($("state"),S.recording?"rec":S.capturing?"ok":"",S.recording?"REC":S.capturing?"Capturing":"Idle");
+  const sy=$("sync");sy.classList.toggle("hidden",!S.capturing);setPill(sy,s.stream_synced?"ok":"warn",s.stream_synced?"Synced":"No sync");
+  const bc=$("btnCapture");bc.disabled=S.recording;bc.textContent=S.capturing?"Stop capture":"Start capture";bc.className="btn "+(S.capturing?"":"primary");
+  const br=$("btnRecord");br.disabled=!S.capturing&&!S.recording;br.textContent=S.recording?"■ Stop rec":"● Record";
+  $("elapsed").textContent=fmtTime(s.record_elapsed_ms||0);
+  $("sRate").textContent=s.sample_rate?fmtRate(s.sample_rate):"—";
+  $("sFrames").textContent=s.frames;$("sErr").textContent=s.errors+" / "+s.missed;
+  $("sFmt").textContent=(s.use_flac?"FLAC":"Raw")+(s.capture_a?" · A":"")+(s.capture_b?" · B":"")+(s.local_save?" · local save":"");
+  const ratio=(c,r)=>r?" ("+(100*c/r).toFixed(0)+"%)":"";
+  $("sA").textContent=s.capture_a?fmtBytes(s.compressed_a)+ratio(s.compressed_a,s.raw_a):"—";
+  $("sB").textContent=s.capture_b?fmtBytes(s.compressed_b)+ratio(s.compressed_b,s.raw_b):"—";
+  $("sWd").textContent=(s.rec_a_waits+s.rec_b_waits)+" / "+(s.rec_a_drops+s.rec_b_drops);
+  $("sWd").style.color=(s.rec_a_drops+s.rec_b_drops)?"var(--bad)":"";
+  $("sFree").textContent=s.server_free_valid?fmtBytes(s.server_free_bytes):"—";
+  $("clipA").textContent=s.clip_a_pos+" / "+s.clip_a_neg;$("clipB").textContent=s.clip_b_pos+" / "+s.clip_b_neg;
+  $("clipA").style.color=(s.clip_a_pos+s.clip_a_neg)?"var(--bad)":"";$("clipB").style.color=(s.clip_b_pos+s.clip_b_neg)?"var(--bad)":"";
+  const pct=(i,t,v)=>setMeter(i,t,v/100,v+"%");
+  pct("bRf","tRf",s.rf_pct);pct("bAud","tAud",s.aud_pct);pct("bRa","tRa",s.rec_a_pct);pct("bRb","tRb",s.rec_b_pct);
+  for(let i=0;i<4;i++){const p=s["audio_peak_ch"+(i+1)]||0;setMeter("mAu"+i,"vAu"+i,p?Math.max(0,1+20*Math.log10(p/32767)/60):0,dbfs(p,32767));}
+  if(S.lastResultId===null)S.lastResultId=s.record_result_id;
+  else if(s.record_result_id!==S.lastResultId){S.lastResultId=s.record_result_id;
+    const msg=s.record_result_detail||(s.record_result_code?"Record request failed (code "+s.record_result_code+")":"Record request completed");
+    $("sResult").textContent=msg;if(s.record_result_code)toast(msg,6000);}
+  $("setLocked").classList.toggle("hidden",!S.recording);
+  document.querySelectorAll("#settingsForm input,#settingsForm select").forEach(e=>e.disabled=S.recording);
+  $("devApply").disabled=S.recording;
+}
+$("btnCapture").onclick=async()=>{const r=await get(S.capturing?"/monitor/stop":"/monitor/start");if(!r.ok)toast(r.text||"Request failed");setTimeout(pollStatus,250);};
+$("btnRecord").onclick=async()=>{
+  const r=await get(S.recording?"/monitor/record?on=0":"/monitor/record?on=1");
+  if(!r.ok)toast((r.text||"Record request refused").trim());setTimeout(pollStatus,250);
+};
+document.querySelectorAll("[data-reset]").forEach(b=>b.onclick=async()=>{await get("/monitor/reset-clips?channel="+b.dataset.reset);pollStatus();});
+
+/* ---------- devices ---------- */
+async function loadDevices(){
+  const r=await get("/monitor/devices").catch(()=>null);if(!r||!r.ok)return;
+  const list=[];let sel=-1;
+  for(const line of r.text.split("\n")){
+    if(line.startsWith("selected="))sel=parseInt(line.slice(9),10);
+    else if(line.startsWith("device=")){const p=line.slice(7).split(",");if(p.length>=4){
+      try{list.push({type:+p[0],index:+p[1],name:decodeURIComponent(p[2]),serial:decodeURIComponent(p.slice(3).join(","))});}catch(e){}}}
+  }
+  S.devices=list;S.selected=sel;
+  const d=$("devSel");d.innerHTML="";
+  list.forEach((dev,i)=>{const o=document.createElement("option");o.value=i;o.textContent=dev.name+(dev.serial?" ("+dev.serial+")":"");if(i===sel)o.selected=true;d.appendChild(o);});
+  if(!list.length){const o=document.createElement("option");o.textContent="No devices";d.appendChild(o);}
+  $("devNote").textContent=sel>=0&&list[sel]?"Active: "+list[sel].name:"";
+}
+$("devApply").onclick=async()=>{
+  const i=+$("devSel").value;const r=await get("/monitor/device?index="+i);
+  toast(r.ok?"Device change queued":(r.text||"Device change refused").trim());setTimeout(loadDevices,800);
+};
+
+/* ---------- output folder ---------- */
+async function loadOutput(){const r=await get("/monitor/fs/output").catch(()=>null);if(r&&r.ok){try{$("outPath").textContent=decodeURIComponent(r.text.trim())||"—";}catch(e){}}}
+const FS={path:"",parent:"",computer:false,page:0,more:false,items:[]};
+function fsJoin(base,name){if(FS.computer||!base)return name;const sep=base.includes("\\")||/^[A-Za-z]:/.test(base)?"\\":"/";return base.endsWith(sep)?base+name:base+sep+name;}
+async function fsBrowse(at,page=0){
+  const r=await get("/monitor/fs/browse?at="+encodeURIComponent(at)+"&page="+page).catch(()=>null);
+  if(!r||!r.ok){toast("Cannot list that folder");return;}
+  const items=[];let path="",parent="",computer=false,more=false;
+  for(const line of r.text.split("\n")){const eq=line.indexOf("=");if(eq<0)continue;const k=line.slice(0,eq),v=line.slice(eq+1);
+    try{if(k==="path")path=decodeURIComponent(v);else if(k==="parent")parent=decodeURIComponent(v);
+      else if(k==="computer")computer=v==="1";else if(k==="more")more=v==="1";else if(k==="item")items.push(decodeURIComponent(v));}catch(e){}}
+  Object.assign(FS,{path,parent,computer,page,more,items});
+  $("fsPath").textContent=computer?"Computer":path;$("fsMore").textContent=more||page?"page "+(page+1):"";
+  const list=$("fsList");list.innerHTML="";
+  if(page>0){const b=document.createElement("button");b.className="btn small";b.textContent="← Previous";b.onclick=()=>fsBrowse(FS.path,page-1);list.appendChild(b);}
+  for(const n of items){const b=document.createElement("button");b.className="dir";b.textContent=n;b.onclick=()=>fsBrowse(fsJoin(path,n));list.appendChild(b);}
+  if(!items.length)list.insertAdjacentHTML("beforeend",'<p class="note">No sub-folders</p>');
+  if(more){const b=document.createElement("button");b.className="btn small";b.textContent="Next →";b.onclick=()=>fsBrowse(FS.path,page+1);list.appendChild(b);}
+  $("fsSelect").disabled=computer||!path;
+}
+$("outBrowse").onclick=()=>{$("fsDlg").showModal();const cur=$("outPath").textContent;fsBrowse(cur&&cur!=="—"?cur:"");};
+$("fsHome").onclick=()=>fsBrowse("");$("fsUp").onclick=()=>fsBrowse(FS.parent);
+$("fsClose").onclick=$("fsCancel").onclick=()=>$("fsDlg").close();
+$("fsSelect").onclick=async()=>{const r=await get("/monitor/fs/select?at="+encodeURIComponent(FS.path));
+  toast(r.ok?"Output folder change queued":(r.text||"Refused").trim());$("fsDlg").close();setTimeout(loadOutput,700);};
+
+/* ---------- settings ---------- */
+const B="bool",T="text";
+const META=[
+ ["Capture",[["capture_a","Capture RF A",B],["capture_b","Capture RF B",B],["rf_bits_a","RF A bits",[8,12,16]],["rf_bits_b","RF B bits",[8,12,16]],
+   ["misrc_mode","MISRC mode",B],["misrc_v15_v25_ab_swap","v1.5/v2.5 A/B swap",B],["stop_on_dropout","Stop on dropout",B],
+   ["capture_limit_seconds","Capture limit (s, 0=off)",[0,864000,1]],["record_limit_seconds","Record limit (s, 0=off)",[0,864000,1]],
+   ["rf_preview_budget_percent","RF preview budget %",[50,300,1]]]],
+ ["Compression",[["use_flac","FLAC compression",B],["flac_level","FLAC level",[0,8,1]],["flac_threads","FLAC threads",[1,32,1]],["flac_verification","FLAC verification",B]]],
+ ["File naming",[["output_base_name","Base name",T],["auto_names_enabled","Auto names",B],["append_timestamp_on_capture_start","Append timestamp",B],
+   ["overwrite_files","Overwrite files",B],["output_filename_a","File A",T],["output_filename_b","File B",T],["capture_time","Capture time",T]]],
+ ["Resample",[["enable_resample_a","Resample A",B],["resample_rate_a","Rate A",[1,100000,"any"]],["resample_gain_a","Gain A (dB)",[-48,48,"any"]],["resample_quality_a","Quality A",[0,4,1]],
+   ["enable_resample_b","Resample B",B],["resample_rate_b","Rate B",[1,100000,"any"]],["resample_gain_b","Gain B (dB)",[-48,48,"any"]],["resample_quality_b","Quality B",[0,4,1]]]],
+ ["Audio outputs",[["enable_audio_4ch","4-ch file",B],["audio_4ch_filename","4-ch name",T],["enable_audio_2ch_12","2-ch 1/2 file",B],["audio_2ch_12_filename","2-ch 1/2 name",T],
+   ["enable_audio_2ch_34","2-ch 3/4 file",B],["audio_2ch_34_filename","2-ch 3/4 name",T],
+   ["enable_audio_1ch_1","Mono CH1",B],["audio_label_0","CH1 label",T],["audio_file_0","CH1 file",T],
+   ["enable_audio_1ch_2","Mono CH2",B],["audio_label_1","CH2 label",T],["audio_file_1","CH2 file",T],
+   ["enable_audio_1ch_3","Mono CH3",B],["audio_label_2","CH3 label",T],["audio_file_2","CH3 file",T],
+   ["enable_audio_1ch_4","Mono CH4",B],["audio_label_3","CH4 label",T],["audio_file_3","CH4 file",T],
+   ["audio_tag_0","Audio tag 1",T],["audio_tag_1","Audio tag 2",T],["audio_tag_2","Audio tag 3",T]]],
+ ["Level auto-stop",[["level_autostop_enabled","Enabled",B],["level_autostop_vpp","Threshold Vpp",[0.5,4,"any"]],["level_autostop_vpp_hsdaoh","Threshold Vpp (HSDAOH)",[0.5,4,"any"]],
+   ["level_autostop_level_str","Level",T],["level_autostop_duration_str","Duration",T]]],
+ ["Ingest metadata",[["ingest_project","Project",T],["ingest_tape_id","Tape ID",T],["ingest_tape_format","Format",T],["ingest_tape_size","Size",T],["ingest_tape_speed","Speed",T],
+   ["ingest_tape_condition","Condition",T],["ingest_operator","Operator",T],["ingest_location","Location",T],["ingest_notes","Notes",T],["rf_tag_0","RF A tag",T],["rf_tag_1","RF B tag",T]]],
+];
+const setQueue=[];let setBusy=false;
+async function loadSettings(){
+  $("setStatus").textContent="Loading…";
+  const r=await get("/monitor/settings").catch(()=>null);
+  if(!r||!r.ok){$("setStatus").textContent="Could not load settings";return;}
+  const vals={};for(const line of r.text.split("\n")){const eq=line.indexOf("=");if(eq>0){try{vals[line.slice(0,eq)]=decodeURIComponent(line.slice(eq+1));}catch(e){}}}
+  S.settings=vals;renderSettings();$("setStatus").textContent=Object.keys(vals).length+" settings from server";
+}
+function renderSettings(){
+  const form=$("settingsForm");form.innerHTML="";const known=new Set();
+  const groups=META.map(([g,f])=>[g,f.filter(x=>x[0] in S.settings)]);
+  const other=Object.keys(S.settings).filter(k=>!META.some(([,f])=>f.some(x=>x[0]===k))).map(k=>[k,k,T]);
+  if(other.length)groups.push(["Other",other]);
+  for(const [name,fields] of groups){if(!fields.length)continue;
+    const fs=document.createElement("fieldset");fs.innerHTML="<legend></legend>";fs.firstChild.textContent=name;
+    for(const [key,label,type] of fields){known.add(key);
+      const row=document.createElement("div");row.className="field";const id="set_"+key;
+      const lab=document.createElement("label");lab.htmlFor=id;lab.textContent=label;row.appendChild(lab);
+      let input;const v=S.settings[key];
+      if(type===B){input=document.createElement("input");input.type="checkbox";input.checked=v==="1";input.style.justifySelf="end";}
+      else if(Array.isArray(type)&&!key.startsWith("rf_bits")){ /* [min,max,step] */
+        input=document.createElement("input");input.type="number";input.min=type[0];input.max=type[1];input.step=type[2];input.value=v;}
+      else if(Array.isArray(type)){input=document.createElement("select");for(const o of type){const op=document.createElement("option");op.value=op.textContent=o;input.appendChild(op);}input.value=v;}
+      else{input=document.createElement("input");input.type="text";input.value=v;input.spellcheck=false;}
+      input.id=id;input.disabled=S.recording;
+      input.addEventListener("change",()=>{const nv=input.type==="checkbox"?(input.checked?"1":"0"):String(input.value);
+        if(nv===S.settings[key])return;row.classList.add("changed");queueSet(key,nv,row);});
+      row.appendChild(input);fs.appendChild(row);}
+    form.appendChild(fs);}
+}
+function queueSet(key,value,row){const i=setQueue.findIndex(q=>q.key===key);if(i>=0)setQueue.splice(i,1);setQueue.push({key,value,row,tries:0});pumpSet();}
+async function pumpSet(){
+  if(setBusy||!setQueue.length)return;setBusy=true;const q=setQueue[0];
+  try{
+    const r=await get("/monitor/settings/set?key="+encodeURIComponent(q.key)+"&value="+encodeURIComponent(q.value));
+    if(r.ok){setQueue.shift();S.settings[q.key]=q.value;q.row&&q.row.classList.remove("changed");$("setStatus").textContent="Saved "+q.key;}
+    else if(/pending/.test(r.text||"")&&q.tries++<20){await new Promise(res=>setTimeout(res,250));}
+    else{setQueue.shift();toast("Setting refused: "+q.key+" ("+(r.text||r.status).toString().trim()+")",5000);setTimeout(loadSettings,300);}
+  }catch(e){setQueue.shift();toast("Network error saving "+q.key);}
+  setBusy=false;if(setQueue.length)pumpSet();
+}
+$("setReload").onclick=loadSettings;
+
+/* ---------- scope preview (uncompressed MRD5) ---------- */
+const RD_W=4096,RD_BINS=2049,CH_BYTES=16+4*RD_W+4*RD_BINS;
+function fitCanvas(c){const dpr=window.devicePixelRatio||1;const w=Math.max(50,Math.round(c.clientWidth*dpr)),h=Math.max(50,Math.round(c.clientHeight*dpr));
+  if(c.width!==w||c.height!==h){c.width=w;c.height=h;}return [w,h,dpr];}
+function parseFrame(buf){
+  if(buf.byteLength!==16+2*CH_BYTES)return null;const dv=new DataView(buf);
+  if(String.fromCharCode(dv.getUint8(0),dv.getUint8(1),dv.getUint8(2),dv.getUint8(3))!=="MRD5")return null;
+  const f={channels:dv.getUint8(5),rate:dv.getUint32(8,true),seq:dv.getUint32(12,true),ch:[]};
+  for(let c=0;c<f.channels;c++){const o=16+c*CH_BYTES;
+    f.ch.push({count:dv.getUint32(o,true),trig:dv.getInt32(o+4,true),peakPos:dv.getUint16(o+8,true),peakNeg:dv.getUint16(o+10,true),
+      peak:dv.getUint16(o+12,true),rms:dv.getUint16(o+14,true),wave:new Float32Array(buf,o+16,RD_W),fft:new Float32Array(buf,o+16+4*RD_W,RD_BINS)});}
+  return f;
+}
+function drawGrid(ctx,w,h,dpr,vdiv,hdiv){ctx.strokeStyle=css("--grid");ctx.lineWidth=1;ctx.beginPath();
+  for(let i=1;i<hdiv;i++){const x=Math.round(w*i/hdiv)+.5;ctx.moveTo(x,0);ctx.lineTo(x,h);}
+  for(let i=1;i<vdiv;i++){const y=Math.round(h*i/vdiv)+.5;ctx.moveTo(0,y);ctx.lineTo(w,y);}ctx.stroke();}
+function drawWave(c,ch,color){
+  const [w,h,dpr]=fitCanvas(c);const ctx=c.getContext("2d");ctx.clearRect(0,0,w,h);drawGrid(ctx,w,h,dpr,8,10);
+  if(!ch||!ch.count)return;const n=ch.count,mid=h/2,amp=h/2*0.95;
+  ctx.strokeStyle=color;ctx.lineWidth=Math.max(1,dpr);ctx.beginPath();
+  for(let i=0;i<n;i++){const x=n>1?i*(w-1)/(n-1):0;const v=Math.max(-1.05,Math.min(1.05,ch.wave[i]));const y=mid-v*amp;i?ctx.lineTo(x,y):ctx.moveTo(x,y);}
+  ctx.stroke();
+  if(ch.trig>=0){const x=ch.trig*(w-1)/Math.max(1,n-1);ctx.strokeStyle=css("--warn");ctx.setLineDash([4*dpr,4*dpr]);ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,h);ctx.stroke();ctx.setLineDash([]);}
+}
+function drawFft(c,idx,ch,rate){
+  const [w,h,dpr]=fitCanvas(c);const ctx=c.getContext("2d");ctx.clearRect(0,0,w,h);drawGrid(ctx,w,h,dpr,6,10);
+  if(!ch)return;const a=+$("fftAvg").value;let sm=S.fftSmooth[idx];
+  if(!sm||a===0){sm=S.fftSmooth[idx]=Float32Array.from(ch.fft);}else for(let i=0;i<RD_BINS;i++)sm[i]=a*sm[i]+(1-a)*ch.fft[i];
+  ctx.fillStyle=css("--fft");ctx.globalAlpha=.18;ctx.beginPath();ctx.moveTo(0,h);
+  for(let x=0;x<w;x++){const b0=Math.floor(x*(RD_BINS-1)/w),b1=Math.max(b0+1,Math.floor((x+1)*(RD_BINS-1)/w));let m=0;for(let b=b0;b<b1;b++)if(sm[b]>m)m=sm[b];ctx.lineTo(x,h-m*h);}
+  ctx.lineTo(w,h);ctx.closePath();ctx.fill();ctx.globalAlpha=1;
+  ctx.strokeStyle=css("--fft");ctx.lineWidth=Math.max(1,dpr);ctx.beginPath();
+  for(let x=0;x<w;x++){const b0=Math.floor(x*(RD_BINS-1)/w),b1=Math.max(b0+1,Math.floor((x+1)*(RD_BINS-1)/w));let m=0;for(let b=b0;b<b1;b++)if(sm[b]>m)m=sm[b];x?ctx.lineTo(x,h-m*h):ctx.moveTo(x,h-m*h);}
+  ctx.stroke();
+  ctx.fillStyle=css("--muted");ctx.font=(11*dpr)+"px "+css("--mono");ctx.textBaseline="top";
+  const ny=rate/2;for(let i=1;i<5;i++){const x=w*i/5;ctx.fillText((ny*i/5/1e6).toFixed(ny>=5e6?1:2)+"M",x+3*dpr,3*dpr);}
+  for(let i=1;i<6;i++){ctx.fillText((-120*i/6).toFixed(0)+" dB",3*dpr,h*i/6+2*dpr);}
+}
+async function pollPreview(){
+  if(S.previewBusy||!$("previewOn").checked||document.hidden||$("tab-scope").classList.contains("hidden")||!S.online)return;
+  S.previewBusy=true;
+  try{
+    const z=Math.round(+$("zoom").value*1000),wa=Math.min(RD_W,Math.max(256,Math.round($("waveA").clientWidth*(devicePixelRatio||1)))),
+      wb=Math.min(RD_W,Math.max(256,Math.round($("waveB").clientWidth*(devicePixelRatio||1))));
+    const t=$("trig").checked?1:0,l=Math.round(+$("trigLevel").value||0),m=+$("trigMode").value;
+    const q=`raw=1&za=${z}&zb=${z}&wa=${wa}&wb=${wb}&ta=${t}&tb=${t}&la=${l}&lb=${l}&ma=${m}&mb=${m}&sa=0&sb=1`;
+    const r=await get("/monitor/preview?"+q,{binary:true,timeout:2000});
+    if(!r.ok){$("noPreview").classList.toggle("hidden",r.status!==404);return;}
+    $("noPreview").classList.add("hidden");
+    const f=parseFrame(r.data);if(!f)return;
+    if(f.seq===S.lastSeq)return;S.lastSeq=f.seq;
+    drawWave($("waveA"),f.ch[0],css("--cha"));drawFft($("fftA"),0,f.ch[0],f.rate);
+    $("scopeB").classList.toggle("hidden",f.channels<2);
+    if(f.channels>1){drawWave($("waveB"),f.ch[1],css("--chb"));drawFft($("fftB"),1,f.ch[1],f.rate);}
+    const lv=(ch,id,mid,vid)=>{if(!ch){setMeter(mid,vid,0,"—");return;}const fs=2048;setMeter(mid,vid,ch.peak/fs,dbfs(ch.peak,fs));
+      $(id).textContent="pk "+ch.peak+"  rms "+ch.rms;};
+    lv(f.ch[0],"waInfo","mRfA","vRfA");lv(f.ch[1],"wbInfo","mRfB","vRfB");
+    S.fpsCount++;const now=performance.now();if(now-S.fpsT>1000){S.fps=S.fpsCount*1000/(now-S.fpsT);S.fpsCount=0;S.fpsT=now;}
+    $("previewInfo").textContent=fmtRate(f.rate)+" · "+S.fps.toFixed(1)+" fps";
+  }catch(e){}finally{S.previewBusy=false;}
+}
+
+/* ---------- audio monitor (MAO1 framed Opus, WebCodecs) ---------- */
+const AU={ctl:null,ctx:null,gain:null,dec:null,next:0};
+async function audioStart(){
+  if(typeof AudioDecoder==="undefined"){toast("This browser cannot decode Opus (no WebCodecs AudioDecoder)");return;}
+  const cfg={codec:"opus",sampleRate:48000,numberOfChannels:1};
+  try{const sup=await AudioDecoder.isConfigSupported(cfg);if(!sup.supported){toast("Opus decoding not supported here");return;}}catch(e){}
+  AU.ctx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:48000,latencyHint:"interactive"});
+  AU.gain=AU.ctx.createGain();AU.gain.gain.value=+$("auVol").value;AU.gain.connect(AU.ctx.destination);AU.next=0;
+  AU.dec=new AudioDecoder({output:ad=>{
+    try{const n=ad.numberOfFrames,buf=AU.ctx.createBuffer(1,n,ad.sampleRate),tmp=new Float32Array(n);
+      ad.copyTo(tmp,{planeIndex:0,format:"f32-planar"});buf.copyToChannel(tmp,0);
+      const now=AU.ctx.currentTime;if(AU.next<now+0.03||AU.next>now+0.5)AU.next=now+0.08;
+      const src=AU.ctx.createBufferSource();src.buffer=buf;src.connect(AU.gain);src.start(AU.next);AU.next+=buf.duration;
+    }finally{ad.close();}},error:e=>{$("auNote").textContent="Decoder error: "+e.message;}});
+  AU.dec.configure(cfg);
+  const my=AU.ctl=new AbortController();setAudioUi(true);
+  let ts=0;
+  try{
+    const r=await fetch("/monitor/audio?pair="+$("auPair").value,{cache:"no-store",signal:my.signal});
+    if(!r.ok){toast((await r.text()).trim()||"Audio unavailable");audioStop();return;}
+    $("auNote").textContent="Listening to "+$("auPair").selectedOptions[0].textContent.replace("Listen ","");
+    const rd=r.body.getReader();let acc=new Uint8Array(0);
+    for(;;){const {value,done}=await rd.read();if(done)break;
+      const m=new Uint8Array(acc.length+value.length);m.set(acc);m.set(value,acc.length);acc=m;let off=0;
+      while(acc.length-off>=12){
+        if(acc[off]!==77||acc[off+1]!==65||acc[off+2]!==79||acc[off+3]!==49)throw new Error("bad audio frame");
+        const len=(acc[off+8]<<8)|acc[off+9];if(!len||len>1275)throw new Error("bad audio length");
+        if(acc.length-off<12+len)break;
+        const payload=acc.slice(off+12,off+12+len);off+=12+len;
+        if(AU.dec&&AU.dec.state==="configured"&&AU.dec.decodeQueueSize<20){AU.dec.decode(new EncodedAudioChunk({type:"key",timestamp:ts,data:payload}));}
+        ts+=10000;
+      }
+      acc=acc.slice(off);
+    }
+    $("auNote").textContent="Audio stream ended (capture stopped?)";
+  }catch(e){if(e.name!=="AbortError")$("auNote").textContent="Audio: "+e.message;}
+  if(AU.ctl===my)audioStop(true);
+}
+function audioStop(keepNote){if(AU.ctl)AU.ctl.abort();AU.ctl=null;try{AU.dec&&AU.dec.state!=="closed"&&AU.dec.close();}catch(e){}AU.dec=null;
+  if(AU.ctx){AU.ctx.close().catch(()=>{});AU.ctx=null;}setAudioUi(false);if(!keepNote)$("auNote").textContent="Stopped";}
+function setAudioUi(on){$("auBtn").textContent=on?"■ Stop":"▶ Listen";$("auPair").disabled=on;}
+$("auBtn").onclick=()=>AU.ctl?audioStop():audioStart();
+$("auVol").oninput=()=>{if(AU.gain)AU.gain.gain.value=+$("auVol").value;};
+
+/* ---------- video monitor (MVD1 framed, WebCodecs) ---------- */
+const MVD_CODECS={1:"avc1.640033",2:"hev1.1.6.L153.B0",3:"vp09.00.51.08",4:"av01.0.13M.08"};
+const MVD_NAMES={1:"H.264",2:"HEVC",3:"VP9",4:"AV1"};
+const V={ctl:null,dec:null,codec:0,mask:null,osdTimer:null,frames:0,t:performance.now(),pending:null,wantKey:true};
+async function videoMask(){
+  if(V.mask!==null)return V.mask;let m=0;
+  if(typeof VideoDecoder!=="undefined"){for(const id of [1,2,3,4]){try{const s=await VideoDecoder.isConfigSupported({codec:MVD_CODECS[id],optimizeForLatency:true});if(s.supported)m|=1<<id;}catch(e){}}}
+  return V.mask=m;
+}
+function ctlBits(){
+  const set=(c,sh,mask,v)=>(c&~(mask<<sh))|((v&mask)<<sh);
+  const mode=+$("vMode").value;let c=0;
+  c=set(c,0,3,mode);c=set(c,2,3,+$("vSys").value);
+  if(mode<2){c=set(c,4,1,+$("vFrame").value);c=set(c,5,1,+$("vLevels").value);c=set(c,6,1,+$("vSync").value);c=set(c,7,1,+$("vColour").value);c=set(c,22,3,+$("vOsd").value);c=set(c,12,7,2);}
+  else{const tape=+$("vTape").value;c=set(c,8,1,tape);if(tape){c=set(c,2,3,1);c=set(c,9,3,+$("vBeta").value);}
+    c=set(c,11,1,$("vMesecam").checked?1:0);c=set(c,4,1,+$("vRfFrame").value);c=set(c,12,7,+$("vBudget").value);c=set(c,24,3,+$("vStats").value);c=set(c,6,1,1);c=set(c,7,1,1);}
+  return c>>>0;
+}
+function videoUiSync(){const rf=+$("vMode").value>=2;$("vCvbsOpts").classList.toggle("hidden",rf);$("vRfOpts").classList.toggle("hidden",!rf);
+  const tape=+$("vTape").value===1;$("vBetaWrap").classList.toggle("hidden",!rf||!tape);$("vSys").disabled=rf&&tape;
+  $("vMesecamWrap").classList.toggle("hidden",!rf||tape||$("vSys").value!=="2");}
+["vMode","vTape","vSys"].forEach(id=>$(id).addEventListener("change",videoUiSync));
+/* Any control change restarts a running stream with the new ctl bits. */
+document.querySelectorAll("#tab-video select,#tab-video input").forEach(e=>e.addEventListener("change",()=>{if(V.ctl){videoStop();videoStart();}}));
+function vMsg(t){$("vMsg").textContent=t;$("vMsg").classList.toggle("hidden",!t);}
+function videoConfigure(codec){
+  if(V.dec&&V.dec.state!=="closed")try{V.dec.close();}catch(e){}
+  const cv=$("vCanvas"),g=cv.getContext("2d");
+  V.dec=new VideoDecoder({output:frame=>{try{if(cv.width!==frame.displayWidth||cv.height!==frame.displayHeight){cv.width=frame.displayWidth;cv.height=frame.displayHeight;}
+      g.drawImage(frame,0,0);V.frames++;vMsg("");}finally{frame.close();}},
+    error:e=>{vMsg("Decoder error: "+e.message);V.wantKey=true;}});
+  V.dec.configure({codec:MVD_CODECS[codec],optimizeForLatency:true});V.codec=codec;V.wantKey=true;
+}
+async function videoStart(){
+  const mask=await videoMask();if(!mask){$("videoUnsupported").classList.remove("hidden");return;}
+  const ch=+$("vChan").value,mode=+$("vMode").value,ctl=ctlBits();
+  const my=V.ctl=new AbortController();$("vStart").textContent="Stop video";vMsg("Connecting…");V.codec=0;
+  clearInterval(V.osdTimer);V.osdTimer=setInterval(pollOsd,1000);
+  try{
+    const r=await fetch(`/monitor/video?channel=${ch}&mode=${mode}&bps=750000&fps=2500&ctl=${ctl}&codecs=${mask}`,{cache:"no-store",signal:my.signal});
+    if(!r.ok){const t=(await r.text()).trim();if(V.ctl===my){vMsg(r.status===409?"Channel busy or video unavailable — "+t:t||("HTTP "+r.status));videoStop(true);}return;}
+    vMsg("Waiting for decoded video…");
+    const rd=r.body.getReader();let acc=new Uint8Array(0);
+    for(;;){const {value,done}=await rd.read();if(done)break;
+      const m=new Uint8Array(acc.length+value.length);m.set(acc);m.set(value,acc.length);acc=m;let off=0;
+      while(acc.length-off>=40){
+        const dv=new DataView(acc.buffer,acc.byteOffset+off,40);
+        if(dv.getUint32(0)!==0x4D564431||dv.getUint8(4)!==1||dv.getUint8(5)!==40)throw new Error("bad video frame header");
+        const codec=dv.getUint8(6),flags=dv.getUint8(7),pts=Number(dv.getBigUint64(16)),w=dv.getUint16(24),h=dv.getUint16(26),fps=dv.getUint16(28),len=dv.getUint32(32);
+        if(len>2*1024*1024)throw new Error("video frame too large");
+        if(acc.length-off<40+len)break;
+        const payload=acc.slice(off+40,off+40+len);off+=40+len;
+        if(flags&4)continue;/* heartbeat */
+        if(!MVD_CODECS[codec])continue;
+        if(codec!==V.codec)videoConfigure(codec);
+        if((flags&2)&&!(flags&1)){V.pending=payload;continue;}
+        const key=(flags&1)!==0;if(V.wantKey&&!key)continue;V.wantKey=false;
+        let data=payload;if(V.pending){data=new Uint8Array(V.pending.length+payload.length);data.set(V.pending);data.set(payload,V.pending.length);V.pending=null;}
+        if(V.dec.decodeQueueSize>8){V.wantKey=true;continue;}
+        try{V.dec.decode(new EncodedVideoChunk({type:key?"key":"delta",timestamp:pts,data}));}catch(e){V.wantKey=true;}
+        const now=performance.now();if(now-V.t>1000){$("vInfo").textContent=`${MVD_NAMES[codec]} ${w}×${h} · ${(V.frames*1000/(now-V.t)).toFixed(1)} fps (src ${(fps/100).toFixed(2)})`;V.frames=0;V.t=now;}
+      }
+      acc=acc.slice(off);
+    }
+    if(V.ctl===my)vMsg("Video stream ended");
+  }catch(e){if(e.name!=="AbortError"&&V.ctl===my)vMsg("Video: "+e.message);}
+  if(V.ctl===my)videoStop(true);
+}
+function videoStop(keepMsg){if(V.ctl)V.ctl.abort();V.ctl=null;clearInterval(V.osdTimer);V.osdTimer=null;
+  try{V.dec&&V.dec.state!=="closed"&&V.dec.close();}catch(e){}V.dec=null;V.codec=0;V.pending=null;
+  $("vStart").textContent="Start video";$("vOsd").textContent="";if(!keepMsg)vMsg("Video stopped");}
+async function pollOsd(){
+  const rf=+$("vMode").value>=2;const detail=rf?2-+$("vStats").value:+$("vOsd").value;
+  if(!detail){$("vOsd").textContent="";return;}
+  const r=await get(`/monitor/video/osd?channel=${$("vChan").value}&detail=${detail}`).catch(()=>null);
+  if(r&&r.ok)$("vOsd").textContent=r.text.trim();
+}
+$("vStart").onclick=()=>V.ctl?videoStop():videoStart();
+videoUiSync();
+if(typeof VideoDecoder==="undefined"){
+  $("videoUnsupported").textContent=window.isSecureContext
+    ?"This browser has no WebCodecs video decoder. Use a current Chrome, Edge, Safari or Firefox."
+    :"Video and audio need WebCodecs, which browsers only allow on secure origins. Open this page via http://localhost on the server, or allow this address as secure (Chrome: chrome://flags/#unsafely-treat-insecure-origin-as-secure).";
+  $("videoUnsupported").classList.remove("hidden");
+}
+if(typeof AudioDecoder==="undefined")$("auNote").textContent=window.isSecureContext?"No WebCodecs Opus decoder in this browser.":"Audio needs a secure origin (see Video tab).";
+
+/* ---------- loops ---------- */
+addEventListener("pagehide",()=>{audioStop();videoStop();});
+pollStatus();setInterval(pollStatus,500);
+setInterval(pollPreview,100);
+setInterval(()=>{if(S.online){loadDevices();loadOutput();}},5000);
+</script>
+</body>
+</html>

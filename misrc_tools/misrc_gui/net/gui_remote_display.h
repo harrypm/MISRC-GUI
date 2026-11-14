@@ -35,6 +35,9 @@ void gui_rd_capture(const int16_t *a,const int16_t *b,size_t count,uint32_t samp
 /* Server: process latest capture using the SAME Local SOXR/trigger and FFTW
  * functions; compress; caller frees *wire. Returns false if stale/empty. */
 bool gui_rd_server_build(const gui_rd_config_t cfg[2],void **wire,size_t *wire_size,size_t *uncompressed);
+/* Web UI: the same frame without Zstd (browsers cannot decode it natively).
+ * Caller frees *frame. Only used for ?fmt=raw on /monitor/preview. */
+bool gui_rd_server_build_raw(const gui_rd_config_t cfg[2],gui_rd_frame_t **frame);
 /* Client: strict checked Zstd frame, fixed frame bytes, magic and version. */
 bool gui_rd_client_accept(const void *wire,size_t wire_size);
 bool gui_rd_client_snapshot(gui_rd_frame_t *out);

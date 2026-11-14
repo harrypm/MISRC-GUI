@@ -60,10 +60,15 @@ GUI autoload trigger flag.**
 - Playback: positional files / `playback_file_a|b` config keys.
 - Overwrite confirmation popup: `overwrite_files` config key (documented in
   `--auto-record` usage as the unattended-run requirement).
+- Panel views (sidebar Layout/Left/Right/View, incl. the composite
+  vectorscope "Vector" view): `--panel-view <a|b>:<left>[,<right>]`
+  (one view = single, two = split; repeatable per channel; unknown names
+  print the accepted list and exit 1; logs `[AUTO] --panel-view`). [2026-11-14]
 
 ## Known gaps (backlog under this rule — do not grow this list)
 
-- Panel view/split selection, waveform Signal/Mode/Scale/Trig dropdowns,
+- Waveform Signal/Mode/Scale/Trig dropdowns, vectorscope System/Graticule/
+  Plot/Colour cycle buttons,
   waveform playback Res/Range render-resolution dropdowns (per-panel runtime
   state: `res_points`/`res_range`, no settings key),
   CVBS/RF decoder-mode cycle, OSD/Frame/Levels/Sync selectors: per-panel

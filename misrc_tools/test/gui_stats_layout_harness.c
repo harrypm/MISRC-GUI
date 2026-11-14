@@ -57,7 +57,8 @@ Vector2 gui_font_measure_text(Font font, const char *text, float font_size, floa
 const char *panel_view_type_name(panel_view_type_t type)
 {
     static const char *names[] = {
-        "Waveform", "FFT", "Video", "Histogram", "Waterfall", "Spectro", "Demod"
+        "Waveform", "FFT", "Video", "Histogram", "Waterfall", "Spectro", "Demod",
+        "Vector"
     };
     return type >= 0 && type < PANEL_VIEW_COUNT ? names[type] : "Unknown";
 }

@@ -65,20 +65,18 @@ void gui_rd_capture(const int16_t *a,const int16_t *b,size_t count,uint32_t rate
     atomic_flag_clear_explicit(&raw_lock,memory_order_release);
 }
 size_t gui_rd_wire_capacity(void){return ZSTD_compressBound(sizeof(gui_rd_frame_t));}
-bool gui_rd_server_build(const gui_rd_config_t cfg[2],void **wire,size_t *bytes,size_t *uncompressed){
-    if(!cfg||!wire||!bytes||!uncompressed)return false;
-    *wire=NULL;*bytes=0;*uncompressed=0;
+static gui_rd_frame_t *rd_server_frame(const gui_rd_config_t cfg[2]){
     int16_t *samples=(int16_t*)malloc(GUI_RD_MAX_SOURCE*4);
-    if(!samples)return false;
+    if(!samples)return NULL;
     size_t n;uint32_t rate,seq;uint64_t stamp;
     while(atomic_flag_test_and_set_explicit(&raw_lock,memory_order_acquire))thrd_sleep_ms(1);
     n=raw_count;rate=raw_rate;seq=raw_sequence;stamp=raw_time_ms;
     if(n && n<=GUI_RD_MAX_SOURCE){memcpy(samples,raw_a,n*2);memcpy(samples+GUI_RD_MAX_SOURCE,raw_b,n*2);}
     atomic_flag_clear_explicit(&raw_lock,memory_order_release);
     uint64_t now=get_time_ms();
-    if(n<4096||n>GUI_RD_MAX_SOURCE||!rate||now<stamp||now-stamp>500){free(samples);return false;}
+    if(n<4096||n>GUI_RD_MAX_SOURCE||!rate||now<stamp||now-stamp>500){free(samples);return NULL;}
     gui_rd_frame_t *f=(gui_rd_frame_t*)calloc(1,sizeof(*f));
-    if(!f){free(samples);return false;}
+    if(!f){free(samples);return NULL;}
     memcpy(f->magic,"MRD5",4);f->version=GUI_RD_VERSION;
     f->channels=(seq&0x80000000u)?1:2;
     f->sample_rate=rate;f->sequence=seq&0x7fffffffu;
@@ -110,6 +108,18 @@ bool gui_rd_server_build(const gui_rd_config_t cfg[2],void **wire,size_t *bytes,
         gui_fft_server_bins(src, n>=GUI_RD_WIDTH?GUI_RD_WIDTH:n,rate,f->ch[c].fft,GUI_RD_BINS);
     }
     free(samples);
+    return f;
+}
+bool gui_rd_server_build_raw(const gui_rd_config_t cfg[2],gui_rd_frame_t **frame){
+    if(!cfg||!frame)return false;
+    *frame=rd_server_frame(cfg);
+    return *frame!=NULL;
+}
+bool gui_rd_server_build(const gui_rd_config_t cfg[2],void **wire,size_t *bytes,size_t *uncompressed){
+    if(!cfg||!wire||!bytes||!uncompressed)return false;
+    *wire=NULL;*bytes=0;*uncompressed=0;
+    gui_rd_frame_t *f=rd_server_frame(cfg);
+    if(!f)return false;
     size_t capacity=gui_rd_wire_capacity();
     void *buf=malloc(capacity);
     if(buf){
