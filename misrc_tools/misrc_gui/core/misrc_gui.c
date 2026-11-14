@@ -140,6 +140,10 @@ static void print_usage(const char *program_name) {
             "--gen-format <format> preload the Test Gen tape format: vhs|svhs|\n"
             "           betamax|video8|hi8 (or 0-4). Mirrors the Fmt button on\n"
             "           FM RF waveform panels (the RF modulation family).\n"
+            "--panel-view <a|b>:<left>[,<right>] set a channel's panel view(s) at\n"
+            "           launch: waveform|fft|video|histogram|waterfall|spectro|demod|\n"
+            "           vector. One view = single panel, two = split. Repeatable for\n"
+            "           both channels.\n"
             "--auto-capture starts capture unattended ~1 s after launch (Local mode;\n"
             "           no --config required).\n"
             "--auto-record <seconds> runs a full unattended record cycle: start\n"
@@ -834,6 +838,46 @@ static int gui_run_role_headless_server(const char *config_path,
 }
 #endif
 
+// --panel-view <a|b>:<left>[,<right>] (see print_usage). View names are the
+// view picker's names, lower case ("video", "vector", ...). Unknown values
+// print the accepted names and fail (hard rule: flags fail fast + log).
+static int gui_parse_panel_view_name(const char *name, size_t len) {
+    for (int vt = 0; vt < PANEL_VIEW_COUNT; vt++) {
+        const char *known = panel_view_type_name((panel_view_type_t)vt);
+        if (strlen(known) != len) continue;
+        size_t k = 0;
+        while (k < len && tolower((unsigned char)name[k]) == tolower((unsigned char)known[k])) k++;
+        if (k == len && panel_view_type_available((panel_view_type_t)vt)) return vt;
+    }
+    return -1;
+}
+
+static bool gui_apply_panel_view_arg(gui_app_t *app, const char *arg) {
+    const char *usage = "--panel-view: expected <a|b>:<left>[,<right>] with views "
+                        "waveform|fft|video|histogram|waterfall|spectro|demod|vector";
+    char ch = arg ? (char)tolower((unsigned char)arg[0]) : 0;
+    if ((ch != 'a' && ch != 'b') || arg[1] != ':') {
+        fprintf(stderr, "%s (got '%s')\n", usage, arg ? arg : "");
+        return false;
+    }
+    const char *left = arg + 2;
+    const char *comma = strchr(left, ',');
+    int lv = gui_parse_panel_view_name(left, comma ? (size_t)(comma - left) : strlen(left));
+    int rv = comma ? gui_parse_panel_view_name(comma + 1, strlen(comma + 1)) : -1;
+    if (lv < 0 || (comma && rv < 0)) {
+        fprintf(stderr, "%s (got '%s')\n", usage, arg);
+        return false;
+    }
+    channel_panel_config_t *config = (ch == 'a') ? &app->panel_config_a : &app->panel_config_b;
+    panel_config_set_split(config, comma != NULL);
+    panel_config_set_left_view(config, (panel_view_type_t)lv);
+    if (comma) panel_config_set_right_view(config, (panel_view_type_t)rv);
+    fprintf(stderr, "[AUTO] --panel-view: channel %c %s%s%s\n", ch == 'a' ? 'A' : 'B',
+            panel_view_type_name((panel_view_type_t)lv), comma ? " | " : "",
+            comma ? panel_view_type_name((panel_view_type_t)rv) : "");
+    return true;
+}
+
 int main(int argc, char **argv) {
     if (!file_init_utf8_argv(&argc, &argv)) return 1;
     bool debug_view = false;
@@ -847,6 +891,8 @@ int main(int argc, char **argv) {
     const char *select_device_arg = NULL;  /* --select-device <index-or-name> */
     const char *gen_system_arg = NULL;    /* --gen-system <pal|ntsc|secam|mesecam|0-3> */
     const char *gen_format_arg = NULL;    /* --gen-format <vhs|svhs|betamax|video8|hi8|0-4> */
+    const char *panel_view_args[2] = {0}; /* --panel-view <a|b>:<left>[,<right>] */
+    int panel_view_arg_count = 0;
     bool auto_capture = false;             /* --auto-capture */
     bool auto_record_given = false;        /* --auto-record <seconds> seen */
     int auto_record_seconds = 0;           /* --auto-record seconds */
@@ -926,6 +972,18 @@ int main(int argc, char **argv) {
                 gen_format_arg = argv[++i];
             } else {
                 fprintf(stderr, "--gen-format requires a <vhs|svhs|betamax|video8|hi8|0-4> value\n");
+                return 1;
+            }
+            continue;
+        }
+        if (strcmp(a, "--panel-view") == 0) {
+            // --panel-view <a|b>:<left>[,<right>]: preset a channel's panel
+            // view(s) (hard rule dev/gui_automation_flags_rules.md).
+            // Validated after app init, fail fast.
+            if (i + 1 < argc && panel_view_arg_count < 2) {
+                panel_view_args[panel_view_arg_count++] = argv[++i];
+            } else {
+                fprintf(stderr, "--panel-view requires <a|b>:<left>[,<right>] (at most twice)\n");
                 return 1;
             }
             continue;
@@ -1205,6 +1263,12 @@ int main(int argc, char **argv) {
 
     // Initialize application
     gui_app_init(&app);
+
+    // --panel-view launch overrides (after gui_app_init built the default
+    // panels; before the first frame renders or processes them).
+    for (int pv = 0; pv < panel_view_arg_count; pv++) {
+        if (!gui_apply_panel_view_arg(&app, panel_view_args[pv])) return 1;
+    }
 
     // Set app for text rendering font access
     gui_text_set_app(&app);

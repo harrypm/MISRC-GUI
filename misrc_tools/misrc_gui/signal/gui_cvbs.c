@@ -6,6 +6,7 @@
  */
 
 #include "gui_cvbs.h"
+#include "gui_vectorscope.h"
 #include "../input/gui_playback.h"
 #include "../output/gui_audio.h"
 #include "../output/gui_record.h"
@@ -772,6 +773,133 @@ static double g_pf_q[FILTERED_LINE_MAX + 1];
 // line's porch mean by ~+200 counts). The per-window +/-1/2 trims absorb
 // the residual sub-sample quantization.
 #define CVBS_SYNC_EDGE_DELAY_SAMPLES 8
+
+// H-EDGE REFINEMENT (real MS2130 NTSC bars, 2026-11-14, measured offline on
+// a raw dump): the sync slicer crosses the single-pole ~500 kHz filtered
+// edge (tau 11.8 samples) at a threshold that sits at the committed
+// tip/blank midpoint plus the latest porch clamp. After each vertical
+// interval the AC-coupling sag shifts the baseline AND the sync depth (-6%),
+// the clamp is stale (broad lines fail its gate), and the threshold sits
+// well off the pulse's own midpoint - where it crosses a tau-11.8 edge then
+// moves by up to ~16 samples (0.4 us at 40 MSPS), decaying over ~100 lines:
+// every field's top bent, the two fields' edges disagreed (jagged verticals
+// in the weave) and the vectorscope's line-delay comb mixed misaligned
+// lines. Re-measured at each pulse's OWN 50% point (its tip vs its front
+// porch, on lightly smoothed raw samples) the same capture's H edges run
+// 0.04-sample rms line to line and 1.4 samples p2p over the field (vs 0.34
+// and 21). Each classified H sync is re-timed that way and mapped back to
+// the edge convention every window uses: edge = TRUE sync start (the raw
+// 50% crossing) + CVBS_SYNC_EDGE_DELAY_SAMPLES, so `edge - delay` lands on
+// the real sync start exactly instead of wherever the threshold sat.
+// Measured (offline harness, 4fsc, line-to-line rms / field p2p samples):
+// MS2130 NTSC 6.0 / 15.6 -> 0.007 / 0.025; Test Gen 0.70 / 5.5 -> 0.15 /
+// 0.37.
+#define CVBS_H_RING 2048
+static bool g_cvbs_h_refine = true;   // Tests compare against the slicer edge
+#define CVBS_H_REFINE_OFFSET ((double)CVBS_SYNC_EDGE_DELAY_SAMPLES)
+
+static double cvbs_h_box(const int16_t *ring, int64_t k, int h) {
+    double s = 0.0;
+    for (int64_t j = k - h; j <= k + h; j++) s += ring[j & (CVBS_H_RING - 1)];
+    return s / (double)(2 * h + 1);
+}
+
+// FIELD PERIOD for Auto system detection (the composite vectorscope), from
+// the vertical interval's BROAD pulses on a slicer of its own: tip = a
+// peak-hold minimum leaking up 1% of the span per line, peak = a peak-hold
+// maximum leaking down 0.2% per line, slice at tip + 15% of the span (mid
+// sync for a full-range picture, inside the sync on a black one). The
+// decoder's own slicer cannot be used: run on the WRONG standard its level
+// commit reads the "porch" inside the active picture (PAL windows on an
+// NTSC line) and the slicing level lands in the picture - measured 2026-11-14
+// on NTSC bars into a PAL decoder: ~100k junk sub-microsecond pulses in 2 s,
+// broads 24-28 us but rarely at clean half-line cadence, Auto starved.
+// Only the vertical interval puts two broad (19-36 us) pulses half a line
+// (28-36 us) apart; a train starts at the first such pair after >= 8 lines
+// without one, timed from the pair's first broad; one field = train start
+// to train start.
+static void cvbs_field_broad(cvbs_vsync_state_t *vs, size_t pos, double rate_hz) {
+    double dt_us = vs->fp_last_broad
+        ? (double)(pos - vs->fp_last_broad) / rate_hz * 1e6 : 1e9;
+    if (dt_us > 28.0 && dt_us < 36.0) {
+        if (vs->fp_pair_pos == 0 ||
+            (double)(pos - vs->fp_pair_pos) / rate_hz * 1e6 > 8.0 * 64.0) {
+            size_t train = vs->fp_last_broad;       // The pair's first broad
+            if (vs->broad_train_pos && train > vs->broad_train_pos) {
+                vs->last_field_us = (double)(train - vs->broad_train_pos) / rate_hz * 1e6;
+                vs->field_measures++;
+            }
+            vs->broad_train_pos = train;
+        }
+        vs->fp_pair_pos = pos;
+    }
+    vs->fp_last_broad = pos;
+}
+
+static inline void cvbs_field_detect(cvbs_vsync_state_t *vs, double fv, size_t pos,
+                                     double rate_hz, double leak_per_sample) {
+    if (!vs->fp_init) {
+        vs->fp_tip = vs->fp_peak = fv;
+        vs->fp_init = true;
+    }
+    double span = vs->fp_peak - vs->fp_tip;
+    if (fv < vs->fp_tip) vs->fp_tip = fv; else vs->fp_tip += span * leak_per_sample;
+    if (fv > vs->fp_peak) vs->fp_peak = fv; else vs->fp_peak -= span * leak_per_sample * 0.2;
+    bool low = fv < vs->fp_tip + 0.15 * span;
+    if (low && !vs->fp_in_low) {
+        vs->fp_in_low = true;
+        vs->fp_low_start = pos;
+    } else if (!low && vs->fp_in_low) {
+        vs->fp_in_low = false;
+        double w_us = (double)(pos - vs->fp_low_start) / rate_hz * 1e6;
+        if (w_us >= 19.0 && w_us <= 36.0) cvbs_field_broad(vs, vs->fp_low_start, rate_hz);
+    }
+}
+
+// Diagnostics (tests): count and summed shift of the refined edges.
+static uint64_t g_h_refine_count;
+static double g_h_refine_shift_sum;
+
+// `now` = one past the newest stored sample's global index.
+static bool cvbs_refine_h_edge(const cvbs_vsync_state_t *vs, double rate_hz,
+                               int64_t now, double start_sub, double *out) {
+    const double us = rate_hz / 1e6;
+    int hw = (int)lrint(0.1 * us);
+    if (hw < 1) hw = 1;
+    double e = start_sub - CVBS_H_REFINE_OFFSET;    // Raw-domain estimate
+    for (int it = 0; it < 2; it++) {
+        int64_t p0 = llrint(e - 1.0 * us), p1 = llrint(e - 0.35 * us);
+        int64_t t0 = llrint(e + 1.0 * us), t1 = llrint(e + 3.0 * us);
+        int64_t s0 = llrint(e - 0.6 * us), s1 = llrint(e + 0.6 * us);
+        int64_t lo = (p0 < s0 - hw ? p0 : s0 - hw);
+        int64_t hi = (t1 > s1 + 1 + hw ? t1 : s1 + 1 + hw);
+        if (lo < 0 || hi >= now || now - lo > CVBS_H_RING) return false;
+        if (p1 <= p0 || t1 <= t0) return false;
+        double porch = 0.0, tip = 0.0;
+        for (int64_t k = p0; k < p1; k++) porch += vs->h_ring[k & (CVBS_H_RING - 1)];
+        for (int64_t k = t0; k < t1; k++) tip += vs->h_ring[k & (CVBS_H_RING - 1)];
+        porch /= (double)(p1 - p0);
+        tip /= (double)(t1 - t0);
+        if (porch - tip < 8.0) return false;
+        double mid = 0.5 * (porch + tip);
+        bool found = false;
+        double a = cvbs_h_box(vs->h_ring, s0, hw);
+        for (int64_t k = s0; k < s1; k++) {
+            double b = cvbs_h_box(vs->h_ring, k + 1, hw);
+            if (a >= mid && b < mid) {
+                e = (double)k + (a - mid) / (a - b);
+                found = true;
+                break;
+            }
+            a = b;
+        }
+        if (!found) return false;
+    }
+    *out = e + CVBS_H_REFINE_OFFSET;
+    g_h_refine_count++;
+    g_h_refine_shift_sum += *out - start_sub;
+    return true;
+}
 
 //============================================================================
 // SECAM FM chroma (backlog item 4)
@@ -1774,6 +1902,373 @@ static void cvbs_secam_bell_apply(int dec_count) {
     }
 }
 
+//-----------------------------------------------------------------------------
+// Line-locked chroma for the composite vectorscope
+//-----------------------------------------------------------------------------
+// The picture path below demodulates against a carrier at the NOMINAL fsc of
+// the declared (resampled) sample rate. On a real capture whose clock is off
+// nominal (the MS2130, 2026-11-14) that carrier slips against the signal
+// across every line: the burst fixes the phase at the line start only, so
+// each bar draws an arc on the vectorscope instead of a dot. A vectorscope
+// needs LINE-LOCKED chroma (what a 4fsc TBC output gives tbc-analyse).
+//
+// Here the carrier oscillator is locked to the measured LINE RATE: exactly
+// 283.7516 (PAL) / 227.5 (NTSC) carrier cycles per line, with the line
+// length measured from the classified H-sync edges as (edge now - edge N
+// lines ago) / N. A single line's own edges are not enough: they are only
+// good to ~1 sample, which is ~90 degrees of slip across a 4fsc line
+// (measured); the N-line span averages that down to ~0.01 sample. The
+// oscillator runs continuously from line to line, so the burst steps are the
+// true PAL alternation (-+90 deg) whatever the per-edge noise, and the
+// capture clock error drops out entirely. This is the 4fsc line-locked
+// resample's timing model without the interpolation (the scope needs only
+// chroma phase, not a resampled picture). The Video picture path is
+// untouched.
+#define CVBS_LL_MIN_LINES 32     // Edge span before the line rate is trusted
+#define CVBS_LL_MAX_LINES 640    // Span restarts here (tracks slow drift)
+#define CVBS_LL_HIST 65536       // Comb history ring (power of 2; > 2 lines + slice)
+
+// Comb filter switch (tests compare against the plain bandpass).
+static bool g_cvbs_vscope_comb = true;
+
+typedef struct cvbs_vscope_ll {
+    double *pf_s, *pf_c, *pf_n, *pf_i, *pf_q;  // Per-sample work arrays (line + 1)
+    // Line-rate measurement (H-sync edges, filtered domain, sub-sample)
+    double last_h_edge;          // Newest classified H-sync start
+    bool have_h_edge;
+    double ref_edge;             // Span start
+    bool ref_valid;
+    double line_samples;         // Measured samples per line (span / lines)
+    bool line_valid;
+    // Line-locked carrier oscillator (continuous across consecutive lines)
+    double osc_phase;            // Carrier phase at osc_anchor
+    double osc_w;                // rad / sample
+    uint64_t osc_anchor;
+    bool osc_valid;
+    // PAL V-switch chain
+    double prev_burst_phase;
+    bool prev_valid;
+    // Raw-sample history by global sample index, for the line-delay comb:
+    // [hist_start, hist_end) is a contiguous run of picture-line samples.
+    int16_t *hist;
+    uint64_t hist_start, hist_end;
+    bool hist_valid;
+} cvbs_vscope_ll_t;
+
+static void cvbs_vscope_ll_free(cvbs_decoder_t *decoder) {
+    cvbs_vscope_ll_t *ll = decoder ? decoder->vscope_ll : NULL;
+    if (!ll) return;
+    free(ll->pf_s); free(ll->pf_c); free(ll->pf_n); free(ll->pf_i); free(ll->pf_q);
+    free(ll->hist);
+    free(ll);
+    decoder->vscope_ll = NULL;
+}
+
+static void cvbs_vscope_ll_reset(cvbs_decoder_t *decoder) {
+    cvbs_vscope_ll_t *ll = decoder ? decoder->vscope_ll : NULL;
+    if (!ll) return;
+    ll->have_h_edge = false;
+    ll->ref_valid = false;
+    ll->line_valid = false;
+    ll->osc_valid = false;
+    ll->prev_valid = false;
+    ll->hist_valid = false;
+}
+
+// A classified H sync: extend the line-rate span.
+static void cvbs_vscope_ll_on_hsync(cvbs_decoder_t *decoder, double edge) {
+    cvbs_vscope_ll_t *ll = decoder->vscope_ll;
+    if (!ll) return;
+    ll->last_h_edge = edge;
+    ll->have_h_edge = true;
+    double period = ll->line_valid ? ll->line_samples : cvbs_effective_line_period(decoder);
+    if (period < 1.0) return;
+    if (!ll->ref_valid) {
+        ll->ref_edge = edge;
+        ll->ref_valid = true;
+        return;
+    }
+    double span = edge - ll->ref_edge;
+    int lines = (int)floor(span / period + 0.5);
+    if (lines < 1 || lines > CVBS_LL_MAX_LINES ||
+        fabs(span - (double)lines * period) > 0.1 * period) {
+        ll->ref_edge = edge;    // Lost the count: restart the span
+        return;
+    }
+    if (lines >= CVBS_LL_MIN_LINES) {
+        double measured = span / (double)lines;
+        double pll = cvbs_effective_line_period(decoder);
+        if (pll > 1.0 && fabs(measured / pll - 1.0) < 0.03) {
+            ll->line_samples = measured;
+            ll->line_valid = true;
+        }
+    }
+    if (lines == CVBS_LL_MAX_LINES) ll->ref_edge = edge;
+}
+
+// Demodulated points over [k0, k1): Hann lowpass of the carrier products,
+// burst-locked rotation, then (u, v) = (vc * u_gain, uc * v_gain).
+static void cvbs_vscope_ll_plot(gui_vectorscope_t *scope, int sys,
+                                const double *pi, const double *pq,
+                                const double *hann, int hlen, double hnorm,
+                                double ca, double sa, double u_gain, double v_gain,
+                                int k0, int k1) {
+    const int hh = hlen / 2;
+    for (int k = k0; k < k1; k++) {
+        double ic = 0.0, qc = 0.0;
+        const double *wi = pi + k - hh, *wq = pq + k - hh;
+        for (int j = 0; j < hlen; j++) { ic += hann[j] * wi[j]; qc += hann[j] * wq[j]; }
+        ic *= hnorm;
+        qc *= hnorm;
+        double uc = ic * ca - qc * sa;
+        double vc = ic * sa + qc * ca;
+        gui_vectorscope_add(scope, sys, vc * u_gain, uc * v_gain);
+    }
+}
+
+// A picture line (raw panel-rate samples, line[0] at global `anchor`):
+// demodulate its active chroma into the vectorscope.
+static void cvbs_vscope_ll_line(cvbs_decoder_t *decoder, const int16_t *line,
+                                size_t count, uint64_t anchor, int32_t range) {
+    cvbs_vscope_ll_t *ll = decoder->vscope_ll;
+    if (!ll) {
+        ll = (cvbs_vscope_ll_t *)calloc(1, sizeof(*ll));
+        if (!ll) return;
+        size_t pf = (size_t)FILTERED_LINE_MAX + 1;
+        ll->pf_s = (double *)malloc(pf * sizeof(double));
+        ll->pf_c = (double *)malloc(pf * sizeof(double));
+        ll->pf_n = (double *)malloc(pf * sizeof(double));
+        ll->pf_i = (double *)malloc(pf * sizeof(double));
+        ll->pf_q = (double *)malloc(pf * sizeof(double));
+        ll->hist = (int16_t *)malloc(CVBS_LL_HIST * sizeof(int16_t));
+        decoder->vscope_ll = ll;
+        if (!ll->pf_s || !ll->pf_c || !ll->pf_n || !ll->pf_i || !ll->pf_q || !ll->hist) {
+            cvbs_vscope_ll_free(decoder);
+        }
+        return;   // Edges are measured from now on
+    }
+    // History for the comb: append this slice (a gap restarts the run).
+    if (count > 0 && count < CVBS_LL_HIST / 2) {
+        if (!ll->hist_valid || anchor > ll->hist_end || anchor < ll->hist_start) {
+            ll->hist_start = anchor;
+            ll->hist_valid = true;
+        }
+        for (size_t k = 0; k < count; k++) {
+            ll->hist[(anchor + k) & (CVBS_LL_HIST - 1)] = line[k];
+        }
+        ll->hist_end = anchor + count;
+        if (ll->hist_end - ll->hist_start > CVBS_LL_HIST) {
+            ll->hist_start = ll->hist_end - CVBS_LL_HIST;
+        }
+    }
+    if (!ll->line_valid || !ll->have_h_edge || count < 64) {
+        ll->prev_valid = false;
+        return;
+    }
+    const double line_samples = ll->line_samples;
+    // The line's own H sync (classified ~4.7 us in, so at this end-of-line
+    // decode the newest classified edge is this line's): window origin.
+    double e = ll->last_h_edge - (double)anchor;
+    if (e < -0.3 * line_samples || e > 0.3 * line_samples) {
+        ll->prev_valid = false;
+        return;
+    }
+    const cvbs_baseband_profile_t *profile = cvbs_profile(decoder);
+    const bool pal = (decoder->state.format != CVBS_FORMAT_NTSC);
+    const double cycles = pal ? 283.7516 : 227.5;       // fsc / fH
+    const double spc = line_samples / cycles;           // Samples per carrier cycle
+    const double w = 2.0 * M_PI / spc;
+    const double spu = line_samples / profile->line_us; // Line-locked samples per us
+    int n = (int)(count > (size_t)FILTERED_LINE_MAX ? (size_t)FILTERED_LINE_MAX : count);
+    // Raw-domain sync start (the edge carries the sync lowpass delay, as in
+    // the picture path's windows).
+    const double x0 = e - CVBS_SYNC_EDGE_DELAY_SAMPLES;
+
+    // Continue the oscillator from the previous line (consecutive lines
+    // only; a gap re-seeds it and breaks the V-switch chain).
+    bool consecutive = false;
+    double phase0 = 0.0;
+    if (ll->osc_valid && anchor > ll->osc_anchor) {
+        double gap = (double)(anchor - ll->osc_anchor);
+        if (gap < 1.5 * line_samples) {
+            phase0 = fmod(ll->osc_phase + ll->osc_w * gap, 2.0 * M_PI);
+            consecutive = gap > 0.5 * line_samples;
+        }
+    }
+    if (!consecutive) ll->prev_valid = false;
+    ll->osc_phase = phase0;
+    ll->osc_w = w;
+    ll->osc_anchor = anchor;
+    ll->osc_valid = true;
+
+    // Composite chroma chain, as in a hardware composite vectorscope:
+    //  1. chroma BANDPASS before demodulation - two cascaded stages of
+    //     c[k] = x[k] - (x[k-d] + x[k+d]) / 2 with d = half a carrier cycle
+    //     (peak at fsc, zero at DC; luma at 1 MHz down ~37 dB). Without it a
+    //     luma STEP at a bar edge sits inside the demod window, correlates
+    //     with the carrier and bows every transition off its straight line
+    //     (real MS2130 EBU bars, 2026-11-14: "warpy instead of lines").
+    //  2. demodulate against the line-locked carrier;
+    //  3. symmetric Hann LOWPASS over two carrier cycles on both products
+    //     (nulls at 2fsc).
+    // Every stage is linear-phase and identical for U and V, so a transition
+    // between two colours plots as the straight line between their vectors.
+    // The burst goes through the same chain, so the burst-referenced gain
+    // cancels the filters' gain at fsc.
+    //  0. LINE-DELAY COMB ahead of all that: (x[t] - x[t - D]) / 2 with
+    //     D = 1 line (NTSC, 227.5 cycles: chroma inverts, luma cancels) or
+    //     2 lines (PAL, 567.5 cycles - the V-switch repeats every 2 lines).
+    //     The bandpass alone still passes the fsc energy of a sharp luma
+    //     STEP; NTSC's 180-deg-per-line carrier puts that leak on opposite
+    //     sides on alternate lines and fans every transition into a wedge
+    //     (real MS2130 SMPTE bars, 2026-11-14). On vertically uniform
+    //     content the comb removes luma outright, as a hardware scope's
+    //     comb does. D is the measured line length, fractional, read from
+    //     the history ring with a Catmull-Rom interpolator; with no
+    //     contiguous history (first line after the VBI) the line goes
+    //     through the bandpass alone.
+    const int d = (int)(spc * 0.5 + 0.5);
+    double *bp1 = ll->pf_s, *bp = ll->pf_c, *pi = ll->pf_i, *pq = ll->pf_q;
+    double *xc = ll->pf_n;
+    bool combed = false;
+    if (g_cvbs_vscope_comb && ll->hist_valid) {
+        const double D = (pal ? 2.0 : 1.0) * line_samples;
+        const double first = (double)anchor - D;           // k = 0
+        const double fl = floor(first);
+        const double f = first - fl;
+        if (fl - 1.0 >= (double)ll->hist_start &&
+            fl + (double)n + 2.0 < (double)ll->hist_end &&
+            (double)ll->hist_end - (fl - 1.0) <= (double)CVBS_LL_HIST) {
+            const double f2 = f * f, f3 = f2 * f;
+            const double w0 = -0.5 * f3 + f2 - 0.5 * f;
+            const double w1 = 1.5 * f3 - 2.5 * f2 + 1.0;
+            const double w2 = -1.5 * f3 + 2.0 * f2 + 0.5 * f;
+            const double w3 = 0.5 * f3 - 0.5 * f2;
+            uint64_t i0 = (uint64_t)fl;
+            const int16_t *h = ll->hist;
+            const uint64_t m = CVBS_LL_HIST - 1;
+            for (int k = 0; k < n; k++) {
+                uint64_t i = i0 + (uint64_t)k;
+                double past = w0 * h[(i - 1) & m] + w1 * h[i & m]
+                            + w2 * h[(i + 1) & m] + w3 * h[(i + 2) & m];
+                xc[k] = 0.5 * ((double)line[k] - past);
+            }
+            combed = true;
+        }
+    }
+    if (!combed) {
+        for (int k = 0; k < n; k++) xc[k] = (double)line[k];
+    }
+    for (int k = 0; k < n; k++) {
+        bp1[k] = (k >= d && k + d < n)
+            ? xc[k] - 0.5 * (xc[k - d] + xc[k + d]) : 0.0;
+    }
+    for (int k = 0; k < n; k++) {
+        bp[k] = (k >= 2 * d && k + 2 * d < n)
+            ? 0.25 * (bp1[k] - 0.5 * (bp1[k - d] + bp1[k + d])) : 0.0;
+    }
+    const double cd = cos(w), sd = sin(w);
+    double c = 1.0, s = 0.0;
+    for (int k = 0; k < n; k++) {
+        if ((k & 255) == 0) {
+            double ph = phase0 + w * (double)k;
+            c = cos(ph);
+            s = sin(ph);
+        }
+        pi[k] = bp[k] * c;
+        pq[k] = bp[k] * s;
+        double nc = c * cd - s * sd;
+        s = s * cd + c * sd;
+        c = nc;
+    }
+
+    // Burst: whole carrier cycles on the FLAT part of the envelope - TWO
+    // carrier cycles in from each end of the profile window: one for the
+    // envelope's own rise/fall (the window spans the full nominal burst;
+    // the picture path's 1-sample trim reads PAL ~11% low) and one for the
+    // bandpass's +-1-cycle reach. Measured on the Test Gen bars: chroma
+    // level +4.5% (PAL) at a 1-cycle trim, flat within 0.3% from 2 cycles
+    // (PAL keeps ~6 cycles, NTSC ~5).
+    int b0 = (int)ceil(x0 + profile->burst_start_us * spu + 2.0 * spc);
+    int b1 = (int)floor(x0 + profile->burst_end_us * spu - 2.0 * spc);
+    if (b0 < 2 * d || b1 > n - 2 * d || b1 - b0 < 4) { ll->prev_valid = false; return; }
+    int n_cyc = (int)((double)(b1 - b0) / spc);
+    if (n_cyc < 1) { ll->prev_valid = false; return; }
+    b1 = b0 + (int)(n_cyc * spc + 0.5);
+    double bsi = 0.0, bsq = 0.0;
+    for (int k = b0; k < b1; k++) { bsi += pi[k]; bsq += pq[k]; }
+    double bi = bsi * 2.0 / (double)(b1 - b0);
+    double bq = bsq * 2.0 / (double)(b1 - b0);
+    double burst_amp = sqrt(bi * bi + bq * bq);
+    double burst_phase = atan2(bq, bi);
+    // Gate on the filtered burst against the range (bandpass gain at fsc
+    // is ~1 by the 1/4 normalisation).
+    if (burst_amp < 0.02 * (double)range) { ll->prev_valid = false; return; }
+
+    // PAL V-switch from the burst alternation between consecutive lines on
+    // the continuous line-locked carrier (the picture path's convention).
+    int vswitch = 1;
+    if (pal) {
+        if (!ll->prev_valid) {
+            // No chain yet: V is ambiguous on this line - seed only.
+            ll->prev_burst_phase = burst_phase;
+            ll->prev_valid = true;
+            return;
+        }
+        double step = burst_phase - ll->prev_burst_phase;
+        while (step > M_PI) step -= 2.0 * M_PI;
+        while (step < -M_PI) step += 2.0 * M_PI;
+        vswitch = (step >= 0.0) ? 1 : -1;
+    }
+    ll->prev_burst_phase = burst_phase;
+    ll->prev_valid = true;
+
+    // Burst-locked rotation: the picture path's conventions exactly (see
+    // decode_line_to_pixels). Gain: plot unit 1.0 = blanking..white, so the
+    // burst maps to its standard amplitude - NTSC 20 IRE of 100 (0.2), PAL
+    // 150 mV of 700 (3/14; the picture path's 0.2 is NTSC's value).
+    double psi_expected = pal ? (-M_PI / 2.0 + (double)vswitch * (M_PI / 4.0))
+                              : -M_PI / 2.0;
+    double alpha = psi_expected - burst_phase;
+    double ca = cos(alpha), sa = sin(alpha);
+    double gain = (pal ? 3.0 / 14.0 : 0.2) / burst_amp;
+    double vsw_gain = (double)vswitch * gain;
+
+    // Hann lowpass over two carrier cycles (odd length, symmetric).
+    enum { LL_HANN_MAX = 33 };
+    double hann[LL_HANN_MAX];
+    int hlen = 2 * (int)(spc + 0.5) + 1;
+    if (hlen > LL_HANN_MAX) hlen = LL_HANN_MAX;
+    int hh = hlen / 2;
+    double hsum = 0.0;
+    for (int j = 0; j < hlen; j++) {
+        hann[j] = 0.5 - 0.5 * cos(2.0 * M_PI * (double)(j + 1) / (double)(hlen + 1));
+        hsum += hann[j];
+    }
+    double hnorm = 2.0 / hsum;
+
+    // One point per sample. The lowpass and bandpass reach bounds the span.
+    const int lo = hh + 2 * d, hi = n - hh - 2 * d;
+    int sys = pal ? GUI_VSCOPE_SYS_PAL : GUI_VSCOPE_SYS_NTSC;
+    // Burst, envelope included (its rise/fall draws the line from the
+    // centre, as on a hardware scope). V is NOT unflipped here: the PAL
+    // burst shows as its two vectors at 135 / 225 deg (the NTSC burst at
+    // 180 deg); the picture below is V-switched onto single targets.
+    int q0 = (int)floor(x0 + profile->burst_start_us * spu - spc);
+    int q1 = (int)ceil(x0 + profile->burst_end_us * spu + spc);
+    if (q0 < lo) q0 = lo;
+    if (q1 > hi) q1 = hi;
+    cvbs_vscope_ll_plot(decoder->vscope, sys, pi, pq, hann, hlen, hnorm, ca, sa,
+                        gain, gain, q0, q1);   // transmitted V (no V-switch)
+    // Active picture.
+    int a0 = (int)ceil(x0 + profile->active_start_us * spu);
+    int a1 = (int)floor(x0 + profile->active_end_us * spu);
+    if (a0 < lo) a0 = lo;
+    if (a1 > hi) a1 = hi;
+    cvbs_vscope_ll_plot(decoder->vscope, sys, pi, pq, hann, hlen, hnorm, ca, sa,
+                        gain, vsw_gain, a0, a1);
+}
+
 // Decode a single video line from samples to RGB24 pixels.
 // Luma: pre-filters the entire line, then resamples to the output width.
 // Chroma (colour_mode AUTO): per-line burst-gated quadrature demodulation at
@@ -1937,6 +2432,11 @@ static void decode_line_to_pixels(cvbs_decoder_t *decoder,
         if (secam_dec_count > CVBS_SECAM_MAX_DEC) {
             secam_dec_count = CVBS_SECAM_MAX_DEC;
         }
+    }
+    // Composite vectorscope: this picture line's line-locked chroma
+    // demod (PAL/NTSC quadrature only - SECAM's FM chroma has no burst).
+    if (decoder->vscope && colour && picture_line) {
+        cvbs_vscope_ll_line(decoder, samples, sample_count, carrier_anchor, range);
     }
     if (colour) {
         double rate = cvbs_rate(decoder);
@@ -2509,6 +3009,7 @@ bool gui_cvbs_init(cvbs_decoder_t *decoder) {
 
 void gui_cvbs_cleanup(cvbs_decoder_t *decoder) {
     if (!decoder) return;
+    cvbs_vscope_ll_free(decoder);
 
     if (decoder->texture_valid) {
         UnloadTexture(decoder->frame_texture);
@@ -2568,6 +3069,7 @@ void gui_cvbs_reset(cvbs_decoder_t *decoder) {
     // first post-reset line) and keep the colour MODE as configured.
     decoder->prev_burst_phase = 0.0;
     decoder->prev_burst_valid = 0;
+    cvbs_vscope_ll_reset(decoder);
 
     // Reset the SECAM FM-chroma state (calibration, ident, rings) and the
     // file-scope filter cache (a format/rate switch rebuilds it lazily).
@@ -3145,6 +3647,7 @@ static void complete_field_pll(cvbs_decoder_t *decoder) {
     decoder->field_line_count[field_idx] = line_count;
     decoder->field_sequence++;
     decoder->field_last_update_seq[field_idx] = decoder->field_sequence;
+    if (decoder->vscope) gui_vectorscope_end_field(decoder->vscope);
 
     // Deinterlace and display - works with one or both fields
     // Bob mode is used until both fields are available, then weave takes over
@@ -3830,10 +4333,13 @@ void gui_cvbs_process_buffer(cvbs_decoder_t *decoder,
 
     // Cached VBI pulse state (same write-back pattern as the other locals).
     cvbs_vsync_state_t *vs = &decoder->vsync;
+    // Field-period detector leak: 1% of the span per 64 us line.
+    const double fp_leak = 0.01 / (64e-6 * rate_hz);
 
     // Process each sample
     for (size_t i = 0; i < count; i++) {
         int16_t sample = buf[i];
+        vs->h_ring[global_sample_pos & (CVBS_H_RING - 1)] = sample;
 
         // Apply lowpass filter for cleaner sync detection (fixed-point).
         // prev_filtered is the filter's PREVIOUS output, read from the Q8
@@ -3841,6 +4347,7 @@ void gui_cvbs_process_buffer(cvbs_decoder_t *decoder,
         // interpolation below.
         int16_t prev_filtered = (int16_t)(decoder->lpf_state >> LPF_SHIFT);
         int16_t filtered = apply_lowpass(decoder, sample);
+        cvbs_field_detect(vs, (double)filtered, global_sample_pos, rate_hz, fp_leak);
 
         // Accumulate samples for histogram-based level detection (raw
         // domain - the peak picker's historical domain: sync tip + max).
@@ -4039,10 +4546,18 @@ void gui_cvbs_process_buffer(cvbs_decoder_t *decoder,
                 // reconstructed at the pulse START) and the VBI H reference.
                 vs->eq_run = 0;
                 vs->v_run = 0;
+                double h_edge = vs->pulse_start_sub;
+                double refined;
+                if (g_cvbs_h_refine &&
+                    cvbs_refine_h_edge(vs, rate_hz, (int64_t)global_sample_pos,
+                                       vs->pulse_start_sub, &refined)) {
+                    h_edge = refined;
+                }
                 double phase_at_start = pll->phase -
-                    ((double)global_sample_pos - vs->pulse_start_sub);
+                    ((double)global_sample_pos - h_edge);
                 pll_process_hsync(decoder, phase_at_start);
                 vs->last_h_pos = vs->pulse_start;
+                cvbs_vscope_ll_on_hsync(decoder, h_edge);
                 vs->last_kind = 2;
                 vs->last_pulse_pos = vs->pulse_start;
                 // Update effective period after PLL adjustment
@@ -6555,6 +7070,10 @@ static const panel_vtable_t s_cvbs_vtable = {
 // generator mode when the signal changes, allow user override once
 // flipped". Also makes newly created panels start in the generator's
 // system.
+// Registered by the composite vectorscope panel (a runtime hook so the
+// decoder core never links the panel's render code).
+static void (*s_vectorscope_follow)(void *state, int system_select);
+
 void gui_video_follow_generator_system(gui_app_t *app, int system) {
     // 0..3 (3=MESECAM, RF-only: composite decodes SECAM). The old <= 2
     // guard silently dropped the MESECAM Gen step so the FM decoder never
@@ -6573,12 +7092,17 @@ void gui_video_follow_generator_system(gui_app_t *app, int system) {
             if (slot == 1 && !cfg->split) continue;
             panel_view_type_t view = slot ? cfg->right_view : cfg->left_view;
             void *state = slot ? cfg->right_state : cfg->left_state;
+            /* MESECAM (3) is RF-only - the composite side decodes SECAM. */
+            int composite_system = (system == 3) ? 2 : system;
+            if (view == PANEL_VIEW_VECTORSCOPE && state) {
+                /* Composite vectorscope: applied on its decode thread. */
+                if (s_vectorscope_follow) s_vectorscope_follow(state, composite_system);
+                continue;
+            }
             if (view != PANEL_VIEW_CVBS || !state) continue;
             video_panel_state_t *panel = (video_panel_state_t *)state;
 
-            /* CVBS composite decoder: mirror the System dropdown action.
-             * MESECAM (3) is RF-only - the composite side decodes SECAM. */
-            int composite_system = (system == 3) ? 2 : system;
+            /* CVBS composite decoder: mirror the System dropdown action. */
             panel->cvbs.decoder.overlay.selected_system = composite_system;
             gui_cvbs_set_format(&panel->cvbs.decoder, composite_system);
 
@@ -6610,6 +7134,56 @@ void gui_video_follow_generator_system(gui_app_t *app, int system) {
 
     /* Panels created later this session start in the generator's system. */
     gui_cvbs_set_default_system(system);
+}
+
+//-----------------------------------------------------------------------------
+// Composite feed: the CVBS plugin's exact decode pipeline (fixed-rate soxr
+// resampler + decoder) for panels that need a locked composite decode
+// without the Video panel (the composite vectorscope).
+//-----------------------------------------------------------------------------
+
+struct gui_cvbs_feed {
+    video_cvbs_plugin_t plugin;
+};
+
+void gui_cvbs_set_vectorscope_follow(void (*follow)(void *state, int system_select)) {
+    s_vectorscope_follow = follow;
+}
+
+gui_cvbs_feed_t *gui_cvbs_feed_create(void) {
+    gui_cvbs_feed_t *feed = (gui_cvbs_feed_t *)calloc(1, sizeof(*feed));
+    if (!feed) return NULL;
+    if (!video_cvbs_plugin_init(&feed->plugin)) {
+        free(feed);
+        return NULL;
+    }
+    return feed;
+}
+
+void gui_cvbs_feed_destroy(gui_cvbs_feed_t *feed) {
+    if (!feed) return;
+#if LIBSOXR_ENABLED
+    if (feed->plugin.resample) soxr_delete(feed->plugin.resample);
+    free(feed->plugin.resample_scratch);
+    free(feed->plugin.resample_f32);
+#endif
+    gui_cvbs_cleanup(&feed->plugin.decoder);
+    free(feed);
+}
+
+void gui_cvbs_feed_process(gui_cvbs_feed_t *feed, const int16_t *samples,
+                           size_t count, uint32_t sample_rate) {
+    if (feed) video_cvbs_plugin_process(&feed->plugin, samples, count, sample_rate);
+}
+
+cvbs_decoder_t *gui_cvbs_feed_decoder(gui_cvbs_feed_t *feed) {
+    return feed ? &feed->plugin.decoder : NULL;
+}
+
+void gui_cvbs_feed_set_system(gui_cvbs_feed_t *feed, int system_select) {
+    if (!feed) return;
+    feed->plugin.decoder.overlay.selected_system = system_select;
+    gui_cvbs_set_format(&feed->plugin.decoder, system_select);
 }
 
 //-----------------------------------------------------------------------------

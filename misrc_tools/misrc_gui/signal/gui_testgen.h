@@ -1,8 +1,10 @@
 /*
  * MISRC GUI - Test Signal Generator (Test Gen)
  *
- * Generates standards-accurate composite CVBS test signals (75% colour bars
- * with the hacktv test-card lower rows) for PAL, NTSC and SECAM, ON DEMAND.
+ * Generates standards-accurate composite CVBS test signals for PAL, NTSC and
+ * SECAM, ON DEMAND: 75% colour bars for PAL/SECAM, SMPTE SD colour bars
+ * (75% bars, reverse-blue castellations, -I / white / +Q / PLUGE row) for
+ * NTSC. The tape-RF channel keeps the 8-bar pattern for every system.
  *
  * All timing/level/burst/subcarrier values are copied from hacktv
  * (https://codeberg.org/fsphil/hacktv, GPL-3.0-or-later, (c)2017-2026

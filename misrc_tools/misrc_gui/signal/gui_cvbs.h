@@ -246,6 +246,23 @@ typedef struct {
     int reject_cadence;             // Rejected for cadence outside profile
     int reject_parity;              // Rejected for parity phase/cadence errors
     char last_reject_reason[80];    // Last rejection reason
+    // Measured time between consecutive vertical-interval broad-pulse
+    // trains (us), from a slicer of its own (cvbs_field_detect), so it is
+    // valid when the decoder runs the wrong standard (PAL ~20000, NTSC
+    // ~16683). Read by the composite vectorscope's Auto system detection.
+    // Field-period detector (Auto system): its own tip-relative slicer,
+    // independent of the decoder's standard and committed levels.
+    double fp_tip, fp_peak;         // Peak-hold sync tip / signal peak
+    bool fp_init, fp_in_low;
+    size_t fp_low_start;            // Current low run's start
+    size_t fp_last_broad;           // Last broad pulse start
+    size_t fp_pair_pos;             // Newest broad of a half-line PAIR
+    size_t broad_train_pos;         // First broad of the last train
+    double last_field_us;
+    uint32_t field_measures;        // Increments with each measurement
+    // Raw-sample ring (by global sample index) for the H-edge refinement
+    // (cvbs_refine_h_edge): the classified pulse's own tip / front porch.
+    int16_t h_ring[2048];
 } cvbs_vsync_state_t;
 
 // Histogram-based level detection buffer size
@@ -384,6 +401,14 @@ typedef struct cvbs_decoder {
     cvbs_colour_mode_t colour_mode; // Auto: burst-gated baseband chroma
     double prev_burst_phase;         // Previous line's burst phase (PAL V-switch)
     int prev_burst_valid;           // Previous line had a usable burst
+
+    // Optional composite vectorscope sink (Vectorscope panel only; NULL =
+    // no per-pixel cost). Receives the burst-locked U/V of every active
+    // picture pixel and a field-end publish. Set only while stopped.
+    struct gui_vectorscope *vscope;
+    // Line-locked chroma state for the vectorscope sink (gui_cvbs.c;
+    // allocated on the first staged line, freed by gui_cvbs_cleanup).
+    struct cvbs_vscope_ll *vscope_ll;
 
     // SECAM FM-chroma state (active when the format is CVBS_FORMAT_SECAM and
     // colour_mode is AUTO; see cvbs_secam_state_t above)
@@ -579,6 +604,27 @@ void gui_cvbs_get_secam_diag(cvbs_decoder_t *decoder,
                              double *noise_mad_hz,
                              int *fields_calibrated, int *fields_reused,
                              int *fields_nominal);
+
+//-----------------------------------------------------------------------------
+// Composite feed (the CVBS plugin's decode pipeline without the Video panel)
+//-----------------------------------------------------------------------------
+
+// The CVBS plugin's exact decode chain (fixed-rate resampler + decoder),
+// created in the persisted default system. Used by the composite vectorscope
+// panel. Not thread-safe: create/destroy/set_system/process on one thread
+// (the display thread) or while that thread is not processing.
+typedef struct gui_cvbs_feed gui_cvbs_feed_t;
+gui_cvbs_feed_t *gui_cvbs_feed_create(void);
+void gui_cvbs_feed_destroy(gui_cvbs_feed_t *feed);
+void gui_cvbs_feed_process(gui_cvbs_feed_t *feed, const int16_t *samples,
+                           size_t count, uint32_t sample_rate);
+cvbs_decoder_t *gui_cvbs_feed_decoder(gui_cvbs_feed_t *feed);
+// 0=PAL, 1=NTSC, 2=SECAM (the System selector's value space).
+void gui_cvbs_feed_set_system(gui_cvbs_feed_t *feed, int system_select);
+
+// The composite vectorscope panel registers its Test Gen follow hook here
+// (queues a system change 0..2, applied on the panel's decode thread).
+void gui_cvbs_set_vectorscope_follow(void (*follow)(void *state, int system_select));
 
 // UI publishes active routes once per frame. Extraction does not use the display DSP lock.
 void gui_video_update_rf_routes(gui_app_t *app);
