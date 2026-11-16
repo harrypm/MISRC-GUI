@@ -60,10 +60,19 @@ int gui_testgen_clamp_format(int format);
 /* Samples in one full interlaced frame at the given rate (exact alloc size). */
 size_t gui_testgen_frame_samples(gui_testgen_system_t system, uint32_t sample_rate);
 
+/* Frames in one seamless loop of the composite stream: the colour-frame
+ * sequence (PAL 4 frames / 8 fields, NTSC 2 frames / 4 fields; SECAM 2, its
+ * D'R/D'B frame cadence). Frames 0..n-1 played in order and repeated carry
+ * a continuous subcarrier and an unbroken PAL V-switch. */
+int gui_testgen_loop_frames(gui_testgen_system_t system);
+
 /* Generate one full interlaced frame of composite CVBS into out[cap].
- * frame_index selects the frame in the stream (SECAM uses it for the
+ * frame_index selects the frame in the stream: PAL/NTSC continue the
+ * subcarrier phase and the PAL V-switch from frame_index - 1 (the colour-
+ * frame sequence, see gui_testgen_loop_frames); SECAM uses it for the
  * D'r/D'b line cadence, which alternates every frame, and for the per-line
- * 3-line carrier phase pattern; PAL/NTSC ignore it).
+ * 3-line carrier phase pattern. Line timing is exact to a fraction of a
+ * sample at any rate (no whole-sample line quantization).
  * Returns the number of int16 samples written, 0 if cap is too small.
  * Output is a full-scale int16 composite signal (sync tip ~ -0.30, white
  * ~ +0.70 of full scale for PAL/SECAM; NTSC setup per hacktv). */

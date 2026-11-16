@@ -428,7 +428,9 @@ static double rf_nearest_h(const gui_rf_decoder_t *d, double target, double radi
 }
 
 static uint8_t rf_byte(double value) {
-    return (uint8_t)lrint(rf_clamp(value*255.0, 0.0, 255.0));
+    /* Three calls per preview pixel: clamp then add-and-truncate instead of
+     * a libm lrint per call (same result except on exact .5 values). */
+    return (uint8_t)(rf_clamp(value*255.0, 0.0, 255.0) + 0.5);
 }
 
 static int rf_compare_double(const void *a, const void *b) {

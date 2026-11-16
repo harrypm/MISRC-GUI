@@ -753,11 +753,12 @@ static int32_t g_fir_acc[FILTERED_LINE_MAX];
 // thread fell behind, the feed buffer overran after ~8-10 s and every
 // drop kicked the sync chain). Doubles: the running sums reach ~4e7 and
 // window differences must keep full sample precision.
-static double g_pf_s[FILTERED_LINE_MAX + 1];
-static double g_pf_c[FILTERED_LINE_MAX + 1];
-static double g_pf_n[FILTERED_LINE_MAX + 1];
-static double g_pf_i[FILTERED_LINE_MAX + 1];
+static double g_pf_i[FILTERED_LINE_MAX + 1];    // chroma-chain output x carrier
 static double g_pf_q[FILTERED_LINE_MAX + 1];
+static double g_pf_y[FILTERED_LINE_MAX + 1];    // raw-line prefix (luma box mean)
+static double g_chroma_a[FILTERED_LINE_MAX];    // chroma chain scratch / output
+static double g_chroma_b[FILTERED_LINE_MAX];
+static int16_t g_comb_span[FILTERED_LINE_MAX + 8];  // comb partner, contiguous
 
 // Sync-edge delay of the pulse classifier, in SAMPLES: the PLL wrap (and so
 // the line buffer's k = 0) lands at the sync-pulse START CROSSING of the
@@ -794,8 +795,37 @@ static double g_pf_q[FILTERED_LINE_MAX + 1];
 // Measured (offline harness, 4fsc, line-to-line rms / field p2p samples):
 // MS2130 NTSC 6.0 / 15.6 -> 0.007 / 0.025; Test Gen 0.70 / 5.5 -> 0.15 /
 // 0.37.
-#define CVBS_H_RING 2048
+#define CVBS_H_RING 8192          // == sizeof h_ring; > 2 PAL lines + a line
 static bool g_cvbs_h_refine = true;   // Tests compare against the slicer edge
+
+// SUB-SAMPLE LINE PLACEMENT. A line wraps on a WHOLE sample (the first sample
+// with phase >= period), so the line buffer starts 0..1 sample after the true
+// line origin, and the pixel loop used to read buffer index k as line position
+// k. At the panel's ~4x-fsc decode rate (14.3 / 17.9 MHz) one sample is ~one
+// output pixel, and the fraction walks with the non-integer line length
+// (908.84 samples NTSC, 1145.6 PAL): measured on an analytic composite with
+// exact timing, every vertical edge sawtoothed -0.13 px per line with a
+// ~0.9 px snap back (1 px p2p, every system). At decode time the PLL phase is
+// (next sample - this line's snapped sync origin), so phase - buffer_count
+// is the buffer's measured offset from its OWN sync edge (the wrap fraction
+// plus any period-prediction residual); the pixel loop samples position
+// x - offset (linear on the luma-filtered line, fractional prefix-sum bounds
+// on the colour path).
+static bool g_cvbs_subsample_line = true;   // Tests compare against whole-sample
+
+// PICTURE CHROMA CHAIN: the composite vectorscope's front end
+// (cvbs_vscope_ll_line) ahead of the picture's burst-locked quadrature
+// demod - a line-delay comb (NTSC 1 line, PAL 2 lines; luma cancels on
+// vertically uniform content, chroma inverts over the delay) then a
+// two-stage half-cycle bandpass. The demod window used to see the raw
+// composite, so a luma STEP inside the 2-cycle window correlated with the
+// carrier at the carrier's absolute phase while the burst reference turns
+// 180 deg (NTSC) / 270 deg (PAL) per line: every colour transition decoded
+// with alternating hue fringes and a 2-line zigzag (~1 px PAL, ~0.5 px
+// NTSC on the Test Gen bars, the same on the real MS2130 SMPTE capture).
+// The burst goes through the same chain, so the burst-referenced gain
+// cancels the chain's gain. Luma keeps the raw line's box mean.
+static bool g_cvbs_pic_comb = true;   // Tests compare against bandpass alone
 #define CVBS_H_REFINE_OFFSET ((double)CVBS_SYNC_EDGE_DELAY_SAMPLES)
 
 static double cvbs_h_box(const int16_t *ring, int64_t k, int h) {
@@ -1025,12 +1055,10 @@ static int g_secam_decim = 8;        // decimation factor for the current rate
 static int g_secam_lp_taps = 41;     // band FIR tap count for the current rate
 static int g_secam_dec_count = 0;    // the last line's decimated sample count
 
-// One-line-hold rings: the previous same-component line's FINAL D'x (IRE
-// fractions, post de-emphasis) per component. File-scope like the other
-// per-line scratch (single decoder instance; cleared when the filters
-// rebuild).
-static float  g_secam_hold_final[2][CVBS_SECAM_MAX_DEC];
-static int    g_secam_hold_count[2];
+// The one-line-hold rings and the de-emphasis IIR state live per decoder
+// (cvbs_secam_state_t); a filter rebuild bumps this generation and each
+// decoder clears its own carried state when it next sees the new value.
+static unsigned g_secam_coeffs_gen = 0;
 
 static void cvbs_secam_bell_apply(int dec_count);
 
@@ -1046,7 +1074,6 @@ static double g_secam_lp[CVBS_SECAM_FIR_TAPS_MAX];    // band low-pass (real, sy
 // rebuild (rate/centre move), where the state re-enters from the
 // porch-zero rest and settles within the sync/porch region.
 static double g_secam_deemph_b0, g_secam_deemph_b1, g_secam_deemph_a1;
-static double g_secam_deemph_x1, g_secam_deemph_y1;
 // Cloche (see cvbs_secam_bell_apply): the reference bell factored about
 // the mix-down (block) centre into C * (1 + j n~ fb)/(1 + j d~ fb) and
 // bilinear-mapped to a complex one-pole/one-zero section (12 real mults
@@ -1099,10 +1126,10 @@ static void cvbs_secam_build_filters(double rate, double block_centre_hz) {
                               0.5 * (CVBS_SECAM_BAND_FLAT_HZ
                                      + CVBS_SECAM_BAND_STOP_HZ), rate);
 
-    // Clear the one-line-hold rings on any rebuild (rate/centre change:
-    // the hold would bridge across a discontinuity).
-    g_secam_hold_count[0] = 0;
-    g_secam_hold_count[1] = 0;
+    // Every decoder clears its one-line hold and de-emphasis state on any
+    // rebuild (rate/centre change: the hold would bridge across a
+    // discontinuity) - see the generation check in cvbs_secam_decode_line.
+    g_secam_coeffs_gen++;
 
     // Cloche factors: the reference bell A(f) = (1 + j1.26 F)/(1 + j16 F),
     // F = f/c_bell - c_bell/f, at the TRUE frequency f. After mix-down by
@@ -1211,8 +1238,6 @@ static void cvbs_secam_build_filters(double rate, double block_centre_hz) {
         g_secam_deemph_b0 = (1.0 + kz) / (1.0 + kp);
         g_secam_deemph_b1 = (1.0 - kz) / (1.0 + kp);
         g_secam_deemph_a1 = (1.0 - kp) / (1.0 + kp);
-        g_secam_deemph_x1 = 0.0;
-        g_secam_deemph_y1 = 0.0;
     }
 
     // Luma notch (2nd-order, broad) at the block centre: removes the steady
@@ -1258,7 +1283,11 @@ static void cvbs_secam_notch_line(int16_t *line, int n) {
                     - g_secam_notch_a1 * y1 - g_secam_notch_a2 * y2;
         x2 = x1; x1 = x0;
         y2 = y1; y1 = y0;
-        line[i] = (int16_t)lrint(y0);
+        // Round half away from zero by add-and-truncate (no libm call per
+        // sample; lrint was ~16 ns each = ~40 us per SECAM line).
+        if (y0 > 32767.0) y0 = 32767.0;
+        if (y0 < -32768.0) y0 = -32768.0;
+        line[i] = (int16_t)(y0 + (y0 >= 0.0 ? 0.5 : -0.5));
     }
 }
 
@@ -1500,6 +1529,11 @@ static void cvbs_secam_decode_line(cvbs_decoder_t *decoder,
         || fabs(rate - g_secam_coeffs_rate) > CVBS_SECAM_RECENTRE_HZ
         || fabs(block_centre - g_secam_coeffs_centre) > CVBS_SECAM_RECENTRE_HZ) {
         cvbs_secam_build_filters(rate, block_centre);
+    }
+    if (s->filters_gen != g_secam_coeffs_gen) {
+        s->filters_gen = g_secam_coeffs_gen;
+        s->hold_count[0] = s->hold_count[1] = 0;
+        s->deemph_x1 = s->deemph_y1 = 0.0;
     }
 
     // ---- Mix the block band down to baseband (incremental NCO, resync
@@ -1796,14 +1830,14 @@ static void cvbs_secam_decode_line(cvbs_decoder_t *decoder,
         // (slot 1). An earlier [is_red ? 1 : 0] here read the line's OWN
         // component slot - feeding the previous own-component value into
         // the wrong axis and scrambling every bar.
-        const float *hold_prev = g_secam_hold_final[is_red ? 0 : 1];
-        const int hold_count = g_secam_hold_count[is_red ? 0 : 1];
+        const float *hold_prev = s->hold_final[is_red ? 0 : 1];
+        const int hold_count = s->hold_count[is_red ? 0 : 1];
         for (int i = 0; i < dec_count; i++) {
             double y = g_secam_deemph_b0 * g_secam_demod[i]
-                       + g_secam_deemph_b1 * g_secam_deemph_x1
-                       - g_secam_deemph_a1 * g_secam_deemph_y1;
-            g_secam_deemph_x1 = g_secam_demod[i];
-            g_secam_deemph_y1 = y;
+                       + g_secam_deemph_b1 * s->deemph_x1
+                       - g_secam_deemph_a1 * s->deemph_y1;
+            s->deemph_x1 = g_secam_demod[i];
+            s->deemph_y1 = y;
             g_secam_final[i] = y;
         }
         // u01/v01 per decimated sample: this line's component from the
@@ -1832,10 +1866,10 @@ static void cvbs_secam_decode_line(cvbs_decoder_t *decoder,
         // scrambling every bar). The struct ring keeps the CONCEALED DEMOD
         // (deviation units) for the next line's row-2 concealment borrow.
         for (int i = 0; i < dec_count; i++) {
-            g_secam_hold_final[is_red ? 1 : 0][i] =
+            s->hold_final[is_red ? 1 : 0][i] =
                 (float)(g_secam_final[i] * own_scale);
         }
-        g_secam_hold_count[is_red ? 1 : 0] = dec_count;
+        s->hold_count[is_red ? 1 : 0] = dec_count;
         for (int i = 0; i < dec_count; i++) {
             s->prev_demod[is_red ? 1 : 0][i] = (float)g_secam_demod[i];
         }
@@ -2147,10 +2181,14 @@ static void cvbs_vscope_ll_line(cvbs_decoder_t *decoder, const int16_t *line,
             uint64_t i0 = (uint64_t)fl;
             const int16_t *h = ll->hist;
             const uint64_t m = CVBS_LL_HIST - 1;
+            // Contiguous copy of the partner span, then a plain 4-tap (the
+            // picture path's form: four masked ring loads per sample did not
+            // vectorise). g_comb_span is free here - the picture chain, the
+            // only other user, runs after this tap in the same call.
+            int16_t *sp = g_comb_span;
+            for (int k = 0; k < n + 3; k++) sp[k] = h[(i0 - 1 + (uint64_t)k) & m];
             for (int k = 0; k < n; k++) {
-                uint64_t i = i0 + (uint64_t)k;
-                double past = w0 * h[(i - 1) & m] + w1 * h[i & m]
-                            + w2 * h[(i + 1) & m] + w3 * h[(i + 2) & m];
+                double past = w0 * sp[k] + w1 * sp[k + 1] + w2 * sp[k + 2] + w3 * sp[k + 3];
                 xc[k] = 0.5 * ((double)line[k] - past);
             }
             combed = true;
@@ -2159,13 +2197,18 @@ static void cvbs_vscope_ll_line(cvbs_decoder_t *decoder, const int16_t *line,
     if (!combed) {
         for (int k = 0; k < n; k++) xc[k] = (double)line[k];
     }
-    for (int k = 0; k < n; k++) {
-        bp1[k] = (k >= d && k + d < n)
-            ? xc[k] - 0.5 * (xc[k - d] + xc[k + d]) : 0.0;
-    }
-    for (int k = 0; k < n; k++) {
-        bp[k] = (k >= 2 * d && k + 2 * d < n)
-            ? 0.25 * (bp1[k] - 0.5 * (bp1[k - d] + bp1[k + d])) : 0.0;
+    // The two cascaded half-cycle stages x[k] - (x[k-d] + x[k+d]) / 2, times
+    // 1/4, as one 5-tap pass (identical response: gain 1 at fsc, zero at
+    // DC); zero where either stage reached outside the line, as before.
+    {
+        const int d2 = 2 * d;
+        for (int k = 0; k < d2 && k < n; k++) bp[k] = 0.0;
+        for (int k = d2; k + d2 < n; k++) {
+            bp[k] = 0.375 * xc[k] - 0.25 * (xc[k - d] + xc[k + d])
+                  + 0.0625 * (xc[k - d2] + xc[k + d2]);
+        }
+        for (int k = (n - d2 > d2 ? n - d2 : d2); k < n; k++) bp[k] = 0.0;
+        (void)bp1;
     }
     const double cd = cos(w), sd = sin(w);
     double c = 1.0, s = 0.0;
@@ -2279,6 +2322,33 @@ static void cvbs_vscope_ll_line(cvbs_decoder_t *decoder, const int16_t *line,
 // burst phase alternation between lines (+-90 degree steps). Weak or missing
 // bursts (or SECAM, whose chroma is FM) suppress colour for that line and
 // the pixel falls back to the exact legacy grayscale mapping.
+// Luma kernel over the line BODY (half_taps .. n - half_taps): outer loop
+// over taps, inner over samples, so each inner loop is a plain widening
+// multiply-accumulate the vectoriser maps to SIMD (the former per-sample
+// inner reduction over a runtime tap count stayed scalar: ~20k scalar MACs
+// per line). The line edges are filtered separately (clamped).
+static void cvbs_luma_kernel_body(const int16_t *src, int n,
+                                  const cvbs_luma_kernel_t *kernel) {
+    const int half_taps = kernel->taps / 2;
+    const int end = n - half_taps;
+    if (end <= half_taps) return;
+    const int body = end - half_taps;
+    int32_t *acc = g_fir_acc;
+    {
+        const int32_t c0 = kernel->coeffs[0];
+        for (int i = 0; i < body; i++) acc[i] = (int32_t)src[i] * c0;
+    }
+    for (int k = 1; k < kernel->taps; k++) {
+        const int32_t ck = kernel->coeffs[k];
+        const int16_t *p = src + k;
+        for (int i = 0; i < body; i++) acc[i] += (int32_t)p[i] * ck;
+    }
+    const int shift = kernel->shift;
+    for (int i = 0; i < body; i++) {
+        g_filtered_line[half_taps + i] = (int16_t)(acc[i] >> shift);
+    }
+}
+
 static void decode_line_to_pixels(cvbs_decoder_t *decoder,
                                   const int16_t *samples, size_t sample_count,
                                   const cvbs_levels_t *levels,
@@ -2303,6 +2373,22 @@ static void decode_line_to_pixels(cvbs_decoder_t *decoder,
     if (n > full_line_samples) n = full_line_samples;
     if (n > FILTERED_LINE_MAX) n = FILTERED_LINE_MAX;
     if (n < 16) return;
+
+    // SUB-SAMPLE LINE PLACEMENT (see g_cvbs_subsample_line): the buffer's
+    // offset from this line's own sync origin, bounded so a stream jump or
+    // an unsnapped VBI line can never shift a line by more than a few
+    // samples. The pixel loop places LUMA by it (the fraction interpolated:
+    // kernel output on gray lines, the box mean through the prefix sum on
+    // colour lines); chroma takes the nearest whole-sample window, where a
+    // half-sample position is far below its bandwidth. Ring index of src[0]
+    // = global_sample_pos - sample_count (the loop stores each sample at
+    // its pre-increment index and wraps after the increment).
+    double line_off = 0.0;
+    if (g_cvbs_subsample_line && decoder->pll.locked) {
+        double off = decoder->pll.phase - (double)sample_count;
+        if (off > -4.0 && off < 4.0) line_off = off;
+    }
+    const int64_t ring0 = (int64_t)decoder->global_sample_pos - (int64_t)sample_count;
 
     // Pre-calculate level normalization (fixed-point: multiply by 255, divide by range)
     // DC restoration: this line's black is the committed black shifted by
@@ -2334,27 +2420,21 @@ static void decode_line_to_pixels(cvbs_decoder_t *decoder,
         g_filtered_line[i] = (int16_t)(sum >> kernel.shift);
     }
 
-    // Main body: outer loop over taps, inner over samples, so each inner
-    // loop is a plain widening multiply-accumulate the vectoriser maps to
-    // SIMD (the former per-sample inner reduction over a runtime tap count
-    // stayed scalar: ~20k scalar MACs per line).
+    // Main body (cvbs_luma_kernel_body): skipped when the line will decode
+    // in colour - the colour path takes its luma from the chroma window's
+    // box mean and only reads the kernel output within chroma_half + 1 of
+    // the line ends, which the edge passes cover (half_taps >= 5 > 4 + 1).
+    // If the burst gate turns the line gray, the body runs then.
     int end = n - half_taps;
-    if (end > half_taps) {
-        const int body = end - half_taps;
-        int32_t *acc = g_fir_acc;
-        {
-            const int32_t c0 = kernel.coeffs[0];
-            for (int i = 0; i < body; i++) acc[i] = (int32_t)src[i] * c0;
-        }
-        for (int k = 1; k < kernel.taps; k++) {
-            const int32_t ck = kernel.coeffs[k];
-            const int16_t *p = src + k;
-            for (int i = 0; i < body; i++) acc[i] += (int32_t)p[i] * ck;
-        }
-        const int shift = kernel.shift;
-        for (int i = 0; i < body; i++) {
-            g_filtered_line[half_taps + i] = (int16_t)(acc[i] >> shift);
-        }
+    const bool colour_possible = (decoder->colour_mode == CVBS_COLOUR_AUTO) &&
+        !(decoder->state.format == CVBS_FORMAT_SECAM && decoder->pll.locked);
+    // A vectorscope-only feed (pixels_wanted false) needs the sync, porch
+    // and vectorscope work only: no luma kernel, chroma chain or pixel loop.
+    const bool want_pixels = decoder->pixels_wanted;
+    bool luma_body_done = false;
+    if (!colour_possible && want_pixels) {
+        cvbs_luma_kernel_body(src, n, &kernel);
+        luma_body_done = true;
     }
 
     // Handle right edge (last half_taps samples) - clamp to edge
@@ -2391,8 +2471,17 @@ static void decode_line_to_pixels(cvbs_decoder_t *decoder,
              - CVBS_SYNC_EDGE_DELAY_SAMPLES;
     int s1 = cvbs_us_to_samples(decoder, profile->active_end_us)
              - CVBS_SYNC_EDGE_DELAY_SAMPLES;
-    int ax0 = (int)(((int64_t)s0 * pixel_width + n - 1) / n);
-    int ax1 = (int)(((int64_t)s1 * pixel_width) / n);
+    // NOMINAL horizontal scale: one line_us across the frame width (the
+    // render crop's mapping, cvbs_render_frame). The buffer's actual count
+    // n walks 908/909 (NTSC at 14.3 MHz; 1145/1146 PAL) as the whole-sample
+    // wrap slides along the 908.84-sample period, so scaling by n stretched
+    // each line by up to 1/909: measured on an exact analytic composite as
+    // +0.7 px spikes at the right of the frame every ~6 lines (+0.25 px at
+    // a quarter width). n is only the read bound below.
+    const double map_n = profile->line_us * cvbs_rate(decoder) * 1e-6;
+    const double spp = map_n / (double)pixel_width;   // samples per pixel
+    int ax0 = (int)ceil((double)s0 / spp);
+    int ax1 = (int)floor((double)s1 / spp);
     if (ax0 < 0) ax0 = 0;
     if (ax1 > pixel_width) ax1 = pixel_width;
     if (ax1 < ax0) ax1 = ax0;
@@ -2421,16 +2510,51 @@ static void decode_line_to_pixels(cvbs_decoder_t *decoder,
     double burst_phase = 0.0, burst_amp = 0.0;
     int vswitch = 1;
     int secam_dec_count = 0;
-    if (secam_active) {
+    if (secam_active && (want_pixels || decoder->vscope)) {
         // The SECAM line decode fills g_secam_u/g_secam_v per decimated
         // sample (the pixel loop below samples them) and updates the field
         // accumulators. The luma takes the block-notch (no chroma dots).
-        cvbs_secam_notch_line(g_filtered_line, n);
+        if (want_pixels) cvbs_secam_notch_line(g_filtered_line, n);
         cvbs_secam_decode_line(decoder, src, n, profile,
                                decoder->pll.current_line, picture_line);
         secam_dec_count = g_secam_dec_count;
         if (secam_dec_count > CVBS_SECAM_MAX_DEC) {
             secam_dec_count = CVBS_SECAM_MAX_DEC;
+        }
+        // Composite vectorscope, SECAM: the decoded colour difference of the
+        // active picture as U/V - this line's own component plus the held
+        // previous line's other one (the receiver's one-line pairing), the
+        // same u01/v01 the picture renders, so 75% bars land on the PAL
+        // 75% targets. SECAM has no burst: the plot is absolute (deviation),
+        // not burst-referenced.
+        // The demod runs decimated (~2.2 MHz, g_secam_decim panel samples
+        // per point): plotted as-is a transition got one point or none and
+        // the scope showed bar dots without the lines between them. Trace it
+        // at the panel rate instead - a Catmull-Rom curve through the
+        // decimated points (the D'x signals are band-limited well inside the
+        // decimated Nyquist), one point per panel sample like PAL/NTSC.
+        if (decoder->vscope && picture_line && secam_dec_count > 1) {
+            int d0 = (s0 > 0 ? s0 : 0) / g_secam_decim;
+            int d1 = (s1 > 0 ? s1 : 0) / g_secam_decim;
+            if (d1 > secam_dec_count - 1) d1 = secam_dec_count - 1;
+            const int sub = g_secam_decim > 0 ? g_secam_decim : 1;
+            const double inv = 1.0 / (double)sub;
+            for (int d = d0; d < d1; d++) {
+                const int dm = d > 0 ? d - 1 : d;
+                const int dp = d + 2 < secam_dec_count ? d + 2 : d + 1;
+                const double u0 = g_secam_u[dm], u1 = g_secam_u[d], u2 = g_secam_u[d + 1], u3 = g_secam_u[dp];
+                const double v0 = g_secam_v[dm], v1 = g_secam_v[d], v2 = g_secam_v[d + 1], v3 = g_secam_v[dp];
+                for (int k = 0; k < sub; k++) {
+                    const double f = (double)k * inv, f2 = f * f, f3 = f2 * f;
+                    const double w0 = -0.5 * f3 + f2 - 0.5 * f;
+                    const double w1 = 1.5 * f3 - 2.5 * f2 + 1.0;
+                    const double w2 = -1.5 * f3 + 2.0 * f2 + 0.5 * f;
+                    const double w3 = 0.5 * f3 - 0.5 * f2;
+                    gui_vectorscope_add(decoder->vscope, GUI_VSCOPE_SYS_SECAM,
+                                        w0 * u0 + w1 * u1 + w2 * u2 + w3 * u3,
+                                        w0 * v0 + w1 * v1 + w2 * v2 + w3 * v3);
+                }
+            }
         }
     }
     // Composite vectorscope: this picture line's line-locked chroma
@@ -2438,7 +2562,7 @@ static void decode_line_to_pixels(cvbs_decoder_t *decoder,
     if (decoder->vscope && colour && picture_line) {
         cvbs_vscope_ll_line(decoder, samples, sample_count, carrier_anchor, range);
     }
-    if (colour) {
+    if (colour && want_pixels) {
         double rate = cvbs_rate(decoder);
         double dphase = 2.0 * M_PI * profile->fsc_hz / rate;
 
@@ -2474,25 +2598,78 @@ static void decode_line_to_pixels(cvbs_decoder_t *decoder,
         // One pass over the line: the incremental carrier rotation feeds the
         // five prefix sums directly (no per-sample table store; every
         // window below reads prefix differences).
-        double acc_s = 0.0, acc_c = 0.0, acc_n = 0.0, acc_i = 0.0, acc_q = 0.0;
-        g_pf_s[0] = g_pf_c[0] = g_pf_n[0] = g_pf_i[0] = g_pf_q[0] = 0.0;
+        // Picture chroma chain (see g_cvbs_pic_comb): comb, then bandpass,
+        // into xc. The ring index of src[0] is global_sample_pos -
+        // sample_count (the loop stores each sample at its pre-increment
+        // index and wraps after the increment).
+        const double spc = rate / profile->fsc_hz;
+        const int bpd = (int)(spc * 0.5 + 0.5);
+        double *xc = g_chroma_a, *bp = g_chroma_b;
+        bool combed = false;
+        if (g_cvbs_pic_comb && decoder->pll.locked) {
+            const double D = (pal ? 2.0 : 1.0) * cvbs_effective_line_period(decoder);
+            const int64_t gsp = (int64_t)decoder->global_sample_pos;
+            // src[k] sits at ring position ring0 + k; its partner is D earlier.
+            const double first = (double)ring0 - D;
+            const double flr = floor(first);
+            const int64_t fl = (int64_t)flr;
+            // The delayed segment [fl-1, fl+n+2] must sit inside the ring's
+            // window (past samples only: D >= 8 keeps it behind this line).
+            if (fl - 1 >= 0 && fl - 1 >= gsp - (int64_t)CVBS_H_RING && D >= 8.0) {
+                const double f = first - flr, f2 = f * f, f3 = f2 * f;
+                const double w0 = -0.5 * f3 + f2 - 0.5 * f;
+                const double w1 = 1.5 * f3 - 2.5 * f2 + 1.0;
+                const double w2 = -1.5 * f3 + 2.0 * f2 + 0.5 * f;
+                const double w3 = 0.5 * f3 - 0.5 * f2;
+                // Contiguous copy of the partner span, then a plain 4-tap
+                // (vectorisable; four masked ring loads per sample were not).
+                const int16_t *hr = decoder->vsync.h_ring;
+                const uint64_t m = CVBS_H_RING - 1;
+                int16_t *sp = g_comb_span;
+                for (int k = 0; k < n + 3; k++) sp[k] = hr[(uint64_t)(fl - 1 + k) & m];
+                for (int k = 0; k < n; k++) {
+                    double past = w0 * sp[k] + w1 * sp[k + 1] + w2 * sp[k + 2] + w3 * sp[k + 3];
+                    xc[k] = 0.5 * ((double)src[k] - past);
+                }
+                combed = true;
+            }
+        }
+        if (!combed) {
+            for (int k = 0; k < n; k++) xc[k] = (double)src[k];
+        }
+        // Two cascaded half-cycle stages x[k] - (x[k-d] + x[k+d]) / 2, as one
+        // 5-tap pass (gain 1 at fsc; exact zero for DC and for ramps, so the
+        // output is mean-free and no window-mean term is needed below).
+        {
+            const int d2 = 2 * bpd;
+            for (int k = 0; k < d2 && k < n; k++) bp[k] = 0.0;
+            for (int k = d2; k + d2 < n; k++) {
+                bp[k] = 0.375 * xc[k] - 0.25 * (xc[k - bpd] + xc[k + bpd])
+                      + 0.0625 * (xc[k - d2] + xc[k + d2]);
+            }
+            for (int k = (n - d2 > d2 ? n - d2 : d2); k < n; k++) bp[k] = 0.0;
+        }
+
+        double acc_i = 0.0, acc_q = 0.0, acc_y = 0.0;
+        g_pf_i[0] = g_pf_q[0] = g_pf_y[0] = 0.0;
         for (int k = 0; k < n; k++) {
             if ((k & 255) == 0) {
                 double ph = (double)(table_anchor + (uint64_t)k) * dphase;
                 c = cos(ph);
                 s = sin(ph);
             }
-            double v = (double)src[k];
-            acc_s += v;
-            acc_c += c;
-            acc_n += s;
+            double v = bp[k];
             acc_i += v * c;
             acc_q += v * s;
-            g_pf_s[k + 1] = acc_s;
-            g_pf_c[k + 1] = acc_c;
-            g_pf_n[k + 1] = acc_n;
+            // Luma = composite minus the separated chroma (comb Y, or the
+            // notch when the comb has no history): the raw box mean left a
+            // partial cycle wherever the chroma amplitude changed inside
+            // the window, a dot column at every colour edge alternating
+            // with the carrier's per-line phase.
+            acc_y += (double)src[k] - v;
             g_pf_i[k + 1] = acc_i;
             g_pf_q[k + 1] = acc_q;
+            g_pf_y[k + 1] = acc_y;
             double nc = c * cd - s * sd;
             s = s * cd + c * sd;
             c = nc;
@@ -2532,11 +2709,10 @@ static void decode_line_to_pixels(cvbs_decoder_t *decoder,
             // sum (src - mean) * carrier = sum src*carrier - mean * sum carrier,
             // all four sums as prefix differences.
             double wlen = (double)(b1 - b0);
-            double wmean = (g_pf_s[b1] - g_pf_s[b0]) / wlen;
-            double sum_i = (g_pf_i[b1] - g_pf_i[b0])
-                           - wmean * (g_pf_c[b1] - g_pf_c[b0]);
-            double sum_q = (g_pf_q[b1] - g_pf_q[b0])
-                           - wmean * (g_pf_n[b1] - g_pf_n[b0]);
+            // The chain output is mean-free (see the bandpass), so the
+            // window-mean term that the raw composite needed is gone.
+            double sum_i = g_pf_i[b1] - g_pf_i[b0];
+            double sum_q = g_pf_q[b1] - g_pf_q[b0];
             double norm = 2.0 / wlen;
             double bi = sum_i * norm, bq = sum_q * norm;
             burst_amp = sqrt(bi * bi + bq * bq);
@@ -2565,6 +2741,10 @@ static void decode_line_to_pixels(cvbs_decoder_t *decoder,
     }
     if (!colour) {
         decoder->prev_burst_valid = 0;  // a gray line breaks the V-switch chain
+        if (!luma_body_done && want_pixels) {
+            cvbs_luma_kernel_body(src, n, &kernel);
+            luma_body_done = true;
+        }
     }
 
     // Back-porch mean (burst end .. active start, trimmed two samples at
@@ -2626,6 +2806,8 @@ static void decode_line_to_pixels(cvbs_decoder_t *decoder,
     // inversion, so the vswitch-detected expected angle is -90 + vswitch*45.
     // The recovered (uc, vc) is then (V, U): the U/V assignment below swaps
     // them back, and vswitch unflips PAL's alternating transmitted V.
+    if (!want_pixels) return;   // vectorscope-only feed: no picture pass
+
     double alpha = 0.0, gain = 0.0;
     if (colour) {
         double psi_expected = pal
@@ -2690,22 +2872,19 @@ static void decode_line_to_pixels(cvbs_decoder_t *decoder,
         }
     }
 
-    // Exact integer window centre per pixel, x_center(px) =
-    // floor(((2px+1) * n) / (2W)), advanced incrementally (Bresenham) -
-    // bit-identical to the former per-pixel 64-bit division.
-    const int64_t xc_den = 2 * (int64_t)pixel_width;
-    const int64_t xc_inc_q = (2 * (int64_t)n) / xc_den;
-    const int64_t xc_inc_r = (2 * (int64_t)n) % xc_den;
-    int64_t xc = (int64_t)n / xc_den;
-    int64_t xc_rem = (int64_t)n % xc_den;
-
-    // Fixed-point position tracking (16.16 format)
-    int32_t pos = 0;
-    int32_t step = (n << 16) / pixel_width;
+    // Pixel -> sample on the NOMINAL scale, placed by the line's sub-sample
+    // offset (16.16): luma reads the fraction, chroma the nearest window.
+    const int32_t step = (int32_t)(spp * 65536.0);
+    int32_t pos = (int32_t)(-line_off * 65536.0);
+    double xcf = 0.5 * spp - line_off;   // chroma window centre (samples)
 
     for (int px = 0; px < pixel_width; px++) {
-        int idx = pos >> 16;
-        if (idx >= n) idx = n - 1;
+        int idx = pos >> 16;              // arithmetic shift: floor
+        int32_t frac = pos & 0xFFFF;
+        if (idx < 0) { idx = 0; frac = 0; }
+        if (idx >= n - 1) { idx = n - 1; frac = 0; }
+        const int idx1 = idx + 1 < n ? idx + 1 : idx;
+        const double ft = (double)frac * (1.0 / 65536.0);
 
         // Hybrid split (see the setup above): leveled studio-swing mapping
         // for the active window of picture lines, the fixed IRE-domain
@@ -2717,7 +2896,9 @@ static void decode_line_to_pixels(cvbs_decoder_t *decoder,
         // unchanged, only the level transfer differs from the legacy raw
         // 0..255 mapping.
         bool leveled = picture_line && px >= ax0 && px < ax1;
-        double ire = (double)(g_filtered_line[idx] - black) * ire_per_count;
+        double ire = ((double)g_filtered_line[idx]
+                      + ft * (double)(g_filtered_line[idx1] - g_filtered_line[idx])
+                      - (double)black) * ire_per_count;
 
         // Chroma: integrate I/Q over a window of TWO carrier periods
         // centered on the pixel (chroma_half each side), clamped to the
@@ -2743,7 +2924,7 @@ static void decode_line_to_pixels(cvbs_decoder_t *decoder,
                 v01 = g_secam_v[dec];
             }
         } else if (colour) {
-            int x_center = (int)xc;
+            int x_center = (int)xcf;
             int c0 = x_center - chroma_half;
             int c1 = x_center + chroma_half;
             if (c0 < 1) c0 = 1;
@@ -2763,12 +2944,19 @@ static void decode_line_to_pixels(cvbs_decoder_t *decoder,
                 // luma kernel still passes ~10% of it - measured: every
                 // strongly-coloured bar's luma lifted by ~10% of its chroma
                 // amplitude). All sums are prefix differences.
-                double cmean = (g_pf_s[c1] - g_pf_s[c0]) * snap_inv[len];
-                ire = (cmean - (double)black) * ire_per_count;
-                double sum_i = (g_pf_i[c1] - g_pf_i[c0])
-                               - cmean * (g_pf_c[c1] - g_pf_c[c0]);
-                double sum_q = (g_pf_q[c1] - g_pf_q[c0])
-                               - cmean * (g_pf_n[c1] - g_pf_n[c0]);
+                // Chroma from the chain's prefix sums (mean-free after the
+                // bandpass: no window-mean term) on the whole-sample window;
+                // luma from the chroma-subtracted line's box mean over the
+                // same window at its TRUE sub-sample position (the prefix
+                // sum interpolated at the fractional bounds = the exact box
+                // with partial end samples).
+                const double dlt = xcf - (double)x_center;
+                const int c1n = c1 < n ? c1 + 1 : c1;
+                const double y0 = g_pf_y[c0] + dlt * (g_pf_y[c0 + 1] - g_pf_y[c0]);
+                const double y1 = g_pf_y[c1] + dlt * (g_pf_y[c1n] - g_pf_y[c1]);
+                ire = ((y1 - y0) * snap_inv[len] - (double)black) * ire_per_count;
+                double sum_i = g_pf_i[c1] - g_pf_i[c0];
+                double sum_q = g_pf_q[c1] - g_pf_q[c0];
                 double norm = snap_norm[len];
                 double ic = sum_i * norm, qc = sum_q * norm;
                 // Correlation algebra for the REAL encoder convention
@@ -2786,10 +2974,7 @@ static void decode_line_to_pixels(cvbs_decoder_t *decoder,
                 u01 = vc * gain;
                 v01 = uc * vsw_gain;
             }
-            // Advance the exact window centre to the next pixel.
-            xc += xc_inc_q;
-            xc_rem += xc_inc_r;
-            if (xc_rem >= xc_den) { xc_rem -= xc_den; xc++; }
+            xcf += spp;
         }
 
         // Display luma through the hybrid split: studio-swing mapping for
@@ -2834,6 +3019,7 @@ bool gui_cvbs_init(cvbs_decoder_t *decoder) {
     // burst decode the exact legacy grayscale anyway; the Off mode is one
     // button click away).
     decoder->colour_mode = CVBS_COLOUR_AUTO;
+    decoder->pixels_wanted = true;
 
     // Allocate field buffers (each field is half the frame height).
     // RGB24 rows (3 bytes per pixel) since the colour decode writes full
@@ -3082,8 +3268,6 @@ void gui_cvbs_reset(cvbs_decoder_t *decoder) {
     decoder->secam.for_ = CVBS_SECAM_FOR_HZ;
     decoder->secam.dr_on_even = true;
     g_secam_coeffs_valid = false;
-    g_secam_hold_count[0] = 0;
-    g_secam_hold_count[1] = 0;
 
     // Reset line buffer
     decoder->line_buffer_count = 0;
@@ -3651,24 +3835,25 @@ static void complete_field_pll(cvbs_decoder_t *decoder) {
 
     // Deinterlace and display - works with one or both fields
     // Bob mode is used until both fields are available, then weave takes over
-    deinterlace_fields(decoder);
-
-    // Copy deinterlaced frame to back buffer (display thread writes here)
     int frame_h = decoder->frame_height;
     int frame_w = decoder->frame_width;
     if (frame_h > CVBS_MAX_HEIGHT) frame_h = CVBS_MAX_HEIGHT;
     if (frame_w > CVBS_MAX_WIDTH) frame_w = CVBS_MAX_WIDTH;
     if (frame_w < 1) return;
+    if (decoder->pixels_wanted) {
+        deinterlace_fields(decoder);
 
-    memcpy(decoder->display_back, decoder->frame_buffer,
-           (size_t)frame_w * 3u * (size_t)frame_h);
-    // Signal that new frame is ready for the render thread
-    atomic_store(&decoder->display_ready, 1);
-    /* No network or encoder work here: optional bounded frame handoff only.
-     * The decoder owns display_back; callback must copy before returning. */
-    if (decoder->monitor_frame_sink)
-        decoder->monitor_frame_sink(decoder->monitor_frame_sink_context,
-            decoder->display_back, (unsigned)frame_w, (unsigned)frame_h, get_time_us());
+        // Copy deinterlaced frame to back buffer (display thread writes here)
+        memcpy(decoder->display_back, decoder->frame_buffer,
+               (size_t)frame_w * 3u * (size_t)frame_h);
+        // Signal that new frame is ready for the render thread
+        atomic_store(&decoder->display_ready, 1);
+        /* No network or encoder work here: optional bounded frame handoff only.
+         * The decoder owns display_back; callback must copy before returning. */
+        if (decoder->monitor_frame_sink)
+            decoder->monitor_frame_sink(decoder->monitor_frame_sink_context,
+                decoder->display_back, (unsigned)frame_w, (unsigned)frame_h, get_time_us());
+    }
     decoder->state.frame_complete = true;
     decoder->state.frames_decoded++;
     decoder->debug.fields_decoded++;
@@ -5482,6 +5667,7 @@ typedef struct {
     uint32_t resample_in_rate;
     uint32_t resample_out_rate;
     bool resample_failed;
+    bool resample_stale;      // Skipped own resampling (cache hit): clear soxr before resuming
     int16_t *resample_scratch;
     size_t resample_scratch_cap;
     // FLOAT staging for the resampler output: soxr's INT16 output path
@@ -6281,18 +6467,43 @@ static bool cvbs_plugin_resample_block(video_cvbs_plugin_t *plugin,
     // domain is NORMALIZED +-1.0 (measured: chunk absum 0.16/sample vs
     // 8012 on the int16 path - the first FLOAT32 build rounded the whole
     // stream to 0/+-1 and the decoder saw a dead signal), so the
-    // conversion rescales by 32768. lrintf (default round-to-nearest-even)
-    // + a range clamp is deterministic.
+    // conversion rescales by 32768. Clamp, then round half away from zero
+    // by add-and-truncate: deterministic like the lrintf it replaces (the
+    // two differ only on exact .5 values) and vectorisable. lrintf was a
+    // libm call per sample: 1.5 ms of the 1.64 ms frame budget at 40 MSPS
+    // (measured 2026-11-16, MinGW UCRT) against 0.18 ms for the soxr HQ
+    // filter itself - the whole preview resampler was 90% this loop.
+    const float *f32 = plugin->resample_f32;
+    int16_t *i16 = plugin->resample_scratch;
     for (size_t k = 0; k < produced; k++) {
-        long v = lrintf(plugin->resample_f32[k] * 32768.0f);
-        if (v > 32767) v = 32767;
-        if (v < -32768) v = -32768;
-        plugin->resample_scratch[k] = (int16_t)v;
+        float v = f32[k] * 32768.0f;
+        if (v > 32767.0f) v = 32767.0f;
+        if (v < -32768.0f) v = -32768.0f;
+        i16[k] = (int16_t)(v + (v >= 0.0f ? 0.5f : -0.5f));
     }
     *out_count = produced;
     return true;
 }
 #endif  // LIBSOXR_ENABLED
+
+// Per-frame resample cache (display thread only). Two feeds on one channel
+// (Video + Vector) resample the SAME frame to the SAME rate; the second
+// reuses the first's output. Keyed on the display frame sequence that
+// panel_process_all bumps per frame (0 = no sequence, e.g. the headless
+// harnesses: cache disabled) plus the frame pointer, count and rates. A
+// streaming soxr fed the identical sequence produces the identical output,
+// so the reuse is exact apart from the filter transient after a reset; a
+// feed that skipped its own resampler clears it before resuming. Measured
+// live 2026-11-16: 0.25 ms of the 1.64 ms frame per feed at 40 MSPS.
+uint64_t g_cvbs_display_frame_seq = 0;
+static struct {
+    uint64_t seq;
+    const int16_t *src;
+    size_t count;
+    uint32_t in_rate, out_rate;
+    const int16_t *data;
+    size_t n;
+} g_rs_cache;
 
 static void video_cvbs_plugin_process(video_cvbs_plugin_t *plugin,
                                       const int16_t *samples,
@@ -6312,8 +6523,34 @@ static void video_cvbs_plugin_process(video_cvbs_plugin_t *plugin,
                                (double)in_rate) + 8192u;
         size_t out_count = 0;
         uint64_t t_rs = get_time_us();
-        bool rs_ok = cvbs_plugin_resample_grow(plugin, need) &&
-                     cvbs_plugin_resample_block(plugin, samples, count, &out_count);
+        bool rs_ok;
+        const int16_t *rs_data;
+        const uint64_t seq = g_cvbs_display_frame_seq;
+        if (seq != 0 && g_rs_cache.seq == seq && g_rs_cache.src == samples &&
+            g_rs_cache.count == count && g_rs_cache.in_rate == in_rate &&
+            g_rs_cache.out_rate == out_rate && g_rs_cache.data) {
+            rs_data = g_rs_cache.data;
+            out_count = g_rs_cache.n;
+            rs_ok = true;
+            plugin->resample_stale = true;
+        } else {
+            if (plugin->resample_stale) {
+                soxr_clear(plugin->resample);
+                plugin->resample_stale = false;
+            }
+            rs_ok = cvbs_plugin_resample_grow(plugin, need) &&
+                    cvbs_plugin_resample_block(plugin, samples, count, &out_count);
+            rs_data = plugin->resample_scratch;
+            if (rs_ok && seq != 0) {
+                g_rs_cache.seq = seq;
+                g_rs_cache.src = samples;
+                g_rs_cache.count = count;
+                g_rs_cache.in_rate = in_rate;
+                g_rs_cache.out_rate = out_rate;
+                g_rs_cache.data = rs_data;   // valid until the owner's next call (same thread)
+                g_rs_cache.n = out_count;
+            }
+        }
         uint64_t rs_spent = get_time_us() - t_rs;
         g_prof_resample_us += rs_spent;
         // The OSD per-field "ms" is the WHOLE panel cost against the field
@@ -6327,8 +6564,7 @@ static void video_cvbs_plugin_process(video_cvbs_plugin_t *plugin,
             // error would slip the carrier reference tens of degrees per
             // line and scramble the hues (see cvbs_measure_hh_spacing).
             decoder->rate_trusted = true;
-            gui_cvbs_process_buffer(decoder, plugin->resample_scratch,
-                                    out_count, out_rate);
+            gui_cvbs_process_buffer(decoder, rs_data, out_count, out_rate);
             resampled = true;
         }
     }
@@ -7178,6 +7414,10 @@ void gui_cvbs_feed_process(gui_cvbs_feed_t *feed, const int16_t *samples,
 
 cvbs_decoder_t *gui_cvbs_feed_decoder(gui_cvbs_feed_t *feed) {
     return feed ? &feed->plugin.decoder : NULL;
+}
+
+void gui_cvbs_feed_set_pixels(gui_cvbs_feed_t *feed, bool wanted) {
+    if (feed) feed->plugin.decoder.pixels_wanted = wanted;
 }
 
 void gui_cvbs_feed_set_system(gui_cvbs_feed_t *feed, int system_select) {

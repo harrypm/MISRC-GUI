@@ -6,7 +6,11 @@
  */
 
 #include "panel_interface.h"
+#include "../signal/gui_cvbs.h"
 #include "../../common/threading.h"
+#include "../../common/buffer_manager.h"
+#include "../../common/misrc_debug.h"
+#include <stdio.h>
 #include <string.h>
 
 //-----------------------------------------------------------------------------
@@ -158,24 +162,77 @@ panel_menu_t panel_instance_get_menu(panel_instance_t *instance, size_t index) {
 // Batch Processing
 //-----------------------------------------------------------------------------
 
+// Display-thread throughput profile (MISRC_DEBUG): microseconds spent in
+// each panel type's process(), the panel-config lock wait, and the frame
+// count, printed every ~2 s with the display FIFO fill and drop count. The
+// per-frame budget at 40 MSPS is 1638 us (65536 samples); when the sum of
+// the per-type averages exceeds it the FIFO fills (1024 frames = 1.7 s of
+// latency) and then drops a trickle of blocks - every drop is a stream jump
+// for the decoders (dev/prompt_display_pipeline_counters_readme.md).
+static const char *const s_prof_names[PANEL_VIEW_COUNT] = {
+    [PANEL_VIEW_WAVEFORM] = "wave", [PANEL_VIEW_FFT] = "fft",
+    [PANEL_VIEW_CVBS] = "video", [PANEL_VIEW_HISTOGRAM] = "hist",
+    [PANEL_VIEW_WATERFALL] = "wfall", [PANEL_VIEW_SPECTROGRAPH] = "spectro",
+    [PANEL_VIEW_DEMOD] = "demod", [PANEL_VIEW_VECTORSCOPE] = "vector",
+};
+static uint64_t s_prof_us[PANEL_VIEW_COUNT];
+static uint32_t s_prof_calls[PANEL_VIEW_COUNT];
+static uint64_t s_prof_lock_us, s_prof_frames, s_prof_last_ms;
+
+static void panel_prof_tick(gui_app_t *app) {
+    if (!misrc_debug_enabled()) return;
+    uint64_t now = get_time_ms();
+    if (s_prof_last_ms == 0) { s_prof_last_ms = now; return; }
+    if (now - s_prof_last_ms < 2000) return;
+    double secs = (double)(now - s_prof_last_ms) / 1000.0;
+    char line[512];
+    int len = snprintf(line, sizeof(line), "[PANELPROF] %.0f frames/s:",
+                       (double)s_prof_frames / secs);
+    double sum = 0.0;
+    for (int t = 0; t < PANEL_VIEW_COUNT; t++) {
+        if (!s_prof_calls[t]) continue;
+        double per = (double)s_prof_us[t] / (double)s_prof_calls[t];
+        sum += (double)s_prof_us[t] / (double)(s_prof_frames ? s_prof_frames : 1);
+        len += snprintf(line + len, sizeof(line) - (size_t)len, " %s=%.0fus(x%u)",
+                        s_prof_names[t] ? s_prof_names[t] : "?", per,
+                        (unsigned)(s_prof_calls[t] / (s_prof_frames ? s_prof_frames : 1)));
+    }
+    size_t cap = app->buffers.buffers[BUF_DISPLAY].buffer_size;
+    size_t fill = cap ? bufmgr_fill_level(&app->buffers, BUF_DISPLAY) : 0;
+    snprintf(line + len, sizeof(line) - (size_t)len,
+             " | per-frame %.0fus lockwait %.0fus | DISP %u%% drops %u",
+             sum, (double)s_prof_lock_us / (double)(s_prof_frames ? s_prof_frames : 1),
+             cap ? (unsigned)(fill * 100 / cap) : 0u,
+             (unsigned)atomic_load(&app->buffers.stats[BUF_DISPLAY].write_drops));
+    fprintf(stderr, "%s\n", line);
+    memset(s_prof_us, 0, sizeof(s_prof_us));
+    memset(s_prof_calls, 0, sizeof(s_prof_calls));
+    s_prof_lock_us = 0;
+    s_prof_frames = 0;
+    s_prof_last_ms = now;
+}
+
+static inline void process_timed(panel_view_type_t view, void *state,
+                                 const int16_t *samples, size_t count,
+                                 uint32_t sample_rate) {
+    const panel_vtable_t *vt = panel_get_vtable(view);
+    if (!vt || !vt->process || !state) return;
+    uint64_t t0 = get_time_us();
+    vt->process(state, samples, count, sample_rate);
+    if (view >= 0 && view < PANEL_VIEW_COUNT) {
+        s_prof_us[view] += get_time_us() - t0;
+        s_prof_calls[view]++;
+    }
+}
+
 // Helper to process a single panel config's panels
 static void process_config_panels(channel_panel_config_t *config,
                                   const int16_t *samples, size_t count,
                                   uint32_t sample_rate) {
     if (!config || !samples || count == 0) return;
-
-    // Get vtable for left panel and process if it has a process function
-    const panel_vtable_t *left_vtable = panel_get_vtable(config->left_view);
-    if (left_vtable && left_vtable->process && config->left_state) {
-        left_vtable->process(config->left_state, samples, count, sample_rate);
-    }
-
-    // Process right panel if in split mode
+    process_timed(config->left_view, config->left_state, samples, count, sample_rate);
     if (config->split) {
-        const panel_vtable_t *right_vtable = panel_get_vtable(config->right_view);
-        if (right_vtable && right_vtable->process && config->right_state) {
-            right_vtable->process(config->right_state, samples, count, sample_rate);
-        }
+        process_timed(config->right_view, config->right_state, samples, count, sample_rate);
     }
 }
 
@@ -198,7 +255,11 @@ void panel_process_all(gui_app_t *app,
                        uint32_t sample_rate) {
     if (!app || count == 0) return;
 
+    g_cvbs_display_frame_seq++;   // per-frame resample cache key (gui_cvbs.c)
+    uint64_t t_lock = get_time_us();
     panel_cfg_lock(app);
+    s_prof_lock_us += get_time_us() - t_lock;
+    s_prof_frames++;
 
     // Process channel A panels
     if (samples_a) {
@@ -211,4 +272,5 @@ void panel_process_all(gui_app_t *app,
     }
 
     panel_cfg_unlock(app);
+    panel_prof_tick(app);
 }

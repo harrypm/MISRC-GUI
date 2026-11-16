@@ -28,7 +28,9 @@
 
 #define VS_CELLS ((size_t)GUI_VSCOPE_GRID * GUI_VSCOPE_GRID)
 
-enum { VS_GRAT_75 = 0, VS_GRAT_100 = 1, VS_GRAT_OFF = 2, VS_GRAT_COUNT };
+// Both = the 75% and 100% bar targets together (one label per colour, at the
+// outer 100% target), for sources whose bar level is not known in advance.
+enum { VS_GRAT_75 = 0, VS_GRAT_100 = 1, VS_GRAT_BOTH = 2, VS_GRAT_OFF = 3, VS_GRAT_COUNT };
 enum { VS_PLOT_POINTS = 0, VS_PLOT_DENSITY = 1, VS_PLOT_COUNT };
 enum { VS_BTN_SYSTEM = 0, VS_BTN_GRAT, VS_BTN_PLOT, VS_BTN_COLOUR, VS_BTN_COUNT };
 
@@ -127,6 +129,7 @@ static void *vs_create(void) {
     }
     cvbs_decoder_t *dec = gui_cvbs_feed_decoder(s->feed);
     dec->vscope = &s->scope;
+    gui_cvbs_feed_set_pixels(s->feed, false);   // scope only: no picture pass
     atomic_init(&s->pending_system, -1);
     int sys = (dec->state.format == CVBS_FORMAT_NTSC) ? 1
             : (dec->state.format == CVBS_FORMAT_SECAM) ? 2 : 0;
@@ -318,9 +321,15 @@ static void vs_draw_graticule(const vectorscope_panel_t *s, int system,
 
     if (s->graticule == VS_GRAT_OFF) return;
     static const char *names[7] = { "", "B", "G", "Cy", "R", "Mg", "Yl" };
-    double pct = (s->graticule == VS_GRAT_100) ? 1.0 : 0.75;
+    const bool both = s->graticule == VS_GRAT_BOTH;
+    const double pcts[2] = { both ? 0.75 : (s->graticule == VS_GRAT_100 ? 1.0 : 0.75), 1.0 };
+    const int pct_count = both ? 2 : 1;
     int label_font = (int)fmaxf(12.0f, 14.0f * sc * 1.33f);
+    for (int pi = 0; pi < pct_count; pi++)
     for (int rgb = 1; rgb < 7; rgb++) {
+        const double pct = pcts[pi];
+        // Both: label each colour once, at the outer (100%) target.
+        const bool label = !both || pi == pct_count - 1;
         double u, v;
         gui_vectorscope_bar_target(system, rgb, pct, &u, &v);
         double mag = hypot(u, v) * px_per_unit;
@@ -342,15 +351,18 @@ static void vs_draw_graticule(const vectorscope_panel_t *s, int system,
         DrawLineV((Vector2){ p.x - cross / 2, p.y }, (Vector2){ p.x + cross / 2, p.y }, vs_alpha(col, 220));
         DrawLineV((Vector2){ p.x, p.y - cross / 2 }, (Vector2){ p.x, p.y + cross / 2 }, vs_alpha(col, 220));
 
-        Vector2 lp = vs_point(c, deg, mag + 48.0f * sc);
-        int w = gui_text_measure(names[rgb], label_font);
-        gui_text_draw(names[rgb], lp.x - w / 2.0f, lp.y - label_font / 2.0f, label_font, col);
+        if (label) {
+            Vector2 lp = vs_point(c, deg, mag + 48.0f * sc);
+            int w = gui_text_measure(names[rgb], label_font);
+            gui_text_draw(names[rgb], lp.x - w / 2.0f, lp.y - label_font / 2.0f, label_font, col);
+        }
     }
 
     // Burst target(s): the transmitted burst vector, independent of the bar
     // level (NTSC 20 IRE at 180 deg; PAL 3/14 of blanking..white at 135 and
     // 225 deg, the two V-switch phases). Matches where the burst is plotted.
-    {
+    // SECAM has no burst (FM chroma): no mark.
+    if (system != GUI_VSCOPE_SYS_SECAM) {
         const bool pal = system == GUI_VSCOPE_SYS_PAL;
         const double amp = pal ? 3.0 / 14.0 : 0.2;
         const double degs[2] = { pal ? 135.0 : 180.0, 225.0 };
@@ -431,14 +443,17 @@ static void vs_render(void *state_ptr, gui_app_t *app, int channel,
         DrawTexturePro(s->tex, (Rectangle){ 0, 0, GUI_VSCOPE_GRID, GUI_VSCOPE_GRID },
                        dst, (Vector2){ 0, 0 }, 0.0f, WHITE);
     }
-    if (system != GUI_VSCOPE_SYS_SECAM) vs_draw_graticule(s, system, centre, side);
+    // SECAM plots its decoded D'B/D'R as U/V on the same (PAL) targets.
+    vs_draw_graticule(s, system, centre, side);
 
     DrawRectangleLinesEx(bounds, 1, COLOR_GRID_MAJOR);
     gui_text_draw("Vectorscope", bounds.x + 8, bounds.y + 4, FONT_SIZE_OSC_LABEL, COLOR_TEXT);
 
     const char *msg = NULL;
-    if (system == GUI_VSCOPE_SYS_SECAM) msg = "SECAM: FM chroma has no burst phase";
-    else if (!s->have_data || s->points == 0) msg = "No burst-locked colour";
+    if (!s->have_data || s->points == 0)
+        msg = (system == GUI_VSCOPE_SYS_SECAM) ? "No SECAM colour" : "No burst-locked colour";
+    else if (system == GUI_VSCOPE_SYS_SECAM)
+        msg = "SECAM: D'B/D'R as U/V (no burst reference)";
     if (msg) {
         int w = gui_text_measure(msg, FONT_SIZE_DROPDOWN_OPT);
         gui_text_draw(msg, centre.x - w / 2.0f, bounds.y + bounds.height - 28.0f,
@@ -448,7 +463,7 @@ static void vs_render(void *state_ptr, gui_app_t *app, int channel,
 
 static const char *vs_button_label(const vectorscope_panel_t *s, int b, char *buf, size_t n) {
     static const char *systems[] = { "PAL", "NTSC", "SECAM" };
-    static const char *grats[] = { "75%", "100%", "Off" };
+    static const char *grats[] = { "75%", "100%", "Both", "Off" };
     switch (b) {
         case VS_BTN_SYSTEM: {
             int sys = atomic_load(&((vectorscope_panel_t *)s)->decoder_system);

@@ -80,15 +80,19 @@ static int simulated_capture_thread(void *ctx) {
         return -1;
     }
 
-    /* Pre-generated frames. cvbs_frame and rf_frame each hold TWO frames
-     * (indices 0 and 1) streamed alternately; both pairs have the same
-     * sample count. */
+    /* Pre-generated frames, streamed in a loop. cvbs_frame holds the
+     * composite colour-frame sequence (gui_testgen_loop_frames: PAL 4
+     * frames, NTSC/SECAM 2) so the subcarrier and the PAL V-switch run on
+     * unbroken across the loop seam - a 2-frame PAL loop jumped the carrier
+     * 180 degrees every 80 ms. rf_frame holds TWO frames (indices 0 and 1).
+     * Every frame has the same sample count. */
     int sim_system = -1;   /* force first generation */
     int sim_format = -1;   /* force first generation */
     int16_t *cvbs_frame = NULL;
     int16_t *rf_frame = NULL;
     size_t frame_samples = 0;      /* samples in ONE frame */
-    size_t stream_samples = 0;     /* total across both frames */
+    size_t cvbs_stream_samples = 0;  /* composite loop length */
+    size_t stream_samples = 0;     /* RF loop length (both frames) */
     /* Per-channel streaming positions. Both frame pairs have the same
      * length, but the positions are kept independent so a tape-FORMAT
      * change (RF-only) restarts just the RF stream - CH1's composite
@@ -133,22 +137,28 @@ static int simulated_capture_thread(void *ctx) {
             sim_format = want_format;
             size_t need = gui_testgen_frame_samples(
                 (gui_testgen_system_t)sim_system, SIM_SAMPLE_RATE);
+            const int cvbs_frames = gui_testgen_loop_frames(
+                (gui_testgen_system_t)sim_system);
             if (need > 0) {
+                /* realloc either pointer independently: a failed realloc
+                 * leaves the old block valid, so keep the pointers in step
+                 * with what actually succeeded. */
                 int16_t *grown_cvbs = (int16_t *)realloc(cvbs_frame,
-                                                    2 * need * sizeof(int16_t));
+                                    (size_t)cvbs_frames * need * sizeof(int16_t));
+                if (grown_cvbs) cvbs_frame = grown_cvbs;
                 int16_t *grown_rf = (int16_t *)realloc(rf_frame,
                                                     2 * need * sizeof(int16_t));
+                if (grown_rf) rf_frame = grown_rf;
                 if (grown_cvbs && grown_rf) {
-                    cvbs_frame = grown_cvbs;
-                    rf_frame = grown_rf;
                     frame_samples = need;
+                    cvbs_stream_samples = (size_t)cvbs_frames * need;
                     stream_samples = 2 * need;
-                    gui_testgen_frame(
-                        (gui_testgen_system_t)sim_system, cvbs_frame, need,
-                        SIM_SAMPLE_RATE, 0);
-                    gui_testgen_frame(
-                        (gui_testgen_system_t)sim_system, cvbs_frame + need,
-                        need, SIM_SAMPLE_RATE, 1);
+                    for (int f = 0; f < cvbs_frames; f++) {
+                        gui_testgen_frame(
+                            (gui_testgen_system_t)sim_system,
+                            cvbs_frame + (size_t)f * need, need,
+                            SIM_SAMPLE_RATE, (uint32_t)f);
+                    }
                     gui_testgen_rf_frame(
                         (gui_testgen_system_t)sim_system,
                         (gui_testgen_format_t)sim_format, rf_frame, need,
@@ -160,19 +170,17 @@ static int simulated_capture_thread(void *ctx) {
                     cvbs_stream_pos = 0;
                     rf_stream_pos = 0;
                     fprintf(stderr, "[SIM] Regenerated %s %s frames "
-                            "(2x %zu samples at %u MSPS): CH1 CVBS + CH2 RF\n",
+                            "(CVBS %dx / RF 2x %zu samples at %u MSPS): CH1 CVBS + CH2 RF\n",
                             gui_testgen_system_name((gui_testgen_system_t)sim_system),
                             gui_testgen_format_name((gui_testgen_format_t)sim_format),
-                            need, SIM_SAMPLE_RATE / 1000000);
+                            cvbs_frames, need, SIM_SAMPLE_RATE / 1000000);
                 } else {
-                    free(grown_cvbs);
-                    free(grown_rf);
-                    /* Keep any previous valid pair; on the first failure
-                     * there is nothing to stream. */
-                    if (!cvbs_frame || !rf_frame) {
-                        frame_samples = 0;
-                        stream_samples = 0;
-                    }
+                    /* Out of memory: the buffers now hold a size that no
+                     * longer matches either stream's content - stop
+                     * streaming rather than read past a shorter block. */
+                    frame_samples = 0;
+                    cvbs_stream_samples = 0;
+                    stream_samples = 0;
                 }
             }
         } else if (want_format != sim_format) {
@@ -214,8 +222,8 @@ static int simulated_capture_thread(void *ctx) {
              * gates are relative), so the absolute scale is free; 1024
              * keeps the ~0.72-0.87 generator amplitude inside the 12-bit
              * domain with headroom. */
-            if (stream_samples > 0) {
-                size_t at_cvbs = (size_t)(cvbs_stream_pos % (uint64_t)stream_samples);
+            if (stream_samples > 0 && cvbs_stream_samples > 0) {
+                size_t at_cvbs = (size_t)(cvbs_stream_pos % (uint64_t)cvbs_stream_samples);
                 size_t at_rf = (size_t)(rf_stream_pos % (uint64_t)stream_samples);
                 int16_t cvbs_s = (int16_t)(((double)cvbs_frame[at_cvbs] / 32767.0) * 2170.0);
                 int16_t rf_s = (int16_t)(((double)rf_frame[at_rf] / 32767.0) * 1024.0);

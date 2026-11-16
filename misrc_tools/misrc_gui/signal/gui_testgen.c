@@ -56,6 +56,16 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+/* Clamp to int16 and round half away from zero by add-and-truncate: the
+ * same samples as lrint except on exact .5 values, without a libm call per
+ * sample (MinGW's lrint measured ~50 ns: five per sample were most of the
+ * frame's generation time). */
+static inline int16_t ht_r16(double v) {
+    if (v > 32767.0) v = 32767.0;
+    if (v < -32768.0) v = -32768.0;
+    return (int16_t)(v + (v >= 0.0 ? 0.5 : -0.5));
+}
+
 /* --- hacktv vid_config structs (verbatim values) ------------------------- */
 
 typedef struct {
@@ -65,14 +75,14 @@ typedef struct {
     double hsync_us;            /* 4.70 */
     double vsync_short_us;      /* 2.35 / 2.30 (eq pulse) */
     double vsync_long_us;       /* 27.30 / 27.10 (broad pulse) */
-    double sync_rise_us;        /* 0.20 / 0.25 */
+    double sync_rise_us;        /* edge 10-90% rise (PASS 2 Hann pulse) */
     double white_level;         /* 0.70 / 100/140 */
     double black_level;         /* 0.00 / 7.5/140 */
     double blanking_level;      /* 0.00 */
     double sync_level;          /* -0.30 / -40/140 */
     int colour_mode;            /* PAL / NTSC / SECAM */
     double burst_width_us;      /* 2.25 / 2.50 */
-    double burst_rise_us;       /* 0.30 */
+    double burst_rise_us;       /* burst envelope 10-90% build-up, 0.30 */
     double burst_left_us;       /* 5.60 / 5.30 */
     double burst_level_frac;    /* 3/7 / 4/10 of white-blank */
     double fsc_hz;              /* 4433618.75 / 3579545.4545 */
@@ -95,11 +105,13 @@ typedef struct {
  * HackDAC reference measures 0.221 V p-p - reproduced by the ITU frac times
  * the 0.75 capture-chain chroma gain below (measured, see the probe log). */
 static const ht_config_t HT_CONF[GUI_TESTGEN_SYSTEM_COUNT] = {
-    /* PAL — hacktv vid_config_pal (sync_rise 0.32 = the measured real-chain
-     * edge: the EBU reference's blanking->white 10-90 is 0.19us, i.e. a
-     * raised-cosine parameter of 0.32).
+    /* PAL — hacktv vid_config_pal (sync_rise 0.19 = the measured real-chain
+     * edge: the EBU reference's blanking->white 10-90 is 0.19us). Active
+     * line 10.5 us / 52 us (ITU-R BT.470; the live EBU bars on the MS2130
+     * measure 10.54 us): hacktv's 10.40 started the picture inside the
+     * decoder's back-porch level window (its profile active_start is 10.5).
      * Field 1 picture starts at slot 43, field 2 at slot 667 (288 lines). */
-    { 625, 51.95, 10.40, 4.70, 2.35, 27.30, 0.32,
+    { 625, 52.00, 10.50, 4.70, 2.35, 27.30, 0.19,
       0.70, 0.00, 0.00, -0.30,
       HT_PAL, 2.25, 0.30, 5.60, 3.0/14.0, 4433618.75, 0.877, 0.493,
       1250, 5, { 43, 667 }, 288 },
@@ -109,7 +121,7 @@ static const ht_config_t HT_CONF[GUI_TESTGEN_SYSTEM_COUNT] = {
      * picture - with hacktv's 9.20 the porch sampler lands inside the
      * castellated edge strip and poisons the level commit.
      * Field 1 picture starts at slot 38, field 2 at slot 564 (242 lines). */
-    { 525, 52.90, 9.45, 4.70, 2.30, 27.10, 0.32,
+    { 525, 52.90, 9.45, 4.70, 2.30, 27.10, 0.19,
       100.0/140, 7.5/140, 0.00, -40.0/140,
       HT_NTSC, 2.50, 0.30, 5.30, 0.20, 3579545.4545, 0.877, 0.493,
       1050, 6, { 38, 564 }, 242 },
@@ -117,19 +129,44 @@ static const ht_config_t HT_CONF[GUI_TESTGEN_SYSTEM_COUNT] = {
      * ev_co/eu_co are the SECAM D deviations in Hz per colour-difference
      * unit (hacktv's SECAM configs REPLACE the PAL 0.877/0.493 with them):
      * ev_co = -1.902*280e3 (D'R), eu_co = +1.505*230e3 (D'B). */
-    { 625, 51.95, 10.40, 4.70, 2.35, 27.30, 0.32,
+    { 625, 52.00, 10.50, 4.70, 2.35, 27.30, 0.19,
       0.70, 0.00, 0.00, -0.30,
       HT_SECAM, 2.25, 0.30, 5.60, 0.0, 4433618.75,
       -1.902 * 280e3, 1.505 * 230e3,
       1250, 5, { 43, 667 }, 288 },
 };
 
-/* Capture-chain chroma gain: the real EBU HackDAC reference measures its
- * bar chroma AND burst uniformly at 0.75x the standard amplitudes (yellow
- * chroma 0.176 composite vs the standard 0.235; burst 0.221 p-p vs 0.3 -
- * a 0.075-span uniform factor, direct max/min probe of the raw file).
- * The simulated device emulates a live capture through the same chain. */
-#define HT_CHROMA_GAIN 0.75
+/* Capture-chain chroma gain: the Simulated device emulates a live capture,
+ * and the capture chain's response at the subcarrier leaves bar chroma AND
+ * burst uniformly below the standard amplitude relative to the sync height.
+ * Measured on live MS2130 captures (2026-11-16, per-bar complex demod
+ * against each line's own sync tip / back porch, every bar and the burst
+ * agreeing to 0.3%): EBU PAL bars 0.79, SMPTE NTSC bars 0.80. The earlier
+ * single 0.75 came from a max/min probe of the EBU HackDAC reference FILE.
+ * Burst referencing cancels it (scope and picture); the waveform shows it. */
+#define HT_CHROMA_GAIN_PAL  0.79
+#define HT_CHROMA_GAIN_NTSC 0.80
+/* SECAM: the capture chain scales the FM subcarrier's AMPLITUDE like PAL's
+ * (same band), but it cannot change the frequency deviation, which carries
+ * the colour: standard D'R/D'B deviation (gain 1). The earlier 0.75 on the
+ * deviation (from the EBU reference card) put every SECAM bar a quarter
+ * inside its vectorscope target. */
+#define HT_SECAM_DEV_GAIN 1.0
+
+/* Chroma bandwidth: the bar colour-difference signals are band-limited like
+ * a real encoder's (each colour step becomes a raised-cosine transition,
+ * 10-90% below). The old renderer switched chroma instantly at every bar
+ * edge: the transition's spectrum ran past the decoder's chroma band and
+ * its 2 x fsc image traced a chain of loops along every transition on the
+ * vectorscope, where the live EBU bars draw clean straight lines. Matched on
+ * the live MS2130 captures through the vectorscope's own detector (bandpass,
+ * demod, 2-cycle Hann): bar-to-bar 10-90 0.57 us PAL, 0.585 us NTSC. */
+#define HT_CHROMA_RISE_PAL_US  0.34
+#define HT_CHROMA_RISE_NTSC_US 0.30
+
+static double ht_chroma_gain(int colour_mode) {
+    return colour_mode == 2 ? HT_CHROMA_GAIN_NTSC : HT_CHROMA_GAIN_PAL;  /* PAL, SECAM */
+}
 
 /* AC-coupling baseline bump (measured on the EBU reference, per line): at
  * each field's VBI the whole baseline rides up and decays back (the porch:
@@ -176,18 +213,21 @@ static const ht_config_t HT_CONF[GUI_TESTGEN_SYSTEM_COUNT] = {
 #define HT_SECAM_DR_HZ  (-1.902 * 280e3)
 #define HT_SECAM_DB_HZ  (1.505 * 230e3)
 
-/* --- hacktv _burstwin (raised-cosine envelope) --------------------------- */
-
+/* --- Burst envelope ----------------------------------------------------------
+ * Raised-cosine edges, 50% points at t = 0 (burst start) and t = width, edge
+ * 10-90% build-up time = rise (ITU-R BT.1700 / SMPTE 170M: 0.3 us). t, width
+ * and rise in seconds.
+ * The earlier port stepped the envelope from 0 to 1 at t = rise/2 (no rise at
+ * all) and from 1 to 0.5 at t = width: measured on the generator output with
+ * the composite vectorscope work (2026-11-16) as a hard-edged burst starting
+ * 0.15 us late and 0.15 us short (PAL 2.10 us, NTSC 2.35 us wide). */
+#define HT_RC_EDGE_1090 0.590334   /* 10-90% span of a raised-cosine edge / its length */
 static double ht_burstwin(double t, double width, double rise) {
-    /* t in seconds from burst start; width/rise in seconds */
-    if (t < 0 || t > width + rise) return 0.0;
-    double w;
-    if (t < rise / 2) w = 0.0;
-    else if (t < width) w = 1.0;
-    else if (t < width + rise / 2) w = (width + rise / 2 - t) / rise;
-    else w = 0.0;
-    w = fmax(0.0, fmin(1.0, w));
-    return 0.5 - 0.5 * cos(M_PI * w);
+    const double te = rise / HT_RC_EDGE_1090;          /* full edge length */
+    const double d = (t < 0.5 * width) ? t : (width - t);   /* signed distance inside the nearer 50% point */
+    if (d <= -0.5 * te) return 0.0;
+    if (d >= 0.5 * te) return 1.0;
+    return 0.5 + 0.5 * sin(M_PI * d / te);
 }
 
 /* --- SECAM chain (port of hacktv _vid_render_secam + filters) ------------ */
@@ -319,11 +359,11 @@ static const ht_rgb_t SMPTE_MID[7] = {
     { 0.75, 0.75, 0.75 },
 };
 
-static void ht_smpte_px(const ht_config_t *c, int row, int rows, int ax, int width,
+static void ht_smpte_px(const ht_config_t *c, int row, int rows, double ax, double width,
                         double *y, double *u, double *v) {
     const double span = c->white_level - c->black_level;        /* 92.5 IRE */
     const double chroma_span = span / (c->white_level - c->blanking_level);
-    double pos = 7.0 * (double)ax / (double)width;               /* in bar widths */
+    double pos = 7.0 * ax / width;                                /* in bar widths */
     if (pos < 0.0) pos = 0.0;
     if (pos >= 7.0) pos = 6.999999;
     *y = *u = *v = 0.0;
@@ -511,6 +551,126 @@ static bool ht_grid_build(const ht_config_t *c, size_t need,
     return true;
 }
 
+/* --- Sub-sample line model (composite) ----------------------------------------
+ * Every slot starts at its EXACT position s * need / slots (fractional
+ * samples): the old renderer started each line on a whole sample, so NTSC at
+ * 40 MSPS (2542.22 samples/line) alternated 2542/2543-sample lines and every
+ * line's sync, burst and picture moved +-0.5 sample against the (continuous)
+ * subcarrier - measured as 9.3 deg rms / 16 deg peak SCH jitter, which a
+ * line comb cannot cancel. Now each sample takes the AREA average of the
+ * piecewise-constant line content over its own width (the one edge it may
+ * straddle found by bisection), so every edge lands at its exact fractional
+ * time; PASS 2's symmetric pulse then shapes it without moving it. */
+typedef struct {
+    int type;            /* sl_pulse_t */
+    bool active;         /* H line inside the picture */
+    bool ntsc;
+    int row, rows;       /* picture row (SMPTE layout) */
+    double pulse;        /* sync pulse width, samples */
+    double act_l, act_w; /* active window, samples from the line start */
+    double black, white, blank, sync;
+    const ht_config_t *c;
+} ht_line_t;
+
+/* Base (sync/luma) level and bar chroma u/v (white-blank span units, before
+ * the chain gain) at line-relative position x samples. Blanking outside. */
+static void ht_line_at(const ht_line_t *L, double x, double *base, double *u, double *v) {
+    *u = *v = 0.0;
+    *base = L->blank;
+    if (x < 0.0) return;
+    if (x < L->pulse) { *base = L->sync; return; }
+    if (L->type != SL_H || !L->active) return;
+    double ax = x - L->act_l;
+    if (ax < 0.0 || ax >= L->act_w) return;
+    double y, uu, vv;
+    if (L->ntsc) {
+        ht_smpte_px(L->c, L->row, L->rows, ax, L->act_w, &y, &uu, &vv);
+    } else {
+        int bar = (int)(8.0 * ax / L->act_w);
+        if (bar > 7) bar = 7;
+        ht_rgb_to_yuv(L->c, HT_BARS[bar].r, HT_BARS[bar].g, HT_BARS[bar].b, &y, &uu, &vv);
+    }
+    *base = L->black + y * (L->white - L->black);
+    *u = uu;
+    *v = vv;
+}
+
+/* Area average over [x - 0.5, x + 0.5]: the line content never changes twice
+ * within one sample (its shortest feature is microseconds long). */
+static void ht_line_cov(const ht_line_t *L, double x, double *base, double *u, double *v) {
+    double b0, u0, v0, b1, u1, v1;
+    double lo = x - 0.5, hi = x + 0.5;
+    ht_line_at(L, lo, &b0, &u0, &v0);
+    ht_line_at(L, hi, &b1, &u1, &v1);
+    if (b0 == b1 && u0 == u1 && v0 == v1) {
+        *base = b0; *u = u0; *v = v0;
+        return;
+    }
+    double a = lo, b = hi;
+    for (int i = 0; i < 32; i++) {
+        double m = 0.5 * (a + b), bm, um, vm;
+        ht_line_at(L, m, &bm, &um, &vm);
+        if (bm == b0 && um == u0 && vm == v0) a = m; else b = m;
+    }
+    double f = 0.5 * (a + b) - lo;          /* share of the sample at the left value */
+    *base = b0 * f + b1 * (1.0 - f);
+    *u = u0 * f + u1 * (1.0 - f);
+    *v = v0 * f + v1 * (1.0 - f);
+}
+
+/* Band-limited bar chroma: the line's exact colour-difference steps (found
+ * once per line by a coarse scan + bisection on ht_line_at), each rendered
+ * as an integrated raised-cosine of pulse length T: the continuous
+ * band-limited envelope, sampled at the sample centres. */
+typedef struct { double x, du, dv; } ht_cstep_t;
+
+static int ht_chroma_steps(const ht_line_t *L, double scan, ht_cstep_t *st, int max) {
+    int n = 0;
+    double x0 = L->act_l - 2.0, b0, u0, v0;
+    ht_line_at(L, x0, &b0, &u0, &v0);
+    const double end = L->act_l + L->act_w + 2.0;
+    for (double x1 = x0 + scan; x0 < end && n < max; x0 = x1, x1 += scan) {
+        double b1, u1, v1;
+        ht_line_at(L, x1, &b1, &u1, &v1);
+        if (u1 == u0 && v1 == v0) continue;
+        double a = x0, b = x1;
+        for (int i = 0; i < 40; i++) {
+            double m = 0.5 * (a + b), bm, um, vm;
+            ht_line_at(L, m, &bm, &um, &vm);
+            if (um == u0 && vm == v0) a = m; else b = m;
+        }
+        st[n].x = 0.5 * (a + b);
+        st[n].du = u1 - u0;
+        st[n].dv = v1 - v0;
+        n++;
+        u0 = u1; v0 = v1;
+    }
+    return n;
+}
+
+/* Step response of a Hann pulse, t in pulse lengths (0.5 at t = 0). */
+static inline double ht_hann_step(double t) {
+    if (t <= -0.5) return 0.0;
+    if (t >= 0.5) return 1.0;
+    return t + 0.5 + sin(2.0 * M_PI * t) / (2.0 * M_PI);
+}
+
+/* Subcarrier cycles in one frame, exactly (NTSC 227.5 x 525 = 119437.5;
+ * PAL 283.75 x 625 + 1 (the 25 Hz offset) = 177344.75): whole quarter
+ * cycles, so a NTSC frame pair / PAL frame quad closes on itself. */
+static double ht_frame_cycles(const ht_config_t *c) {
+    double line_us = (c->lines == 525) ? 1001.0 / 15.75 : 64.0;
+    return floor(c->fsc_hz * line_us * 1e-6 * (double)c->lines * 4.0 + 0.5) / 4.0;
+}
+
+int gui_testgen_loop_frames(gui_testgen_system_t system) {
+    switch (system) {
+        case GUI_TESTGEN_PAL: return 4;    /* 4-frame (8-field) PAL sequence */
+        case GUI_TESTGEN_NTSC: return 2;   /* 2-frame (4-field) NTSC sequence */
+        default: return 2;                 /* SECAM D'R/D'B frame cadence */
+    }
+}
+
 size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
                          uint32_t sample_rate, uint32_t frame_index) {
     if ((int)system < 0 || (int)system >= GUI_TESTGEN_SYSTEM_COUNT) return 0;
@@ -554,136 +714,165 @@ size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
     double sync16 = c->sync_level * level;
 
     /* hacktv vid_init: burst parameters (plus the chain gain) */
-    int burst_left_smp = (int)(c->burst_left_us * (double)sample_rate / 1e6 + 0.5);
+    const double rate = (double)sample_rate;
     double burst_rise_s = c->burst_rise_us * 1e-6;
     double burst_width_s = c->burst_width_us * 1e-6;
-    double burst_amp = c->burst_level_frac * (white16 - blank16) * HT_CHROMA_GAIN;
+    double burst_amp = c->burst_level_frac * (white16 - blank16) * ht_chroma_gain(c->colour_mode);
     if (burst_amp < 0) burst_amp = -burst_amp;
 
-    /* hacktv vid_init: colour carrier phase increment per sample */
-    double fsc_inc = 2.0 * M_PI * c->fsc_hz / (double)sample_rate;
+    /* Exact (fractional) geometry, samples. */
+    const double slot_len = (double)need / (double)slots_total;
+    const double burst_l_f = c->burst_left_us * 1e-6 * rate;
+    const double act_l_f = c->active_left_us * 1e-6 * rate;
+    double act_w_f = c->active_width_us * 1e-6 * rate;
+    if (act_l_f + act_w_f > 2.0 * slot_len) act_w_f = 2.0 * slot_len - act_l_f;
+
+    /* Continuous subcarrier across frames: the carrier is locked to the
+     * generated line rate (exactly ht_frame_cycles per frame) and frame k
+     * starts where frame k-1 ended, so consecutive frame_index values make
+     * the standard colour-frame sequence (NTSC 2 frames, PAL 4). The old
+     * renderer restarted the carrier at phase 0 every frame: a -169 deg
+     * (NTSC) / +90 deg (PAL) carrier jump at every frame seam. */
+    const double frame_cycles = ht_frame_cycles(c);
+    const double cyc_per_smp = frame_cycles / (double)need;
+    double cyc0 = fmod((double)frame_index * frame_cycles, 1.0);
+    /* PAL V-switch: alternates on EVERY line through the frame and across
+     * frames (625 is odd, so it flips frame to frame). The old per-field
+     * H-index parity broke the alternation at both field boundaries.
+     * Frame 0's first H line stays +V. */
+    const int hpar = (c->lines == 525) ? 0 : 1;
+    const int train_len = 3 * c->eq_count;
+    const int first_h_slot = train_len + (((train_len & 1) != hpar) ? 1 : 0);
+    const long long first_line = (first_h_slot - hpar) / 2;   /* frame 0's first H line */
+    (void)eq_smp; (void)broad_smp; (void)hsync_smp; (void)active_left;
+    (void)active_width; (void)line_smp;
 
 /* PASS 1: baseband luma/sync into base_buf, chroma into chroma_buf.
      * hacktv applies the sync_rise shaping only to the sync/level steps and
      * keeps chroma on its own path; a combined filter would attenuate the
-     * 4.43 MHz subcarrier. */
+     * 4.43 MHz subcarrier. Positions are fractional (see ht_line_t). */
     for (int s = 0; s < slots_total; s++) {
         size_t ss = slot_start[s];
-        size_t se = slot_start[s + 1];
         if (ss >= need) break;
+        if (slot_type[s] == SL_BLANK) continue;  /* blanking (buffers are zeroed) */
 
-        switch (slot_type[s]) {
-            case SL_EQ:
-                for (size_t n = ss; n < se && n < need; n++) {
-                    if (n - ss < (size_t)eq_smp) {
-                        base_buf[n] = (int16_t)lrint(sync16 * 32767.0);
-                    }
-                }
-                break;
+        const bool h_line = slot_type[s] == SL_H;
+        /* An H line spans this slot plus the next (the active picture spans
+         * ~52us of the 64us line); EQ/broad pulses stay in their slot. */
+        size_t se = h_line ? ((s + 2 <= slots_total) ? slot_start[s + 2] : need)
+                           : slot_start[s + 1];
+        const double ls = (double)s * slot_len;          /* exact line/slot start */
+        const int field = (s < mid) ? 0 : 1;
+        const int a0 = c->act_first[field];
+        const int a1 = a0 + 2 * (c->act_lines - 1);
 
-            case SL_BROAD:
-                for (size_t n = ss; n < se && n < need; n++) {
-                    if (n - ss < (size_t)broad_smp) {
-                        base_buf[n] = (int16_t)lrint(sync16 * 32767.0);
-                    }
-                }
-                break;
+        ht_line_t L;
+        L.type = slot_type[s];
+        L.active = h_line && s >= a0 && s <= a1;
+        L.ntsc = c->colour_mode == HT_NTSC;
+        L.row = (s - a0) / 2;
+        L.rows = c->act_lines;
+        L.pulse = (slot_type[s] == SL_EQ ? c->vsync_short_us
+                   : slot_type[s] == SL_BROAD ? c->vsync_long_us : c->hsync_us) * 1e-6 * rate;
+        L.act_l = act_l_f;
+        L.act_w = act_w_f;
+        L.black = black16;
+        L.white = white16;
+        L.blank = blank16;
+        L.sync = sync16;
+        L.c = c;
 
-            case SL_BLANK:
-                break;  /* blanking level (buffers are zeroed) */
+        /* PAL V-switch / SECAM line parity: the frame-continuous line count. */
+        int pal_switch = 1;
+        if (h_line && c->colour_mode == HT_PAL) {
+            long long line = (long long)frame_index * c->lines + (s - hpar) / 2 - first_line;
+            pal_switch = ((line & 1) == 0) ? 1 : -1;
+        }
+        (void)slot_hidx;
 
-            case SL_H: {
-                /* One full line: this slot plus the next (the active
-                 * picture spans ~52us of the 64us line). */
-                size_t ss2 = (s + 2 <= slots_total) ? slot_start[s + 2] : need;
-                int hidx = slot_hidx[s];
-                int field = (s < mid) ? 0 : 1;
-                int a0 = c->act_first[field];
-                int a1 = a0 + 2 * (c->act_lines - 1);
-                bool active = (s >= a0 && s <= a1);
-                /* PAL V-switch / SECAM line parity (even H index -> +V) */
-                int pal_switch = ((hidx & 1) == 0) ? 1 : -1;
-                if (c->colour_mode == HT_NTSC) pal_switch = 1;
-
-                for (size_t n = ss; n < ss2 && n < need; n++) {
-                    size_t x = n - ss;
-                    size_t abs_pos = n;
-
-                    double signal = blank16;
-                    double chroma = 0.0;
-
-                    /* H sync (hacktv _render_sync_pulses H LUT) */
-                    if (x < (size_t)hsync_smp) signal = sync16;
-
-                    if (c->colour_mode == HT_PAL || c->colour_mode == HT_NTSC) {
-                        /* Burst on every H line (hacktv burst window) */
-                        if (x >= (size_t)burst_left_smp) {
-                            double bt = (double)(x - (size_t)burst_left_smp)
-                                      / (double)sample_rate;
-                            double w = ht_burstwin(bt, burst_width_s, burst_rise_s);
-                            if (w > 0.0) {
-                                double phase = fsc_inc * (double)abs_pos;
-                                if (c->colour_mode == HT_NTSC) {
-                                    /* NTSC burst: 180 degrees (hacktv: -sin) */
-                                    chroma += -w * burst_amp * sin(phase);
-                                } else {
-                                    /* PAL burst: +-135 degrees with V-switch */
-                                    double ang = (pal_switch > 0)
-                                        ? 135.0 * M_PI / 180.0
-                                        : 225.0 * M_PI / 180.0;
-                                    chroma += w * burst_amp * sin(phase + ang);
-                                }
-                            }
-                        }
-                    }
-
-                    /* Active video (hacktv _vid_next_line_raster) */
-                    if (active) {
-                        int ax = (int)x - active_left;
-                        if (ax >= 0 && ax < active_width) {
-                            double y, u, v;
-                            if (c->colour_mode == HT_NTSC) {
-                                /* NTSC: SMPTE SD colour bars */
-                                ht_smpte_px(c, (s - a0) / 2, c->act_lines,
-                                            ax, active_width, &y, &u, &v);
-                            } else {
-                                int bar = (ax * 8) / active_width;
-                                if (bar > 7) bar = 7;
-                                if (bar < 0) bar = 0;
-                                ht_rgb_to_yuv(c, HT_BARS[bar].r, HT_BARS[bar].g,
-                                              HT_BARS[bar].b, &y, &u, &v);
-                            }
-
-                            /* hacktv yuv_level_lookup: y in black..white */
-                            signal = black16 + y * (white16 - black16);
-
-                            if (c->colour_mode == HT_PAL ||
-                                c->colour_mode == HT_NTSC) {
-                                /* QAM on the subcarrier: U rides sin,
-                                 * V rides cos with the PAL V-switch. */
-                                double u_scaled = u * (white16 - blank16)
-                                                * HT_CHROMA_GAIN;
-                                double v_scaled = v * (white16 - blank16)
-                                                * HT_CHROMA_GAIN;
-                                double phase = fsc_inc * (double)abs_pos;
-                                chroma += u_scaled * sin(phase) +
-                                          v_scaled * pal_switch * cos(phase);
-                            }
-                        }
-                    }
-
-                double base_v = signal * 32767.0;
-                    if (base_v > 32767.0) base_v = 32767.0;
-                    if (base_v < -32768.0) base_v = -32768.0;
-                    base_buf[n] = (int16_t)lrint(base_v);
-
-                    double chroma_v16 = chroma * 32767.0;
-                    if (chroma_v16 > 32767.0) chroma_v16 = 32767.0;
-                    if (chroma_v16 < -32768.0) chroma_v16 = -32768.0;
-                    chroma_buf[n] = (int16_t)lrint(chroma_v16);
-                }
-                break;
+        /* Coverage: this sample's right edge is the next sample's left. */
+        double lb, lu, lv;
+        ht_line_at(&L, (double)ss - ls - 0.5, &lb, &lu, &lv);
+        /* Carrier by rotation (exact phase re-synced every 256 samples). */
+        const bool qam = h_line && (c->colour_mode == HT_PAL || c->colour_mode == HT_NTSC);
+        const double dph = 2.0 * M_PI * cyc_per_smp;
+        const double rcd = cos(dph), rsd = sin(dph);
+        /* PAL burst sin(phase + ang) = sin*cos(ang) + cos*sin(ang) */
+        const double bang = (pal_switch > 0) ? 135.0 * M_PI / 180.0 : 225.0 * M_PI / 180.0;
+        const double bca = cos(bang), bsa = sin(bang);
+        const double chroma_k = (white16 - blank16) * ht_chroma_gain(c->colour_mode);
+        double cc = 1.0, cs = 0.0;
+        /* Band-limited bar chroma for picture lines (see HT_CHROMA_RISE). */
+        ht_cstep_t steps[48];
+        int nsteps = 0, kdone = 0;
+        double ubase = 0.0, vbase = 0.0;
+        const double cpl = (c->colour_mode == HT_NTSC ? HT_CHROMA_RISE_NTSC_US
+                                                       : HT_CHROMA_RISE_PAL_US)
+                           / 0.482199 * 1e-6 * rate;    /* Hann pulse, samples */
+        if (qam && L.active) nsteps = ht_chroma_steps(&L, 0.2e-6 * rate, steps, 48);
+        for (size_t n = ss; n < se && n < need; n++) {
+            const double xf = (double)n - ls;   /* fractional line position */
+            double signal, u, v, rb, ru, rv;
+            ht_line_at(&L, xf + 0.5, &rb, &ru, &rv);
+            if (lb == rb && lu == ru && lv == rv) {
+                signal = lb; u = lu; v = lv;
+            } else {
+                ht_line_cov(&L, xf, &signal, &u, &v);
             }
+            lb = rb; lu = ru; lv = rv;
+            double chroma = 0.0;
+
+            if (qam) {
+                if (n == ss || ((n - ss) & 255) == 0) {
+                    double cyc = cyc0 + (double)n * cyc_per_smp;
+                    double phase = 2.0 * M_PI * (cyc - floor(cyc));
+                    cc = cos(phase);
+                    cs = sin(phase);
+                }
+                /* Burst on every H line, envelope at the exact position */
+                double w = ht_burstwin((xf - burst_l_f) / rate, burst_width_s, burst_rise_s);
+                if (w > 0.0) {
+                    if (c->colour_mode == HT_NTSC) {
+                        /* NTSC burst: 180 degrees (hacktv: -sin) */
+                        chroma += -w * burst_amp * cs;
+                    } else {
+                        /* PAL burst: +-135 degrees with V-switch */
+                        chroma += w * burst_amp * (cs * bca + cc * bsa);
+                    }
+                }
+                /* QAM on the subcarrier: U rides sin, V rides cos with the
+                 * PAL V-switch - the band-limited envelope from the line's
+                 * steps (0 outside the picture). */
+                (void)u; (void)v;
+                if (nsteps) {
+                    while (kdone < nsteps && xf >= steps[kdone].x + 0.5 * cpl) {
+                        ubase += steps[kdone].du;
+                        vbase += steps[kdone].dv;
+                        kdone++;
+                    }
+                    double eu = ubase, ev = vbase;
+                    for (int k = kdone; k < nsteps && xf > steps[k].x - 0.5 * cpl; k++) {
+                        double sfrac = ht_hann_step((xf - steps[k].x) / cpl);
+                        eu += steps[k].du * sfrac;
+                        ev += steps[k].dv * sfrac;
+                    }
+                    if (eu != 0.0 || ev != 0.0)
+                        chroma += chroma_k * (eu * cs + ev * pal_switch * cc);
+                }
+                double nc = cc * rcd - cs * rsd;
+                cs = cs * rcd + cc * rsd;
+                cc = nc;
+            }
+
+            double base_v = signal * 32767.0;
+            if (base_v > 32767.0) base_v = 32767.0;
+            if (base_v < -32768.0) base_v = -32768.0;
+            base_buf[n] = ht_r16(base_v);
+
+            double chroma_v16 = chroma * 32767.0;
+            if (chroma_v16 > 32767.0) chroma_v16 = 32767.0;
+            if (chroma_v16 < -32768.0) chroma_v16 = -32768.0;
+            chroma_buf[n] = ht_r16(chroma_v16);
         }
     }
 
@@ -709,8 +898,8 @@ size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
         const double dmax_db = (HT_SECAM_DB - HT_SECAM_FM + 506e3) / HT_SECAM_DEV;
         const double dmin_dr = (HT_SECAM_DR - HT_SECAM_FM - 506e3) / HT_SECAM_DEV;
         const double dmax_dr = (HT_SECAM_DR - HT_SECAM_FM + 350e3) / HT_SECAM_DEV;
-        const double fm_level = (white16 - blank16) * 32767.0 * HT_CHROMA_GAIN;
-        const size_t chroma_left = (size_t)hsync_smp;
+        const double fm_level = (white16 - blank16) * 32767.0 * ht_chroma_gain(c->colour_mode);
+        const double chroma_left_f = c->hsync_us * 1e-6 * rate;
         const size_t chroma_len = (size_t)((HT_SECAM_WIN_US * 1e-6
                                 + HT_SECAM_RISE_US * HT_SECAM_IRT1090 * 1e-6)
                                 * (double)sample_rate) + 1;
@@ -755,6 +944,9 @@ size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
             if (ss >= need) break;
             len = (ss2 > need ? need : ss2) - ss;
             if (len == 0) continue;
+            /* Sample 0 of this line sits fo samples after the exact line
+             * start (0 at 40 MSPS, where every 625-line slot is whole). */
+            const double fo = (double)ss - (double)s * slot_len;
 
             hidx = slot_hidx[s];
             field = (s < mid) ? 0 : 1;
@@ -774,8 +966,7 @@ size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
                 double dev = (dr ? 1.0 : -1.0) * HT_SECAM_FSYNC / HT_SECAM_DEV;
                 double rw = (dr ? 15e-6 : 18e-6);
                 for (size_t x = 0; x < len; x++) {
-                    double t = (double)((ssize_t)x - active_left)
-                               / (double)sample_rate / rw;
+                    double t = ((double)x + fo - act_l_f) / rate / rw;
                     if (t < 0.0) t = 0.0;
                     if (t > 1.0) t = 1.0;
                     d_line[x] = rest + dev * t;
@@ -787,22 +978,20 @@ size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
                  * the capture: the cyan D'b plateau reads 0.75x the
                  * standard deviation with no D'r blend). */
                 for (size_t x = 0; x < len; x++) {
-                    if (x < (size_t)active_left ||
-                        x >= (size_t)active_left + (size_t)active_width) {
+                    double ax = (double)x + fo - act_l_f;
+                    if (ax < 0.0 || ax >= act_w_f) {
                         d_line[x] = rest;
                         continue;
                     }
-                    int ax = (int)x - active_left;
-                    int bar = (ax * 8) / active_width;
+                    int bar = (int)(8.0 * ax / act_w_f);
                     if (bar > 7) bar = 7;
                     if (bar < 0) bar = 0;
                     double y, u, v;
                     ht_rgb_to_yuv(c, HT_BARS[bar].r, HT_BARS[bar].g,
                                   HT_BARS[bar].b, &y, &u, &v);
                     /* u/v are the SECAM deviations in Hz (the SECAM
-                     * config's ev_co/eu_co); the chain gain scales the
-                     * deviation (0.75x, measured on the real card). */
-                    double own_hz = HT_CHROMA_GAIN * (dr ? v : u);
+                     * config's ev_co/eu_co), at the standard deviation. */
+                    double own_hz = HT_SECAM_DEV_GAIN * (dr ? v : u);
                     d_line[x] = (own_hz + (dr ? HT_SECAM_DR : HT_SECAM_DB)
                                  - HT_SECAM_FM) / HT_SECAM_DEV;
                 }
@@ -839,20 +1028,26 @@ size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
                 if (d_line[x] > dmax) d_line[x] = dmax;
             }
 
-            /* FM render with the cloche gain and envelope */
+            /* FM render with the cloche gain and envelope (the window and
+             * the per-line phase reference start at the exact chroma_left
+             * time; at 40 MSPS fo is 0 and this is the whole-sample form). */
             phase = ((global % 3) == 0) ? 0.0 : M_PI;
-            for (size_t x = chroma_left; x < len; x++) {
-                size_t w = x - chroma_left;
+            size_t x_first = (size_t)ceil(chroma_left_f - fo);
+            if (x_first < len) {
+                double w0 = (double)x_first + fo - chroma_left_f;
+                phase += 2.0 * M_PI * (HT_SECAM_FM + d_line[x_first] * HT_SECAM_DEV) * w0 / rate;
+            }
+            for (size_t x = x_first; x < len; x++) {
+                double wf = (double)x + fo - chroma_left_f;
                 double env, freq, g_re, g_im, c;
-                if (w >= chroma_len) break;
-                env = ht_rc_window((double)w / (double)sample_rate,
-                                   env_rise / 2.0, env_width, env_rise);
+                if (wf >= (double)chroma_len) break;
+                env = ht_rc_window(wf / rate, env_rise / 2.0, env_width, env_rise);
                 freq = HT_SECAM_FM + d_line[x] * HT_SECAM_DEV;
                 ht_secam_g(freq, &g_re, &g_im);
                 c = fm_level * (cos(phase) * g_re - sin(phase) * g_im) * env;
                 if (c > 32767.0) c = 32767.0;
                 if (c < -32768.0) c = -32768.0;
-                chroma_buf[ss + x] = (int16_t)lrint(c);
+                chroma_buf[ss + x] = ht_r16(c);
                 phase += 2.0 * M_PI * freq / (double)sample_rate;
             }
         }
@@ -860,12 +1055,20 @@ size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
         free(d_src);
     }
 
-    /* PASS 2: apply the sync_rise raised-cosine shaping to the BASE signal
-     * only (hacktv's IRT1090 rise shape). The chroma is added unfiltered
-     * afterwards. */
-    int rise_n = (int)(c->sync_rise_us * (double)sample_rate / 1e6 + 0.5);
-    if (rise_n < 1) rise_n = 1;
-    if (rise_n > (int)need) rise_n = (int)need;
+    /* PASS 2: edge shaping of the BASE signal only (the chroma is added
+     * unfiltered afterwards). A symmetric raised-cosine (Hann) PULSE of
+     * length T: every level step becomes the integrated-raised-cosine
+     * S-curve, centred on the step's exact (fractional) position, 10-90% =
+     * 0.4822 T = sync_rise_us. The earlier kernel was a HALF-cosine ramp
+     * (0 -> 1, not 0 -> 1 -> 0): one-sided, so every sync and luma edge came
+     * out lopsided and ~3.5 samples (87 ns at 40 MSPS) early against the
+     * chroma - measured as the burst sitting 5.85 us after the sync 50%
+     * point instead of 5.60. */
+    const double pulse_len = c->sync_rise_us / 0.482199 * 1e-6 * rate;
+    int kern_half = (int)floor(0.5 * pulse_len);
+    if (kern_half < 0) kern_half = 0;
+    if (2 * kern_half + 1 > (int)need) kern_half = ((int)need - 1) / 2;
+    const int rise_n = 2 * kern_half + 1;
     double *kern = (double *)malloc((size_t)rise_n * sizeof(double));
     if (!kern) {
         free(base_buf);
@@ -876,28 +1079,27 @@ size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
     {
         double sum = 0.0;
         for (int i = 0; i < rise_n; i++) {
-            /* Raised-cosine pulse (hacktv IRT1090 rise shape) */
-            kern[i] = 0.5 - 0.5 * cos(M_PI * ((double)i + 0.5) / (double)rise_n);
+            double j = (double)(i - kern_half);
+            kern[i] = (pulse_len > 0.0 && fabs(j) < 0.5 * pulse_len)
+                ? 0.5 + 0.5 * cos(2.0 * M_PI * j / pulse_len) : 0.0;
             sum += kern[i];
         }
+        if (sum <= 0.0) { kern[kern_half] = 1.0; sum = 1.0; }
         for (int i = 0; i < rise_n; i++) kern[i] /= sum;
     }
-    int kern_half = rise_n / 2;
     for (size_t n = 0; n < need; n++) {
         double base_f = 0.0;
         for (int i = 0; i < rise_n; i++) {
-            size_t idx = (size_t)((ssize_t)n - kern_half + i);
-            if (idx >= need) {
-                /* Frame wrap: the stream is continuous, so fold the
-                 * kernel tail onto the frame start (and vice versa). */
-                idx %= need;
-            }
+            /* The stream is continuous: wrap at both frame ends. */
+            long long idx = (long long)n - kern_half + i;
+            if (idx < 0) idx += (long long)need;
+            else if (idx >= (long long)need) idx -= (long long)need;
             base_f += kern[i] * (double)base_buf[idx];
         }
         double value = base_f;
         if (value > 32767.0) value = 32767.0;
         if (value < -32768.0) value = -32768.0;
-        out[n] = (int16_t)lrint(value);
+        out[n] = ht_r16(value);
     }
     free(kern);
     free(base_buf);
@@ -934,7 +1136,7 @@ size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
                     if ((size_t)idx >= a1n - a0n) idx = (ssize_t)(a1n - a0n) - 1;
                     acc += nt[j] * tmp[idx];
                 }
-                out[n] = (int16_t)lrint(acc);
+                out[n] = ht_r16(acc);
             }
             free(tmp);
         }
@@ -947,7 +1149,7 @@ size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
         double value = (double)out[n] + (double)chroma_buf[n];
         if (value > 32767.0) value = 32767.0;
         if (value < -32768.0) value = -32768.0;
-        out[n] = (int16_t)lrint(value);
+        out[n] = ht_r16(value);
     }
     free(chroma_buf);
 
@@ -966,22 +1168,32 @@ size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
         double lines_per_frame = (double)c->lines;
         double half = lines_per_frame / 2.0;   /* 312.5 / 262.5 */
         double amp = HT_SAG_PEAK * 32767.0;
+        /* The four exponentials advance by a constant factor per sample;
+         * multiply instead of calling exp() per sample (re-synced exactly
+         * every 4096 samples). exp(-(t - P)/tau) clamped at 1 equals
+         * exp(-max(0, t - P)/tau). */
+        const double dl = lines_per_frame / (double)need;
+        const double kr = exp(-dl / HT_SAG_TAU_RISE), kd = exp(-dl / HT_SAG_TAU_DECAY);
+        double er1 = 1.0, ed1 = 1.0, er2 = 1.0, ed2 = 1.0;
         for (size_t n = 0; n < need; n++) {
-            double line = (double)n * lines_per_frame / (double)need;
+            double line = (double)n * dl;
             double d2 = line - half;
-            double b1 = amp * (1.0 - exp(-line / HT_SAG_TAU_RISE))
-                            * exp(-fmax(0.0, line - HT_SAG_PIC_START)
-                                      / HT_SAG_TAU_DECAY);
+            if ((n & 4095) == 0) {
+                er1 = exp(-line / HT_SAG_TAU_RISE);
+                ed1 = exp(-(line - HT_SAG_PIC_START) / HT_SAG_TAU_DECAY);
+                er2 = exp(-d2 / HT_SAG_TAU_RISE);
+                ed2 = exp(-(d2 - HT_SAG_PIC_START) / HT_SAG_TAU_DECAY);
+            }
+            double b1 = amp * (1.0 - er1) * (ed1 < 1.0 ? ed1 : 1.0);
             double b2 = 0.0;
             if (d2 >= 0.0) {
-                b2 = amp * (1.0 - exp(-d2 / HT_SAG_TAU_RISE))
-                         * exp(-fmax(0.0, d2 - HT_SAG_PIC_START)
-                                   / HT_SAG_TAU_DECAY);
+                b2 = amp * (1.0 - er2) * (ed2 < 1.0 ? ed2 : 1.0);
             }
+            er1 *= kr; ed1 *= kd; er2 *= kr; ed2 *= kd;
             double value = (double)out[n] + b1 + b2;
             if (value > 32767.0) value = 32767.0;
             if (value < -32768.0) value = -32768.0;
-            out[n] = (int16_t)lrint(value);
+            out[n] = ht_r16(value);
         }
     }
 
@@ -1285,7 +1497,7 @@ size_t gui_testgen_rf_frame(gui_testgen_system_t system, gui_testgen_format_t fo
             double value = rf * 32767.0;
             if (value > 32767.0) value = 32767.0;
             if (value < -32768.0) value = -32768.0;
-            out[n] = (int16_t)lrint(value);
+            out[n] = ht_r16(value);
         }
     }
 

@@ -1068,6 +1068,20 @@ if raylib_dep.found()
     )
     test('gui_vectorscope', vectorscope_test, timeout: 120)
 
+    # Video decode line placement: an analytic composite with exact line
+    # timing through the panel path (soxr + decode); every vertical bar edge
+    # must decode as a straight line (sub-sample placement, nominal scale).
+    cvbs_line_test = executable('gui_cvbs_line_test',
+      ['test/gui_cvbs_line_test.c', 'misrc_gui/signal/gui_trigger.c',
+       'misrc_gui/signal/gui_vectorscope.c', 'misrc_gui/signal/gui_testgen.c'],
+      dependencies: cvbs_baseband_deps,
+      include_directories: gui_includes,
+      c_args: gui_cflags,
+      link_args: ldflags,
+      override_options: ['b_lto=true', 'optimization=2'],
+    )
+    test('gui_cvbs_line', cvbs_line_test, timeout: 180)
+
     # gui_audio.c (included by both harnesses) redirects stdio through the
     # mls_proxy_* macros; the harnesses already self-define those (their own
     # file_open_utf8 stubs get renamed by the macro). The only extra symbol
@@ -1219,6 +1233,9 @@ rf_testgen_test = executable('gui_testgen_rf_test',
   rf_preview_sources + ['test/gui_testgen_rf_test.c', 'misrc_gui/signal/gui_testgen.c'],
   dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
 test('gui_testgen_rf', rf_testgen_test, timeout: 120)
+testgen_cvbs_test = executable('gui_testgen_cvbs_test', 'test/gui_testgen_cvbs_test.c',
+  dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
+test('gui_testgen_cvbs', testgen_cvbs_test, timeout: 120)
 rf_resampler_test = executable('gui_rf_resampler_test',
   ['test/gui_rf_resampler_test.c', 'misrc_gui/signal/gui_rf_resampler.c'],
   dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)

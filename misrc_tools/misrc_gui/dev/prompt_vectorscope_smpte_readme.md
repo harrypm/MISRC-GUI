@@ -202,3 +202,238 @@ round arcs, comb mixing misaligned lines).
   zero bad readings. Suite 57/58 (update_cli environmental).
 
 Signed-off-by: harrypm
+
+## Follow-up: line stability of all CVBS system modes
+
+> Line stablity of all cvbs system modes
+> a critical thing is to not increese the CPU load demand
+
+Measured offline with an analytic composite (exact line timing, raised-cosine
+edges, burst + chroma on alternate bars) through the real panel path (soxr to
+the fixed decode rate, then the decoder), locating every vertical bar edge per
+decoded row at its half-level crossing. Before: every edge sawtoothed ~1 px
+p2p on every system (NTSC 0.35-0.4 px line-to-line, PAL 0.45-1.1, SECAM 0.55),
+with +0.7 px spikes at the right of the frame every ~6 lines. Two causes, both
+in `decode_line_to_pixels`:
+
+- The line wraps on a WHOLE sample, so each line's buffer starts 0..1 sample
+  after its true origin and the fraction walks with the non-integer line
+  length (908.84 samples NTSC, 1145.6 PAL at the decode rates). The PLL phase
+  at decode time minus the buffer count is that offset exactly; the pixel loop
+  now places luma by it (sub-sample).
+- The pixel scale was the buffer's actual count (908 or 909), so each line was
+  stretched by up to 1/909 - proportional to x, hence the right-side spikes.
+  The scale is now the nominal line period (one line_us across the frame
+  width, the render crop's mapping); the count is only the read bound.
+
+After (line-to-line rms / field p2p, px): NTSC 0.012 / 0.034, PAL 0.006 /
+0.012, 625 as SECAM 0.008 / 0.016; +-500 ppm clock the same; 34 dB SNR
+(30 codes rms) 0.07 / 0.24; real MS2130 NTSC capture 0.009 / 0.03 (was
+0.16 / 0.44). Limits: below ~30 dB SNR isolated lines still jump (a single
+misread sync); not a tape-level concern.
+
+Colour edges: every colour transition decoded with alternating hue fringes
+and a 2-line zigzag (~1 px PAL, ~0.5 px NTSC; the same on the real MS2130
+SMPTE capture) - the luma step inside the 2-cycle demod window correlated
+with the carrier at its absolute phase, which turns 180/270 deg per line
+against the burst reference. The picture chroma path now runs the
+vectorscope's front end (line-delay comb, NTSC 1 line / PAL 2 lines, from
+the decoder's sample ring, then the half-cycle bandpass), and luma is the
+composite minus the separated chroma (comb Y / notch), which also removed
+the alternating dot column the raw box mean left at chroma edges. The real
+capture's edges are clean. The Test Gen's own NTSC bars keep a mild 2-line
+residual: the generator's integer-sample slots make its lines 2542/2543
+samples long, so its subcarrier advances 227.5 +- 0.09 cycles per line
+(+-32 deg jitter a 1-line comb cannot cancel); a real signal has none.
+Fractional slot timing in gui_testgen is the follow-up.
+
+CPU (us per decoded line, the decoder's own profile counters, baseline = the
+committed vectorscope branch built from the same sources, 5 alternating runs,
+min / median): NTSC colour 20.9 / 23.5 before, 19.8 / 23.7 after; PAL colour
+28.9 / 30.6 before, 24.6 / 33.0 after (single runs scatter +-20%, so: equal).
+Gray decode (Colour: Off) 4.5 -> 5.9 (the per-pixel luma interpolation; a
+one-pass shift of the filtered line would remove it if wanted). Kept neutral
+by skipping the 17-tap luma kernel body on colour lines (their luma is the
+window box mean), dropping the window-mean prefix arrays (the bandpass output
+is mean-free), fusing the bandpass into one 5-tap pass, chroma on the nearest
+whole-sample window (luma alone is placed sub-sample), and keeping the pixel
+loop integer. An exact chroma placement (one fractional-delay pass of the
+line) measured ~+2 us/line and took the real capture's edge alternation from
+1.0 to 0.5 levels; not taken. Note for later: the soxr HQ resampler costs
+about twice the whole line decode on this path (1.7-2.4 s per 2 s of video
+in the harness) - the real CPU lever here.
+
+- Test: `gui_cvbs_line_test`. Luma-only sources (525/625, exact and +-60
+  ppm, 625 as SECAM): every edge straight within 0.05 px line-to-line / 0.15
+  px p2p. Sources with burst + chroma on alternate bars (the colour path):
+  0.2 / 0.45 px - measured ~0.10 px line-to-line, chroma-to-luma crosstalk
+  where a chroma edge coincides with a luma edge (the bandpass passes only
+  part of the chroma envelope's sidebands; the leftover in luma alternates
+  with the carrier's per-line phase). Exact chroma placement did not change
+  it, so it is the chain, not the placement. Measured on complete fields:
+  the rows above picture_start_line render through the hybrid VBI mapping
+  (plateaus clipped) and read ~0.2 px off - contrast, not timing.
+- Ring `h_ring` 2048 -> 8192 samples (two PAL lines for the comb).
+
+Signed-off-by: (pending harrypm - please check Video panel + Vector on the
+MS2130 with NTSC SMPTE and a PAL source)
+
+## Follow-up: Test Gen accuracy, measured with the vectorscope (2026-11-16)
+
+User request:
+
+> use the vectorscope to cleanup the NTSC/SECAM and PAL test signal genarator modes to make them more accurate
+> add a both mode for the graticules mode for vectorscope
+
+Instruments (scratchpad `vs_measure.c`, kept as the new test below): the
+Vector panel's exact chain (`gui_cvbs_feed`, scope-only) per-target
+centroid / spread / off-path energy, plus DIRECT measurement of the raw
+generator samples (AC bump subtracted): H-sync 50% edges against the exact
+half-line slot grid, burst carrier phase per line in the absolute stream
+frame, burst envelope timing, SECAM per-bar FM plateau frequency.
+
+Found (old generator, 40 MSPS):
+
+| fault | NTSC | PAL | SECAM |
+|---|---|---|---|
+| whole-sample line starts (2542/2543-sample lines) | SCH jitter 9.3 deg rms, 16 deg max | exact at 40 MSPS | exact at 40 MSPS |
+| edge kernel a HALF-cosine ramp (one-sided) | every sync/luma edge ~3.5 samples (87 ns) early vs chroma, lopsided | same | same |
+| burst window `ht_burstwin` | hard step at +0.15 us, 50% width 2.35 us (spec 2.50) | hard step, 2.10 us (spec 2.25) | - |
+| burst 50% start after sync 50% | 5.54 us (spec 5.30) | 5.84 us (spec 5.60) | - |
+| subcarrier restarted at phase 0 every frame | -169 deg jump every frame | +90 deg every frame | - |
+| PAL V-switch from per-field H index | - | broken at both field boundaries | - |
+| Simulated loop of 2 frames | - | 180 deg carrier jump every 80 ms | - |
+| not visible on the scope | - | - | "FM chroma has no burst phase" |
+
+Changed (`signal/gui_testgen.c`, `.h`, `input/gui_simulated.c`):
+
+- Sub-sample line model: every slot starts at its exact position
+  `s * need / slots`; each sample is the area average of the piecewise-
+  constant line content (the one edge it may straddle found by bisection).
+- PASS 2 edge kernel: symmetric Hann pulse, 10-90% = `sync_rise_us` (now
+  0.19 us, the EBU reference's measured edge, stated directly).
+- Burst window: raised-cosine edges, 50% points at burst start and
+  start + width, 10-90% build-up = `burst_rise_us` (0.30 us, ITU/SMPTE).
+- Subcarrier locked to the generated line rate (exactly 119437.5 / 177344.75
+  cycles per frame) and continued across `frame_index`; PAL V-switch from
+  the frame-continuous line count. New `gui_testgen_loop_frames()` (PAL 4,
+  NTSC 2, SECAM 2); the Simulated device loops that many composite frames
+  (RF stays 2). Its realloc failure path no longer frees live buffers.
+- SECAM chroma pass uses the same fractional line origin (identical output
+  at 40 MSPS).
+- Generation 7x faster (lrint per sample -> clamp + add-and-truncate,
+  rotating carrier, recursive AC-bump exponentials): PAL 349 -> 48 ms per
+  frame, NTSC 304 -> 41, SECAM 495 -> 124. A PAL system switch (now 4
+  frames) stalls the simulated stream 0.19 s instead of 0.70 s.
+
+After (40 MSPS): SCH jitter NTSC 0.06 deg rms; sync 50% exactly on the slot
+grid; burst 5.28 / 5.59 us start, 2.49 / 2.25 us wide; zero carrier or
+V-switch breaks across every VBI and the loop seam. Through the Vector panel
+chain: bar centroids unchanged (within 0.2 deg / 0.4%), off-path energy NTSC
+0.366 -> 0.291%, PAL 0.534 -> 0.422%. Decoded picture bars: NTSC every high
+component 212 and every low 30 (old: 212..219 / 22..29 drifting across the
+bars); PAL high-component drift 178 -> 202 became 176 -> 190.
+
+Vectorscope SECAM (`signal/gui_cvbs.[ch]`, `visualization/gui_vectorscope_panel.c`):
+the SECAM line decode's D'B/D'R (the u01/v01 the picture renders) plot as
+U/V on the PAL 75% targets; the SECAM decode now also runs for a scope-only
+feed. Its one-line hold rings and de-emphasis IIR state moved from file
+scope into `cvbs_secam_state_t` (a filter-rebuild generation clears them):
+two SECAM decoders (Video + Vector) handed each other their last line at
+every chunk boundary. SECAM Test Gen on the scope: every bar within 2.8 deg
+hue and 6% amplitude of the 75% targets x 0.75; the generator's own FM
+plateaus are within 5.6 kHz of rest + D x deviation x 0.75, so the residual
+is the SECAM demod's.
+
+Graticule: new "Both" mode (75% and 100% targets together, one label per
+colour at the outer target).
+
+Tests: new `gui_testgen_cvbs` (direct accuracy contract; fails 14 checks on
+the old generator, passes the new one, 0.9 s). `gui_vectorscope` now runs
+the scope-only feed and adds SECAM. Suite 58/59 (update_cli environmental).
+CPU of the PAL/NTSC decode unchanged (no code path touched).
+
+Not changed, needs a decision:
+
+- `HT_CHROMA_GAIN` 0.75 (the EBU HackDAC reference's measured chroma level)
+  stays. PAL/NTSC: invisible after burst referencing (scope and picture),
+  visible only as chroma excursion on the waveform. SECAM has no burst, so
+  the 0.75 x deviation shows as 25% short bars on the scope and 25% less
+  saturation in the picture. Standard SECAM deviation is a one-line change
+  (the D'x deviation gain in PASS 1.5).
+- PAL picture saturation (decoder, not generator): the picture path still
+  uses NTSC's `0.2 / burst` gain and a burst window reaching into the
+  envelope ramps (the scope path uses 3/14 and a 2-cycle trim). Decoded PAL
+  bars read high components 176..190 across the bars where they should be
+  equal.
+- Chroma bar transitions are hard-switched (no ~1.3 MHz chroma band-limit);
+  invisible on the scope (linear chain), small cross-luma in the picture.
+
+### Against the live EBU PAL / SMPTE NTSC (2026-11-16, later)
+
+User feedback:
+
+> bars are off a bit compared to a real sample and scope readout
+> or I should say the vector is? I have live EBU PAL playing
+
+A 2 s raw dump of the live EBU PAL (MS2130, the Video plugin's input; a
+temporary `MISRC_CVBS_DUMP` hook, removed again) and the earlier SMPTE NTSC
+dump were read with the same instruments as the Test Gen: the Vector chain,
+and a waveform-monitor style per-bar readout (luma, chroma against each
+line's own sync height, hue against the burst, transition timing through the
+scope's own detector).
+
+| | live EBU PAL | live SMPTE NTSC | Test Gen before | Test Gen after |
+|---|---|---|---|---|
+| bars on the Vector panel | within 0.2 deg / 0.8% | within 0.4 deg | within 0.2 deg / 0.4% | unchanged |
+| points off the straight transitions | 0.009% | 0.003% | 0.42% PAL / 0.29% NTSC | 0.000% / 0.002% |
+| chroma + burst vs sync | 0.79 | 0.80 | 0.75 | 0.79 / 0.80 |
+| bar-to-bar 10-90 (scope detector) | 0.570 us | 0.585 us | 0.43 / 0.49 (instant switch) | 0.569 / 0.583 |
+| PAL active start (50% of white) | 10.61 us | - | 10.47 | 10.57 |
+
+What the user saw: the Test Gen switched bar chroma instantly, so every
+transition on the Vector panel was a chain of loops (the 2 x fsc image of a
+wideband step leaking past the 2-cycle demod lowpass), where the live bars
+draw clean straight lines. Changed:
+
+- Band-limited bar chroma: each colour step is an integrated raised-cosine
+  (10-90 0.34 us PAL / 0.30 us NTSC, matched on the live captures through
+  the scope's detector), rendered from the line's exact steps.
+- Chain gain per system: PAL 0.79, NTSC 0.80 (measured live, chroma and
+  burst agreeing to 0.3%); SECAM keeps 0.75 (`HT_SECAM_CHROMA_GAIN`).
+- PAL/SECAM active line 10.50 / 52.0 us (ITU; live 10.54): hacktv's 10.40
+  started the picture inside the decoder's back-porch window (profile 10.5).
+
+Not copied from the live sources (their imperfections): NTSC source hue
+-0.2..-0.4 deg on every bar; PAL source transitions drawn as slightly
+doubled lines (a small U/V timing mismatch in its encoder); live luma
+1-1.5% low and PAL black 0.008 below blank.
+
+Tests: `gui_vectorscope` now also fails if more than 0.05% of points leave
+the straight transitions; its SECAM clusters use a 0.04 radius (the 0.08
+one caught the FM demod's blue->black overshoot after the 0.1 us bar move).
+Suite 58/59 (update_cli environmental). Generation 55 / 47 / 126 ms per
+PAL / NTSC / SECAM frame (originally 349 / 304 / 495).
+
+### SECAM on the Vector panel: lines, standard deviation (2026-11-16, later)
+
+User feedback:
+
+> PAL Looks good, NTSC is okay, SECAM is still a bit off vector is not useful dots but no lines
+
+- Dots, no lines: the SECAM demod runs decimated (~2.2 MHz, `g_secam_decim`
+  panel samples per point) and the scope plotted only those points, so a
+  bar-to-bar transition got one point or none. The scope now traces a
+  Catmull-Rom curve through the decimated points at the panel rate (one
+  point per panel sample, like PAL/NTSC): 534k -> 4.3M points per 16
+  fields, transitions drawn (with SECAM's own pre-emphasis hooks).
+- A bit off: the generator's SECAM deviation carried the old 0.75 card
+  factor, every bar a quarter inside its target. A capture chain scales the
+  subcarrier amplitude, never the FM deviation: standard deviation
+  (`HT_SECAM_DEV_GAIN` 1.0), amplitude at the PAL chain gain 0.79. SECAM
+  bars now land within 1.6 deg / 3.6% of the standard 75% targets (the SECAM
+  demod's own error); the generator's FM plateaus within 10.4 kHz (the
+  standard LF pre-emphasis still settling in the bar centre, under 4% of
+  the deviation; `gui_testgen_cvbs` limit 15 kHz).
+
+Signed-off-by: harrypm (PAL "looks good", NTSC "okay" on the live A/B; SECAM pending)

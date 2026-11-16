@@ -192,9 +192,18 @@ typedef struct {
 
     // Per-line streaming rings: the CONCEALED DEMOD of the previous
     // same-component line (deviation units - the click-concealment row-2
-    // borrow domain; the one-line-hold finals live file-scope in the .c).
+    // borrow domain).
     float  prev_demod[2][CVBS_SECAM_MAX_DEC]; // [0] last D'B, [1] last D'R
     int    prev_dec_count[2];    // Decimated samples held per ring row
+    // One-line hold: the previous same-component line's FINAL (u01/v01
+    // units) - [0] D'B, [1] D'R - and the de-emphasis IIR state carried
+    // across lines. Per decoder: as file-scope copies, the Video and Vector
+    // panels' SECAM decoders (both on the display thread, chunk after
+    // chunk) handed each other their last line at every chunk boundary.
+    float  hold_final[2][CVBS_SECAM_MAX_DEC];
+    int    hold_count[2];
+    double deemph_x1, deemph_y1;
+    unsigned filters_gen;        // Shared filter-cache generation this state follows
 
     // Filter cache: rebuilt when the locked carrier offset moves
     bool   filters_ready;
@@ -262,7 +271,9 @@ typedef struct {
     uint32_t field_measures;        // Increments with each measurement
     // Raw-sample ring (by global sample index) for the H-edge refinement
     // (cvbs_refine_h_edge): the classified pulse's own tip / front porch.
-    int16_t h_ring[2048];
+    int16_t h_ring[8192];          // CVBS_H_RING: raw samples by global index
+                                   // (H-edge refinement; picture chroma comb
+                                   // reads 1-2 lines back)
 } cvbs_vsync_state_t;
 
 // Histogram-based level detection buffer size
@@ -399,6 +410,12 @@ typedef struct cvbs_decoder {
     // vector is measured per decoded line in the line-local carrier frame;
     // prev_burst_phase carries the PAL V-switch alternation between lines.
     cvbs_colour_mode_t colour_mode; // Auto: burst-gated baseband chroma
+    // false = no picture consumer (a vectorscope-only feed): the line decode
+    // stops after the sync/porch/vectorscope work and the per-field
+    // deinterlace + frame copies are skipped. Measured live 2026-11-16: the
+    // Vector panel's own feed cost 1.1 ms of the 1.64 ms frame budget at
+    // 40 MSPS with the picture pass it never displayed.
+    bool pixels_wanted;
     double prev_burst_phase;         // Previous line's burst phase (PAL V-switch)
     int prev_burst_valid;           // Previous line had a usable burst
 
@@ -621,6 +638,12 @@ void gui_cvbs_feed_process(gui_cvbs_feed_t *feed, const int16_t *samples,
 cvbs_decoder_t *gui_cvbs_feed_decoder(gui_cvbs_feed_t *feed);
 // 0=PAL, 1=NTSC, 2=SECAM (the System selector's value space).
 void gui_cvbs_feed_set_system(gui_cvbs_feed_t *feed, int system_select);
+// Display frame sequence, bumped by panel_process_all once per frame: keys
+// the per-frame resample cache shared by the Video and Vector feeds.
+extern uint64_t g_cvbs_display_frame_seq;
+// false: the feed drives a vectorscope only (no picture decode, see
+// cvbs_decoder_t.pixels_wanted). Default true.
+void gui_cvbs_feed_set_pixels(gui_cvbs_feed_t *feed, bool wanted);
 
 // The composite vectorscope panel registers its Test Gen follow hook here
 // (queues a system change 0..2, applied on the panel's decode thread).
