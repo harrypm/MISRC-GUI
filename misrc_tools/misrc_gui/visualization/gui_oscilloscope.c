@@ -2382,6 +2382,7 @@ static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, in
 static void waveform_panel_update_drag(waveform_panel_state_t *state, gui_app_t *app, Rectangle bounds) {
     if (!state || !app) return;
     waveform_state_lock(state);
+    if (app->settings_panel_open) state->dragging = false;
     bool dragging = state->dragging;
     waveform_state_unlock(state);
     if (!dragging) return;
@@ -2488,7 +2489,8 @@ static void waveform_render(void *state_ptr, gui_app_t *app, int channel,
     // position (default zoom, trigger level centered, phosphor cleared).
     // The left-click dispatch never sees the middle button, so this is
     // polled here per frame with a bounds hit test.
-    if (IsMouseButtonPressed(MOUSE_MIDDLE_BUTTON) && !gui_popup_is_open()) {
+    if (IsMouseButtonPressed(MOUSE_MIDDLE_BUTTON) &&
+        !app->settings_panel_open && !gui_popup_is_open()) {
         Vector2 mouse = gui_ui_get_mouse_position();
         if (CheckCollisionPointRec(mouse, bounds)) {
             uint64_t now_ms = get_time_ms();

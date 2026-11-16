@@ -1475,6 +1475,7 @@ static void fft_vtable_render(void *state_ptr, gui_app_t *app, int channel,
     }
 
     // Update drag state for pan (continuous while mouse is held)
+    if (app->settings_panel_open) fft->dragging = false;
     fft_update_drag(fft, bounds);
 
     // Swap buffers to get latest FFT data from display thread

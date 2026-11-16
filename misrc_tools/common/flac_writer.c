@@ -22,6 +22,12 @@
 #include <unistd.h>
 #include <sched.h>
 #include <pthread.h>
+typedef cpu_set_t flac_affinity_t;
+#elif LIBFLAC_ENABLED == 1 && defined(_WIN32) && defined(MISRC_WINDOWS_FLAC_AFFINITY)
+#define FLAC_AFFINITY_WINDOWS 1
+#include <windows.h>
+#include <pthread.h>
+typedef GROUP_AFFINITY flac_affinity_t;
 #endif
 
 static void flac_writer_set_affinity_error(
@@ -34,6 +40,16 @@ static void flac_writer_set_affinity_error(
     error_message[error_message_size - 1] = '\0';
 }
 
+#ifdef _WIN32
+const char *flac_writer_affinity_unavailable_reason(void) {
+#if defined(FLAC_AFFINITY_WINDOWS)
+    return GetActiveProcessorGroupCount() == 1 ? NULL : "Requires a single processor group";
+#else
+    return "FLAC affinity is unavailable in this build";
+#endif
+}
+#endif
+
 #if defined(__linux__)
 static int flac_writer_cpu_count_set(const cpu_set_t *set) {
     if (!set) return 0;
@@ -43,10 +59,12 @@ static int flac_writer_cpu_count_set(const cpu_set_t *set) {
     }
     return count;
 }
+#endif
 
-static bool flac_writer_parse_affinity_cpu_list_linux(
+#if defined(__linux__) || defined(FLAC_AFFINITY_WINDOWS)
+static bool flac_writer_parse_affinity_cpu_list(
     const char *cpu_list,
-    cpu_set_t *target_set,
+    flac_affinity_t *target_set,
     char *error_message,
     size_t error_message_size
 ) {
@@ -59,10 +77,15 @@ static bool flac_writer_parse_affinity_cpu_list_linux(
         return false;
     }
 
+#if defined(__linux__)
     long cpu_conf = sysconf(_SC_NPROCESSORS_CONF);
     long max_cpu_index = (cpu_conf > 0) ? (cpu_conf - 1) : (CPU_SETSIZE - 1);
 
     CPU_ZERO(target_set);
+#else
+    long max_cpu_index = (long)(sizeof(target_set->Mask) * CHAR_BIT - 1);
+    *target_set = (flac_affinity_t){0};
+#endif
     const char *p = cpu_list;
     bool parsed_any = false;
 
@@ -117,6 +140,7 @@ static bool flac_writer_parse_affinity_cpu_list_linux(
             flac_writer_set_affinity_error(error_message, error_message_size, msg);
             return false;
         }
+#if defined(__linux__)
         if (end_cpu >= CPU_SETSIZE) {
             char msg[160];
             snprintf(msg, sizeof(msg),
@@ -129,6 +153,11 @@ static bool flac_writer_parse_affinity_cpu_list_linux(
         for (long cpu = start_cpu; cpu <= end_cpu; cpu++) {
             CPU_SET((int)cpu, target_set);
         }
+#else
+        for (long cpu = start_cpu; cpu <= end_cpu; cpu++) {
+            target_set->Mask |= (KAFFINITY)1 << cpu;
+        }
+#endif
         parsed_any = true;
 
         while (*p && isspace((unsigned char)*p)) p++;
@@ -147,11 +176,16 @@ static bool flac_writer_parse_affinity_cpu_list_linux(
         }
     }
 
+#if defined(__linux__)
     if (!parsed_any || flac_writer_cpu_count_set(target_set) == 0) {
+#else
+    if (!parsed_any) {
+#endif
         flac_writer_set_affinity_error(error_message, error_message_size, "FLAC affinity list produced no CPU targets");
         return false;
     }
 
+#if defined(__linux__)
     cpu_set_t allowed_set;
     if (sched_getaffinity(0, sizeof(allowed_set), &allowed_set) == 0) {
         for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
@@ -165,13 +199,39 @@ static bool flac_writer_parse_affinity_cpu_list_linux(
             }
         }
     }
+#else
+    GROUP_AFFINITY current_group;
+    DWORD_PTR process_mask, system_mask;
+    const char *unavailable = flac_writer_affinity_unavailable_reason();
+    if (unavailable) {
+        flac_writer_set_affinity_error(error_message, error_message_size, unavailable);
+        return false;
+    }
+    if (!GetThreadGroupAffinity(GetCurrentThread(), &current_group) ||
+        !GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask)) {
+        char msg[160];
+        snprintf(msg, sizeof(msg), "Cannot query Windows FLAC CPU affinity (error %lu)", GetLastError());
+        flac_writer_set_affinity_error(error_message, error_message_size, msg);
+        return false;
+    }
+    if (target_set->Mask & ~(process_mask & system_mask)) {
+        char msg[192];
+        snprintf(msg, sizeof(msg), "FLAC affinity CPU list includes CPUs unavailable in processor group %u (allowed mask 0x%llx)",
+                 (unsigned)current_group.Group, (unsigned long long)(process_mask & system_mask));
+        flac_writer_set_affinity_error(error_message, error_message_size, msg);
+        return false;
+    }
+    target_set->Group = current_group.Group;
+#endif
 
     return true;
 }
 #endif
 
 bool flac_writer_affinity_supported(void) {
-#if defined(__linux__)
+#if defined(_WIN32)
+    return flac_writer_affinity_unavailable_reason() == NULL;
+#elif defined(__linux__)
     return true;
 #else
     return false;
@@ -183,9 +243,9 @@ bool flac_writer_validate_affinity_cpu_list(
     char *error_message,
     size_t error_message_size
 ) {
-#if defined(__linux__)
-    cpu_set_t parsed_set;
-    return flac_writer_parse_affinity_cpu_list_linux(
+#if defined(__linux__) || defined(FLAC_AFFINITY_WINDOWS)
+    flac_affinity_t parsed_set;
+    return flac_writer_parse_affinity_cpu_list(
         cpu_list,
         &parsed_set,
         error_message,
@@ -196,7 +256,11 @@ bool flac_writer_validate_affinity_cpu_list(
     flac_writer_set_affinity_error(
         error_message,
         error_message_size,
-        "FLAC affinity is only supported on Linux"
+#if defined(_WIN32)
+        "FLAC affinity is unavailable in this Windows build"
+#else
+        "FLAC affinity is available on Linux and compatible Windows builds"
+#endif
     );
     return false;
 #endif
@@ -244,6 +308,12 @@ struct flac_writer {
 
     // Configuration (copy)
     flac_writer_config_t config;
+#if defined(FLAC_AFFINITY_WINDOWS)
+    // Published by the writer before its first process call can create workers.
+    flac_affinity_t affinity;
+    DWORD worker_affinity_error;
+    bool worker_affinity_error_reported;
+#endif
 
     // Statistics
     uint64_t samples_written;
@@ -363,6 +433,82 @@ static void report_error(flac_writer_t *writer, flac_writer_error_t error, const
         writer->config.error_cb(writer->config.callback_user_data, error, msg);
     }
 }
+
+#if defined(FLAC_AFFINITY_WINDOWS)
+typedef struct {
+    SRWLOCK lock;
+    CONDITION_VARIABLE ready;
+    const GROUP_AFFINITY *affinity;
+    void *(*entry)(void *);
+    void *arg;
+    DWORD affinity_error;
+    bool started;
+} flac_worker_start_t;
+
+static _Thread_local flac_writer_t *flac_starting_workers;
+
+static void *flac_worker_start(void *arg) {
+    flac_worker_start_t *start = arg;
+    AcquireSRWLockExclusive(&start->lock);
+    void *(*entry)(void *) = start->entry;
+    void *entry_arg = start->arg;
+    if (!SetThreadGroupAffinity(GetCurrentThread(), start->affinity, NULL)) {
+        start->affinity_error = GetLastError();
+    }
+    start->started = true;
+    WakeConditionVariable(&start->ready);
+    ReleaseSRWLockExclusive(&start->lock);
+
+    // libFLAC waits for this worker even when setting affinity fails.
+    return entry(entry_arg);
+}
+
+int __real_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
+                          void *(*entry)(void *), void *arg);
+
+// The Windows GUI link redirects static libFLAC's worker creation here.
+int __wrap_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
+                          void *(*entry)(void *), void *arg) {
+    flac_writer_t *writer = flac_starting_workers;
+    if (!writer || arg != writer->encoder) {
+        return __real_pthread_create(thread, attr, entry, arg);
+    }
+
+    // Wait for the worker to take the entry arguments and apply affinity.
+    // This keeps the handoff on the stack without an extra allocation failure.
+    flac_worker_start_t start = {
+        .lock = SRWLOCK_INIT,
+        .ready = CONDITION_VARIABLE_INIT,
+        .affinity = &writer->affinity,
+        .entry = entry,
+        .arg = arg,
+    };
+    int rc = __real_pthread_create(thread, attr, flac_worker_start, &start);
+    if (rc != 0) return rc;
+
+    AcquireSRWLockExclusive(&start.lock);
+    while (!start.started) {
+        SleepConditionVariableSRW(&start.ready, &start.lock, INFINITE, 0);
+    }
+    if (!writer->worker_affinity_error) {
+        writer->worker_affinity_error = start.affinity_error;
+    }
+    ReleaseSRWLockExclusive(&start.lock);
+    return 0;
+}
+
+static void flac_writer_report_worker_affinity_error(flac_writer_t *writer) {
+    if (writer->worker_affinity_error_reported) return;
+    DWORD error = writer->worker_affinity_error;
+    if (error) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "Failed to apply FLAC compression worker affinity \"%s\" (Windows error %lu)",
+                 writer->config.affinity_cpu_list, error);
+        writer->worker_affinity_error_reported = true;
+        report_error(writer, FLAC_WRITER_ERR_AFFINITY, msg);
+    }
+}
+#endif
 
 /* ============================================================================
  * Default Configuration
@@ -507,10 +653,10 @@ flac_writer_error_t flac_writer_apply_thread_affinity(flac_writer_t *writer) {
         return FLAC_WRITER_OK;
     }
 
-#if defined(__linux__) && !defined(__ANDROID__)
-    cpu_set_t target_set;
+#if (defined(__linux__) && !defined(__ANDROID__)) || defined(FLAC_AFFINITY_WINDOWS)
+    flac_affinity_t target_set;
     char parse_err[256];
-    if (!flac_writer_parse_affinity_cpu_list_linux(
+    if (!flac_writer_parse_affinity_cpu_list(
             writer->config.affinity_cpu_list,
             &target_set,
             parse_err,
@@ -519,6 +665,7 @@ flac_writer_error_t flac_writer_apply_thread_affinity(flac_writer_t *writer) {
         return FLAC_WRITER_ERR_AFFINITY;
     }
 
+#if defined(__linux__) && !defined(__ANDROID__)
     int rc = pthread_setaffinity_np(pthread_self(), sizeof(target_set), &target_set);
     if (rc != 0) {
         char msg[256];
@@ -528,10 +675,23 @@ flac_writer_error_t flac_writer_apply_thread_affinity(flac_writer_t *writer) {
         report_error(writer, FLAC_WRITER_ERR_AFFINITY, msg);
         return FLAC_WRITER_ERR_AFFINITY;
     }
+#else
+    if (!SetThreadGroupAffinity(GetCurrentThread(), &target_set, NULL)) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "Failed to apply FLAC writer affinity \"%s\" (Windows error %lu)",
+                 writer->config.affinity_cpu_list, GetLastError());
+        report_error(writer, FLAC_WRITER_ERR_AFFINITY, msg);
+        return FLAC_WRITER_ERR_AFFINITY;
+    }
+    writer->affinity = target_set;
+#endif
 
     return FLAC_WRITER_OK;
+#elif defined(_WIN32)
+    report_error(writer, FLAC_WRITER_ERR_AFFINITY, "FLAC affinity is unavailable in this Windows build");
+    return FLAC_WRITER_ERR_AFFINITY;
 #else
-    report_error(writer, FLAC_WRITER_ERR_AFFINITY, "FLAC affinity is only supported on Linux");
+    report_error(writer, FLAC_WRITER_ERR_AFFINITY, "FLAC affinity is available on Linux and compatible Windows builds");
     return FLAC_WRITER_ERR_AFFINITY;
 #endif
 }
@@ -650,7 +810,15 @@ int flac_writer_process(flac_writer_t *writer, const int32_t *samples, uint32_t 
     // For mono, we pass address of our single pointer
     const FLAC__int32 *channel_ptrs[1] = { samples };
 
+#if defined(FLAC_AFFINITY_WINDOWS)
+    flac_writer_t *previous_writer = flac_starting_workers;
+    flac_starting_workers = writer->affinity.Mask ? writer : NULL;
+#endif
     FLAC__bool ok = FLAC__stream_encoder_process(writer->encoder, channel_ptrs, num_samples);
+#if defined(FLAC_AFFINITY_WINDOWS)
+    flac_starting_workers = previous_writer;
+    if (writer->affinity.Mask) flac_writer_report_worker_affinity_error(writer);
+#endif
     if (!ok) {
         char msg[256];
         snprintf(msg, sizeof(msg), "FLAC process error: %s",

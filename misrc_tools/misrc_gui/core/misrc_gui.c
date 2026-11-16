@@ -2105,5 +2105,10 @@ int main(int argc, char **argv) {
     // normal interactive exits and successful cycles).
     if (auto_record_seconds > 0 &&
         (auto_rec_phase != AUTO_REC_IDLE || gui_record_last_stop_failed())) auto_rec_failed = true;
+#if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
+    // A blocked playback reader can hold a stdio lock after CloseWindow().
+    // Skip C runtime teardown if a loader is still running.
+    if (gui_playback_has_load_workers()) _Exit(auto_rec_failed ? 1 : 0);
+#endif
     return auto_rec_failed ? 1 : 0;
 }

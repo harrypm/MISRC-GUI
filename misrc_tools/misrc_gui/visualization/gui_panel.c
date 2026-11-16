@@ -341,7 +341,7 @@ static bool try_panel_click(gui_app_t *app, int channel, panel_view_type_t type,
 }
 
 bool panel_handle_all_clicks(gui_app_t *app, Vector2 mouse_pos) {
-    if (!app) return false;
+    if (!app || app->settings_panel_open) return false;
 
     // Process both channels
     for (int ch = 0; ch < 2; ch++) {
@@ -390,7 +390,7 @@ static bool try_panel_scroll(panel_view_type_t type, void *state,
 }
 
 bool panel_handle_all_scrolls(gui_app_t *app, float delta) {
-    if (!app || delta == 0.0f) return false;
+    if (!app || app->settings_panel_open || delta == 0.0f) return false;
 
     // Process both channels
     for (int ch = 0; ch < 2; ch++) {

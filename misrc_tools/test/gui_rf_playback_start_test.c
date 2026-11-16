@@ -40,6 +40,12 @@ static FLAC__StreamDecoderInitStatus start_test_decoder_init_stream(
     FLAC__StreamDecoderMetadataCallback metadata_callback,
     FLAC__StreamDecoderErrorCallback error_callback,void *userdata);
 
+struct gui_app;
+static int start_test_dispatch_capture_start(struct gui_app *app);
+static void start_test_push_monitor_audio(const int16_t *samples, size_t frames);
+
+#define gui_app_start_capture start_test_dispatch_capture_start
+#define gui_audio_push_playback start_test_push_monitor_audio
 #define malloc start_test_malloc
 #define calloc start_test_calloc
 #define free start_test_free
@@ -71,6 +77,12 @@ static FLAC__StreamDecoderInitStatus start_test_decoder_init_stream(
 #undef free
 #undef calloc
 #undef malloc
+#undef gui_audio_push_playback
+#undef gui_app_start_capture
+
+#include "../misrc_gui/net/gui_net.h"
+
+int gui_app_start_capture(gui_app_t *app);
 
 #define START_TEST_TIMEOUT_MS 5000u
 #define START_TEST_SAMPLES 131072u
@@ -92,6 +104,7 @@ static atomic_bool start_test_tail_delay_once;
 static atomic_bool start_test_tail_hold_once,start_test_tail_entered,start_test_tail_release;
 static _Atomic(FILE *) start_test_error_file;
 static atomic_bool start_test_slow_next,start_test_read_entered,start_test_release_read;
+static atomic_bool start_test_hold_open;
 static atomic_size_t start_test_slow_read_count;
 static atomic_bool start_test_extract_failure,start_test_extract_running;
 static atomic_uint start_test_sink_writes,start_test_callback_writes;
@@ -181,6 +194,10 @@ static FILE *start_test_register_file(FILE *file) {
     return file;
 }
 static FILE *start_test_open_read_utf8(const char *filepath) {
+    if (atomic_exchange(&start_test_hold_open, false)) {
+        atomic_store(&start_test_read_entered, true);
+        while (!atomic_load(&start_test_release_read)) thrd_sleep_ms(1);
+    }
     return start_test_register_file(file_open_read_utf8(filepath));
 }
 static FILE *start_test_open_utf8(const char *filepath,const char *mode) {
@@ -340,8 +357,29 @@ static FLAC__StreamDecoderInitStatus start_test_decoder_init_stream(
     return status;
 }
 
+static unsigned start_test_remote_starts;
+static atomic_size_t start_test_audio_frames;
+
+static int start_test_dispatch_capture_start(gui_app_t *app) {
+    if (app->settings.net_mode == GUI_NET_MODE_CLIENT ||
+        app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT) {
+        ++start_test_remote_starts;
+        return 0;
+    }
+    return gui_app_start_capture(app);
+}
+
+static void start_test_push_monitor_audio(const int16_t *samples, size_t frames) {
+    assert(samples && frames);
+    atomic_fetch_add(&start_test_audio_frames, frames);
+}
+
 /* Surrounding services are controlled, while the actual FLAC producer runs. */
 double GetTime(void) { return (double)gui_playback_clock_us()/1000000.0; }
+bool CheckCollisionPointRec(Vector2 point, Rectangle rect) {
+    return point.x >= rect.x && point.x < rect.x + rect.width &&
+           point.y >= rect.y && point.y < rect.y + rect.height;
+}
 void gui_app_set_status(gui_app_t *app,const char *message) {
     snprintf(app->status_message,sizeof(app->status_message),"%s",message);
 }
@@ -486,6 +524,11 @@ static int start_test_poll_complete(void) {
 }
 static void start_test_assert_clean(void) {
     assert(!gui_playback_is_starting(&start_test_app));
+    uint64_t begin = start_test_clock_ms();
+    while (atomic_load(&s_playback_load_workers) || atomic_load(&start_test_live_allocations)) {
+        assert(start_test_clock_ms() - begin < START_TEST_TIMEOUT_MS);
+        thrd_sleep_ms(1);
+    }
     assert(!gui_playback_is_running(&start_test_app));
     assert(!gui_playback_is_indexing(&start_test_app,0));
     assert(!gui_playback_is_indexing(&start_test_app,1));
@@ -532,10 +575,15 @@ static void start_test_error_details(const char *normal,const char *bad,const ch
     }
     /* Cancellation wins even when the completed prepare already has an error. */
     assert(gui_playback_start_async(&start_test_app,missing,NULL)==0);
-    start_test_wait_flag(&s_playback_start.done);
-    assert(s_playback_start.prepared && s_playback_start.prepared->info_a.error[0]);
+    uint64_t begin = start_test_clock_ms();
+    while (atomic_load(&s_playback_start->state) != PLAYBACK_LOAD_DONE) {
+        assert(start_test_clock_ms() - begin < START_TEST_TIMEOUT_MS);
+        thrd_sleep_ms(1);
+    }
+    assert(s_playback_start->prepared->info_a.error[0]);
     gui_playback_cancel_start(&start_test_app);
-    assert(start_test_poll_complete()==-1);
+    assert(!gui_playback_is_starting(&start_test_app));
+    assert(gui_playback_poll_start(&start_test_app) == 0);
     assert(strcmp(start_test_app.status_message,"Playback load cancelled")==0);
     gui_playback_finish_start(&start_test_app);start_test_assert_clean();
     puts("Playback sync/async A/B errors, no-detail fallback, cancellation precedence and cleanup passed");
@@ -747,8 +795,9 @@ static void start_test_cancel_retry(const char *fixture) {
     uint64_t request_ms=start_test_clock_ms()-begin;
     /* Cancellation must return while the controlled read remains blocked. */
     assert(!atomic_load(&start_test_release_read));
+    assert(!gui_playback_is_starting(&start_test_app));
+    assert(gui_playback_poll_start(&start_test_app) == 0);
     atomic_store(&start_test_release_read,true);
-    assert(start_test_poll_complete()==-1);
     assert(strcmp(start_test_app.status_message,"Playback load cancelled")==0);
     gui_playback_finish_start(&start_test_app);
     start_test_assert_clean();
@@ -769,14 +818,124 @@ static void start_test_exit_pending(const char *fixture) {
     start_test_wait_flag(&start_test_read_entered);
     thrd_t thread;
     assert(thrd_create_with_priority(&thread,start_test_finish_thread,NULL,THRD_PRIORITY_NORMAL)==thrd_success);
-    thrd_sleep_ms(30);
-    assert(!atomic_load(&start_test_finish_done)); /* finish joins pending I/O. */
-    atomic_store(&start_test_release_read,true);
     start_test_wait_flag(&start_test_finish_done);
+    assert(!atomic_load(&start_test_release_read)); /* shutdown never joins pending I/O */
+    atomic_store(&start_test_release_read,true);
     thrd_join(thread,NULL);
     start_test_assert_clean();
-    puts("Playback exit during pending read: cancel, join, decoder/allocation cleanup passed");
+    puts("Playback exit during pending read: shutdown returned before the read, then worker cleaned up");
 }
+static void start_test_drop_load(const char *fixture, const char *missing) {
+    start_test_app.device_count = 1;
+    start_test_app.devices[0].type = DEVICE_TYPE_PLAYBACK;
+    start_test_app.selected_device = 0;
+    // UI layout metadata must do no I/O even with a saved path.
+    snprintf(start_test_app.settings.playback_file_a,
+             sizeof(start_test_app.settings.playback_file_a), "%s", missing);
+    atomic_store(&start_test_hold_open, true);
+    playback_file_info_t info = {0};
+    assert(!gui_playback_get_selected_file_info(&start_test_app, 0, &info));
+    assert(atomic_exchange(&start_test_hold_open, false));
+
+    const char *paths[] = { missing };
+    assert(gui_playback_handle_dropped_files(&start_test_app, paths, 1, 0, 0));
+    assert(start_test_poll_complete() == -1);
+    assert(strcmp(start_test_app.status_message, "No playable files in the drop (see the log)") == 0);
+    start_test_assert_clean();
+
+    // Hold the open itself, simulating an unresponsive directory. The
+    // caller must take ownership of the queued path before returning.
+    char ephemeral[FILE_PATH_MAX];
+    snprintf(ephemeral, sizeof(ephemeral), "%s", fixture);
+    paths[0] = ephemeral;
+    atomic_store(&start_test_read_entered, false);
+    atomic_store(&start_test_release_read, false);
+    atomic_store(&start_test_hold_open, true);
+    assert(gui_playback_handle_dropped_files(&start_test_app, paths, 1, 0, 0));
+    ephemeral[0] = '\0';
+    start_test_wait_flag(&start_test_read_entered);
+    assert(gui_playback_poll_start(&start_test_app) == 0);
+    gui_playback_cancel_start(&start_test_app);
+    assert(!gui_playback_is_starting(&start_test_app) && !atomic_load(&start_test_release_read));
+
+    // A new load can complete even while the cancelled one is still in I/O.
+    paths[0] = fixture;
+    assert(gui_playback_handle_dropped_files(&start_test_app, paths, 1, 0, 0));
+    assert(start_test_poll_complete() == 1);
+    assert(gui_playback_get_selected_file_info(&start_test_app, 0, &info));
+    assert(info.valid && strcmp(info.filepath, fixture) == 0);
+    atomic_store(&start_test_release_read, true);
+    start_test_stop_clean();
+    assert(gui_playback_get_selected_file_info(&start_test_app, 0, &info));
+    start_test_app.settings.playback_file_a[0] = '\0';
+    puts("Playback idle metadata, missing drop, blocked open, cancellation and retry passed");
+}
+
+static void start_test_drop_zones_and_audio(const char *a, const char *b, const char *audio) {
+    FLAC__StreamEncoder *encoder = FLAC__stream_encoder_new();
+    assert(encoder);
+    assert(FLAC__stream_encoder_set_channels(encoder, 1));
+    assert(FLAC__stream_encoder_set_bits_per_sample(encoder, 16));
+    assert(FLAC__stream_encoder_set_sample_rate(encoder, 48000));
+    const FLAC__int32 samples[4096] = { 1234 };
+    assert(FLAC__stream_encoder_set_total_samples_estimate(encoder, 4096));
+    assert(FLAC__stream_encoder_init_file(encoder, audio, NULL, NULL) ==
+           FLAC__STREAM_ENCODER_INIT_STATUS_OK);
+    assert(FLAC__stream_encoder_process_interleaved(encoder, samples, 4096));
+    assert(FLAC__stream_encoder_finish(encoder));
+    FLAC__stream_encoder_delete(encoder);
+
+    start_test_app.panel_config_a.left_bounds = (Rectangle){0, 0, 200, 100};
+    start_test_app.panel_config_b.left_bounds = (Rectangle){0, 100, 200, 100};
+    atomic_store(&start_test_channel_mask, 1u);
+    const char *first_drop[] = {audio, a};
+    assert(gui_playback_handle_dropped_files(&start_test_app, first_drop, 2, 40, 30));
+    assert(start_test_poll_complete() == 1);
+    assert(strcmp(start_test_app.settings.playback_file_a, a) == 0);
+    assert(start_test_app.settings.playback_file_b[0] == '\0');
+    assert(strcmp(start_test_app.settings.playback_audio_file, audio) == 0);
+    assert(s_playback->audio && s_playback->audio->rate_hz == 48000);
+    uint64_t begin = start_test_clock_ms();
+    while (atomic_load(&start_test_audio_frames) == 0) {
+        assert(start_test_clock_ms() - begin < START_TEST_TIMEOUT_MS);
+        thrd_sleep_ms(1);
+    }
+
+    start_test_stop_clean();
+    atomic_store(&start_test_channel_mask, 3u);
+    const char *second_drop[] = {b};
+    assert(gui_playback_handle_dropped_files(&start_test_app, second_drop, 1, 40, 130));
+    assert(start_test_poll_complete() == 1);
+    assert(strcmp(s_playback->info_a.filepath, a) == 0);
+    assert(strcmp(s_playback->info_b.filepath, b) == 0);
+    assert(s_playback->audio && strcmp(start_test_app.settings.playback_audio_file, audio) == 0);
+    start_test_stop_clean();
+
+    const int remote_modes[] = {GUI_NET_MODE_CLIENT, GUI_NET_MODE_MONITOR_CLIENT};
+    for (unsigned i = 0; i < sizeof(remote_modes) / sizeof(remote_modes[0]); i++) {
+        start_test_app.settings.net_mode = remote_modes[i];
+        unsigned previous = start_test_remote_starts;
+        // The retained A path is intentionally unusable. A remote drop still
+        // dispatches start through the app without preparing local playback.
+        snprintf(start_test_app.settings.playback_file_a,
+                 sizeof(start_test_app.settings.playback_file_a), "%s", "missing-remote-a.flac");
+        assert(gui_playback_handle_dropped_files(&start_test_app, second_drop, 1, 40, 130));
+        assert(start_test_poll_complete() == -1);
+        assert(start_test_remote_starts == previous + 1);
+        assert(strcmp(start_test_app.settings.playback_file_a, "missing-remote-a.flac") == 0);
+        assert(strcmp(start_test_app.settings.playback_file_b, b) == 0);
+        assert(strcmp(start_test_app.settings.playback_audio_file, audio) == 0);
+        start_test_assert_clean();
+    }
+    start_test_app.settings.net_mode = GUI_NET_MODE_LOCAL;
+    start_test_app.settings.playback_file_a[0] = '\0';
+    start_test_app.settings.playback_file_b[0] = '\0';
+    start_test_app.settings.playback_audio_file[0] = '\0';
+    atomic_store(&start_test_channel_mask, 1u);
+    assert(remove(audio) == 0);
+    puts("Playback A/B drop zones, retained selections, FLAC monitor feed and remote start dispatch passed");
+}
+
 static void start_test_wait_writes(unsigned previous) {
     uint64_t begin=start_test_clock_ms();
     while(atomic_load(&start_test_sink_writes)<=previous) {
@@ -1672,7 +1831,8 @@ static uint16_t start_test_crc16(const uint8_t *bytes,size_t count) {
 
 static void start_test_scan_only_begin(const char *fixture,bool held) {
     playback_ctx_t *ctx=start_test_calloc(1,sizeof(*ctx)); assert(ctx);
-    assert(gui_playback_prepare(ctx,&start_test_app,fixture,NULL,NULL)==0);
+    ctx->app = &start_test_app;
+    assert(gui_playback_prepare(ctx,NULL,fixture,NULL,NULL)==0);
     assert(ctx->info_a.valid && ctx->info_a.total_samples==0);
     atomic_store(&ctx->state,PLAYBACK_STATE_PAUSED); // No producer/starvation in this metadata-only test
     s_playback=ctx;
@@ -1900,7 +2060,8 @@ static void start_test_held_source_identity(const char *normal,const char *other
         &count,NULL,false,&observer) && count==0); // Actual producer FILE is the wrong identity.
     fclose(held);
     playback_ctx_t *ctx=start_test_calloc(1,sizeof(*ctx)); assert(ctx);
-    assert(gui_playback_prepare(ctx,&start_test_app,normal,NULL,NULL)==0);
+    ctx->app = &start_test_app;
+    assert(gui_playback_prepare(ctx,NULL,normal,NULL,NULL)==0);
     snprintf(ctx->info_a.filepath,sizeof(ctx->info_a.filepath),"%s",other_unknown);
     ctx->info_a.total_samples=0; ctx->info_a.duration_seconds=0;
     ctx->loaded_key[0]=new_key; ctx->loaded_key_valid[0]=true;
@@ -1917,11 +2078,15 @@ static void start_test_change_after_prepare(const char *normal,const char *unkno
     start_test_zero_total_copy(normal,unknown);
     atomic_store(&start_test_channel_mask,1u);
     assert(gui_playback_start_async(&start_test_app,unknown,NULL)==0);
-    start_test_wait_flag(&s_playback_start.done); // Loader complete; UI has not committed it.
+    uint64_t begin = start_test_clock_ms();
+    while (atomic_load(&s_playback_start->state) != PLAYBACK_LOAD_PREPARED) {
+        assert(start_test_clock_ms() - begin < START_TEST_TIMEOUT_MS);
+        thrd_sleep_ms(1);
+    }
     FILE *file=fopen(unknown,"r+b"); assert(file);
     assert(fseek(file,26,SEEK_SET)==0); int byte=fgetc(file); assert(byte>=0);
     assert(fseek(file,26,SEEK_SET)==0 && fputc(byte^1,file)!=EOF); fclose(file);
-    assert(gui_playback_poll_start(&start_test_app)==-1);
+    assert(start_test_poll_complete()==-1);
     start_test_assert_clean();
     start_test_zero_total_copy(normal,unknown);
     puts("Playback input changed after private prepare: UI commit rejects observed mismatch and releases prepared resources passed");
@@ -2030,7 +2195,8 @@ static void start_test_tail_nested_fixture(const char *path) {
 
 static playback_ctx_t *start_test_tail_prepare(const char *path,bool held) {
     playback_ctx_t *ctx=start_test_calloc(1,sizeof(*ctx)); assert(ctx);
-    assert(gui_playback_prepare(ctx,&start_test_app,path,NULL,NULL)==0);
+    ctx->app = &start_test_app;
+    assert(gui_playback_prepare(ctx,NULL,path,NULL,NULL)==0);
     atomic_store(&ctx->state,PLAYBACK_STATE_PAUSED);
     atomic_store(&ctx->speed,PLAYBACK_SPEED_0_5X); atomic_store(&ctx->loop_enabled,false);
     atomic_store(&ctx->current_sample,1234); atomic_store(&ctx->current_sample_a,1234);
@@ -2128,7 +2294,8 @@ static void start_test_tail_flow(const char *directory,const char *unknown,const
     assert(gui_playback_length_cache_lookup(&key,&cached) && cached==8192);
     gui_playback_retire_context(); start_test_assert_clean();
     ctx=start_test_calloc(1,sizeof(*ctx)); assert(ctx);
-    assert(gui_playback_prepare(ctx,&start_test_app,nested,NULL,NULL)==0);
+    ctx->app = &start_test_app;
+    assert(gui_playback_prepare(ctx,NULL,nested,NULL,NULL)==0);
     assert(ctx->info_a.total_samples==8192 && !ctx->info_a.length_provisional); // Confirmed cache beats tail.
     gui_playback_release_context(ctx); start_test_free(ctx); start_test_assert_clean();
     puts("Playback tail: genuine nested-frame8192 is temporarily421888, complete scan corrects it, controls/cursor/epoch preserved, only8192 in V2 passed");
@@ -2174,14 +2341,16 @@ static void start_test_tail_flow(const char *directory,const char *unknown,const
     assert(ftell(held)==0); fclose(held);
     start_test_tail_nested_fixture(damaged);
     ctx=start_test_calloc(1,sizeof(*ctx)); assert(ctx);
-    assert(gui_playback_prepare(ctx,&start_test_app,damaged,NULL,NULL)==0 && ctx->info_a.length_provisional);
+    ctx->app = &start_test_app;
+    assert(gui_playback_prepare(ctx,NULL,damaged,NULL,NULL)==0 && ctx->info_a.length_provisional);
     file=fopen(damaged,"r+b"); assert(file); assert(fseek(file,26,SEEK_SET)==0 && fputc(1,file)!=EOF); fclose(file);
     assert(gui_playback_commit(&start_test_app,ctx)==-1); start_test_assert_clean();
     puts("Playback bounded tail: read/seek budgets, held FILE mismatch without cursor changes, changed provisional source rejected before commit passed");
 
     // Actual elapsed time is independent of an underestimated provisional endpoint.
     ctx=start_test_calloc(1,sizeof(*ctx)); assert(ctx);
-    assert(gui_playback_prepare(ctx,&start_test_app,unknown,NULL,NULL)==0);
+    ctx->app = &start_test_app;
+    assert(gui_playback_prepare(ctx,NULL,unknown,NULL,NULL)==0);
     ctx->info_a.total_samples=20000000; ctx->info_a.duration_seconds=1;
     ctx->info_a.length_provisional=true; ctx->total_samples=20000000;
     ctx->total_duration_seconds=1; ctx->realtime_sample_rate_hz=20000000;
@@ -2204,8 +2373,9 @@ static void start_test_tail_flow(const char *directory,const char *unknown,const
     assert(gui_playback_start_async(&start_test_app,unknown,NULL)==0);
     start_test_wait_flag(&start_test_tail_entered);
     gui_playback_cancel_start(&start_test_app);
+    assert(!gui_playback_is_starting(&start_test_app));
     atomic_store(&start_test_tail_release,true);
-    assert(start_test_poll_complete()==-1);
+    assert(gui_playback_poll_start(&start_test_app) == 0);
     gui_playback_finish_start(&start_test_app); start_test_assert_clean();
 
     // Real producer A/B starts while full scan is held, even though both have a
@@ -2349,6 +2519,10 @@ int main(int argc,char **argv) {
     start_test_slow_heartbeat(normal);
     start_test_cancel_retry(normal);
     start_test_exit_pending(normal);
+    start_test_drop_load(normal, missing);
+    char sidecar[512];
+    snprintf(sidecar, sizeof(sidecar), "%s/start-monitor.flac", directory);
+    start_test_drop_zones_and_audio(normal, other_normal, sidecar);
     start_test_index_publish(NULL,unknown,START_TEST_SAMPLES);
     start_test_index_publish(normal,other_unknown,START_TEST_OTHER_SAMPLES);
     start_test_index_stop_reopen(unknown,other_normal);

@@ -733,8 +733,9 @@ jobs:
           DEPS_PREFIX="$DEPS_PREFIX" bash scripts/build-rtlsdr.sh
           pkg-config --modversion fftw3f
           pkg-config --modversion libavcodec libavutil libswscale
-          meson setup "$BUILD_DIR" misrc_tools --buildtype release -Dmodern_monitor_codecs=enabled -Drtlsdr=enabled
-          meson compile -C "$BUILD_DIR" misrc_capture misrc_extract misrc_gui
+          meson setup "$BUILD_DIR" misrc_tools --buildtype release -Dmodern_monitor_codecs=enabled -Drtlsdr=enabled -Dwindows_flac_affinity=enabled
+          meson compile -C "$BUILD_DIR" misrc_capture misrc_extract misrc_gui flac_writer_affinity_test
+          meson test -C "$BUILD_DIR" --no-rebuild --print-errorlogs flac_writer_affinity
 
           mkdir -p dist
           cp "$BUILD_DIR/misrc_gui.exe" dist/MISRC.exe
@@ -973,8 +974,9 @@ jobs:
           DEPS_PREFIX="$DEPS_PREFIX" bash scripts/build-rtlsdr.sh
           pkg-config --modversion fftw3f
           pkg-config --modversion libavcodec libavutil libswscale
-          meson setup "$BUILD_DIR" misrc_tools --buildtype release -Dmodern_monitor_codecs=enabled -Drtlsdr=enabled
-          meson compile -C "$BUILD_DIR" misrc_capture misrc_extract misrc_gui
+          meson setup "$BUILD_DIR" misrc_tools --buildtype release -Dmodern_monitor_codecs=enabled -Drtlsdr=enabled -Dwindows_flac_affinity=enabled
+          meson compile -C "$BUILD_DIR" misrc_capture misrc_extract misrc_gui flac_writer_affinity_test
+          meson test -C "$BUILD_DIR" --no-rebuild --print-errorlogs flac_writer_affinity
 
           mkdir -p dist
           cp "$BUILD_DIR/misrc_gui.exe" dist/MISRC.exe

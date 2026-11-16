@@ -45,6 +45,11 @@
   }
   #define thrd_join(a,b) thrd_join_impl(a,b)
 
+  static inline void thrd_detach(thrd_t thread) {
+    extern __declspec(dllimport) int __stdcall CloseHandle(void*);
+    CloseHandle(thread);
+  }
+
   /* Sleep for milliseconds */
   static inline void thrd_sleep_ms(int ms) {
     extern __declspec(dllimport) void __stdcall Sleep(unsigned long);
@@ -142,6 +147,7 @@
 
   #define thrd_create(a,b,c) pthread_create(a,NULL,(void* (*)(void *))b,c)
   #define thrd_join(a,b) pthread_join(a,(void**)(b))
+  #define thrd_detach(thread) pthread_detach(thread)
 
   /* Sleep for milliseconds */
   static inline void thrd_sleep_ms(int ms) {

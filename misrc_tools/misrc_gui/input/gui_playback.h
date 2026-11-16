@@ -109,15 +109,17 @@ typedef struct {
 // Returns 0 on success, -1 on error
 int gui_playback_start(gui_app_t *app, const char *file_a, const char *file_b);
 
-// UI startup: file preparation is private to a joinable background loader.
+// UI startup: a background loader owns the request paths and readers.
 // Poll every render frame (also publishes background lengths):
-// 1 startup committed, -1 failed/cancelled, 0 no startup result.
+// 1 startup committed, -1 load ended without starting playback, 0 no result.
 int gui_playback_start_async(gui_app_t *app, const char *file_a, const char *file_b);
 bool gui_playback_is_starting(gui_app_t *app);
 int gui_playback_poll_start(gui_app_t *app);
 void gui_playback_cancel_start(gui_app_t *app);
-// Shutdown only: cancel and join before releasing the app and its buffers.
+// Shutdown: abandon the loader without waiting for pending file I/O.
 void gui_playback_finish_start(gui_app_t *app);
+// Windows and desktop Linux may bypass stdio cleanup while a reader is blocked.
+bool gui_playback_has_load_workers(void);
 
 
 // Stop playback and close files
@@ -183,10 +185,8 @@ bool gui_playback_get_file_info_a(gui_app_t *app, playback_file_info_t *info);
 bool gui_playback_get_file_info_b(gui_app_t *app, playback_file_info_t *info);
 
 // Get file info for the playback file selected in settings (channel: 0=A, 1=B).
-// Returns the live playback file info while playback is running; otherwise
-// validates the settings-selected file (cached by path, so it is cheap to
-// call per frame) so the UI can show bit depth / sample rate / duration
-// readouts before playback starts. Returns true when the info is valid.
+// Returns live playback info, or the last loaded info if the stopped
+// selection matches. Safe to call every frame: this never opens a file.
 bool gui_playback_get_selected_file_info(gui_app_t *app, int channel, playback_file_info_t *info);
 
 // Validate a FLAC file before playback (check format compatibility)
@@ -199,9 +199,9 @@ bool gui_playback_validate_file(const char *filepath, playback_file_info_t *info
 // container (FLAC/Ogg-FLAC/raw/.lds) becomes the file for the channel whose
 // PANEL ZONE the drop landed on (point = the logical pointer position from
 // gui_ui_get_mouse_position; x/y instead of Vector2 keeps this header
-// raylib-free). Assigns the settings, selects the Playback device and
-// (re)starts playback through the normal start path. Returns true when any
-// file was accepted. Audio plays through the Audio Mon button (no
+// raylib-free). Copies the paths and queues classification on a worker.
+// Poll applies the drop and calls the normal capture start entry point when
+// RF is selected. Returns true when queued. Audio plays through Audio Mon (no
 // auto-enable, mirroring device-audio monitoring).
 bool gui_playback_handle_dropped_files(gui_app_t *app, const char *const *paths,
                                        size_t count, float point_x, float point_y);
