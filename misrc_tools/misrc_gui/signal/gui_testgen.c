@@ -306,16 +306,9 @@ static void ht_fir_band_reject(double *taps, int ntaps, double sample_rate,
     for (int n = 0; n < ntaps; n++) taps[n] *= gain;
 }
 
-/* hacktv _secam_g: complex cloche (bell) gain of the chroma sub-carrier at
- * f Hz: 0.115 * (1 + j*16u) / (1 + j*1.26u), u = f/f0 - f0/f. */
-static void ht_secam_g(double f, double *g_re, double *g_im) {
-    double u = f / HT_SECAM_F0 - HT_SECAM_F0 / f;
-    double lq = 16.0 * u;
-    double rq = 1.26 * u;
-    double d = 1.0 + rq * rq;
-    *g_re = 0.115 * (1.0 + lq * rq) / d;
-    *g_im = 0.115 * (lq - rq) / d;
-}
+/* hacktv's _secam_g (the cloche gain 0.115 (1 + j16u)/(1 + j1.26u),
+ * u = f/f0 - f0/f, evaluated at the instantaneous frequency) is replaced by
+ * the same network as a linear biquad filter - see the SECAM FM render. */
 
 /* --- hacktv av_test bars (75% amplitude) --------------------------------- */
 
@@ -917,6 +910,20 @@ size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
             return 0;
         }
         ht_fir_low_pass(lp, 15, (double)sample_rate, 1.70e6, 1.0);
+        /* Linear cloche biquad (see the FM render), normalised by d0. */
+        double bell_n0, bell_n1, bell_n2, bell_d1, bell_d2;
+        {
+            const double w0 = 2.0 * M_PI * HT_SECAM_F0;
+            const double K = w0 / tan(w0 / (2.0 * rate)), K2 = K * K;
+            const double a2 = 0.115 * 16.0, a1 = 0.115 * w0, a0 = 0.115 * 16.0 * w0 * w0;
+            const double b2 = 1.26, b1 = w0, b0 = 1.26 * w0 * w0;
+            const double d0 = b2 * K2 + b1 * K + b0;
+            bell_n0 = (a2 * K2 + a1 * K + a0) / d0;
+            bell_n1 = (-2.0 * a2 * K2 + 2.0 * a0) / d0;
+            bell_n2 = (a2 * K2 - a1 * K + a0) / d0;
+            bell_d1 = (-2.0 * b2 * K2 + 2.0 * b0) / d0;
+            bell_d2 = (b2 * K2 - b1 * K + b0) / d0;
+        }
         {
             /* hacktv's IIR (in {1.0,-0.90456054} / out {2.90456054,
              * -2.80912108}; y = x*b0 + x_prev*b1 - y_prev*a1) is the
@@ -1028,26 +1035,39 @@ size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
                 if (d_line[x] > dmax) d_line[x] = dmax;
             }
 
-            /* FM render with the cloche gain and envelope (the window and
-             * the per-line phase reference start at the exact chroma_left
-             * time; at 40 MSPS fo is 0 and this is the whole-sample form). */
+            /* FM render, the cloche, the envelope (the window and the
+             * per-line phase reference start at the exact chroma_left time;
+             * at 40 MSPS fo is 0 and this is the whole-sample form).
+             * The cloche (HF pre-correction) is the LINEAR bell network on
+             * the constant-amplitude carrier: A(f) = 0.115 (1 + j16u) /
+             * (1 + j1.26u), u = f/f0 - f0/f, i.e. with j u = s/w0 + w0/s
+             * H(s) = 0.115 (16 s^2 + w0 s + 16 w0^2) / (1.26 s^2 + w0 s +
+             * 1.26 w0^2), bilinear pre-warped at w0. hacktv evaluates A(f)
+             * per sample at the INSTANTANEOUS frequency instead - right for
+             * a steady carrier, but during every colour transition that
+             * twists the phase in a way no real bell (and no receiver's
+             * anti-bell) does: measured on the vectorscope as wiggling,
+             * U/V-skewed SECAM transitions (12% of the points off the
+             * straight transitions; 2.9% with the linear network). */
             phase = ((global % 3) == 0) ? 0.0 : M_PI;
             size_t x_first = (size_t)ceil(chroma_left_f - fo);
             if (x_first < len) {
                 double w0 = (double)x_first + fo - chroma_left_f;
                 phase += 2.0 * M_PI * (HT_SECAM_FM + d_line[x_first] * HT_SECAM_DEV) * w0 / rate;
             }
+            double bx1 = 0.0, bx2 = 0.0, by1 = 0.0, by2 = 0.0;
             for (size_t x = x_first; x < len; x++) {
                 double wf = (double)x + fo - chroma_left_f;
-                double env, freq, g_re, g_im, c;
+                double env, freq, cv;
                 if (wf >= (double)chroma_len) break;
                 env = ht_rc_window(wf / rate, env_rise / 2.0, env_width, env_rise);
                 freq = HT_SECAM_FM + d_line[x] * HT_SECAM_DEV;
-                ht_secam_g(freq, &g_re, &g_im);
-                c = fm_level * (cos(phase) * g_re - sin(phase) * g_im) * env;
-                if (c > 32767.0) c = 32767.0;
-                if (c < -32768.0) c = -32768.0;
-                chroma_buf[ss + x] = ht_r16(c);
+                double carrier = cos(phase);
+                double belled = bell_n0 * carrier + bell_n1 * bx1 + bell_n2 * bx2
+                              - bell_d1 * by1 - bell_d2 * by2;
+                bx2 = bx1; bx1 = carrier; by2 = by1; by1 = belled;
+                cv = fm_level * belled * env;
+                chroma_buf[ss + x] = ht_r16(cv);
                 phase += 2.0 * M_PI * freq / (double)sample_rate;
             }
         }

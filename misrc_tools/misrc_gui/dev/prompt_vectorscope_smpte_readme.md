@@ -436,4 +436,64 @@ User feedback:
   standard LF pre-emphasis still settling in the bar centre, under 4% of
   the deviation; `gui_testgen_cvbs` limit 15 kHz).
 
+### SECAM transitions: the bell, both ends (2026-11-16, later still)
+
+User feedback on the Vector panel (screenshot, SECAM Test Gen):
+
+> Better but wonky
+
+Transitions wiggled and bent, D'R lagging D'B. Isolated with the meter:
+decoder band width (wider is worse: more luma in the FM band), click
+concealment (no effect), an IDEAL reference receiver on the generator's
+chroma alone (exact inverse bell, wideband discriminator, exact inverse
+pre-emphasis), and no bell at either end. Two causes:
+
+1. Generator: hacktv's cloche is a complex gain evaluated at the
+   INSTANTANEOUS frequency per sample - right for a steady carrier, but at
+   every colour transition it twists the phase in a way no real bell does.
+   Now the same network as a linear biquad on the constant-amplitude carrier
+   (H(s) = 0.115 (16 s^2 + w0 s + 16 w0^2)/(1.26 s^2 + w0 s + 1.26 w0^2),
+   bilinear pre-warped at f0).
+2. Decoder: it computed the anti-bell path every line and never used it -
+   the picture demod read the bell-free discriminator, a choice tuned on a
+   BELL-LESS synthetic fixture (`gui_cvbs_test`), where an anti-bell can
+   only distort. Every real SECAM signal carries the bell, so its phase bent
+   D'R and D'B transitions differently (their rests sit either side of the
+   bell centre). The demod now reads the bell path (`g_secam_f`); porch,
+   zero, ident, concealment and killer stay bell-free. No CPU change (the
+   path was already computed).
+
+| SECAM Test Gen on the Vector chain | off-path points | bars |
+|---|---|---|
+| as committed (201a65f) | 12.3% | within 1.6 deg / 3.6% |
+| linear bell, decoder unchanged | 5.6% | within 1.4 deg / 3.9% |
+| linear bell + anti-bell demod (now) | 2.9% | within 0.9 deg / 3.9% |
+| ideal reference receiver | (straight but for small limiter hooks) | - |
+
+`gui_cvbs_test`'s SECAM fixtures now carry the encoder's bell (~9 IRE at
+f0, the Test Gen's level); with the bell-path demod they read 0.31-0.34
+max RGB error, the committed decoder on the old bell-less fixtures 0.31-0.32
+(the check enforces hue order; per-channel errors are informational).
+The remaining gentle bows (G->Mg, Cy->G) are the decoder's ~1 MHz FM band
+at a 2.2 MHz decimated rate; the faint axis lines are the first picture
+lines of each field pairing with a held blanking line (zero colour).
+Suite 58/59. SECAM generation 114 ms per frame (was 126).
+
+Follow-up ("Quite a bit tighter nearly there"): the axis lines are gone - each
+decoder records whether each held component came from a picture line
+(`hold_picture`), and the scope skips lines whose pair is a blanking line
+(`line_pair_valid`); off-path 2.9% -> 2.8%. The remaining curved finishes
+(D'R settling on a slow tail) are mostly the standard's deviation limiter
+clipping the pre-emphasised transition peaks - D'R swings further and clips
+harder; the ideal reference receiver shows the same hooks, shorter. A wider
+decoder band (+-700 kHz) trims them a little (2.8% -> 2.1%) but changes
+real SECAM decoding with no real SECAM capture to check it against: not
+taken.
+
+harrypm on the result (screenshot, SECAM Test Gen, also the +-700 kHz band
+comparison build): "still needs to be fixed this is off the lines are not
+straight and tight so the SECAM generation needs to be improved" - OPEN.
+The decoder band stays +-515 kHz in source (the comparison binary showed no
+visible gain).
+
 Signed-off-by: harrypm (PAL "looks good", NTSC "okay" on the live A/B; SECAM pending)

@@ -544,6 +544,33 @@ typedef struct {
     bool pre_correct;         // apply the encoder's LF pre-correction
 } gen_secam_cfg_t;
 
+// The SECAM encoder's HF pre-correction (the "bell", BT.470): a linear
+// network on the FM subcarrier, A(f) = (1 + j16u)/(1 + j1.26u),
+// u = f/f0 - f0/f, f0 = 4.286 MHz - i.e. with j u = s/w0 + w0/s,
+// H(s) = (16 s^2 + w0 s + 16 w0^2)/(1.26 s^2 + w0 s + 1.26 w0^2), the
+// bell's 0.115 floor normalised to 1 at f0. Bilinear, pre-warped at w0.
+// Every real SECAM signal carries it; the decoder demodulates through
+// its inverse (the bell path).
+typedef struct { double n0, n1, n2, d1, d2, x1, x2, y1, y2; } secam_bell_t;
+static void secam_bell_init(secam_bell_t *b, double rate) {
+    const double w0 = 2.0 * TEST_PI * CVBS_SECAM_BELL_CENTRE_HZ;
+    const double K = w0 / tan(w0 / (2.0 * rate)), K2 = K * K;
+    const double a2 = 16.0, a1 = w0, a0 = 16.0 * w0 * w0;
+    const double b2 = 1.26, b1 = w0, b0 = 1.26 * w0 * w0;
+    const double d0 = b2 * K2 + b1 * K + b0;
+    b->n0 = (a2 * K2 + a1 * K + a0) / d0;
+    b->n1 = (-2.0 * a2 * K2 + 2.0 * a0) / d0;
+    b->n2 = (a2 * K2 - a1 * K + a0) / d0;
+    b->d1 = (-2.0 * b2 * K2 + 2.0 * b0) / d0;
+    b->d2 = (b2 * K2 - b1 * K + b0) / d0;
+    b->x1 = b->x2 = b->y1 = b->y2 = 0.0;
+}
+static double secam_bell_step(secam_bell_t *b, double x) {
+    double y = b->n0 * x + b->n1 * b->x1 + b->n2 * b->x2 - b->d1 * b->y1 - b->d2 * b->y2;
+    b->x2 = b->x1; b->x1 = x; b->y2 = b->y1; b->y1 = y;
+    return y;
+}
+
 // Generate a synthetic SECAM baseband signal: PAL 625 geometry, per-line
 // alternating D'R/D'B FM chroma on the bars, rest carriers across the
 // porch, phase-continuous FM (the frequency track integrated per sample).
@@ -586,6 +613,8 @@ static int16_t *gen_secam(const gen_secam_cfg_t *cfg, size_t *out_length) {
 
     double phase = 0.0;   // continuous FM phase (radians)
     int v_line = 0;
+    secam_bell_t bell;
+    secam_bell_init(&bell, rate);
 
     for (size_t i = 0; i < total_lines; i++) {
         int field = -1;
@@ -696,7 +725,11 @@ static int16_t *gen_secam(const gen_secam_cfg_t *cfg, size_t *out_length) {
             phase += 2.0 * TEST_PI * f_inst / rate;
 
             double value = LEVEL_ZERO + ire * COUNTS_PER_IRE;
-            value += carrier_amp_ire * COUNTS_PER_IRE * sin(phase);
+            // The carrier through the encoder's bell: ~9 IRE at f0 (the
+            // Test Gen's level, ~18 IRE p-p, near the standard 23% p-p),
+            // boosted up to ~3x away from f0 - the bell's HF pre-emphasis
+            // (the ident bottles reach ~30 IRE).
+            value += COUNTS_PER_IRE * secam_bell_step(&bell, 0.4 * carrier_amp_ire * sin(phase));
             int iv = (int)(value + 0.5);
             if (iv < -32768) iv = -32768;
             if (iv > 32767) iv = 32767;
@@ -1226,7 +1259,10 @@ int main(int argc, char **argv) {
     // (the decoder's causal de-emphasis IIR must invert the encoder's
     // pre-correction end to end); the flat-deviation fixture is the
     // robustness case - no real encoder emits it, and the de-emphasis then
-    // shows its own true transient behaviour (the reference's too).
+    // shows its own true transient behaviour (the reference's too). Every
+    // fixture carries the encoder's HF bell: the decoder demodulates through
+    // its inverse (2026-11-16 - demodulating a belled signal without it
+    // bent every bar transition on the vectorscope).
     run_secam_numeric_match();
     run_secam_bars(0.0, true, "SECAM studio");
     run_secam_bars(105000.0, true, "SECAM offset +105 kHz");

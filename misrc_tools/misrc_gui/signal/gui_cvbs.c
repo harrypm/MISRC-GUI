@@ -1711,24 +1711,26 @@ static void cvbs_secam_decode_line(cvbs_decoder_t *decoder,
     if (a0 < 0) a0 = 0;
     if (a1 > dec_count) a1 = dec_count;
 
-    // The picture demod runs on the BELL-FREE discriminator (g_secam_fref):
-    // measured on the studio fixture, the bilinear cloche's asymmetric phase
-    // response (its centre sits 42 kHz below the block centre) biased the
-    // BELLED carrier readings by -19.5 kHz at foR / ~0-10 kHz at foB, and
-    // its amplitude tilt dropped the strongly-deviated sidebands' envelope
-    // (|A|~0.3 at +-390 kHz) below the concealment's 12 dB dip floor,
-    // squashing whole bars to ~+0.25 D'x. The bell-free path reads the
-    // carriers within tens of Hz (the porch/ident already use it - the
-    // reference's fInstRef). The bell stays built + verified by the
-    // numeric-match contract; carrying it into the demod is future work
-    // (pre-warp correction or a magnitude-only post-demod shaping).
+    // The picture demod runs on the BELL path (g_secam_f, through the
+    // receiver's anti-bell): every real SECAM signal carries the encoder's
+    // HF bell, and its phase response bends D'R and D'B transitions
+    // differently (their rest carriers sit on opposite sides of the bell
+    // centre) unless the receiver undoes it - measured on the vectorscope as
+    // wiggling, U/V-skewed transitions (12% / 5.6% of the points off the
+    // straight transitions vs 2.9% through the anti-bell). The bell-free
+    // path (g_secam_fref) keeps the porch, zero and ident measurements, and
+    // the concealment / killer envelopes stay bell-free (lpre), so the
+    // anti-bell's amplitude tilt never trips the dip floor. History: until
+    // 2026-11-16 this read g_secam_fref, tuned on a BELL-LESS synthetic
+    // fixture (where an anti-bell can only distort); the fixtures now carry
+    // the encoder's bell.
     for (int i = 0; i < dec_count; i++) {
         double d = 0.0;
         if (picture_line && i >= a0 && i < a1 && killer_level > 0.0) {
             double env = sqrt(g_secam_lpre[i] * g_secam_lpre[i]
                               + g_secam_lpim[i] * g_secam_lpim[i]);
             if (env >= killer_level) {
-                d = (g_secam_fref[i] - zero) / deviation;
+                d = (g_secam_f[i] - zero) / deviation;
             }
         }
         if (d < lo_bound) d = lo_bound;
@@ -1869,7 +1871,13 @@ static void cvbs_secam_decode_line(cvbs_decoder_t *decoder,
             s->hold_final[is_red ? 1 : 0][i] =
                 (float)(g_secam_final[i] * own_scale);
         }
+        // The held component pairs with real colour only when it came from
+        // a picture line (a blanking line's demod is zero): the vectorscope
+        // skips lines that pair with one (they drew lines along both axes
+        // from the first picture line of every field).
+        s->line_pair_valid = picture_line && hold_valid && s->hold_picture[is_red ? 0 : 1];
         s->hold_count[is_red ? 1 : 0] = dec_count;
+        s->hold_picture[is_red ? 1 : 0] = picture_line;
         for (int i = 0; i < dec_count; i++) {
             s->prev_demod[is_red ? 1 : 0][i] = (float)g_secam_demod[i];
         }
@@ -2533,7 +2541,8 @@ static void decode_line_to_pixels(cvbs_decoder_t *decoder,
         // at the panel rate instead - a Catmull-Rom curve through the
         // decimated points (the D'x signals are band-limited well inside the
         // decimated Nyquist), one point per panel sample like PAL/NTSC.
-        if (decoder->vscope && picture_line && secam_dec_count > 1) {
+        if (decoder->vscope && picture_line && secam_dec_count > 1 &&
+            decoder->secam.line_pair_valid) {
             int d0 = (s0 > 0 ? s0 : 0) / g_secam_decim;
             int d1 = (s1 > 0 ? s1 : 0) / g_secam_decim;
             if (d1 > secam_dec_count - 1) d1 = secam_dec_count - 1;

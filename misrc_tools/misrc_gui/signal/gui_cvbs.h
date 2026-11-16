@@ -202,6 +202,8 @@ typedef struct {
     // chunk) handed each other their last line at every chunk boundary.
     float  hold_final[2][CVBS_SECAM_MAX_DEC];
     int    hold_count[2];
+    bool   hold_picture[2];      // That held line was a picture line (its colour is real)
+    bool   line_pair_valid;      // This line's held component came from a picture line
     double deemph_x1, deemph_y1;
     unsigned filters_gen;        // Shared filter-cache generation this state follows
 
