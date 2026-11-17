@@ -5,10 +5,11 @@
 
 > (Multiple Input Simultaneous RF Capture Graphical User Interface) 
 
-A universal cross platform GUI tool for interfacing with and visualizing monitoring and control of FM RF archival focused, capture device workflows.
+A universal cross platform GUI tool for interfacing with and visualising monitoring and control of FM RF archival focused, capture device workflows.
 
 
 ### Current Supported Hardware
+
 
 - [MISRC](https://misrc.org) (v1.0-v1.5a / native v2.5)
 - CXADC Linux (single cards and Clockgen Mod with sound)
@@ -56,7 +57,7 @@ For `misrc_capture` to be able to access the MS2130 or MS2131 capture device, yo
 
 Firstly download [Zadig](https://zadig.akeo.ie/)
 
-Force the installation of `WinUSB (v6.1.7600.16385)` or `libusb-win32 (v1.2.6.0)` driver on your MS2130/MS2131 adapter, on `interface 0` leave `interface 4` alone. 
+Force the installation of `WinUSB (v6.1.7600.16385)` or `libusb-win32 (v1.2.6.0)` driver on your MS2130/MS2131 adaptor, on `interface 0` leave `interface 4` alone. 
 
 ```
 Interface 0 - USB Video
@@ -127,7 +128,9 @@ The GUI is built with several layers of fallback and prevention measures to stop
 - Memory Budget (Allows you to limit/raise the buffers for higher stability on low end or high end systems) 
 - Mode Selection
 
+
 ### Operation Modes
+
 
 Local - Entirely local capture standalone.
 Server - Broadcasts current capture and feed to network.
@@ -144,7 +147,7 @@ Record button is clear when not in use.
 
 Record button is RED when capturing is in use.
 
-The record button will turn orange and state finalizing when a file is still being processed i.g adding timing header information or encoding from spill over or memory.
+The record button will turn orange and state finalising when a file is still being processed i.g adding timing header information or encoding from spill over or memory.
 
 Audio monitoring has on/off and CH 1/2 or Ch 3/4 switching and level indicators in Green/Yellow/Red for visual loudness level. 
 
@@ -154,7 +157,7 @@ Audio monitoring has on/off and CH 1/2 or Ch 3/4 switching and level indicators 
 
 <img width="436" height="340" alt="image" src="assets/images/MISRC_GUI_Window_Record_Auto_Control_Current.png" />
 
-Timer mode allows for `HH:MM:SS` timing to stop the capture, with an arm/disarm system but will append current duration to the total timer duration and will not allow you to accidentality stop your capture if you forgot to set the timer beforehand. 
+Timer mode allows for `HH:MM:SS` timing to stop the capture, with an arm/disarm system but will append current duration to the total timer duration and will not allow you to accidentally stop your capture if you forgot to set the timer beforehand. 
 
 Level Autostop, this allows for you to set a overall % level alongside a timer to automatically stop captures when a tape is clearly reached its end and no active signal is being captured thus presenting a drastically lower level, users should be careful with this to prevent re-runs if tapes have spaced recordings.
 
@@ -185,16 +188,15 @@ There is a unified plugin system for deploying decoders.
 Included currently are the following viewer modes.
 
 - Stream Waveform (similar to an oscilloscope) 
-- FTT (visualizes peaks of signals carriers i.g video/hifi or your local FM radio)
+- FTT (visualises peaks of signals carriers i.g video/hifi or your local FM radio)
 - CVBS (PAL/NTSC/SECAM with hybrid mode) 
-- Tape FM (VHS, Betamax NTSC + HiFi) 
+- Tape FM (VHS, Betamax NTSC + HiFi)
+- HiFi-FM Audio decoder (Tape Format --> HiFi FM)
+- Composite Vectorscope
+- Histogram
+- Spectograph 
 
 <img width="140" height="132" alt="image" src="assets/images/MISRC_GUI_Window_Monitor_Plugins_Current.png" />
-
-
-Experimental support for [Tape-Decode](https://github.com/harrypm/tape-decode-rust) (A Rust re-write of vhs-decode) is also a working progress, this plugin hopes to allow for a quick is this working inspection and in the future potentially direct to file decoding however currently this does have massive limitation implications and performance cost implications, so it's not a high priority over the stability of the core feature of seeing there is something and getting it safely captured to file. 
-
-There is plans for a basic quality hi-fi audio decoder mode based off of the GNU radio script, allowing for directional test point finding and quick testing of sanity of if there is a HiFi FM signal present.
 
 
 ## During Capture Readout 
@@ -234,7 +236,7 @@ Persistence config, once you have configured your settings a global configuratio
 
 Understanding the waveform scale. 
 
-There are two visualization modes currently implemented. 
+There are two visualisation modes currently implemented. 
 
 - Level Bar (vertical colour indicator)
 - Waveform Line
@@ -244,7 +246,7 @@ There are two visualization modes currently implemented.
 
 On the zero line that is your DC offset position your signal should be level with this position to begin with irrespective of your gain level of the signal of input.
 
-Ideal saturation range at 8-bit is typically within the plus +0.5 and -0.5 range of visualization, of course please do confirm with an oscilloscope and your recorded files before committing to long duration archival visualizations are of a decimated amount i.g (100/1000th samples) of data not an absolute of what is being captured to file.
+Ideal saturation range at 8-bit is typically within the plus +0.5 and -0.5 range of visualisation, of course please do confirm with an oscilloscope and your recorded files before committing to long duration archival visualisations are of a decimated amount i.g (100/1000th samples) of data not an absolute of what is being captured to file.
 
 Trigger modes like an oscilloscope can be done in the simple following. 
 
