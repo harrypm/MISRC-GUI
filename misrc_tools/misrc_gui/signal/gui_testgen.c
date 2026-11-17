@@ -208,6 +208,11 @@ static double ht_chroma_gain(int colour_mode) {
  * prototype at 16 MHz; redesigned here for the 40 MSPS stream. */
 #define HT_SECAM_PE_FZ  85000.0
 #define HT_SECAM_PE_FP  255000.0
+/* D'R / D'B pre-filter (before the pre-emphasis): Gaussian, -3 dB here
+ * (fitted to a real broadcast encoder, see the FM render). The half-length
+ * bound covers 4 sigma up to ~125 MSPS. */
+#define HT_SECAM_DX_F3        800000.0
+#define HT_SECAM_DX_HALF_MAX  128
 /* Chroma D deviations per unit of colour difference (hacktv ev_co/eu_co
  * for SECAM: ev_co = -1.902*280e3 D'R, eu_co = +1.505*230e3 D'B) */
 #define HT_SECAM_DR_HZ  (-1.902 * 280e3)
@@ -273,21 +278,6 @@ static void ht_kaiser(double *taps, int ntaps, double beta) {
         taps[i] = ht_i_zero(beta * sqrt(1.0 - temp * temp)) * i_beta;
     }
     taps[ntaps - 1] = i_beta;
-}
-
-static void ht_fir_low_pass(double *taps, int ntaps, double sample_rate,
-                            double cutoff, double gain) {
-    int M = (ntaps - 1) / 2;
-    double fwT0 = 2.0 * M_PI * cutoff / sample_rate;
-    ht_kaiser(taps, ntaps, 7.0);
-    for (int n = -M; n <= M; n++) {
-        if (n == 0) taps[n + M] *= fwT0 / M_PI;
-        else taps[n + M] *= sin(n * fwT0) / (n * M_PI);
-    }
-    double fmax = taps[M];
-    for (int n = 1; n <= M; n++) fmax += 2 * taps[n + M];
-    gain /= fmax;
-    for (int n = 0; n < ntaps; n++) taps[n] *= gain;
 }
 
 static void ht_fir_band_reject(double *taps, int ntaps, double sample_rate,
@@ -875,8 +865,10 @@ size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
      * vertically averaged with the previous line's opposite component
      * (hacktv chrominance_buffer second half); the first 9 H lines of each
      * field carry the field ident ramp instead (D'r +350 kHz over 15 us,
-     * D'b -350 kHz over 18 us, from active_left). Then: 15-tap kaiser
-     * low-pass at 1.7 MHz, the SECAM video pre-emphasis horn (85/255 kHz,
+     * D'b -350 kHz over 18 us, from active_left). Then: the D'x pre-filter
+     * (Gaussian, -3 dB at 0.8 MHz, fitted to a real Philips encoder;
+     * hacktv: 15-tap kaiser at 1.7 MHz), the
+     * SECAM video pre-emphasis horn (85/255 kHz,
      * DC gain 1, x3 HF; hacktv's 16 MHz IIR redesigned here for the stream
      * rate), per-type deviation clamps (D'b [CB-350k, CB+506k], D'r
      * [CR-506k, CR+350k]), then FM render across the 56.9 us window
@@ -900,7 +892,8 @@ size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
         const double env_rise = HT_SECAM_RISE_US * HT_SECAM_IRT1090 * 1e-6;
         double *d_line = (double *)malloc((size_t)(line_smp + 8) * sizeof(double));
         double *d_src = (double *)malloc((size_t)(line_smp + 8) * sizeof(double));
-        double lp[15];
+        double lp[2 * HT_SECAM_DX_HALF_MAX + 1];
+        int lp_half;
         double pe_b0, pe_b1, pe_fb;
 
         if (!d_line || !d_src) {
@@ -909,7 +902,32 @@ size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
             free(base_buf); free(chroma_buf);
             return 0;
         }
-        ht_fir_low_pass(lp, 15, (double)sample_rate, 1.70e6, 1.0);
+        /* D'R / D'B pre-filter before the pre-emphasis: Gaussian, -3 dB at
+         * 0.8 MHz, no overshoot - FITTED to a real broadcast encoder: a
+         * Philips PM5544 SECAM generator captured on the MS2130 (harrypm,
+         * 2026-11-17). Its bar transitions, inverse-belled and aligned per
+         * edge, match this filter at 11 kHz RMS deviation (Gaussian 1.3 MHz
+         * 20 kHz, the old hacktv-style 15-tap 26 kHz; best 0.75-0.8 MHz).
+         * hacktv's 15-tap kaiser "1.7 MHz" low-pass, redesigned at the
+         * stream rate, truncated inside the sinc's first zero (+-175 ns at
+         * 40 MSPS) and band-limited far less: the pre-emphasised transition
+         * spikes hit the deviation stops harder than a broadcast encoder's,
+         * and each clipped spike leaves a de-emphasis tail that differs
+         * between D'R and D'B (the curved SECAM vectorscope transitions).
+         * Yl..B vectorscope path off-path share (noise-free, de-emphasised):
+         * Philips 2.9%, this filter 1.5%, the old 15-tap 2.6%. */
+        {
+            const double sigma_f = HT_SECAM_DX_F3 / sqrt(log(2.0));   /* |H(f3)| = 1/sqrt(2) */
+            const double st = (double)sample_rate / (2.0 * M_PI * sigma_f);
+            double gs = 0.0;
+            lp_half = (int)ceil(4.0 * st);
+            if (lp_half > HT_SECAM_DX_HALF_MAX) lp_half = HT_SECAM_DX_HALF_MAX;
+            for (int j = -lp_half; j <= lp_half; j++) {
+                lp[j + lp_half] = exp(-0.5 * (double)j * (double)j / (st * st));
+                gs += lp[j + lp_half];
+            }
+            for (int j = 0; j <= 2 * lp_half; j++) lp[j] /= gs;
+        }
         /* Linear cloche biquad (see the FM render), normalised by d0. */
         double bell_n0, bell_n1, bell_n2, bell_d1, bell_d2;
         {
@@ -1004,15 +1022,15 @@ size_t gui_testgen_frame(gui_testgen_system_t system, int16_t *out, size_t cap,
                 }
             }
 
-            /* 15-tap kaiser low-pass, block mode (edges held) */
+            /* D'x pre-filter (Gaussian 0.8 MHz), block mode (edges held) */
             memcpy(d_src, d_line, len * sizeof(double));
             for (size_t x = 0; x < len; x++) {
                 double acc = 0.0;
-                for (int j = -7; j <= 7; j++) {
+                for (int j = -lp_half; j <= lp_half; j++) {
                     ssize_t idx = (ssize_t)x + j;
                     if (idx < 0) idx = 0;
                     if ((size_t)idx >= len) idx = (ssize_t)len - 1;
-                    acc += lp[j + 7] * d_src[idx];
+                    acc += lp[j + lp_half] * d_src[idx];
                 }
                 d_line[x] = acc;
             }

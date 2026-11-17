@@ -496,4 +496,122 @@ straight and tight so the SECAM generation needs to be improved" - OPEN.
 The decoder band stays +-515 kHz in source (the comparison binary showed no
 visible gain).
 
+### SECAM generation: where the curvature comes from (2026-11-16, night)
+
+Measured with scratch harnesses on the Test Gen at 40 MSPS:
+
+- `secam_skew.c` reads each vectorscope line's own and held components and
+  compares their bar-edge 50% crossings. The result is a component skew,
+  not a hold misalignment:
+  - D'R crosses -118 / +228 / -7 / +97 / -55 / 0 / -18 ns relative to D'B
+    at the seven bar edges.
+  - The sign flips between D'R and D'B lines with the same magnitude.
+  - The skew depends on each edge's absolute levels, not only its step.
+    Yl->Cy and R->B have identical steps but skews of 228 and 0 ns. That is
+    the signature of the deviation stops clipping the pre-emphasised
+    transition spikes; the de-emphasis turns every clipped spike into a
+    different tail on D'R and D'B.
+  - Decoding at 16 MHz, an integer 1024-sample line, did not remove the
+    doubled transitions, so the sub-sample line offset is not the cause.
+- Off-path share through the ideal reference receiver (exact inverse bell,
+  wideband discriminator, exact de-emphasis) and through our decoder:
+
+| Generator | Ideal receiver | Our decoder |
+|---|---|---|
+| Before (15-tap kaiser D'x pre-filter) | 2.93% | 2.81% |
+| D'x Gaussian -3 dB at 1.6 MHz | - | 2.73% |
+| D'x Gaussian -3 dB at 1.3 MHz (taken) | 1.97% | 2.58% |
+| D'x Gaussian -3 dB at 1.0 MHz | - | 2.40% |
+| Deviation stops removed (not standard) | 1.20% | 6.64% |
+
+- On the old generator our decoder already matched an ideal receiver, at
+  2.8% against 2.9%. The curves are in the signal, and real SECAM encoders
+  clip at the same standard deviation limits.
+- Removing the stops is not an option. It is non-standard, and the
+  decoder's FM band cannot follow the unclipped spikes (6.6%).
+- Change taken in `gui_testgen.c`: the D'R/D'B pre-filter is now a Gaussian
+  at -3 dB 1.3 MHz, the SECAM colour-difference band.
+  - hacktv's 15-tap kaiser "1.7 MHz" low-pass, redesigned at the stream
+    rate, truncated inside the sinc's first zero (+-175 ns at 40 MSPS). It
+    band-limited far less than any standard encoder, so the spikes clipped
+    harder.
+  - Off-path through our decoder: 2.81% -> 2.58%.
+  - The SECAM targets, the generator plateaus and the suite are unchanged
+    (59/60).
+- What is left, about 2% even through an ideal receiver, is the SECAM
+  limiter itself. Straight PAL/NTSC-style transitions are not reachable on
+  a standard SECAM bar signal. A real SECAM capture would show whether
+  hardware encoders filter harder still. None is available here.
+
+### SECAM against real references (2026-11-17)
+
+harrypm: "keep trying to improve SECAM", and pointed to real SECAM
+captures from the MS2130 at 40 MSPS, 12-bit FLAC (header rate 40 kHz by
+the MISRC convention; ffprobe-checked):
+
+- `Desktop/EBU_HackDac2_MISRC_V2.5/SECAM/10sec/cvbs-secam-ebu_2026.10.21_14.40.52_CVBS_12-bit.flac`.
+  This is hacktv (HackDAC) colour bars: a HACKTV logo box over the G..R
+  bars on some lines, and a reverse-bar strip at the bottom of the field.
+- `Desktop/EBU_HackDac2_MISRC_V2.5/SECAM/cvbs_secam_philips_test_pattern_cvbs_12-bit.flac`.
+  This is a Philips PM5544 hardware generator, a broadcast-grade encoder,
+  with its 75% bar band on field rows 86..104 at 20..52 us.
+
+Method (scratchpad tools):
+
+- `secam_fm_probe.c` / `secam_rows.c`: the carrier's instantaneous
+  frequency through an exact inverse bell gives the pre-emphasised
+  deviation D(t). It is averaged per component over bar lines (or per field
+  row), and aligned to each line's 0H.
+- `fm_path.py`: D(t) de-emphasised and scaled to U/V gives the noise-free
+  vectorscope path and its off-path share.
+- `trans_fit.py`: per-transition shape RMS against a reference.
+- `hacktv_model.c`: hacktv's exact SECAM chain at a chosen pixel rate.
+
+Findings:
+
+- **Plateaus.** Both real sources sit on the standard deviations within a
+  few kHz, and so does the Test Gen. A probe artefact (the field-ident
+  lines passing the bar gate) first read as a generator drift; it was
+  fixed in the probe.
+- **The HackDAC reference is curvier than standard SECAM.** Yl..B path
+  off-path is 11.0%. hacktv at 13.5-14 MHz reproduces it (10.3%; curve fit
+  12-13 kHz RMS against 23 for our generator). The causes are its
+  per-sample bell lookup at the instantaneous frequency, and its
+  pre-emphasis IIR coefficients fixed for 16 MHz, so their corners drop at
+  other rates. With a linear bell the hacktv model fits far worse (37-47
+  kHz).
+- **The Philips broadcast encoder draws the same path as our Test Gen.**
+  Yl..B off-path: Philips 2.9%, Test Gen 1.5-2.6%. The S-curves and hooks
+  are SECAM, not a generator fault.
+- **Pre-filter fitted to the Philips transitions.** Per-transition RMS
+  against the Philips capture:
+
+| D'x pre-filter | RMS vs Philips |
+|---|---|
+| 15-tap (old) | 26.2 kHz |
+| Gaussian 1.6 MHz | 23.2 kHz |
+| Gaussian 1.3 MHz | 20.4 kHz |
+| Gaussian 1.0 MHz | 15.3 kHz |
+| Gaussian 0.9 MHz | 13.2 kHz |
+| Gaussian 0.8 MHz (taken) | 11.4 kHz |
+| Gaussian 0.75 MHz | 11.2 kHz |
+| Gaussian 0.7 MHz | 11.9 kHz |
+
+  The HackDAC capture itself scores 32 kHz against the Philips.
+- **Change taken.** `HT_SECAM_DX_F3` is now 0.8 MHz. Test Gen through the
+  decoder: off-path 2.29% (2.81% before 2026-11-16 night). Bars within
+  0.9 deg / 3.7%. Suite 59/60.
+- **Decoder on real SECAM.** The EBU bars land within 1.9 deg / 2.9% and
+  the Philips bars within 0.6 deg / 4.4%. Their extra paths are picture
+  content (logo, reverse bars, PM5544 elements) and the one-line pairing
+  at horizontal colour boundaries, not decode errors.
+
+### Test signal mode: the Vector panel follows the generator (2026-11-17)
+
+Shared with the WFM panel; details and harness results in
+`prompt_waveform_monitor_readme.md` (Test signal mode auto-switching).
+In test signal mode the scope follows the generator's system whatever
+changed it. After a follow, Auto voting holds until the followed field
+rate arrives. Before this, NTSC -> SECAM ended on PAL.
+
 Signed-off-by: harrypm (PAL "looks good", NTSC "okay" on the live A/B; SECAM pending)
