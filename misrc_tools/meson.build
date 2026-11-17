@@ -510,7 +510,7 @@ if raylib_dep.found()
     'misrc_gui/signal/gui_headswitch_lock.c',
     'misrc_gui/signal/gui_trigger.c',
     'misrc_gui/signal/gui_cvbs.c',
-    'misrc_gui/signal/gui_vectorscope.c',
+    'misrc_gui/signal/gui_vectorscope.c', 'misrc_gui/signal/gui_wfm.c',
     'misrc_gui/signal/gui_vhs_fm.c',
     'misrc_gui/signal/gui_rf_resampler.c',
     'misrc_gui/processing/gui_rf_preview_worker.c', 'misrc_gui/signal/gui_beta_hifi.c',
@@ -528,6 +528,7 @@ if raylib_dep.found()
     'misrc_gui/visualization/gui_panel.c',
     'misrc_gui/visualization/gui_histogram_panel.c',
     'misrc_gui/visualization/gui_vectorscope_panel.c',
+    'misrc_gui/visualization/gui_wfm_panel.c',
     'misrc_gui/visualization/gui_spectrogram.c',
     'misrc_gui/visualization/gui_text.c',
     'misrc_gui/visualization/gui_vu_meter.c',
@@ -1020,7 +1021,7 @@ if raylib_dep.found()
     test('gui_rf_input_stamps', rf_input_stamps_test)
     rf_routes_test = executable('gui_rf_routes_test',
       ['test/gui_rf_routes_test.c', 'misrc_gui/signal/gui_vhs_hifi.c',
-       'misrc_gui/signal/gui_vectorscope.c'],
+       'misrc_gui/signal/gui_vectorscope.c', 'misrc_gui/signal/gui_wfm.c'],
       dependencies: overlay_test_deps + [dependency('threads')],
       include_directories: gui_includes,
       c_args: gui_cflags,
@@ -1046,7 +1047,7 @@ if raylib_dep.found()
     endif
     cvbs_baseband_test = executable('gui_cvbs_test',
       ['test/gui_cvbs_test.c', 'misrc_gui/signal/gui_trigger.c',
-       'misrc_gui/signal/gui_vectorscope.c'],
+       'misrc_gui/signal/gui_vectorscope.c', 'misrc_gui/signal/gui_wfm.c'],
       dependencies: cvbs_baseband_deps,
       include_directories: gui_includes,
       c_args: gui_cflags,
@@ -1059,7 +1060,7 @@ if raylib_dep.found()
     # vectorscope panel's decode chain must land on the graticule targets.
     vectorscope_test = executable('gui_vectorscope_test',
       ['test/gui_vectorscope_test.c', 'misrc_gui/signal/gui_trigger.c',
-       'misrc_gui/signal/gui_vectorscope.c', 'misrc_gui/signal/gui_testgen.c'],
+       'misrc_gui/signal/gui_vectorscope.c', 'misrc_gui/signal/gui_wfm.c', 'misrc_gui/signal/gui_testgen.c'],
       dependencies: cvbs_baseband_deps,
       include_directories: gui_includes,
       c_args: gui_cflags,
@@ -1068,12 +1069,27 @@ if raylib_dep.found()
     )
     test('gui_vectorscope', vectorscope_test, timeout: 120)
 
+    # Composite waveform monitor: Test Gen bars through the WFM panel's decode
+    # chain must land on their luma levels, sync/blanking on the normative
+    # levels and the sync edge on 0H.
+    wfm_test = executable('gui_wfm_test',
+      ['test/gui_wfm_test.c', 'misrc_gui/signal/gui_trigger.c',
+       'misrc_gui/signal/gui_vectorscope.c', 'misrc_gui/signal/gui_wfm.c',
+       'misrc_gui/signal/gui_testgen.c'],
+      dependencies: cvbs_baseband_deps,
+      include_directories: gui_includes,
+      c_args: gui_cflags,
+      link_args: ldflags,
+      override_options: ['b_lto=true', 'optimization=2'],
+    )
+    test('gui_wfm', wfm_test, timeout: 120)
+
     # Video decode line placement: an analytic composite with exact line
     # timing through the panel path (soxr + decode); every vertical bar edge
     # must decode as a straight line (sub-sample placement, nominal scale).
     cvbs_line_test = executable('gui_cvbs_line_test',
       ['test/gui_cvbs_line_test.c', 'misrc_gui/signal/gui_trigger.c',
-       'misrc_gui/signal/gui_vectorscope.c', 'misrc_gui/signal/gui_testgen.c'],
+       'misrc_gui/signal/gui_vectorscope.c', 'misrc_gui/signal/gui_wfm.c', 'misrc_gui/signal/gui_testgen.c'],
       dependencies: cvbs_baseband_deps,
       include_directories: gui_includes,
       c_args: gui_cflags,
@@ -1144,7 +1160,7 @@ if raylib_dep.found()
         'test/gui_rf_playback_reconnect_test.c', 'test/gui_playback_audio_stub.c',
         'test/monitor_local_save_stub.c',
         'common/file_utils.c',
-        'misrc_gui/signal/gui_vectorscope.c',
+        'misrc_gui/signal/gui_vectorscope.c', 'misrc_gui/signal/gui_wfm.c',
         'misrc_gui/input/gui_playback_length_cache.c',
         'misrc_gui/visualization/gui_fft.c',
         'misrc_gui/ui/gui_chrome_hide.c',

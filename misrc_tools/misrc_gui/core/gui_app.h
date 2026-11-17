@@ -33,6 +33,7 @@ typedef enum {
     PANEL_VIEW_SPECTROGRAPH,       // Scrolling FFT spectrogram (time X, freq Y)
     PANEL_VIEW_DEMOD,              // Demodulator (WFM/NFM/AM/USB/LSB) view on I/Q samples
     PANEL_VIEW_VECTORSCOPE,        // Composite vectorscope (burst-locked chroma U/V)
+    PANEL_VIEW_WFM,                // Composite waveform monitor (tbc-analyse raster)
     PANEL_VIEW_COUNT
     // Future: PANEL_VIEW_XY
 } panel_view_type_t;

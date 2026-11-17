@@ -16,11 +16,17 @@
 #include "../ui/gui_ui.h"
 #include "../ui/gui_chrome_hide.h"
 #include "gui_text.h"
+#include "gui_oscilloscope.h"   // gui_waveform_test_mode_active
+#include "../signal/gui_testgen.h"  // gui_testgen_clamp_system
 #include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+// Test Gen follow hold: field measurements (~5 s) before Auto may vote
+// against a followed system that never arrives.
+#define GEN_FOLLOW_HOLD_FIELDS 250
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -43,6 +49,16 @@ typedef struct {
     atomic_bool auto_system;       // Auto: 50 Hz fields -> PAL, 59.94 -> NTSC
     uint32_t seen_measures;        // Display thread: last vsync measurement read
     int vote_system, votes;        // Display thread: consecutive mismatching fields
+    // Test Gen follow (the Video panels' behaviour): the render thread
+    // watches the generator's system (app->settings.video_system) in test
+    // signal mode and queues it; the decode thread then HOLDS Auto voting
+    // until a measured field period matches the followed system (or
+    // GEN_FOLLOW_HOLD_FIELDS pass), so the old system's tail still in the
+    // pipeline - and the generator's regeneration gap - cannot vote the
+    // panel back (NTSC -> SECAM otherwise fell back to NTSC, then PAL).
+    int follow_hold;               // Decode thread: field measurements left
+    int follow_target;             // Decode thread: the followed system
+    int gen_seen;                  // Render thread: last generator system followed (-1 none)
 
     // Render thread: the last two fields (one frame, like tbc's "All").
     uint32_t *field_counts[2];
@@ -131,6 +147,7 @@ static void *vs_create(void) {
     dec->vscope = &s->scope;
     gui_cvbs_feed_set_pixels(s->feed, false);   // scope only: no picture pass
     atomic_init(&s->pending_system, -1);
+    s->gen_seen = -1;
     int sys = (dec->state.format == CVBS_FORMAT_NTSC) ? 1
             : (dec->state.format == CVBS_FORMAT_SECAM) ? 2 : 0;
     atomic_init(&s->decoder_system, sys);
@@ -186,6 +203,9 @@ static void vs_process(void *state_ptr, const int16_t *samples, size_t count,
     if (!s || !s->feed || !samples || count == 0) return;
     int pending = atomic_exchange(&s->pending_system, -1);
     if (pending >= 0 && pending <= 2) {
+        s->follow_target = pending;
+        s->follow_hold = GEN_FOLLOW_HOLD_FIELDS;
+        s->votes = 0;
         gui_cvbs_feed_set_system(s->feed, pending);
         gui_vectorscope_reset(&s->scope);
         atomic_store(&s->decoder_system, pending);
@@ -205,7 +225,13 @@ static void vs_process(void *state_ptr, const int16_t *samples, size_t count,
         int want = det == GUI_VSCOPE_SYS_PAL ? 0 : det == GUI_VSCOPE_SYS_NTSC ? 1 : -1;
         int cur = atomic_load(&s->decoder_system);
         bool match = want == cur || (want == 0 && cur == 2);
-        if (want < 0) {
+        if (s->follow_hold > 0) {
+            // Held after a follow: release once the stream shows the
+            // followed system's field rate (625-line covers SECAM).
+            bool arrived = want == s->follow_target || (want == 0 && s->follow_target == 2);
+            s->follow_hold = arrived ? 0 : s->follow_hold - 1;
+            s->votes = 0;
+        } else if (want < 0) {
             // Unclassifiable interval (a missed or false sync): no vote.
         } else if (match) {
             s->votes = 0;
@@ -221,11 +247,34 @@ static void vs_process(void *state_ptr, const int16_t *samples, size_t count,
     }
 }
 
+// Manual System pick: queue it without touching the generator tracking,
+// so it holds until the generator's system next changes (the Video
+// panels' "user override once flipped" rule).
+static void vs_queue_system(vectorscope_panel_t *s, int system_select) {
+    if (s && system_select >= 0 && system_select <= 2) {
+        atomic_store(&s->pending_system, system_select);
+    }
+}
+
 static void vs_follow_system(void *state_ptr, int system_select) {
     vectorscope_panel_t *s = state_ptr;
     if (s && system_select >= 0 && system_select <= 2) {
         atomic_store(&s->pending_system, system_select);
+        s->gen_seen = system_select;   // UI thread (Gen click / follow)
     }
+}
+
+// Test signal mode: follow the generator's system whatever changed it (the
+// Gen button, a Video panel's System pick, --gen-system), like the Video
+// panels' decoders. MESECAM (RF only) is SECAM on the composite side.
+static void vs_follow_generator(vectorscope_panel_t *s, gui_app_t *app) {
+    if (!gui_waveform_test_mode_active(app)) {
+        s->gen_seen = -1;   // re-sync on the next entry into test mode
+        return;
+    }
+    int sys = gui_testgen_clamp_system(app->settings.video_system);
+    if (sys == 3) sys = 2;
+    if (sys != s->gen_seen) vs_follow_system(s, sys);
 }
 
 //-----------------------------------------------------------------------------
@@ -394,12 +443,12 @@ static void vs_draw_graticule(const vectorscope_panel_t *s, int system,
 
 static void vs_render(void *state_ptr, gui_app_t *app, int channel,
                       Rectangle bounds, Color channel_color) {
-    (void)app;
     (void)channel;
     (void)channel_color;
     vectorscope_panel_t *s = state_ptr;
     DrawRectangleRec(bounds, COLOR_METER_BG);
     if (!s) return;
+    vs_follow_generator(s, app);
 
     int system = atomic_load(&s->decoder_system) == 1 ? GUI_VSCOPE_SYS_NTSC
                : atomic_load(&s->decoder_system) == 2 ? GUI_VSCOPE_SYS_SECAM
@@ -524,11 +573,11 @@ static bool vs_handle_click(void *state_ptr, gui_app_t *app, int channel,
                     // Auto -> PAL -> NTSC -> SECAM -> Auto.
                     if (atomic_load(&s->auto_system)) {
                         atomic_store(&s->auto_system, false);
-                        vs_follow_system(s, 0);
+                        vs_queue_system(s, 0);
                     } else if (atomic_load(&s->decoder_system) >= 2) {
                         atomic_store(&s->auto_system, true);
                     } else {
-                        vs_follow_system(s, atomic_load(&s->decoder_system) + 1);
+                        vs_queue_system(s, atomic_load(&s->decoder_system) + 1);
                     }
                     break;
                 }

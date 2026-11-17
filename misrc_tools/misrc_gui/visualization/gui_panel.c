@@ -34,6 +34,7 @@ static const char* s_view_names[] = {
     [PANEL_VIEW_SPECTROGRAPH] = "Spectro",
     [PANEL_VIEW_DEMOD] = "Demod",
     [PANEL_VIEW_VECTORSCOPE] = "Vector",
+    [PANEL_VIEW_WFM] = "WFM",
 };
 
 const char* panel_view_type_name(panel_view_type_t type) {
@@ -47,6 +48,7 @@ bool panel_view_type_available(panel_view_type_t type) {
         case PANEL_VIEW_CVBS:
         case PANEL_VIEW_HISTOGRAM:
         case PANEL_VIEW_VECTORSCOPE:
+        case PANEL_VIEW_WFM:
             return true;
         case PANEL_VIEW_FFT:
             return gui_fft_available();

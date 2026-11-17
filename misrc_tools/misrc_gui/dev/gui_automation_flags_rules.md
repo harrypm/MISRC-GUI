@@ -64,6 +64,12 @@ GUI autoload trigger flag.**
   vectorscope "Vector" view): `--panel-view <a|b>:<left>[,<right>]`
   (one view = single, two = split; repeatable per channel; unknown names
   print the accepted list and exit 1; logs `[AUTO] --panel-view`). [2026-11-14]
+- WFM (waveform monitor) panel System / Channel / Range / Units / Phosphor /
+  Intensity buttons: `--wfm <key=value,...>` (channel=y|yc|c, range=
+  active|frame, units=ire|mv, phosphor=on|off, intensity=0.1..10, system=
+  auto|pal|ntsc|secam; launch state of every WFM panel created after it;
+  unknown keys/values print the accepted list and exit 1; logs
+  `[AUTO] --wfm` and `[AUTO] WFM panel: ...` per panel). [2026-11-16]
 
 ## Known gaps (backlog under this rule — do not grow this list)
 

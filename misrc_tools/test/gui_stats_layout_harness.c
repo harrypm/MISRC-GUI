@@ -58,7 +58,7 @@ const char *panel_view_type_name(panel_view_type_t type)
 {
     static const char *names[] = {
         "Waveform", "FFT", "Video", "Histogram", "Waterfall", "Spectro", "Demod",
-        "Vector"
+        "Vector", "WFM"
     };
     return type >= 0 && type < PANEL_VIEW_COUNT ? names[type] : "Unknown";
 }

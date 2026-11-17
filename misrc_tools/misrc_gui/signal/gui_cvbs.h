@@ -428,6 +428,10 @@ typedef struct cvbs_decoder {
     // Line-locked chroma state for the vectorscope sink (gui_cvbs.c;
     // allocated on the first staged line, freed by gui_cvbs_cleanup).
     struct cvbs_vscope_ll *vscope_ll;
+    // Optional waveform monitor sink (WFM panel only; NULL = no per-line
+    // cost): every locked line on its sub-sample 0H grid plus a field-end
+    // publish (gui_wfm.h). Set only while stopped.
+    struct gui_wfm *wfm;
 
     // SECAM FM-chroma state (active when the format is CVBS_FORMAT_SECAM and
     // colour_mode is AUTO; see cvbs_secam_state_t above)
@@ -630,7 +634,7 @@ void gui_cvbs_get_secam_diag(cvbs_decoder_t *decoder,
 
 // The CVBS plugin's exact decode chain (fixed-rate resampler + decoder),
 // created in the persisted default system. Used by the composite vectorscope
-// panel. Not thread-safe: create/destroy/set_system/process on one thread
+// and waveform monitor panels. Not thread-safe: create/destroy/set_system/process on one thread
 // (the display thread) or while that thread is not processing.
 typedef struct gui_cvbs_feed gui_cvbs_feed_t;
 gui_cvbs_feed_t *gui_cvbs_feed_create(void);
@@ -650,6 +654,10 @@ void gui_cvbs_feed_set_pixels(gui_cvbs_feed_t *feed, bool wanted);
 // The composite vectorscope panel registers its Test Gen follow hook here
 // (queues a system change 0..2, applied on the panel's decode thread).
 void gui_cvbs_set_vectorscope_follow(void (*follow)(void *state, int system_select));
+// Same hook for any other panel view driven by its own composite feed (the
+// waveform monitor).
+void gui_cvbs_set_feed_follow(panel_view_type_t view,
+                              void (*follow)(void *state, int system_select));
 
 // UI publishes active routes once per frame. Extraction does not use the display DSP lock.
 void gui_video_update_rf_routes(gui_app_t *app);

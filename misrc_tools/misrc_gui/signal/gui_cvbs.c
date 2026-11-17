@@ -7,6 +7,7 @@
 
 #include "gui_cvbs.h"
 #include "gui_vectorscope.h"
+#include "gui_wfm.h"
 #include "../input/gui_playback.h"
 #include "../output/gui_audio.h"
 #include "../output/gui_record.h"
@@ -2571,6 +2572,32 @@ static void decode_line_to_pixels(cvbs_decoder_t *decoder,
     if (decoder->vscope && colour && picture_line) {
         cvbs_vscope_ll_line(decoder, samples, sample_count, carrier_anchor, range);
     }
+    // Waveform monitor: this line on the monitor's fixed time grid. The
+    // line buffer's 0H (the sync leading edge's 50% point) sits at
+    // -CVBS_SYNC_EDGE_DELAY_SAMPLES - line_off (the pixel loop's placement);
+    // the monitor reads the line, and the previous line's front porch, from
+    // the raw-sample ring (src[0] = ring0).
+    if (decoder->wfm && decoder->pll.locked) {
+        gui_wfm_line_t wl = {
+            .ring = decoder->vsync.h_ring,
+            .ring_mask = CVBS_H_RING - 1,
+            .ring0 = ring0,
+            .off0h = -(double)CVBS_SYNC_EDGE_DELAY_SAMPLES - line_off,
+            .rate = cvbs_rate(decoder),
+            .line_us = profile->line_us,
+            .burst_end_us = profile->burst_end_us,
+            .active_start_us = profile->active_start_us,
+            .active_end_us = profile->active_end_us,
+            .swing_nom = decoder->adaptive.porch_valid
+                ? (double)decoder->adaptive.porch_level - (double)decoder->levels.sig_min
+                : 0.0,
+            .system = decoder->state.format == CVBS_FORMAT_NTSC ? GUI_WFM_SYS_NTSC
+                    : decoder->state.format == CVBS_FORMAT_SECAM ? GUI_WFM_SYS_SECAM
+                    : GUI_WFM_SYS_PAL,
+            .picture = picture_line,
+        };
+        gui_wfm_add_line(decoder->wfm, &wl);
+    }
     if (colour && want_pixels) {
         double rate = cvbs_rate(decoder);
         double dphase = 2.0 * M_PI * profile->fsc_hz / rate;
@@ -3841,6 +3868,7 @@ static void complete_field_pll(cvbs_decoder_t *decoder) {
     decoder->field_sequence++;
     decoder->field_last_update_seq[field_idx] = decoder->field_sequence;
     if (decoder->vscope) gui_vectorscope_end_field(decoder->vscope);
+    if (decoder->wfm) gui_wfm_end_field(decoder->wfm);
 
     // Deinterlace and display - works with one or both fields
     // Bob mode is used until both fields are available, then weave takes over
@@ -7315,9 +7343,9 @@ static const panel_vtable_t s_cvbs_vtable = {
 // generator mode when the signal changes, allow user override once
 // flipped". Also makes newly created panels start in the generator's
 // system.
-// Registered by the composite vectorscope panel (a runtime hook so the
-// decoder core never links the panel's render code).
-static void (*s_vectorscope_follow)(void *state, int system_select);
+// Registered by the feed-driven panels (composite vectorscope, waveform
+// monitor): runtime hooks so the decoder core never links their render code.
+static void (*s_feed_follow[PANEL_VIEW_COUNT])(void *state, int system_select);
 
 void gui_video_follow_generator_system(gui_app_t *app, int system) {
     // 0..3 (3=MESECAM, RF-only: composite decodes SECAM). The old <= 2
@@ -7339,9 +7367,10 @@ void gui_video_follow_generator_system(gui_app_t *app, int system) {
             void *state = slot ? cfg->right_state : cfg->left_state;
             /* MESECAM (3) is RF-only - the composite side decodes SECAM. */
             int composite_system = (system == 3) ? 2 : system;
-            if (view == PANEL_VIEW_VECTORSCOPE && state) {
-                /* Composite vectorscope: applied on its decode thread. */
-                if (s_vectorscope_follow) s_vectorscope_follow(state, composite_system);
+            if ((unsigned)view < PANEL_VIEW_COUNT && s_feed_follow[view] && state) {
+                /* Feed-driven panels (vectorscope, waveform monitor):
+                 * applied on their decode thread. */
+                s_feed_follow[view](state, composite_system);
                 continue;
             }
             if (view != PANEL_VIEW_CVBS || !state) continue;
@@ -7392,7 +7421,12 @@ struct gui_cvbs_feed {
 };
 
 void gui_cvbs_set_vectorscope_follow(void (*follow)(void *state, int system_select)) {
-    s_vectorscope_follow = follow;
+    s_feed_follow[PANEL_VIEW_VECTORSCOPE] = follow;
+}
+
+void gui_cvbs_set_feed_follow(panel_view_type_t view,
+                              void (*follow)(void *state, int system_select)) {
+    if ((unsigned)view < PANEL_VIEW_COUNT && view != PANEL_VIEW_CVBS) s_feed_follow[view] = follow;
 }
 
 gui_cvbs_feed_t *gui_cvbs_feed_create(void) {

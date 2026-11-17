@@ -876,6 +876,10 @@ static bool waveform_test_mode_active(gui_app_t *app) {
            !atomic_load(&app->playback_running);
 }
 
+bool gui_waveform_test_mode_active(gui_app_t *app) {
+    return waveform_test_mode_active(app);
+}
+
 // Player-only render-resolution selector visibility: the selected device is
 // the playback device and the panel is not in test-generator mode (the Gen
 // row owns the second overlay row there). User request 2026-11-03.

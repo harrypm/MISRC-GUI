@@ -36,6 +36,7 @@
 #endif
 #include "../input/gui_playback.h"
 #include "../visualization/gui_text.h"
+#include "../visualization/gui_wfm_panel.h"
 #include "../input/gui_capture.h"
 #include "../processing/gui_extract.h"
 #include "../signal/gui_cvbs.h"
@@ -142,8 +143,12 @@ static void print_usage(const char *program_name) {
             "           FM RF waveform panels (the RF modulation family).\n"
             "--panel-view <a|b>:<left>[,<right>] set a channel's panel view(s) at\n"
             "           launch: waveform|fft|video|histogram|waterfall|spectro|demod|\n"
-            "           vector. One view = single panel, two = split. Repeatable for\n"
-            "           both channels.\n"
+            "           vector|wfm. One view = single panel, two = split. Repeatable\n"
+            "           for both channels.\n"
+            "--wfm <key=value,...> launch state of WFM (waveform monitor) panels:\n"
+            "           channel=y|yc|c, range=active|frame, units=ire|mv,\n"
+            "           phosphor=on|off, intensity=0.1..10, system=auto|pal|ntsc|\n"
+            "           secam (any subset; defaults y, active, ire, off, 3.0, auto).\n"
             "--auto-capture starts capture unattended ~1 s after launch (Local mode;\n"
             "           no --config required).\n"
             "--auto-record <seconds> runs a full unattended record cycle: start\n"
@@ -854,7 +859,7 @@ static int gui_parse_panel_view_name(const char *name, size_t len) {
 
 static bool gui_apply_panel_view_arg(gui_app_t *app, const char *arg) {
     const char *usage = "--panel-view: expected <a|b>:<left>[,<right>] with views "
-                        "waveform|fft|video|histogram|waterfall|spectro|demod|vector";
+                        "waveform|fft|video|histogram|waterfall|spectro|demod|vector|wfm";
     char ch = arg ? (char)tolower((unsigned char)arg[0]) : 0;
     if ((ch != 'a' && ch != 'b') || arg[1] != ':') {
         fprintf(stderr, "%s (got '%s')\n", usage, arg ? arg : "");
@@ -986,6 +991,17 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "--panel-view requires <a|b>:<left>[,<right>] (at most twice)\n");
                 return 1;
             }
+            continue;
+        }
+        if (strcmp(a, "--wfm") == 0) {
+            // --wfm <key=value,...>: launch state of new WFM panels (hard rule
+            // dev/gui_automation_flags_rules.md). Validated here, fail fast;
+            // applied before --panel-view creates any panel.
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--wfm requires <key=value,...>\n");
+                return 1;
+            }
+            if (!gui_wfm_panel_apply_launch_arg(argv[++i])) return 1;
             continue;
         }
         if (strcmp(a, "--auto-capture") == 0) {

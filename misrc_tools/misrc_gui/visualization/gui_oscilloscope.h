@@ -38,6 +38,12 @@ void gui_waveform_panel_register(void);
 // gui_simulated_start() succeeds.
 void gui_waveform_apply_generator_defaults(gui_app_t *app);
 
+// Test signal mode: the Simulated device is the selected source, not
+// recording, no playback session (the Gen row's visibility rule). The
+// feed-driven panels (Vector, WFM) follow the generator's system while it
+// holds.
+bool gui_waveform_test_mode_active(gui_app_t *app);
+
 //-----------------------------------------------------------------------------
 // Cleanup
 //-----------------------------------------------------------------------------
