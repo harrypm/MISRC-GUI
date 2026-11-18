@@ -1113,8 +1113,7 @@ void gui_app_init(gui_app_t *app) {
         gui_fft_panel_register();
         gui_cvbs_panel_register();
         gui_histogram_panel_register();
-        gui_waterfall_panel_register();
-        gui_spectrograph_panel_register();
+        gui_spectrograph_panel_register();   // Spectro (Waterfall merged in: Dir Vertical)
         gui_demod_panel_register();
         gui_vectorscope_panel_register();
         gui_wfm_panel_register();

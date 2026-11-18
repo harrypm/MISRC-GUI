@@ -52,9 +52,10 @@ bool panel_view_type_available(panel_view_type_t type) {
             return true;
         case PANEL_VIEW_FFT:
             return gui_fft_available();
-        case PANEL_VIEW_WATERFALL:
         case PANEL_VIEW_SPECTROGRAPH:
             return gui_spectrogram_available();
+        case PANEL_VIEW_WATERFALL:
+            return false;   // Legacy: merged into Spectro (Dir: Vertical); not listed
         case PANEL_VIEW_DEMOD:
             return gui_demod_available();
         default:
@@ -277,7 +278,13 @@ static void panel_slot_switch_view(panel_view_type_t *view, void **state,
     *state = create_state ? panel_create_view_state(new_view) : NULL;
 }
 
+// The legacy Waterfall id opens Spectro (no Waterfall panel is registered).
+static panel_view_type_t panel_view_resolve(panel_view_type_t type) {
+    return type == PANEL_VIEW_WATERFALL ? PANEL_VIEW_SPECTROGRAPH : type;
+}
+
 void panel_config_set_left_view(channel_panel_config_t *config, panel_view_type_t type) {
+    type = panel_view_resolve(type);
     panel_slot_switch_view(&config->left_view, &config->left_state,
                            &config->left_cached_view,
                            &config->left_cached_state,
@@ -285,6 +292,7 @@ void panel_config_set_left_view(channel_panel_config_t *config, panel_view_type_
 }
 
 void panel_config_set_right_view(channel_panel_config_t *config, panel_view_type_t type) {
+    type = panel_view_resolve(type);
     panel_slot_switch_view(&config->right_view, &config->right_state,
                            &config->right_cached_view,
                            &config->right_cached_state,

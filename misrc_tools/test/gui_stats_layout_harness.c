@@ -65,7 +65,8 @@ const char *panel_view_type_name(panel_view_type_t type)
 
 bool panel_view_type_available(panel_view_type_t type)
 {
-    return type >= 0 && type < PANEL_VIEW_COUNT;
+    // As the app: the legacy Waterfall id is merged into Spectro, not listed.
+    return type >= 0 && type < PANEL_VIEW_COUNT && type != PANEL_VIEW_WATERFALL;
 }
 
 static void reset_app(void)

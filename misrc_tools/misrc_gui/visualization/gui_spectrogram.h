@@ -1,13 +1,15 @@
 /*
- * MISRC GUI - Real-time Spectrogram / Waterfall panel module
+ * MISRC GUI - Real-time Spectrogram panel module ("Spectro")
  *
- * Provides two FFT-derived scrolling 2D color views that share one engine:
+ * One FFT-derived scrolling 2D colour view with a readout-direction
+ * dropdown (top-right, left of the palette dropdown, no label):
  *
- *   Waterfall    - frequency on X, time scrolling down, newest at top
- *                  (SDR / radio convention).
- *   Spectrograph - time on X scrolling left, frequency on Y with low freq
- *                  at the bottom and high freq at the top (audio / speech
- *                  spectrogram convention).
+ *   Horizontal - time on X scrolling left, frequency on Y with low freq
+ *                at the bottom and high freq at the top (audio / speech
+ *                spectrogram convention). The default.
+ *   Vertical   - frequency on X, time scrolling down, newest at top
+ *                (SDR / radio waterfall convention; the former Waterfall
+ *                view, merged 2026-11-18).
  *
  * Both reuse the existing FFT engine (gui_fft_process_raw / fft_state_t) for
  * the per-frame magnitude spectrum, then map magnitude to the same heatmap
@@ -35,11 +37,18 @@
 // Panel Interface Registration
 //-----------------------------------------------------------------------------
 
-// Register the Waterfall panel vtable with the panel registry. Call once at startup.
-void gui_waterfall_panel_register(void);
-
-// Register the Spectrograph panel vtable with the panel registry. Call once at startup.
+// Register the Spectro panel vtable with the panel registry. Call once at startup.
 void gui_spectrograph_panel_register(void);
+
+// --spectro <key=value,...>: launch state of every Spectro panel created after
+// it (dir=horizontal|vertical, palette=phosphor|heat; the palette is shared by
+// all Spectro panels). Prints the accepted list and returns false on a bad
+// key / value.
+bool gui_spectrogram_apply_launch_arg(const char *arg);
+
+// Set a Spectro panel's readout direction (state = the panel's view state;
+// the legacy --panel-view name "waterfall" opens Spectro vertical).
+void gui_spectrogram_set_vertical(void *state, bool vertical);
 
 //-----------------------------------------------------------------------------
 // Availability

@@ -1,9 +1,12 @@
 /*
- * MISRC GUI - Real-time Spectrogram / Waterfall panel implementation
+ * MISRC GUI - Real-time Spectrogram panel implementation ("Spectro")
  *
- * Shared engine for the Waterfall (PANEL_VIEW_WATERFALL) and Spectrograph
- * (PANEL_VIEW_SPECTROGRAPH) panels. See gui_spectrogram.h for the high-level
- * description and threading model.
+ * One panel (PANEL_VIEW_SPECTROGRAPH) with a readout-direction dropdown
+ * (harrypm 2026-11-18: "Merge waterfall mode into Spectro add a dropdown
+ * horisonstally to switch readout direction"): Horizontal is the former
+ * Spectro, Vertical the former Waterfall view (PANEL_VIEW_WATERFALL is kept
+ * only as a legacy id that maps here). See gui_spectrogram.h for the
+ * high-level description and threading model.
  *
  * Rendering strategy:
  *   A CPU RGBA8 history buffer is kept in "display order" (the row/column that
@@ -15,11 +18,13 @@
  *   DrawTexturePro using a negative source height so buffer row 0 maps to the
  *   top of the screen.
  *
- *   Waterfall:    freq on X (tex_w = SPEC_FREQ_BINS), time on Y scrolling down,
+ *   Vertical:     freq on X (tex_w = SPEC_FREQ_BINS), time on Y scrolling down,
  *                 newest written at buffer row 0 (drawn at the top).
- *   Spectrograph: time on X scrolling left (tex_w = SPEC_TIME_BINS), freq on Y,
+ *   Horizontal:   time on X scrolling left (tex_w = SPEC_TIME_BINS), freq on Y,
  *                 newest written at buffer col (tex_w-1) (drawn at the right),
  *                 high freq at buffer row 0 (drawn at the top).
+ *   Both hold SPEC_FREQ_BINS x SPEC_TIME_BINS pixels, so a direction change
+ *   only swaps the dimensions (the GPU texture is re-created).
  */
 
 #include "gui_spectrogram.h"
@@ -54,8 +59,8 @@
 // panel while paused adjusts the span (1 s .. 60 s).
 #define SPEC_PAUSED_WINDOW_SECONDS 3.0
 
-#define SPEC_LABEL_H     16     // Waterfall: bottom strip reserved for freq labels (px)
-#define SPEC_LABEL_W     34     // Spectrograph: left strip reserved for freq labels (px)
+#define SPEC_LABEL_H     16     // Vertical: bottom strip reserved for freq labels (px)
+#define SPEC_LABEL_W     34     // Horizontal: left strip reserved for freq labels (px)
 
 #define SPEC_AXIS_DIVS   8      // Number of frequency grid divisions
 
@@ -66,7 +71,7 @@
 typedef struct spectro_engine {
     fft_state_t fft;                 // Reusable FFT engine (display thread writes back buffer)
 
-    bool time_on_x;                  // false = Waterfall (freq X, time Y), true = Spectrograph (time X, freq Y)
+    bool time_on_x;                  // Dir: true = Horizontal (time X, freq Y), false = Vertical (freq X, time Y)
     int  freq_bins;                  // == SPEC_FREQ_BINS (frequency axis length in the texture)
     int  time_bins;                  // == SPEC_TIME_BINS (time axis length in the texture)
 
@@ -81,6 +86,7 @@ typedef struct spectro_engine {
 
     Texture2D tex;                   // GPU texture (created lazily in render thread)
     bool tex_valid;
+    bool tex_recreate;               // Direction changed: dimensions swapped, render re-creates the texture
     bool needs_full_upload;          // True after clear/init -> upload whole texture once
 
     bool frame_valid;                // True once at least one FFT frame has been consumed
@@ -110,6 +116,12 @@ typedef struct spectro_engine {
     Rectangle palette_btn_rect;
     Rectangle palette_opts_rect[2];
     bool palette_dropdown_open;
+
+    // Readout-direction dropdown (no label; left of the palette dropdown on
+    // the same row): Horizontal / Vertical.
+    Rectangle dir_btn_rect;
+    Rectangle dir_opts_rect[2];
+    bool dir_dropdown_open;
 
     // Double-click chrome-hide tracker (see ui/gui_chrome_hide.h): toggles
     // ALL overlay chrome (palette dropdown, axis labels, PAUSED indicator);
@@ -243,6 +255,79 @@ static void resample_magnitude(const float *src, int n_src, float *dst, int n_ds
 }
 
 //-----------------------------------------------------------------------------
+// Readout direction + launch state (--spectro)
+//-----------------------------------------------------------------------------
+
+enum { SPEC_DIR_HORIZONTAL = 0, SPEC_DIR_VERTICAL = 1, SPEC_DIR_COUNT };
+static const char *const s_dir_names[SPEC_DIR_COUNT] = { "Horizontal", "Vertical" };
+static const char *const s_palette_names[2] = { "Phosphor", "Heat" };
+
+// Launch state for new panels (hard rule dev/gui_automation_flags_rules.md).
+static struct {
+    int dir;
+    bool from_flag;
+} s_spec_launch = { SPEC_DIR_HORIZONTAL, false };
+
+bool gui_spectrogram_apply_launch_arg(const char *arg) {
+    static const char *usage =
+        "--spectro: expected comma-separated key=value pairs: dir=horizontal|vertical, "
+        "palette=phosphor|heat";
+    if (!arg || !*arg) {
+        fprintf(stderr, "%s (got '')\n", usage);
+        return false;
+    }
+    int dir = s_spec_launch.dir, palette = s_spec_palette;
+    const char *p = arg;
+    while (*p) {
+        const char *comma = strchr(p, ',');
+        size_t len = comma ? (size_t)(comma - p) : strlen(p);
+        const char *eq = memchr(p, '=', len);
+        size_t klen = eq ? (size_t)(eq - p) : 0;
+        const char *val = eq ? eq + 1 : NULL;
+        size_t vlen = eq ? len - klen - 1 : 0;
+        #define SPEC_IS(str, n, lit) ((n) == sizeof(lit) - 1 && strncmp((str), lit, (n)) == 0)
+        bool ok = false;
+        if (eq && SPEC_IS(p, klen, "dir")) {
+            if (SPEC_IS(val, vlen, "horizontal")) { dir = SPEC_DIR_HORIZONTAL; ok = true; }
+            else if (SPEC_IS(val, vlen, "vertical")) { dir = SPEC_DIR_VERTICAL; ok = true; }
+        } else if (eq && SPEC_IS(p, klen, "palette")) {
+            if (SPEC_IS(val, vlen, "phosphor")) { palette = SPEC_PALETTE_PHOSPHOR; ok = true; }
+            else if (SPEC_IS(val, vlen, "heat")) { palette = SPEC_PALETTE_HEAT; ok = true; }
+        }
+        #undef SPEC_IS
+        if (!ok) {
+            fprintf(stderr, "%s (got '%s')\n", usage, arg);
+            return false;
+        }
+        p += len + (comma ? 1 : 0);
+    }
+    s_spec_launch.dir = dir;
+    s_spec_launch.from_flag = true;
+    s_spec_palette = palette;   // the palette is shared by every Spectro panel
+    fprintf(stderr, "[AUTO] --spectro: dir=%s palette=%s\n", s_dir_names[dir],
+            s_palette_names[s_spec_palette]);
+    return true;
+}
+
+// Set the readout direction (no GL: the render re-creates the texture). The
+// history buffer holds the same pixel count either way; it is cleared (the
+// rolling history is laid out per direction).
+static void spectro_set_time_on_x(spectro_engine_t *e, bool time_on_x) {
+    if (!e || e->time_on_x == time_on_x) return;
+    e->time_on_x = time_on_x;
+    e->tex_w = time_on_x ? e->time_bins : e->freq_bins;
+    e->tex_h = time_on_x ? e->freq_bins : e->time_bins;
+    if (e->pixels) memset(e->pixels, 0, (size_t)e->tex_w * e->tex_h * 4);
+    e->tex_recreate = true;
+    e->needs_full_upload = true;
+    if (e->analysis_active) e->analysis_rerequest = true;
+}
+
+void gui_spectrogram_set_vertical(void *state, bool vertical) {
+    spectro_set_time_on_x((spectro_engine_t *)state, !vertical);
+}
+
+//-----------------------------------------------------------------------------
 // Lifecycle
 //-----------------------------------------------------------------------------
 
@@ -284,8 +369,14 @@ static void *spectro_create(bool time_on_x) {
     return e;
 }
 
-static void *waterfall_vtable_create(void)    { return spectro_create(false); }
-static void *spectrograph_vtable_create(void) { return spectro_create(true); }
+static void *spectrograph_vtable_create(void) {
+    void *state = spectro_create(s_spec_launch.dir == SPEC_DIR_HORIZONTAL);
+    if (state && s_spec_launch.from_flag) {
+        fprintf(stderr, "[AUTO] Spectro panel: dir=%s palette=%s\n",
+                s_dir_names[s_spec_launch.dir], s_palette_names[s_spec_palette]);
+    }
+    return state;
+}
 
 static void spectro_vtable_destroy(void *state_ptr) {
     if (!state_ptr) return;
@@ -337,7 +428,7 @@ static void spectro_append_frame(spectro_engine_t *e) {
     if (!e->frame_valid) return;
 
     if (!e->time_on_x) {
-        // Waterfall: time on Y (rows), freq on X (cols). Newest at row 0 (top).
+        // Vertical: time on Y (rows), freq on X (cols). Newest at row 0 (top).
         // Shift rows down by one (discard oldest at bottom).
         memmove(e->pixels + (size_t)e->tex_w * 4,
                 e->pixels,
@@ -350,7 +441,7 @@ static void spectro_append_frame(spectro_engine_t *e) {
             p[0] = c[0]; p[1] = c[1]; p[2] = c[2]; p[3] = c[3];
         }
     } else {
-        // Spectrograph: time on X (cols), freq on Y (rows). Newest at col (tex_w-1) (right).
+        // Horizontal: time on X (cols), freq on Y (rows). Newest at col (tex_w-1) (right).
         // High freq at row 0 (top), low freq at row (tex_h-1) (bottom).
         // Shift columns left by one (discard oldest at left), per row.
         for (int r = 0; r < e->tex_h; r++) {
@@ -372,13 +463,13 @@ static void spectro_append_frame(spectro_engine_t *e) {
 //-----------------------------------------------------------------------------
 
 // Write the current e->frame as time slice `index` (0 = window start).
-// Spectrograph: slice 0 at the LEFT edge, newest (window end) at the right.
-// Waterfall: slice 0 at the BOTTOM, newest at the top (matches live flow).
+// Horizontal: slice 0 at the LEFT edge, newest (window end) at the right.
+// Vertical: slice 0 at the BOTTOM, newest at the top (matches live flow).
 static void spectro_write_slice_index(spectro_engine_t *e, int index) {
     if (!e || !e->frame_valid || index < 0) return;
 
     if (!e->time_on_x) {
-        // Waterfall: freq on X (cols), time on Y (rows). Oldest at bottom.
+        // Vertical: freq on X (cols), time on Y (rows). Oldest at bottom.
         int row = e->time_bins - 1 - index;
         if (row < 0 || row >= e->tex_h) return;
         for (int f = 0; f < e->freq_bins && f < e->tex_w; f++) {
@@ -387,7 +478,7 @@ static void spectro_write_slice_index(spectro_engine_t *e, int index) {
             p[0] = c[0]; p[1] = c[1]; p[2] = c[2]; p[3] = c[3];
         }
     } else {
-        // Spectrograph: time on X (cols), freq on Y (rows). Oldest at left.
+        // Horizontal: time on X (cols), freq on Y (rows). Oldest at left.
         int col = index;
         if (col >= e->tex_w) return;
         for (int f = 0; f < e->freq_bins; f++) {
@@ -433,7 +524,8 @@ static void spectro_update_paused_window(spectro_engine_t *e, gui_app_t *app, in
     }
 }
 
-// Reload the view after a palette change (same spectra, new LUT):
+// Reload the view after a palette or direction change (same spectra, new
+// LUT / layout):
 // - Paused analysis: instantly re-map the current publication through the
 //   new LUT AND re-request the window (guarantees a fully-correct render
 //   even if a new publish raced the snapshot).
@@ -518,7 +610,7 @@ static void spectro_draw_overlay(spectro_engine_t *e, double real_rate_hz,
     }
 
     if (!e->time_on_x) {
-        // Waterfall: frequency on X (0 at left, Nyquist at right).
+        // Vertical: frequency on X (0 at left, Nyquist at right).
         // Labels drawn just inside the bottom edge.
         float label_y = bounds.y + bounds.height - label_h - pad;
         for (int d = 0; d <= divs; d++) {
@@ -562,7 +654,7 @@ static void spectro_draw_overlay(spectro_engine_t *e, double real_rate_hz,
         DrawLineEx((Vector2){bounds.x, bounds.y}, (Vector2){bounds.x + bounds.width, bounds.y},
                    2.0f, COLOR_GRID_MAJOR);
     } else {
-        // Spectrograph: frequency on Y (0 at bottom, Nyquist at top).
+        // Horizontal: frequency on Y (0 at bottom, Nyquist at top).
         // Labels drawn just inside the left edge, vertically centered on each gridline.
         float label_x = bounds.x + pad;
         for (int d = 0; d <= divs; d++) {
@@ -620,6 +712,56 @@ static void spectro_draw_overlay(spectro_engine_t *e, double real_rate_hz,
 }
 
 //-----------------------------------------------------------------------------
+// Dropdown drawing (the palette dropdown's style, shared by Dir)
+//-----------------------------------------------------------------------------
+
+static float spec_dropdown_width(const char *const *names, int n, float to_logical_w) {
+    float w = 0;
+    for (int i = 0; i < n; i++) {
+        float lw = (float)((int)(gui_text_measure(names[i], FONT_SIZE_DROPDOWN_OPT) * to_logical_w)) + 26;
+        if (lw > w) w = lw;
+    }
+    return w;
+}
+
+static void spec_draw_dropdown_button(Rectangle btn, const char *lbl, bool open, float to_logical_w) {
+    DrawRectangleRounded(btn, 0.15f, 4, open ? COLOR_BUTTON_HOVER : COLOR_BUTTON);
+    int text_w = (int)((float)gui_text_measure(lbl, FONT_SIZE_DROPDOWN_OPT) * to_logical_w);
+    float total_w = (float)text_w + 12;
+    float text_x = btn.x + (btn.width - total_w) / 2;
+    float text_y = btn.y + (btn.height - FONT_SIZE_DROPDOWN_OPT) / 2;
+    gui_text_draw(lbl, text_x, text_y, FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+    float as = 5.0f;
+    float ax = text_x + (float)text_w + 6;
+    float acy = btn.y + btn.height / 2;
+    if (open) {
+        Vector2 top = { ax + as / 2, acy - as / 2 };
+        Vector2 left = { ax, acy + as / 2 };
+        Vector2 right = { ax + as, acy + as / 2 };
+        DrawTriangle(top, left, right, COLOR_TEXT);
+    } else {
+        Vector2 bottom = { ax + as / 2, acy + as / 2 };
+        Vector2 left = { ax, acy - as / 2 };
+        Vector2 right = { ax + as, acy - as / 2 };
+        DrawTriangle(bottom, right, left, COLOR_TEXT);
+    }
+}
+
+static void spec_draw_dropdown_options(Rectangle btn, const char *const *names, int n, int selected,
+                                       Rectangle *opts, float to_logical_w) {
+    const float opt_h = 20;
+    for (int i = 0; i < n; i++) {
+        Rectangle opt = { btn.x, btn.y + btn.height + (float)i * opt_h, btn.width, opt_h };
+        opts[i] = opt;
+        bool hover = CheckCollisionPointRec(gui_ui_get_mouse_position(), opt);
+        DrawRectangleRec(opt, gui_dropdown_option_color(selected == i, hover));
+        int lw = (int)((float)gui_text_measure(names[i], FONT_SIZE_DROPDOWN_OPT) * to_logical_w);
+        gui_text_draw(names[i], opt.x + (opt.width - (float)lw) / 2,
+                      opt.y + (opt_h - FONT_SIZE_DROPDOWN_OPT) / 2, FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+    }
+}
+
+//-----------------------------------------------------------------------------
 // Rendering (render thread, GL available)
 //-----------------------------------------------------------------------------
 
@@ -640,6 +782,14 @@ static void spectro_vtable_render(void *state_ptr, gui_app_t *app, int channel,
                  FONT_SIZE_OSC_MSG, COLOR_TEXT_DIM);
         DrawRectangleLinesEx(bounds, 1, COLOR_GRID_MAJOR);
         return;
+    }
+
+    // A direction change swapped the history's dimensions: re-create the
+    // texture at the new size.
+    if (e->tex_recreate) {
+        if (e->tex_valid) UnloadTexture(e->tex);
+        e->tex_valid = false;
+        e->tex_recreate = false;
     }
 
     // Create the GPU texture lazily (needs an OpenGL context, i.e. render thread).
@@ -788,67 +938,39 @@ static void spectro_vtable_render(void *state_ptr, gui_app_t *app, int channel,
                      FONT_SIZE_OSC_SCALE, COLOR_TEXT);
     }
 
-    // Palette dropdown (top-right): Phosphor / Heat. Selecting a palette
-    // RELOADS the view through the new LUT (see spectro_palette_reload).
-    // Skipped entirely while the chrome is hidden (the button rect then
-    // stays stale; spectro_vtable_handle_click guards clicks on the flag).
+    // Top-right dropdown row, left to right: [Horizontal|Vertical]
+    // (readout direction) then the palette [Phosphor|Heat]. Selecting a
+    // palette or direction RELOADS the view (see spectro_palette_reload).
+    // Skipped entirely while the chrome is hidden (the button rects then
+    // stay stale; spectro_vtable_handle_click guards clicks on the flag).
     if (!gui_chrome_hide_hidden(&e->chrome_hide)) {
-        static const char *pal_names[2] = { "Phosphor", "Heat" };
-        float btn_h = 18;
-        float pad = 8;
-        float text_scale = gui_ui_get_scale_factor();
-        float to_logical_w = 1.0f / text_scale;
-        float btn_w = 0;
-        for (int i = 0; i < 2; i++) {
-            float w = (float)((int)(gui_text_measure(pal_names[i], FONT_SIZE_DROPDOWN_OPT) * to_logical_w)) + 26;
-            if (w > btn_w) btn_w = w;
-        }
+        const float btn_h = 18;
+        const float pad = 8;
+        const float gap = 6;
+        float to_logical_w = 1.0f / gui_ui_get_scale_factor();
+        float pal_w = spec_dropdown_width(s_palette_names, 2, to_logical_w);
+        float dir_w = spec_dropdown_width(s_dir_names, SPEC_DIR_COUNT, to_logical_w);
         e->palette_btn_rect = (Rectangle){
-            bounds.x + bounds.width - btn_w - pad, bounds.y + 6, btn_w, btn_h
+            bounds.x + bounds.width - pal_w - pad, bounds.y + 6, pal_w, btn_h
         };
-        Color btn_bg = e->palette_dropdown_open ? COLOR_BUTTON_HOVER : COLOR_BUTTON;
-        DrawRectangleRounded(e->palette_btn_rect, 0.15f, 4, btn_bg);
-        {
-            const char *lbl = pal_names[s_spec_palette];
-            int text_w = (int)((float)gui_text_measure(lbl, FONT_SIZE_DROPDOWN_OPT) * to_logical_w);
-            float total_w = (float)text_w + 12;
-            float text_x = e->palette_btn_rect.x + (e->palette_btn_rect.width - total_w) / 2;
-            float text_y = e->palette_btn_rect.y + (btn_h - FONT_SIZE_DROPDOWN_OPT) / 2;
-            gui_text_draw(lbl, text_x, text_y, FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
-            float as = 5.0f;
-            float ax = text_x + (float)text_w + 6;
-            float acy = e->palette_btn_rect.y + btn_h / 2;
-            if (e->palette_dropdown_open) {
-                Vector2 top = { ax + as / 2, acy - as / 2 };
-                Vector2 left = { ax, acy + as / 2 };
-                Vector2 right = { ax + as, acy + as / 2 };
-                DrawTriangle(top, left, right, COLOR_TEXT);
-            } else {
-                Vector2 bottom = { ax + as / 2, acy + as / 2 };
-                Vector2 left = { ax, acy - as / 2 };
-                Vector2 right = { ax + as, acy - as / 2 };
-                DrawTriangle(bottom, right, left, COLOR_TEXT);
-            }
+        e->dir_btn_rect = (Rectangle){
+            e->palette_btn_rect.x - gap - dir_w, bounds.y + 6, dir_w, btn_h
+        };
+        // No text label (harrypm 2026-11-18): the button reads Horizontal /
+        // Vertical on its own, like the palette button.
+        spec_draw_dropdown_button(e->dir_btn_rect, s_dir_names[e->time_on_x ? SPEC_DIR_HORIZONTAL
+                                                                            : SPEC_DIR_VERTICAL],
+                                  e->dir_dropdown_open, to_logical_w);
+        spec_draw_dropdown_button(e->palette_btn_rect, s_palette_names[s_spec_palette],
+                                  e->palette_dropdown_open, to_logical_w);
+        if (e->dir_dropdown_open) {
+            spec_draw_dropdown_options(e->dir_btn_rect, s_dir_names, SPEC_DIR_COUNT,
+                                       e->time_on_x ? SPEC_DIR_HORIZONTAL : SPEC_DIR_VERTICAL,
+                                       e->dir_opts_rect, to_logical_w);
         }
         if (e->palette_dropdown_open) {
-            float opt_h = 20;
-            for (int i = 0; i < 2; i++) {
-                Rectangle opt = {
-                    e->palette_btn_rect.x,
-                    e->palette_btn_rect.y + btn_h + (float)i * opt_h,
-                    e->palette_btn_rect.width,
-                    opt_h
-                };
-                e->palette_opts_rect[i] = opt;
-                bool selected = ((int)s_spec_palette == i);
-                bool hover = CheckCollisionPointRec(gui_ui_get_mouse_position(), opt);
-                DrawRectangleRec(opt, gui_dropdown_option_color(selected, hover));
-                const char *lbl = pal_names[i];
-                int lw = (int)((float)gui_text_measure(lbl, FONT_SIZE_DROPDOWN_OPT) * to_logical_w);
-                float lx = opt.x + (opt.width - (float)lw) / 2;
-                float ly = opt.y + (opt_h - FONT_SIZE_DROPDOWN_OPT) / 2;
-                gui_text_draw(lbl, lx, ly, FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
-            }
+            spec_draw_dropdown_options(e->palette_btn_rect, s_palette_names, 2, s_spec_palette,
+                                       e->palette_opts_rect, to_logical_w);
         }
     }
 }
@@ -857,14 +979,13 @@ static void spectro_vtable_render(void *state_ptr, gui_app_t *app, int channel,
 // Vtables + Registration
 //-----------------------------------------------------------------------------
 
-// Palette dropdown clicks (top-right): open/select/close. Selecting a
-// palette RELOADS the view through the new LUT (paused: the same spectra
-// re-mapped instantly + a fresh request; rolling: history cleared and
-// refilled in the new palette). Returns true when a control consumed the
-// click; false when no control was hit.
+// Dropdown clicks (top-right row: Dir, palette): open / select / close. A
+// selection RELOADS the view (paused: the same spectra re-mapped instantly +
+// a fresh request; rolling: history cleared and refilled). One dropdown is
+// open at a time. Returns true when a control consumed the click; false
+// when no control was hit.
 static bool spectro_handle_palette_click(spectro_engine_t *e, gui_app_t *app, int channel,
                                          Vector2 click) {
-
     if (e->palette_dropdown_open) {
         for (int i = 0; i < 2; i++) {
             if (CheckCollisionPointRec(click, e->palette_opts_rect[i])) {
@@ -881,8 +1002,27 @@ static bool spectro_handle_palette_click(spectro_engine_t *e, gui_app_t *app, in
         e->palette_dropdown_open = false;
         return true;
     }
+    if (e->dir_dropdown_open) {
+        for (int i = 0; i < SPEC_DIR_COUNT; i++) {
+            if (CheckCollisionPointRec(click, e->dir_opts_rect[i])) {
+                const bool time_on_x = i == SPEC_DIR_HORIZONTAL;
+                if (e->time_on_x != time_on_x) {
+                    spectro_set_time_on_x(e, time_on_x);
+                    spectro_palette_reload(e, app, channel);
+                }
+                e->dir_dropdown_open = false;
+                return true;
+            }
+        }
+        e->dir_dropdown_open = false;
+        return true;
+    }
     if (CheckCollisionPointRec(click, e->palette_btn_rect)) {
         e->palette_dropdown_open = true;
+        return true;
+    }
+    if (CheckCollisionPointRec(click, e->dir_btn_rect)) {
+        e->dir_dropdown_open = true;
         return true;
     }
     return false;
@@ -909,10 +1049,11 @@ static bool spectro_vtable_handle_click(void *state_ptr, gui_app_t *app, int cha
     }
 
     // Double-click anywhere else on the panel toggles ALL overlay chrome
-    // (palette dropdown, axis labels, PAUSED indicator) for a clean
+    // (Dir + palette dropdowns, axis labels, PAUSED indicator) for a clean
     // spectrogram view.
     if (gui_chrome_hide_feed_click(&e->chrome_hide, click)) {
         e->palette_dropdown_open = false;
+        e->dir_dropdown_open = false;
         return true;
     }
     return false;
@@ -938,20 +1079,6 @@ static bool spectro_vtable_handle_scroll(void *state_ptr, float delta, Rectangle
     return true;
 }
 
-static const panel_vtable_t s_waterfall_vtable = {
-    .name = "Waterfall",
-    .create = waterfall_vtable_create,
-    .destroy = spectro_vtable_destroy,
-    .clear = spectro_vtable_clear,
-    .process = spectro_vtable_process,
-    .render = spectro_vtable_render,
-    .render_overlay = NULL,
-    .handle_click = spectro_vtable_handle_click,
-    .handle_scroll = spectro_vtable_handle_scroll,
-    .get_menu_count = NULL,
-    .get_menu = NULL,
-};
-
 static const panel_vtable_t s_spectrograph_vtable = {
     .name = "Spectro",
     .create = spectrograph_vtable_create,
@@ -965,10 +1092,6 @@ static const panel_vtable_t s_spectrograph_vtable = {
     .get_menu_count = NULL,
     .get_menu = NULL,
 };
-
-void gui_waterfall_panel_register(void) {
-    panel_register(PANEL_VIEW_WATERFALL, &s_waterfall_vtable);
-}
 
 void gui_spectrograph_panel_register(void) {
     panel_register(PANEL_VIEW_SPECTROGRAPH, &s_spectrograph_vtable);

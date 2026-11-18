@@ -38,6 +38,7 @@
 #include "../visualization/gui_text.h"
 #include "../visualization/gui_wfm_panel.h"
 #include "../visualization/gui_vectorscope_panel.h"
+#include "../visualization/gui_spectrogram.h"
 #include "../input/gui_capture.h"
 #include "../processing/gui_extract.h"
 #include "../signal/gui_cvbs.h"
@@ -143,9 +144,9 @@ static void print_usage(const char *program_name) {
             "           betamax|video8|hi8 (or 0-4). Mirrors the Fmt button on\n"
             "           FM RF waveform panels (the RF modulation family).\n"
             "--panel-view <a|b>:<left>[,<right>] set a channel's panel view(s) at\n"
-            "           launch: waveform|fft|video|histogram|waterfall|spectro|demod|\n"
-            "           vector|wfm. One view = single panel, two = split. Repeatable\n"
-            "           for both channels.\n"
+            "           launch: waveform|fft|video|histogram|spectro|demod|vector|wfm\n"
+            "           (waterfall = spectro with Dir Vertical). One view = single\n"
+            "           panel, two = split. Repeatable for both channels.\n"
             "--wfm <key=value,...> launch state of WFM (waveform monitor) panels:\n"
             "           channel=y|yc|c, range=active|frame, units=ire|mv,\n"
             "           phosphor=on|off, intensity=0.1..10, system=auto|pal|ntsc|\n"
@@ -158,6 +159,11 @@ static void print_usage(const char *program_name) {
             "           intensity=1..10, system=auto|pal|ntsc|secam (any subset;\n"
             "           defaults standard, whole, active, 75, points, mono, on, 3,\n"
             "           auto; lines/field apply to the Advanced mode).\n"
+            "--spectro <key=value,...> launch state of Spectro panels:\n"
+            "           dir=horizontal|vertical (readout direction: time across,\n"
+            "           newest right / time down, newest top - the former\n"
+            "           Waterfall), palette=phosphor|heat (any subset; defaults\n"
+            "           horizontal, phosphor).\n"
             "--auto-capture starts capture unattended ~1 s after launch (Local mode;\n"
             "           no --config required).\n"
             "--auto-record <seconds> runs a full unattended record cycle: start\n"
@@ -855,7 +861,19 @@ static int gui_run_role_headless_server(const char *config_path,
 // --panel-view <a|b>:<left>[,<right>] (see print_usage). View names are the
 // view picker's names, lower case ("video", "vector", ...). Unknown values
 // print the accepted names and fail (hard rule: flags fail fast + log).
-static int gui_parse_panel_view_name(const char *name, size_t len) {
+// "waterfall" (the merged Waterfall view, 2026-11-18) is accepted as Spectro
+// with Dir: Vertical; *vertical reports it.
+static int gui_parse_panel_view_name(const char *name, size_t len, bool *vertical) {
+    *vertical = false;
+    static const char legacy[] = "waterfall";
+    if (len == sizeof(legacy) - 1 && panel_view_type_available(PANEL_VIEW_SPECTROGRAPH)) {
+        size_t k = 0;
+        while (k < len && tolower((unsigned char)name[k]) == legacy[k]) k++;
+        if (k == len) {
+            *vertical = true;
+            return PANEL_VIEW_SPECTROGRAPH;
+        }
+    }
     for (int vt = 0; vt < PANEL_VIEW_COUNT; vt++) {
         const char *known = panel_view_type_name((panel_view_type_t)vt);
         if (strlen(known) != len) continue;
@@ -868,7 +886,8 @@ static int gui_parse_panel_view_name(const char *name, size_t len) {
 
 static bool gui_apply_panel_view_arg(gui_app_t *app, const char *arg) {
     const char *usage = "--panel-view: expected <a|b>:<left>[,<right>] with views "
-                        "waveform|fft|video|histogram|waterfall|spectro|demod|vector|wfm";
+                        "waveform|fft|video|histogram|spectro|demod|vector|wfm "
+                        "(waterfall = spectro, Dir Vertical)";
     char ch = arg ? (char)tolower((unsigned char)arg[0]) : 0;
     if ((ch != 'a' && ch != 'b') || arg[1] != ':') {
         fprintf(stderr, "%s (got '%s')\n", usage, arg ? arg : "");
@@ -876,8 +895,9 @@ static bool gui_apply_panel_view_arg(gui_app_t *app, const char *arg) {
     }
     const char *left = arg + 2;
     const char *comma = strchr(left, ',');
-    int lv = gui_parse_panel_view_name(left, comma ? (size_t)(comma - left) : strlen(left));
-    int rv = comma ? gui_parse_panel_view_name(comma + 1, strlen(comma + 1)) : -1;
+    bool lvert = false, rvert = false;
+    int lv = gui_parse_panel_view_name(left, comma ? (size_t)(comma - left) : strlen(left), &lvert);
+    int rv = comma ? gui_parse_panel_view_name(comma + 1, strlen(comma + 1), &rvert) : -1;
     if (lv < 0 || (comma && rv < 0)) {
         fprintf(stderr, "%s (got '%s')\n", usage, arg);
         return false;
@@ -886,9 +906,12 @@ static bool gui_apply_panel_view_arg(gui_app_t *app, const char *arg) {
     panel_config_set_split(config, comma != NULL);
     panel_config_set_left_view(config, (panel_view_type_t)lv);
     if (comma) panel_config_set_right_view(config, (panel_view_type_t)rv);
-    fprintf(stderr, "[AUTO] --panel-view: channel %c %s%s%s\n", ch == 'a' ? 'A' : 'B',
-            panel_view_type_name((panel_view_type_t)lv), comma ? " | " : "",
-            comma ? panel_view_type_name((panel_view_type_t)rv) : "");
+    if (lvert && config->left_state) gui_spectrogram_set_vertical(config->left_state, true);
+    if (rvert && config->right_state) gui_spectrogram_set_vertical(config->right_state, true);
+    fprintf(stderr, "[AUTO] --panel-view: channel %c %s%s%s%s%s\n", ch == 'a' ? 'A' : 'B',
+            panel_view_type_name((panel_view_type_t)lv), lvert ? " (Dir Vertical)" : "",
+            comma ? " | " : "",
+            comma ? panel_view_type_name((panel_view_type_t)rv) : "", rvert ? " (Dir Vertical)" : "");
     return true;
 }
 
@@ -1023,6 +1046,17 @@ int main(int argc, char **argv) {
                 return 1;
             }
             if (!gui_vectorscope_panel_apply_launch_arg(argv[++i])) return 1;
+            continue;
+        }
+        if (strcmp(a, "--spectro") == 0) {
+            // --spectro <key=value,...>: launch state of new Spectro panels
+            // (hard rule dev/gui_automation_flags_rules.md). Validated here,
+            // fail fast; applied before --panel-view creates any panel.
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--spectro requires <key=value,...>\n");
+                return 1;
+            }
+            if (!gui_spectrogram_apply_launch_arg(argv[++i])) return 1;
             continue;
         }
         if (strcmp(a, "--auto-capture") == 0) {

@@ -29,8 +29,11 @@ typedef enum {
     PANEL_VIEW_FFT,                // FFT spectrum analysis
     PANEL_VIEW_CVBS,               // CVBS luma decoder view
     PANEL_VIEW_HISTOGRAM,          // Amplitude histogram
-    PANEL_VIEW_WATERFALL,          // Scrolling FFT spectrogram (freq X, time Y, newest at top)
-    PANEL_VIEW_SPECTROGRAPH,       // Scrolling FFT spectrogram (time X, freq Y)
+    PANEL_VIEW_WATERFALL,          // LEGACY id: merged into Spectro (Dir: Vertical) 2026-11-18;
+                                   // never registered or listed - set_*_view maps it to SPECTROGRAPH.
+                                   // Kept so the ids after it (and per-type tables) do not move.
+    PANEL_VIEW_SPECTROGRAPH,       // Scrolling FFT spectrogram "Spectro" (Dir: Horizontal = time X,
+                                   // freq Y; Vertical = freq X, time Y newest at top)
     PANEL_VIEW_DEMOD,              // Demodulator (WFM/NFM/AM/USB/LSB) view on I/Q samples
     PANEL_VIEW_VECTORSCOPE,        // Composite vectorscope (burst-locked chroma U/V)
     PANEL_VIEW_WFM,                // Composite waveform monitor (tbc-analyse raster)

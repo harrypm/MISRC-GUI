@@ -80,6 +80,14 @@ GUI autoload trigger flag.**
   after it; unknown keys/values print the accepted list and exit 1; logs
   `[AUTO] --vector` and `[AUTO] Vector panel: ...` per panel). Closes the
   vectorscope System/Graticule/Plot/Colour known gap. [2026-11-17]
+- Spectro panel Dir (readout direction) and palette dropdowns: `--spectro
+  <key=value,...>` (dir=horizontal|vertical, palette=phosphor|heat; launch
+  state of every Spectro panel created after it, the palette shared by all;
+  unknown keys/values print the accepted list and exit 1; logs
+  `[AUTO] --spectro` and `[AUTO] Spectro panel: ...` per panel). The Waterfall
+  view is merged into Spectro as Dir Vertical: `--panel-view a:waterfall`
+  still opens it (Spectro, Dir Vertical). The palette dropdown had no flag
+  before (an unlisted gap). [2026-11-18]
 
 ## Known gaps (backlog under this rule — do not grow this list)
 
