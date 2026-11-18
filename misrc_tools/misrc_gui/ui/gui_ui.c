@@ -42,6 +42,9 @@
 #include "../visualization/gui_custom_elements.h"
 #include "../../common/buffer_manager.h"
 #include "../../common/file_utils.h"
+#ifdef _WIN32
+#include "../../common/flac_writer.h"
+#endif
 #include "../../common/threading.h"
 #include <clay.h>
 #include <stdio.h>
@@ -1349,7 +1352,7 @@ static bool gui_ui_playback_channel_timeline_info(gui_app_t *app, int channel_in
 
     playback_file_info_t info = {0};
     // Live playback info while running; otherwise the file selected in
-    // settings (validated + cached per path) so timecodes show at idle too.
+    // settings if it has already been loaded, so timecodes can show after Stop.
     (void)gui_playback_get_selected_file_info(app, channel_index, &info);
 
     if (!info.valid) return false;
@@ -1583,16 +1586,14 @@ static void gui_ui_playback_file_basename(gui_app_t *app, int channel,
 {
     if (!dst || dst_len == 0) return;
     dst[0] = '\0';
-    playback_file_info_t info = {0};
-    (void)gui_playback_get_selected_file_info(app, channel, &info);
-    if (info.filepath[0] == '\0') return;
-    const char *slash = strrchr(info.filepath, '/');
+    const char *path = channel == 0 ? app->settings.playback_file_a : app->settings.playback_file_b;
+    const char *slash = strrchr(path, '/');
     const char *sep = slash;
 #ifdef _WIN32
-    const char *bslash = strrchr(info.filepath, '\\');
+    const char *bslash = strrchr(path, '\\');
     if (bslash && (!sep || bslash > sep)) sep = bslash;
 #endif
-    const char *base = sep ? (sep + 1) : info.filepath;
+    const char *base = sep ? (sep + 1) : path;
     gui_ui_copy_text_prefix(dst, dst_len, base);
 }
 static bool gui_ui_seek_playback_from_track(gui_app_t *app, int track_index, float mouse_x)
@@ -2479,7 +2480,9 @@ static bool gui_ui_set_ddd_v1_output_rate(gui_app_t *app,
 #endif
 
 static bool gui_ui_flac_affinity_supported(void) {
-#if defined(__linux__)
+#if defined(_WIN32)
+    return flac_writer_affinity_supported();
+#elif defined(__linux__)
     return true;
 #else
     return false;
@@ -4207,17 +4210,30 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                     }
 
                     if (app->settings.show_core_pinning_in_settings) {
-#if defined(__linux__)
-                        bool flac_affinity_supported = true;
+#ifdef _WIN32
+                        const char *affinity_reason = flac_writer_affinity_unavailable_reason();
+                        const bool flac_affinity_supported = affinity_reason == NULL;
+                        const bool affinity_on = app->settings.flac_affinity_enabled;
+                        const bool affinity_can_toggle = affinity_on ||
+                            (app->settings.use_flac && flac_affinity_supported);
+                        const Clay_String affinity_label = CLAY_STRING("FLAC core pinning (Windows)");
+                        const Clay_String affinity_hint = affinity_reason ? make_string(affinity_reason) :
+                            CLAY_STRING("e.g. 10-17,20");
 #else
-                        bool flac_affinity_supported = false;
+                        const bool flac_affinity_supported = gui_ui_flac_affinity_supported();
+                        const bool affinity_on = flac_affinity_supported && app->settings.flac_affinity_enabled;
+                        const bool affinity_can_toggle = app->settings.use_flac && flac_affinity_supported;
+                        const Clay_String affinity_label = flac_affinity_supported ?
+                            CLAY_STRING("FLAC core pinning (Linux)") : CLAY_STRING("FLAC core pinning");
+                        const Clay_String affinity_hint = flac_affinity_supported ?
+                            CLAY_STRING("e.g. 10-17,20") : CLAY_STRING("Linux/Windows only");
 #endif
-                        bool flac_affinity_available = app->settings.use_flac && flac_affinity_supported;
-                        bool flac_affinity_editable = flac_affinity_available && app->settings.flac_affinity_enabled;
-                        Color affinity_toggle_bg = flac_affinity_available
+                        const bool flac_affinity_editable = app->settings.use_flac &&
+                            flac_affinity_supported && app->settings.flac_affinity_enabled;
+                        Color affinity_toggle_bg = affinity_can_toggle
                             ? (app->settings.flac_affinity_enabled ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON)
                             : ui_disabled_color(COLOR_BUTTON);
-                        Color affinity_toggle_fg = flac_affinity_available
+                        Color affinity_toggle_fg = affinity_can_toggle
                             ? COLOR_TEXT
                             : ui_disabled_color(COLOR_TEXT);
                         Color affinity_list_bg = flac_affinity_editable
@@ -4227,9 +4243,9 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
 
                         CLAY(CLAY_ID("FlacAffinityToggleRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
                             CLAY(CLAY_ID("ToggleFlacAffinity"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(affinity_toggle_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
-                                CLAY_TEXT((app->settings.flac_affinity_enabled && flac_affinity_supported) ? CLAY_STRING("ON") : CLAY_STRING("OFF"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(affinity_toggle_fg) }));
+                                CLAY_TEXT(affinity_on ? CLAY_STRING("ON") : CLAY_STRING("OFF"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(affinity_toggle_fg) }));
                             }
-                            CLAY_TEXT(CLAY_STRING("FLAC core pinning (Linux)"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(affinity_toggle_fg) }));
+                            CLAY_TEXT(affinity_label, CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(affinity_toggle_fg) }));
                         }
 
                         CLAY(CLAY_ID("FlacAffinityListRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
@@ -4242,7 +4258,7 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                                     CLAY_TEXT(make_string(cpu_list), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(affinity_list_fg) }));
                                 }
                             }
-                            CLAY_TEXT(flac_affinity_supported ? CLAY_STRING("e.g. 10-17,20") : CLAY_STRING("Linux only"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                            CLAY_TEXT(affinity_hint, CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
                         }
                     }
 
@@ -11196,16 +11212,27 @@ void gui_handle_interactions(gui_app_t *app) {
                 gui_settings_save(&app->settings);
             }
             if (Clay_PointerOver(CLAY_ID("ToggleFlacAffinity"))) {
-                if (app->settings.show_core_pinning_in_settings &&
-                    gui_ui_flac_affinity_supported() &&
-                    app->settings.use_flac) {
+#ifdef _WIN32
+                const char *affinity_reason = flac_writer_affinity_unavailable_reason();
+                const bool flac_affinity_supported = affinity_reason == NULL;
+                const bool can_toggle = app->settings.flac_affinity_enabled ||
+                    (app->settings.use_flac && flac_affinity_supported);
+#else
+                const bool flac_affinity_supported = gui_ui_flac_affinity_supported();
+                const bool can_toggle = app->settings.use_flac && flac_affinity_supported;
+#endif
+                if (app->settings.show_core_pinning_in_settings && can_toggle) {
                     app->settings.flac_affinity_enabled = !app->settings.flac_affinity_enabled;
                     gui_settings_save(&app->settings);
                     if (!gui_ui_text_field_can_edit(app, s_active_text_field)) {
                         gui_ui_clear_text_edit();
                     }
-                } else if (!gui_ui_flac_affinity_supported()) {
-                    gui_app_set_status(app, "FLAC affinity is Linux-only");
+                } else if (!flac_affinity_supported) {
+#ifdef _WIN32
+                    gui_app_set_status(app, affinity_reason);
+#else
+                    gui_app_set_status(app, "FLAC affinity is available on Linux and compatible Windows builds");
+#endif
                 }
             }
             if (Clay_PointerOver(CLAY_ID("FlacAffinityListField")) &&

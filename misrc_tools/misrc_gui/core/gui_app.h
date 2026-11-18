@@ -273,8 +273,8 @@ typedef struct {
     int flac_level;                            // 0-8
     bool flac_verification;                    // Verify encoder output
     int flac_threads;                          // Number of threads
-    bool flac_affinity_enabled;                // Linux-only: pin FLAC work to selected CPU cores
-    char flac_affinity_cpu_list[64];           // Linux-only CPU list/range string, e.g. "10-17,20"
+    bool flac_affinity_enabled;                // Pin FLAC work on Linux and supported Windows builds
+    char flac_affinity_cpu_list[64];           // Linux/Windows affinity list, e.g. "10-17,20"
 
     // Audio output options
     bool enable_audio_4ch;

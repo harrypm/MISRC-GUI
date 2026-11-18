@@ -2523,7 +2523,11 @@ static void gui_record_open_session_log(gui_app_t *app, const gui_record_output_
         snprintf(msg, sizeof(msg), "FLAC affinity: enabled=%s cpu_list=%s support=%s",
                  app->settings.flac_affinity_enabled ? "on" : "off",
                  app->settings.flac_affinity_cpu_list[0] ? app->settings.flac_affinity_cpu_list : "(none)",
+#ifdef _WIN32
+                 flac_writer_affinity_supported() ? "windows" : "unsupported");
+#else
                  flac_writer_affinity_supported() ? "linux" : "unsupported");
+#endif
         gui_record_log_write_line_locked("INFO", msg);
     }
 
@@ -3238,8 +3242,14 @@ static int gui_record_start_confirmed(gui_app_t *app,
 
 #if LIBFLAC_ENABLED == 1
     if (app->settings.use_flac && app->settings.flac_affinity_enabled) {
+#ifdef _WIN32
+        const char *affinity_reason = flac_writer_affinity_unavailable_reason();
+        if (affinity_reason) {
+            gui_app_set_status(app, affinity_reason);
+#else
         if (!flac_writer_affinity_supported()) {
-            gui_app_set_status(app, "FLAC affinity is only supported on Linux");
+            gui_app_set_status(app, "FLAC affinity is available on Linux and compatible Windows builds");
+#endif
             return RECORD_ERROR;
         }
         char aff_err[256] = {0};

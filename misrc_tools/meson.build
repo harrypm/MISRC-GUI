@@ -469,6 +469,19 @@ rf_audio_sources = [
 # GUI application (requires raylib)
 raylib_dep = dependency('raylib', required: false, static: windows_static_deps)
 
+# Only the Windows GUI and its affinity test intercept libFLAC worker creation.
+windows_flac_affinity_deps = []
+if get_option('windows_flac_affinity').enabled()
+  if host_system != 'windows' or not flac_dep.found()
+    error('Windows FLAC core pinning requires a Windows target with libFLAC')
+  endif
+  winpthread_dep = meson.get_compiler('c').find_library('winpthread', static: true)
+  windows_flac_affinity_deps = [declare_dependency(
+    compile_args: ['-DMISRC_WINDOWS_FLAC_AFFINITY=1'],
+    link_args: ['-Wl,--wrap=pthread_create'],
+    dependencies: winpthread_dep)]
+endif
+
 # LD DTS shares FFmpeg's audio codec libraries with Monitor Video. It needs
 # AVChannelLayout (FFmpeg 5.1+) but does not need libswscale.
 modern_codecs = get_option('modern_monitor_codecs')
@@ -826,7 +839,7 @@ if raylib_dep.found()
     # real built binary (it drives the headless update CLI end to end).
     misrc_gui_exe = executable('misrc_gui',
                 sources_gui + gui_win_resources,
-                dependencies: gui_deps,
+                dependencies: gui_deps + windows_flac_affinity_deps,
                 include_directories: gui_includes,
                 link_args: gui_ldflags,
                 link_with: gui_extra_link_with,
@@ -1293,6 +1306,15 @@ rf_policy_test = executable('gui_rf_preview_policy_test',
   ['test/gui_rf_preview_policy_test.c', 'misrc_gui/processing/gui_rf_preview_policy.c'],
   c_args: cflags)
 test('gui_rf_preview_policy', rf_policy_test)
+
+if windows_flac_affinity_deps.length() > 0
+  flac_writer_affinity_test = executable('flac_writer_affinity_test',
+    ['test/flac_writer_affinity_test.c', 'common/flac_writer.c'],
+    dependencies: [flac_dep] + windows_flac_affinity_deps,
+    c_args: cflags,
+    link_args: ldflags)
+  test('flac_writer_affinity', flac_writer_affinity_test)
+endif
 
 if flac_dep.found()
   rf_record_deps = rf_test_deps + [flac_dep, ld_dts_dep]

@@ -210,16 +210,32 @@ static playback_ctx_t s_idle_playback = {.pending_seek = {PLAYBACK_NO_SEEK, PLAY
 static playback_ctx_t *s_playback = &s_idle_playback;
 static atomic_uint_fast64_t s_rf_end_sequence;
 
-// The render thread owns the job and active-context pointer. The loader only
-// writes its private prepared context; done publishes its result to UI polling.
-static struct {
-    thrd_t thread;
-    bool pending;
-    atomic_bool done;
+// The UI can abandon a loader even while the OS is blocked in file I/O.
+typedef enum {
+    PLAYBACK_LOAD_PREPARING,
+    PLAYBACK_LOAD_PREPARED,
+    PLAYBACK_LOAD_VERIFY,
+    PLAYBACK_LOAD_DONE,
+    PLAYBACK_LOAD_DISCARD,
+    PLAYBACK_LOAD_ACCEPT,
+} playback_load_state_t;
+
+typedef struct {
+    atomic_int state;
     atomic_bool cancel;
     int result;
     playback_ctx_t *prepared;
-} s_playback_start;
+    char files[3][FILE_PATH_MAX]; // RF A, RF B, optional monitor audio
+    char (*drop_paths)[FILE_PATH_MAX];
+    size_t drop_count;
+    int drop_zone;
+    bool drop_picked[3];
+    size_t drop_rejected;
+    size_t drop_extras;
+} playback_load_job_t;
+
+static playback_load_job_t *s_playback_start;
+static atomic_uint s_playback_load_workers;
 
 // A separate reader finds missing lengths after playback starts. Only the UI
 // changes active metadata; each done flag publishes that channel's result.
@@ -4584,89 +4600,31 @@ static playback_drop_kind_t gui_playback_classify_drop(const char *filepath,
 
 #endif // LIBFLAC_ENABLED
 
-bool gui_playback_handle_dropped_files(gui_app_t *app, const char *const *paths,
-                                       size_t count, float point_x, float point_y) {
-    if (!app || !paths || count == 0) return false;
 #if LIBFLAC_ENABLED == 1
-    if (gui_playback_is_starting(app)) {
-        gui_app_set_status(app, "Playback is still loading - wait for it to finish");
-        return false;
-    }
-    Vector2 point = { point_x, point_y };
-    int zone = gui_playback_drop_zone(app, point);
-    const char *rf_a = NULL, *rf_b = NULL, *audio_file = NULL;
-    size_t rejected = 0, extras = 0;
-    for (size_t i = 0; i < count; i++) {
-        const char *p = paths[i];
-        if (!p || !p[0]) continue;
+static void gui_playback_classify_job(playback_load_job_t *job) {
+    for (size_t i = 0; i < job->drop_count && !atomic_load(&job->cancel); i++) {
+        const char *path = job->drop_paths[i];
+        if (!path[0]) continue;
         char err[192] = {0};
-        playback_drop_kind_t kind = gui_playback_classify_drop(p, err, sizeof(err));
-        if (kind == PLAYBACK_DROP_AUDIO) {
-            if (!audio_file) audio_file = p;
-            else extras++;
-        } else if (kind == PLAYBACK_DROP_RF) {
-            if (zone == 0) {
-                if (!rf_a) rf_a = p;
-                else extras++;
-            } else {
-                if (!rf_b) rf_b = p;
-                else extras++;
-            }
-        } else {
-            rejected++;
-            fprintf(stderr, "[PLAYBACK] Drop rejected: %s (%s)\n",
-                    err[0] ? err : "unsupported file", p);
+        playback_drop_kind_t kind = gui_playback_classify_drop(path, err, sizeof(err));
+        if (kind == PLAYBACK_DROP_REJECT) {
+            ++job->drop_rejected;
+            fprintf(stderr, "[PLAYBACK] Drop rejected: %s (%s)\n", err, path);
+            continue;
         }
-    }
-    if (!rf_a && !rf_b && !audio_file) {
-        gui_app_set_status(app, "No playable files in the drop (see the log)");
-        return false;
-    }
-    // Only slots that received a file this drop change (a B-only drop keeps
-    // the loaded A; a set drop replaces both).
-    if (rf_a) snprintf(app->settings.playback_file_a, sizeof(app->settings.playback_file_a), "%s", rf_a);
-    if (rf_b) snprintf(app->settings.playback_file_b, sizeof(app->settings.playback_file_b), "%s", rf_b);
-    if (audio_file) {
-        snprintf(app->settings.playback_audio_file, sizeof(app->settings.playback_audio_file),
-                 "%s", audio_file);
-    }
-    gui_settings_save(&app->settings);
-    fprintf(stderr,
-            "[PLAYBACK] Drop: zone=%c A=%s B=%s audio=%s (%zu rejected, %zu extra)\n",
-            zone == 0 ? 'A' : 'B',
-            app->settings.playback_file_a[0] ? app->settings.playback_file_a : "(keep)",
-            app->settings.playback_file_b[0] ? app->settings.playback_file_b : "(keep)",
-            app->settings.playback_audio_file[0] ? app->settings.playback_audio_file : "(none)",
-            rejected, extras);
-    // Select the Playback device; stop anything running (capture or an
-    // earlier playback); (re)start through the normal start path.
-    int pb = -1;
-    for (int i = 0; i < app->device_count; i++) {
-        if (app->devices[i].type == DEVICE_TYPE_PLAYBACK) {
-            pb = i;
-            break;
+
+        int slot = kind == PLAYBACK_DROP_AUDIO ? 2 : job->drop_zone;
+        if (kind == PLAYBACK_DROP_RF && slot == 0 && job->drop_picked[0]) slot = 1;
+        if (job->drop_picked[slot]) {
+            ++job->drop_extras;
+            continue;
         }
+        snprintf(job->files[slot], sizeof(job->files[slot]), "%s", path);
+        job->drop_picked[slot] = true;
     }
-    if (pb < 0) {
-        gui_app_set_status(app, "No playback device available");
-        return false;
-    }
-    app->selected_device = pb;
-    if (app->is_capturing || gui_playback_is_running(app)) {
-        gui_app_stop_capture(app);
-    }
-    if (app->settings.playback_file_a[0] || app->settings.playback_file_b[0]) {
-        // start_async sets "Loading playback..."; the commit sets "Playback started".
-        return gui_app_start_capture(app) == 0;
-    }
-    gui_app_set_status(app, "Audio loaded - drop RF files on a channel panel to play");
-    return true;
-#else
-    (void)paths; (void)count; (void)point_x; (void)point_y;
-    gui_app_set_status(app, "Playback drag-and-drop needs FLAC support (not compiled in)");
-    return false;
-#endif
 }
+#endif
+
 
 //-----------------------------------------------------------------------------
 // Playback Thread
@@ -5919,19 +5877,18 @@ static bool gui_playback_prepare_ogg(playback_ctx_t *ctx, int channel, const cha
 }
 #endif // LIBFLAC_ENABLED
 
-static int gui_playback_prepare(playback_ctx_t *ctx, gui_app_t *app,
+static int gui_playback_prepare(playback_ctx_t *ctx, const char *audio_path,
                                 const char *file_a, const char *file_b,
                                 const atomic_bool *cancel) {
     if (!ctx || (!file_a && !file_b) || (cancel && atomic_load(cancel))) return -1;
 #if LIBFLAC_ENABLED != 1
-    (void)app; (void)cancel;
+    (void)audio_path;
     return -1;
 #else
     fprintf(stderr, "[PLAYBACK] Starting playback\n");
     if (file_a) fprintf(stderr, "[PLAYBACK]   Channel A: %s\n", file_a);
     if (file_b) fprintf(stderr, "[PLAYBACK]   Channel B: %s\n", file_b);
 
-    ctx->app = app;
     if ((file_a && strlen(file_a) >= sizeof(ctx->info_a.filepath)) ||
         (file_b && strlen(file_b) >= sizeof(ctx->info_b.filepath))) return -1;
 
@@ -6042,19 +5999,20 @@ static int gui_playback_prepare(playback_ctx_t *ctx, gui_app_t *app,
     // Drag-and-drop audio source (settings.playback_audio_file): opened
     // off-thread with the channels. A failure is non-fatal (playback works
     // without the monitor audio); the error names the file + reason.
-    if (app->settings.playback_audio_file[0]) {
+    if (cancel && atomic_load(cancel)) return -1;
+    if (audio_path && audio_path[0]) {
         char audio_err[192] = {0};
-        ctx->audio = gui_playback_audio_open(app->settings.playback_audio_file,
+        ctx->audio = gui_playback_audio_open(audio_path,
                                              audio_err, sizeof(audio_err));
         if (ctx->audio) {
             fprintf(stderr,
                     "[PLAYBACK] Audio source: %u Hz, %u ch, %u-bit, %" PRIu64 " frames (%s)\n",
                     ctx->audio->rate_hz, ctx->audio->channels, ctx->audio->bits,
-                    ctx->audio->total_frames, app->settings.playback_audio_file);
+                    ctx->audio->total_frames, audio_path);
         } else {
             fprintf(stderr, "[PLAYBACK] Audio source unavailable: %s (%s)\n",
                     audio_err[0] ? audio_err : "open failed",
-                    app->settings.playback_audio_file);
+                    audio_path);
         }
     }
 
@@ -6064,23 +6022,13 @@ static int gui_playback_prepare(playback_ctx_t *ctx, gui_app_t *app,
 #endif
 }
 
-static int gui_playback_commit(gui_app_t *app, playback_ctx_t *prepared) {
-#if LIBFLAC_ENABLED == 1
-    // The private loader may have completed several UI frames ago. Reject an
-    // observed path/held-file change before cached lengths become active.
-    if ((prepared->info_a.valid && !gui_playback_loaded_file_matches(prepared, 0)) ||
-        (prepared->info_b.valid && !gui_playback_loaded_file_matches(prepared, 1))) {
-        gui_playback_release_context(prepared);
-        free(prepared);
-        gui_app_set_status(app, "Playback file changed while loading");
-        return -1;
-    }
-#endif
+static int gui_playback_commit_prepared(gui_app_t *app, playback_ctx_t *prepared) {
+    prepared->app = app;
     if (gui_playback_is_running(app)) gui_playback_stop(app);
     gui_playback_retire_context();
     s_playback = prepared;
 #if LIBFLAC_ENABLED == 1
-    // The loader has joined. Playback no longer belongs to its cancel job.
+    // Active playback no longer belongs to the loader's cancel job.
     s_playback->io_a.cancel = NULL;
     s_playback->io_b.cancel = NULL;
 #endif
@@ -6276,11 +6224,26 @@ static void gui_playback_format_start_error(const playback_ctx_t *ctx,
         snprintf(message, capacity, "Playback failed to start");
 }
 
+static int gui_playback_commit(gui_app_t *app, playback_ctx_t *prepared) {
+#if LIBFLAC_ENABLED == 1
+    // The private loader may have completed several UI frames ago. Reject an
+    // observed path/held-file change before cached lengths become active.
+    if ((prepared->info_a.valid && !gui_playback_loaded_file_matches(prepared, 0)) ||
+        (prepared->info_b.valid && !gui_playback_loaded_file_matches(prepared, 1))) {
+        gui_playback_release_context(prepared);
+        free(prepared);
+        gui_app_set_status(app, "Playback file changed while loading");
+        return -1;
+    }
+#endif
+    return gui_playback_commit_prepared(app, prepared);
+}
+
 int gui_playback_start(gui_app_t *app, const char *file_a, const char *file_b) {
-    if (!app || s_playback_start.pending || (!file_a && !file_b)) return -1;
+    if (!app || s_playback_start || (!file_a && !file_b)) return -1;
     playback_ctx_t *prepared = calloc(1, sizeof(*prepared));
     if (!prepared) return -1;
-    if (gui_playback_prepare(prepared, app, file_a, file_b, NULL) != 0) {
+    if (gui_playback_prepare(prepared, app->settings.playback_audio_file, file_a, file_b, NULL) != 0) {
         char message[256];
         gui_playback_format_start_error(prepared, message, sizeof(message));
         gui_playback_release_context(prepared); free(prepared);
@@ -6289,79 +6252,236 @@ int gui_playback_start(gui_app_t *app, const char *file_a, const char *file_b) {
     return gui_playback_commit(app, prepared);
 }
 
-static int gui_playback_prepare_thread(void *unused) {
-    (void)unused;
-    thrd_set_priority(THRD_PRIORITY_NORMAL);
-    playback_ctx_t *ctx = s_playback_start.prepared;
-    s_playback_start.result = gui_playback_prepare(ctx, ctx->app,
-        ctx->info_a.filepath[0] ? ctx->info_a.filepath : NULL,
-        ctx->info_b.filepath[0] ? ctx->info_b.filepath : NULL,
-        &s_playback_start.cancel);
-    atomic_store(&s_playback_start.done, true);
+static int gui_playback_prepare_thread(void *opaque) {
+    playback_load_job_t *job = opaque;
+    playback_ctx_t *ctx = job->prepared;
+    const bool classifying = job->drop_count != 0;
+    if (classifying) {
+#if LIBFLAC_ENABLED == 1
+        gui_playback_classify_job(job);
+#endif
+        // Classification owns no readers after it returns. Release the worker
+        // slot before publishing the drop so playback can queue preparation.
+        atomic_fetch_sub(&s_playback_load_workers, 1);
+    } else {
+        const char *file_a = job->files[0][0] ? job->files[0] : NULL;
+        const char *file_b = job->files[1][0] ? job->files[1] : NULL;
+        job->result = gui_playback_prepare(ctx, job->files[2], file_a, file_b, &job->cancel);
+    }
+
+    // The UI requests the final identity check after observing preparation.
+    // File identity checks can read the filesystem too, so both checks run here.
+    int next = !classifying && job->result == 0 ? PLAYBACK_LOAD_PREPARED : PLAYBACK_LOAD_DONE;
+    int expected = PLAYBACK_LOAD_PREPARING;
+    atomic_compare_exchange_strong(&job->state, &expected, next);
+
+    for (;;) {
+        int state = atomic_load(&job->state);
+        if (state == PLAYBACK_LOAD_VERIFY) {
+#if LIBFLAC_ENABLED == 1
+            if ((ctx->info_a.valid && !gui_playback_loaded_file_matches(ctx, 0)) ||
+                (ctx->info_b.valid && !gui_playback_loaded_file_matches(ctx, 1))) {
+                job->result = -1;
+            }
+#endif
+            expected = PLAYBACK_LOAD_VERIFY;
+            atomic_compare_exchange_strong(&job->state, &expected, PLAYBACK_LOAD_DONE);
+        } else if (state == PLAYBACK_LOAD_DISCARD) {
+            gui_playback_release_context(ctx);
+            free(ctx);
+            break;
+        } else if (state == PLAYBACK_LOAD_ACCEPT) {
+            break;
+        } else {
+            thrd_sleep_ms(1);
+        }
+    }
+    free(job->drop_paths);
+    free(job);
+    if (!classifying) atomic_fetch_sub(&s_playback_load_workers, 1);
     return 0;
 }
 
 bool gui_playback_is_starting(gui_app_t *app) {
     (void)app;
-    return s_playback_start.pending;
+    return s_playback_start != NULL;
+}
+
+static bool gui_playback_queue_load(gui_app_t *app, playback_load_job_t *job) {
+    if (!job->drop_count) job->prepared = calloc(1, sizeof(*job->prepared));
+    if (job->drop_count || job->prepared) {
+        thrd_t thread;
+        atomic_init(&job->state, PLAYBACK_LOAD_PREPARING);
+        atomic_init(&job->cancel, false);
+        atomic_fetch_add(&s_playback_load_workers, 1);
+        if (thrd_create_with_priority(&thread, gui_playback_prepare_thread,
+                                      job, THRD_PRIORITY_NORMAL) == thrd_success) {
+            thrd_detach(thread);
+            s_playback_start = job;
+            gui_app_set_status(app, "Loading playback...");
+            return true;
+        }
+        atomic_fetch_sub(&s_playback_load_workers, 1);
+    }
+    free(job->prepared);
+    free(job->drop_paths);
+    free(job);
+    gui_app_set_status(app, "Failed to start playback loader");
+    return false;
+}
+
+static playback_load_job_t *gui_playback_new_load(gui_app_t *app) {
+    // A cancelled request can still be inside an OS file call. Bound the
+    // number of outstanding workers while allowing a different path to retry.
+    if (atomic_load(&s_playback_load_workers) >= 4) {
+        gui_app_set_status(app, "Playback readers are waiting for the filesystem");
+        return NULL;
+    }
+    playback_load_job_t *job = calloc(1, sizeof(*job));
+    if (!job) {
+        gui_app_set_status(app, "Failed to allocate playback loader");
+        return NULL;
+    }
+    snprintf(job->files[0], sizeof(job->files[0]), "%s", app->settings.playback_file_a);
+    snprintf(job->files[1], sizeof(job->files[1]), "%s", app->settings.playback_file_b);
+    snprintf(job->files[2], sizeof(job->files[2]), "%s", app->settings.playback_audio_file);
+    return job;
 }
 
 int gui_playback_start_async(gui_app_t *app, const char *file_a, const char *file_b) {
-    if (!app || s_playback_start.pending || app->is_capturing || (!file_a && !file_b)) return -1;
+    if (!app || s_playback_start || app->is_capturing || (!file_a && !file_b)) return -1;
     if ((file_a && strlen(file_a) >= FILE_PATH_MAX) ||
         (file_b && strlen(file_b) >= FILE_PATH_MAX)) {
-        gui_app_set_status(app, "Playback path is too long"); return -1;
-    }
-    playback_ctx_t *ctx = calloc(1, sizeof(*ctx));
-    if (!ctx) { gui_app_set_status(app, "Failed to allocate playback loader"); return -1; }
-    ctx->app = app;
-    if (file_a) snprintf(ctx->info_a.filepath, sizeof(ctx->info_a.filepath), "%s", file_a);
-    if (file_b) snprintf(ctx->info_b.filepath, sizeof(ctx->info_b.filepath), "%s", file_b);
-    s_playback_start.prepared = ctx;
-    atomic_store(&s_playback_start.done, false);
-    atomic_store(&s_playback_start.cancel, false);
-    s_playback_start.pending = true;
-    if (thrd_create_with_priority(&s_playback_start.thread, gui_playback_prepare_thread,
-                                  NULL, THRD_PRIORITY_NORMAL) != thrd_success) {
-        s_playback_start.pending = false; s_playback_start.prepared = NULL;
-        free(ctx); gui_app_set_status(app, "Failed to start playback loader"); return -1;
-    }
-    gui_app_set_status(app, "Loading playback...");
-    return 0;
-}
-
-void gui_playback_cancel_start(gui_app_t *app) {
-    if (!s_playback_start.pending) return;
-    atomic_store(&s_playback_start.cancel, true);
-    if (app) gui_app_set_status(app, "Cancelling playback load...");
-}
-
-int gui_playback_poll_start(gui_app_t *app) {
-    gui_playback_poll_index();
-    if (!s_playback_start.pending || !atomic_load(&s_playback_start.done)) return 0;
-    thrd_join(s_playback_start.thread, NULL);
-    playback_ctx_t *prepared = s_playback_start.prepared;
-    bool cancelled = atomic_load(&s_playback_start.cancel);
-    int result = s_playback_start.result;
-    s_playback_start.pending = false; s_playback_start.prepared = NULL;
-    if (cancelled || result != 0) {
-        char message[256];
-        gui_playback_format_start_error(prepared, message, sizeof(message));
-        gui_playback_release_context(prepared); free(prepared);
-        gui_app_set_status(app, cancelled ? "Playback load cancelled" : message);
+        gui_app_set_status(app, "Playback path is too long");
         return -1;
     }
-    return gui_playback_commit(app, prepared) == 0 ? 1 : -1;
+
+    playback_load_job_t *job = gui_playback_new_load(app);
+    if (!job) return -1;
+    snprintf(job->files[0], sizeof(job->files[0]), "%s", file_a ? file_a : "");
+    snprintf(job->files[1], sizeof(job->files[1]), "%s", file_b ? file_b : "");
+    return gui_playback_queue_load(app, job) ? 0 : -1;
+}
+
+bool gui_playback_handle_dropped_files(gui_app_t *app, const char *const *paths,
+                                       size_t count, float point_x, float point_y) {
+    if (!app || !paths || count == 0) return false;
+#if LIBFLAC_ENABLED == 1
+    if (s_playback_start) {
+        gui_app_set_status(app, "Playback is still loading - wait for it to finish");
+        return false;
+    }
+    playback_load_job_t *job = gui_playback_new_load(app);
+    if (!job) return false;
+    job->drop_paths = calloc(count, sizeof(*job->drop_paths));
+    if (!job->drop_paths) {
+        free(job);
+        gui_app_set_status(app, "Failed to allocate playback paths");
+        return false;
+    }
+    job->drop_count = count;
+    job->drop_zone = gui_playback_drop_zone(app, (Vector2){point_x, point_y});
+    for (size_t i = 0; i < count; i++) {
+        if (paths[i] && strlen(paths[i]) < sizeof(*job->drop_paths)) {
+            snprintf(job->drop_paths[i], sizeof(*job->drop_paths), "%s", paths[i]);
+        }
+    }
+    return gui_playback_queue_load(app, job);
+#else
+    (void)point_x; (void)point_y;
+    gui_app_set_status(app, "Playback drag-and-drop needs FLAC support (not compiled in)");
+    return false;
+#endif
+}
+
+static bool gui_playback_apply_drop(gui_app_t *app, const playback_load_job_t *job) {
+    if (!job->drop_picked[0] && !job->drop_picked[1] && !job->drop_picked[2]) {
+        gui_app_set_status(app, "No playable files in the drop (see the log)");
+        return false;
+    }
+    if (job->drop_picked[0]) {
+        snprintf(app->settings.playback_file_a, sizeof(app->settings.playback_file_a), "%s", job->files[0]);
+    }
+    if (job->drop_picked[1]) {
+        snprintf(app->settings.playback_file_b, sizeof(app->settings.playback_file_b), "%s", job->files[1]);
+    }
+    if (job->drop_picked[2]) {
+        snprintf(app->settings.playback_audio_file, sizeof(app->settings.playback_audio_file), "%s", job->files[2]);
+    }
+    gui_settings_save(&app->settings);
+    fprintf(stderr, "[PLAYBACK] Drop: zone=%c A=%s B=%s audio=%s (%zu rejected, %zu extra)\n",
+            job->drop_zone == 0 ? 'A' : 'B',
+            app->settings.playback_file_a[0] ? app->settings.playback_file_a : "(keep)",
+            app->settings.playback_file_b[0] ? app->settings.playback_file_b : "(keep)",
+            app->settings.playback_audio_file[0] ? app->settings.playback_audio_file : "(none)",
+            job->drop_rejected, job->drop_extras);
+
+    for (int i = 0; i < app->device_count; i++) {
+        if (app->devices[i].type == DEVICE_TYPE_PLAYBACK) {
+            if (app->is_capturing || gui_playback_is_running(app)) gui_app_stop_capture(app);
+            app->selected_device = i;
+            return true;
+        }
+    }
+    gui_app_set_status(app, "No playback device available");
+    return false;
 }
 
 void gui_playback_finish_start(gui_app_t *app) {
     (void)app;
-    if (!s_playback_start.pending) return;
-    atomic_store(&s_playback_start.cancel, true);
-    thrd_join(s_playback_start.thread, NULL);
-    gui_playback_release_context(s_playback_start.prepared);
-    free(s_playback_start.prepared);
-    s_playback_start.prepared = NULL; s_playback_start.pending = false;
+    playback_load_job_t *job = s_playback_start;
+    if (!job) return;
+    s_playback_start = NULL;
+    atomic_store(&job->cancel, true);
+    atomic_store(&job->state, PLAYBACK_LOAD_DISCARD);
+}
+
+bool gui_playback_has_load_workers(void) {
+    return atomic_load(&s_playback_load_workers) != 0;
+}
+
+void gui_playback_cancel_start(gui_app_t *app) {
+    if (!s_playback_start) return;
+    gui_playback_finish_start(app);
+    if (app) gui_app_set_status(app, "Playback load cancelled");
+}
+
+int gui_playback_poll_start(gui_app_t *app) {
+    gui_playback_poll_index();
+    playback_load_job_t *job = s_playback_start;
+    if (!job) return 0;
+
+    int state = atomic_load(&job->state);
+    if (state == PLAYBACK_LOAD_PREPARED) {
+        atomic_store(&job->state, PLAYBACK_LOAD_VERIFY);
+        return 0;
+    }
+    if (state != PLAYBACK_LOAD_DONE) return 0;
+
+    s_playback_start = NULL;
+    if (job->drop_count) {
+        bool applied = gui_playback_apply_drop(app, job);
+        atomic_store(&job->state, PLAYBACK_LOAD_DISCARD);
+        if (!applied) return -1;
+        if (!app->settings.playback_file_a[0] && !app->settings.playback_file_b[0]) {
+            gui_app_set_status(app, "Audio loaded - drop RF files on a channel panel to play");
+            return -1;
+        }
+        // Keep normal capture dispatch, including forwarding remote starts.
+        return gui_app_start_capture(app) == 0 && gui_playback_is_starting(app) ? 0 : -1;
+    }
+
+    playback_ctx_t *prepared = job->prepared;
+    if (job->result != 0) {
+        char message[256];
+        gui_playback_format_start_error(prepared, message, sizeof(message));
+        atomic_store(&job->state, PLAYBACK_LOAD_DISCARD);
+        gui_app_set_status(app, message);
+        return -1;
+    }
+
+    atomic_store(&job->state, PLAYBACK_LOAD_ACCEPT);
+    return gui_playback_commit_prepared(app, prepared) == 0 ? 1 : -1;
 }
 
 void gui_playback_stop(gui_app_t *app) {
@@ -6607,53 +6727,19 @@ bool gui_playback_get_file_info_b(gui_app_t *app, playback_file_info_t *info) {
     return s_playback->info_b.valid;
 }
 
-// --- Selected playback file info (idle readout support) ---
-// While playback runs, the live file info is authoritative. When idle, the
-// file selected in settings is validated once per path change and cached, so
-// per-frame UI readout calls stay cheap. The cache does not watch for on-disk
-// changes to the same path; re-selecting the file refreshes it.
-typedef struct {
-    char path[FILE_PATH_MAX];
-    playback_file_info_t info;
-    bool cached;
-} playback_selected_cache_t;
-
-static playback_selected_cache_t s_selected_cache[2] = {0};
-
+// UI getters never probe files. Keep the last loaded timeline for the same
+// selection after Stop; an unprobed path gets its metadata when loaded.
 bool gui_playback_get_selected_file_info(gui_app_t *app, int channel, playback_file_info_t *info) {
-    if (!app || !info) return false;
-    if (channel != 0 && channel != 1) return false;
+    if (!app || !info || (channel != 0 && channel != 1)) return false;
     memset(info, 0, sizeof(*info));
 
-    // Live playback info when this channel is actually playing.
-    if (gui_playback_is_running(app)) {
-        playback_file_info_t live = {0};
-        bool ok = (channel == 0)
-            ? gui_playback_get_file_info_a(app, &live)
-            : gui_playback_get_file_info_b(app, &live);
-        if (ok && live.valid) {
-            *info = live;
-            return true;
-        }
-    }
-
-    const char *path = (channel == 0) ? app->settings.playback_file_a
-                                      : app->settings.playback_file_b;
-    if (!path || path[0] == '\0') {
+    const playback_file_info_t *loaded = channel == 0 ? &s_playback->info_a : &s_playback->info_b;
+    const char *path = channel == 0 ? app->settings.playback_file_a : app->settings.playback_file_b;
+    if (!loaded->valid || (!gui_playback_is_running(app) && strcmp(path, loaded->filepath) != 0)) {
         return false;
     }
-
-    playback_selected_cache_t *cache = &s_selected_cache[channel];
-    if (!cache->cached || strncmp(cache->path, path, sizeof(cache->path)) != 0) {
-        snprintf(cache->path, sizeof(cache->path), "%s", path);
-        // validate_file fills info even when it returns false (e.g. wrong
-        // channel count), so the readout can still show bit depth / rate.
-        (void)gui_playback_validate_file(path, &cache->info);
-        cache->cached = true;
-    }
-
-    *info = cache->info;
-    return cache->info.valid;
+    *info = *loaded;
+    return true;
 }
 
 void gui_playback_set_loop(gui_app_t *app, bool loop) {

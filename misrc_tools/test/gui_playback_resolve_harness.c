@@ -1120,7 +1120,7 @@ static void raw_harness_channel(const char *path, playback_input_format_t fmt,
     playback_ctx_t *ctx = (playback_ctx_t *)calloc(1, sizeof(*ctx));
     expect_true(ctx != NULL, "context allocated");
     if (!ctx) return;
-    expect_true(gui_playback_prepare(ctx, &s_test_app, path, NULL, NULL) == 0,
+    expect_true(gui_playback_prepare(ctx, NULL, path, NULL, NULL) == 0,
                "raw channel prepares");
     expect_true(ctx->input_is_raw[0], "raw channel flagged");
     expect_i64(ctx->input_format[0], (long long)fmt, "sniffed input format");
@@ -1554,7 +1554,7 @@ static void test_hifi_rf_scaling(const char *temp_dir)
         expect_true(ctx != NULL, "allocate context");
         if (ctx) {
             bool channel_b = i == 1;
-            int prepared = gui_playback_prepare(ctx, &s_test_app, channel_b ? NULL : path,
+            int prepared = gui_playback_prepare(ctx, NULL, channel_b ? NULL : path,
                                                 channel_b ? path : NULL, NULL);
             expect_i64(prepared, 0, "FLAC scaling fixture prepares");
             if (prepared == 0) {
@@ -1785,7 +1785,7 @@ static void ogg_test_expect_nil_decode(const char *path,const decode_ref_t *ref,
                                         unsigned bits)
 {
     playback_ctx_t *ctx=(playback_ctx_t *)calloc(1,sizeof(*ctx));assert(ctx);
-    int result=gui_playback_prepare(ctx,&s_test_app,path,NULL,NULL);
+    int result=gui_playback_prepare(ctx,NULL,path,NULL,NULL);
     expect_i64(result,0,"nil-compatible Ogg prepares through production remux");
     if(result==0) {
         expect_u64(ctx->info_a.total_samples,ref->count,"nil packets add no samples");
@@ -1991,7 +1991,7 @@ static void test_ogg_flac(const char *temp_dir)
     playback_ctx_t *ctx = (playback_ctx_t *)calloc(1, sizeof(*ctx));
     expect_true(ctx != NULL, "Ogg context allocated");
     if (ctx) {
-        expect_true(gui_playback_prepare(ctx, &s_test_app, ldf_path, NULL, NULL) == 0,
+        expect_true(gui_playback_prepare(ctx, NULL, ldf_path, NULL, NULL) == 0,
                     "Ogg channel prepares via the remux");
         expect_i64(ctx->input_format[0], PLAYBACK_INPUT_OGG_FLAC, "Ogg input format");
         expect_true(ctx->decoder_a != NULL, "native decoder on the temp");

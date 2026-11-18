@@ -1331,8 +1331,7 @@ void gui_app_cleanup(gui_app_t *app) {
 #ifdef __ANDROID__
     gui_app_finish_capture_transitions(app);
 #endif
-    // A pending FLAC preparation owns file resources until its worker exits.
-    // Join it before releasing any application, buffer or panel state.
+    // The private loader owns its paths and readers and cleans up when I/O returns.
     gui_playback_finish_start(app);
 
     // Local Save sends its last writes, closes and COMMIT on the server connection.

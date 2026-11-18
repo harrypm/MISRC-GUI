@@ -28,6 +28,9 @@ Use lowercase with underscores:
 | `prompt_server_client_readme.md` | Server/client networking feature prompt log |
 | `prompt_statusbar_readme.md` | Status bar compaction / toolbar scaling prompt log |
 | `prompt_waveform_readout_bug.md` | Waveform readout bug prompt log |
+| [`prompt_windows_flac_affinity_readme.md`](prompt_windows_flac_affinity_readme.md) | Windows FLAC writer and compression worker affinity |
+| [`prompt_settings_overlay_input_bug.md`](prompt_settings_overlay_input_bug.md) | Settings overlay click, scroll, and drag isolation |
+| [`prompt_playback_startup_file_io_bug.md`](prompt_playback_startup_file_io_bug.md) | Playback startup file I/O, background loading, and cancellation |
 | `prompt_raw_readout_cxadc_single_flacwarn_bug.md` | RAW readout fix + CXADC single-card mode + FLAC-off startup warning prompt log |
 | `prompt_appimage_taskbar_desktop_icon_readme.md` | AppImage Desktop-icon cleanup + stable WM_CLASS / taskbar identity prompt log |
 | `prompt_cxadc_direct_native_raw_stream_readme.md` | CXADC direct native RAW stream (byte-exact `.u8`/`.u16`, converted `.s8`/`.s16`) prompt log |

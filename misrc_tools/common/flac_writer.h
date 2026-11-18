@@ -62,9 +62,9 @@ typedef struct {
     // Multi-threading (FLAC API v14+, requires libflac >= 1.5.0)
     uint32_t num_threads;            // 0 = auto-detect, 1 = single-threaded
 
-    // Linux CPU affinity for encoder work thread(s)
+    // CPU affinity for encoder work threads on Linux and supported Windows builds.
     // When enabled, caller can pin FLAC worker context to selected CPUs.
-    bool affinity_enabled;           // Linux-only (no-op elsewhere)
+    bool affinity_enabled;           // Linux and supported Windows builds
     char affinity_cpu_list[64];      // e.g. "10-17,20"
 
     // Seektable configuration
@@ -160,7 +160,12 @@ bool flac_writer_multithreading_available(void);
 // Check if CPU affinity control is supported on this platform.
 bool flac_writer_affinity_supported(void);
 
-// Validate a Linux CPU list/range string (e.g. "10-17,20").
+#ifdef _WIN32
+// Returns NULL when affinity is available, or a message for the settings UI.
+const char *flac_writer_affinity_unavailable_reason(void);
+#endif
+
+// Validate a CPU list/range for Linux or a supported Windows build (e.g. "10-17,20").
 // On success returns true. On failure returns false and writes a message.
 bool flac_writer_validate_affinity_cpu_list(
     const char *cpu_list,
@@ -169,7 +174,7 @@ bool flac_writer_validate_affinity_cpu_list(
 );
 
 // Apply configured CPU affinity to the current thread.
-// Intended to be called by the thread that performs FLAC encoding.
+// Call on the writer thread before encoding starts.
 flac_writer_error_t flac_writer_apply_thread_affinity(flac_writer_t *writer);
 
 #endif // FLAC_WRITER_H
