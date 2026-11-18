@@ -1049,6 +1049,22 @@ static double g_secam_final[CVBS_SECAM_MAX_DEC];     // post de-emphasis D'x (IR
 static float  g_secam_u[CVBS_SECAM_MAX_DEC];         // pixel-loop u01 per dec sample
 static float  g_secam_v[CVBS_SECAM_MAX_DEC];
 static double g_secam_porch_f[40];                   // porch window fInst (median)
+static float  g_secam_adv[CVBS_SECAM_MAX_DEC];       // Advanced vectorscope: own component
+
+// The last decoded line's identification and porch measurement, for the
+// Advanced (transmitted) SECAM vectorscope (set by cvbs_secam_decode_line).
+static struct {
+    bool is_red;          // This line carries D'R (else D'B)
+    bool ident_decisive;  // The porch sat within 40 kHz of exactly one carrier
+    bool porch_ok;
+    double porch_freq;    // Bell-free porch median, Hz
+    double porch_env;     // Bell-free porch envelope (analytic magnitude)
+    double zero;          // This line's rest (the demod's reference), Hz
+    double field_zero;    // The field-tracked rest for this component, Hz
+    double killer;        // Colour-killer envelope level
+    int a0, a1;           // Active window, decimated samples
+    int p0, p1;           // Porch window, decimated samples
+} g_secam_line;
 
 // Rate-relative decimation state (set by cvbs_secam_build_filters; the
 // pixel loop and the porch windows read these):
@@ -1712,6 +1728,19 @@ static void cvbs_secam_decode_line(cvbs_decoder_t *decoder,
     if (a0 < 0) a0 = 0;
     if (a1 > dec_count) a1 = dec_count;
 
+    g_secam_line.is_red = is_red;
+    g_secam_line.ident_decisive = near_for != near_fob;
+    g_secam_line.porch_ok = porch_ok;
+    g_secam_line.porch_freq = porch_freq;
+    g_secam_line.porch_env = porch_env;
+    g_secam_line.zero = zero;
+    g_secam_line.field_zero = field_zero;
+    g_secam_line.killer = killer_level;
+    g_secam_line.a0 = a0;
+    g_secam_line.a1 = a1;
+    g_secam_line.p0 = p0 / decim;
+    g_secam_line.p1 = p1 / decim;
+
     // The picture demod runs on the BELL path (g_secam_f, through the
     // receiver's anti-bell): every real SECAM signal carries the encoder's
     // HF bell, and its phase response bends D'R and D'B transitions
@@ -1976,10 +2005,12 @@ static bool g_cvbs_vscope_comb = true;
 
 typedef struct cvbs_vscope_ll {
     double *pf_s, *pf_c, *pf_n, *pf_i, *pf_q;  // Per-sample work arrays (line + 1)
+    int32_t *pf_cell;                          // The plot pass's grid cells (line + 1)
     // Line-rate measurement (H-sync edges, filtered domain, sub-sample)
     double last_h_edge;          // Newest classified H-sync start
     bool have_h_edge;
     double ref_edge;             // Span start
+    int ref_lines;               // Lines counted since ref_edge
     bool ref_valid;
     double line_samples;         // Measured samples per line (span / lines)
     bool line_valid;
@@ -1991,6 +2022,13 @@ typedef struct cvbs_vscope_ll {
     // PAL V-switch chain
     double prev_burst_phase;
     bool prev_valid;
+    // Advanced (composite measurement) mode: the burst-locked flywheel - a
+    // second-order tracker on the un-swung burst angle (decode-orc fits a
+    // +-32-line straight line; streaming, this tracks it causally at a
+    // similar ~20-line time constant) - and the slow burst-referenced gain.
+    double adv_ref, adv_vel, adv_agc;
+    int adv_bad;                 // Consecutive lines with a > 60 deg innovation
+    bool adv_valid;
     // Raw-sample history by global sample index, for the line-delay comb:
     // [hist_start, hist_end) is a contiguous run of picture-line samples.
     int16_t *hist;
@@ -2002,6 +2040,7 @@ static void cvbs_vscope_ll_free(cvbs_decoder_t *decoder) {
     cvbs_vscope_ll_t *ll = decoder ? decoder->vscope_ll : NULL;
     if (!ll) return;
     free(ll->pf_s); free(ll->pf_c); free(ll->pf_n); free(ll->pf_i); free(ll->pf_q);
+    free(ll->pf_cell);
     free(ll->hist);
     free(ll);
     decoder->vscope_ll = NULL;
@@ -2015,64 +2054,351 @@ static void cvbs_vscope_ll_reset(cvbs_decoder_t *decoder) {
     ll->line_valid = false;
     ll->osc_valid = false;
     ll->prev_valid = false;
+    ll->adv_valid = false;
     ll->hist_valid = false;
 }
 
-// A classified H sync: extend the line-rate span.
+// A classified H sync: extend the line-rate span. Lines are counted edge to
+// edge with the PLL's CURRENT period (a step is a line or a few, so its
+// error never accumulates into the count); span / count is the precise line
+// length. The span used to be counted whole with the last MEASURED length:
+// a stale one (the old system's tail after a PAL -> NTSC switch, 0.8% long)
+// put the count off by more than 0.1 line within ~12 lines, every span
+// restarted before CVBS_LL_MIN_LINES, and the stale length - so a carrier
+// 0.8% off - stuck for good (NTSC Advanced: 109 deg jitter, bars smeared to
+// rings; Standard smeared too).
 static void cvbs_vscope_ll_on_hsync(cvbs_decoder_t *decoder, double edge) {
     cvbs_vscope_ll_t *ll = decoder->vscope_ll;
     if (!ll) return;
+    const double prev = ll->last_h_edge;
+    const bool had_prev = ll->have_h_edge;
     ll->last_h_edge = edge;
     ll->have_h_edge = true;
-    double period = ll->line_valid ? ll->line_samples : cvbs_effective_line_period(decoder);
-    if (period < 1.0) return;
-    if (!ll->ref_valid) {
+    const double pll = cvbs_effective_line_period(decoder);
+    if (pll < 1.0) return;
+    if (!ll->ref_valid || !had_prev) {
         ll->ref_edge = edge;
+        ll->ref_lines = 0;
         ll->ref_valid = true;
         return;
     }
-    double span = edge - ll->ref_edge;
-    int lines = (int)floor(span / period + 0.5);
-    if (lines < 1 || lines > CVBS_LL_MAX_LINES ||
-        fabs(span - (double)lines * period) > 0.1 * period) {
+    const double step = (edge - prev) / pll;
+    const int k = (int)floor(step + 0.5);
+    if (k < 1 || k > 16 || fabs(step - (double)k) > 0.1) {
         ll->ref_edge = edge;    // Lost the count: restart the span
+        ll->ref_lines = 0;
         return;
     }
-    if (lines >= CVBS_LL_MIN_LINES) {
-        double measured = span / (double)lines;
-        double pll = cvbs_effective_line_period(decoder);
-        if (pll > 1.0 && fabs(measured / pll - 1.0) < 0.03) {
+    ll->ref_lines += k;
+    if (ll->ref_lines >= CVBS_LL_MIN_LINES) {
+        const double measured = (edge - ll->ref_edge) / (double)ll->ref_lines;
+        if (fabs(measured / pll - 1.0) < 0.03) {
             ll->line_samples = measured;
             ll->line_valid = true;
         }
     }
-    if (lines == CVBS_LL_MAX_LINES) ll->ref_edge = edge;
+    if (ll->ref_lines >= CVBS_LL_MAX_LINES) {
+        ll->ref_edge = edge;
+        ll->ref_lines = 0;
+    }
 }
 
-// Demodulated points over [k0, k1): Hann lowpass of the carrier products,
-// burst-locked rotation, then (u, v) = (vc * u_gain, uc * v_gain).
-static void cvbs_vscope_ll_plot(gui_vectorscope_t *scope, int sys,
-                                const double *pi, const double *pq,
-                                const double *hann, int hlen, double hnorm,
-                                double ca, double sa, double u_gain, double v_gain,
-                                int k0, int k1) {
+// The hit / transit counts of one window's grid cells (-1 = off the plot)
+// and its box: the scalar pass shared by the PAL / NTSC and SECAM plots.
+// Returns the points plotted.
+static uint64_t cvbs_vscope_count(gui_vectorscope_t *scope, int sys,
+                                  const int32_t *restrict cell, int m,
+                                  int xmin, int xmax, int ymin, int ymax) {
+    // Counts (decode-orc's: a hit per point; with the trace, the transit
+    // from the previous point, both ends, a stay counting its cell once). A
+    // point off the plot is skipped without breaking the trace (the beam
+    // runs on to the next point on the plot). Run-length: the counts of a
+    // beam resting in one cell (bar plateaus - most points) stay in
+    // registers until it moves, so a stay costs no grid write.
+    uint32_t *restrict acc = scope->acc;
+    uint64_t pts = 0;
+    if (scope->trace_on) {
+        uint32_t *tr = scope->acc_tr;
+        int last = -1;
+        uint32_t rh = 0, rt = 0;
+        for (int i = 0; i < m; i++) {
+            const int c = cell[i];
+            if (c < 0) continue;
+            pts++;
+            if (c == last) { rh++; rt++; continue; }
+            if (last >= 0) {
+                gui_vectorscope_transit_between(tr, last, c);
+                acc[last] += rh;
+                tr[last] += rt + 1;     // + the transit's start
+                rt = 1;                 // the transit's end
+            } else {
+                rt = 0;
+            }
+            last = c;
+            rh = 1;
+        }
+        if (last >= 0) {
+            acc[last] += rh;
+            if (rt) tr[last] += rt;
+        }
+    } else {
+        int last = -1;
+        uint32_t rh = 0;
+        for (int i = 0; i < m; i++) {
+            const int c = cell[i];
+            if (c < 0) continue;
+            pts++;
+            if (c == last) { rh++; continue; }
+            if (last >= 0) acc[last] += rh;
+            last = c;
+            rh = 1;
+        }
+        if (last >= 0) acc[last] += rh;
+    }
+    if (pts > 0) {
+        gui_vectorscope_grow_box(scope, xmin, xmax, ymin, ymax);
+        scope->acc_points += pts;
+        scope->acc_system = sys;
+    }
+    return pts;
+}
+
+// Demodulated points over [k0, k1), every scope->stride-th sample: Hann
+// lowpass of the carrier products (pf_i / pf_q), burst-locked rotation,
+// (u, v) = (vc * u_gain, uc * v_gain), grid cell - as contiguous vectorisable
+// passes over the window (the lowpass ran per point, with the plot inside the
+// loop, and did not vectorise) - then one scalar pass for the hits and the
+// beam transits. With csum: the mean chroma magnitude over [c0, c1) (every
+// 2nd plotted point), for the Advanced chroma / burst readout. Uses pf_s,
+// pf_n (free once the bandpass ran) and pf_cell. Returns the points plotted.
+static uint64_t cvbs_vscope_ll_plot(cvbs_vscope_ll_t *ll, gui_vectorscope_t *scope, int sys,
+                                    const double *hann, int hlen, double hnorm,
+                                    double ca, double sa, double u_gain, double v_gain,
+                                    int k0, int k1, int c0, int c1,
+                                    double *csum, uint64_t *cn) {
+    gui_vectorscope_break(scope);   // one trace segment per window
+    if (k1 <= k0) return 0;
     const int hh = hlen / 2;
-    for (int k = k0; k < k1; k++) {
-        double ic = 0.0, qc = 0.0;
-        const double *wi = pi + k - hh, *wq = pq + k - hh;
-        for (int j = 0; j < hlen; j++) { ic += hann[j] * wi[j]; qc += hann[j] * wq[j]; }
-        ic *= hnorm;
-        qc *= hnorm;
-        double uc = ic * ca - qc * sa;
-        double vc = ic * sa + qc * ca;
-        gui_vectorscope_add(scope, sys, vc * u_gain, uc * v_gain);
+    const int st = scope->stride > 1 ? 2 : 1;
+    const int m = (k1 - k0 + st - 1) / st;
+    double *restrict oi = ll->pf_s, *restrict oq = ll->pf_n;
+    int32_t *restrict cell = ll->pf_cell;
+    const double *restrict wi = ll->pf_i + k0 - hh, *restrict wq = ll->pf_q + k0 - hh;
+    for (int i = 0; i < m; i++) { oi[i] = 0.0; oq[i] = 0.0; }
+    if (st == 1) {
+        for (int j = 0; j < hlen; j++) {
+            const double h = hann[j];
+            for (int i = 0; i < m; i++) { oi[i] += h * wi[i + j]; oq[i] += h * wq[i + j]; }
+        }
+    } else {
+        for (int j = 0; j < hlen; j++) {
+            const double h = hann[j];
+            for (int i = 0; i < m; i++) { oi[i] += h * wi[2 * i + j]; oq[i] += h * wq[2 * i + j]; }
+        }
+    }
+    if (csum && c1 > c0) {
+        int i0 = c0 > k0 ? (c0 - k0 + st - 1) / st : 0;
+        int i1 = c1 > k0 ? (c1 - k0 + st - 1) / st : 0;
+        if (i1 > m) i1 = m;
+        double sum = 0.0;
+        uint64_t cnt = 0;
+        for (int i = i0; i < i1; i += 2) {
+            sum += sqrt(oi[i] * oi[i] + oq[i] * oq[i]);
+            cnt++;
+        }
+        *csum += hnorm * sum;
+        *cn += cnt;
+    }
+    // Grid cells (gui_vectorscope_cell's mapping) and their box.
+    const double half = 0.5 * GUI_VSCOPE_GRID, kp = half / GUI_VSCOPE_FULL_SCALE;
+    const double ax = hnorm * u_gain * kp * sa, bx = hnorm * u_gain * kp * ca;
+    const double ay = -hnorm * v_gain * kp * ca, by = hnorm * v_gain * kp * sa;
+    int xmin = GUI_VSCOPE_GRID, xmax = -1, ymin = GUI_VSCOPE_GRID, ymax = -1;
+    for (int i = 0; i < m; i++) {
+        const int x = (int)(half + oi[i] * ax + oq[i] * bx);
+        const int y = (int)(half + oi[i] * ay + oq[i] * by);
+        const bool in = (unsigned)x < GUI_VSCOPE_GRID && (unsigned)y < GUI_VSCOPE_GRID;
+        cell[i] = in ? ((y << GUI_VSCOPE_GRID_SHIFT) | x) : -1;
+        const int xl = in ? x : GUI_VSCOPE_GRID, xh = in ? x : -1;
+        const int yl = in ? y : GUI_VSCOPE_GRID, yh = in ? y : -1;
+        xmin = xl < xmin ? xl : xmin;
+        xmax = xh > xmax ? xh : xmax;
+        ymin = yl < ymin ? yl : ymin;
+        ymax = yh > ymax ? yh : ymax;
+    }
+    return cvbs_vscope_count(scope, sys, cell, m, xmin, xmax, ymin, ymax);
+}
+
+// Advanced flywheel gains: a second-order tracker (phase + rate) with a
+// ~20-line time constant, and the burst-level average for the slow gain.
+#define CVBS_ADV_TRACK_A 0.1
+#define CVBS_ADV_TRACK_B 0.005
+#define CVBS_ADV_AGC_A   0.05
+
+// Advanced (composite measurement) mode for one line: decode-orc's composite
+// scope on the streaming line-locked demod (tbc-tools tbc-analyse's
+// Advanced vectorscope tab). Differences from the standard path:
+//  - the reference is the burst-locked FLYWHEEL, not this line's burst:
+//    per-line burst phase error shows as spread (the jitter readout);
+//  - NO V-switch correction: PAL picture lines alternate between the two
+//    mirrored target sets, the bursts sit at 135 / 225 deg - what a
+//    hardware PAL composite vectorscope shows (both sets of bars);
+//  - the gain follows the burst level slowly (no per-line ACC);
+//  - the line window (active / whole line / burst) and the field range
+//    (picture lines / every line) are selectable; every line runs, so the
+//    oscillator and the flywheel stay continuous through the VBI;
+//  - instrument readouts accumulate per field (gui_vscope_meas_t).
+static void cvbs_vscope_ll_advanced(cvbs_decoder_t *decoder, cvbs_vscope_ll_t *ll,
+                                    const int16_t *line, int n, double x0, double spu,
+                                    double spc, int d, bool pal,
+                                    const cvbs_baseband_profile_t *profile,
+                                    bool have_burst, double burst_amp, double burst_amp_raw,
+                                    double burst_phase, bool consecutive, bool picture_line) {
+    gui_vectorscope_t *vs = decoder->vscope;
+
+    // V-switch chain, as the standard path; a burst-less line breaks it.
+    int vswitch = 0;
+    if (have_burst) {
+        if (!pal) {
+            vswitch = 1;
+        } else if (ll->prev_valid) {
+            double step = burst_phase - ll->prev_burst_phase;
+            while (step > M_PI) step -= 2.0 * M_PI;
+            while (step < -M_PI) step += 2.0 * M_PI;
+            vswitch = (step >= 0.0) ? 1 : -1;
+        }
+        ll->prev_burst_phase = burst_phase;
+        ll->prev_valid = true;
+    } else {
+        ll->prev_valid = false;
+    }
+    if (!consecutive) ll->adv_valid = false;   // the oscillator re-seeded: new phase frame
+
+    // Flywheel on the un-swung burst angle (the -U axis direction).
+    bool measured = false;
+    double innov = 0.0;
+    if (have_burst && vswitch != 0) {
+        const double unswung = burst_phase - (pal ? (double)vswitch * (M_PI / 4.0) : 0.0);
+        if (!ll->adv_valid) {
+            ll->adv_ref = unswung;
+            ll->adv_vel = 0.0;
+            ll->adv_agc = burst_amp;
+            ll->adv_bad = 0;
+            ll->adv_valid = true;
+        } else {
+            const double pred = ll->adv_ref + ll->adv_vel;
+            innov = unswung - pred;
+            while (innov > M_PI) innov -= 2.0 * M_PI;
+            while (innov < -M_PI) innov += 2.0 * M_PI;
+            // Re-acquire after 8 lines in a row off by > 60 deg: a tracker
+            // whose rate went wrong (a system change's old-signal tail, a
+            // source switch) cannot pull back through the +-180 deg wrap.
+            ll->adv_bad = fabs(innov) > M_PI / 3.0 ? ll->adv_bad + 1 : 0;
+            if (ll->adv_bad >= 8) {
+                ll->adv_ref = unswung;
+                ll->adv_vel = 0.0;
+                ll->adv_agc = burst_amp;
+                ll->adv_bad = 0;
+                innov = 0.0;
+            } else {
+                ll->adv_ref = pred + CVBS_ADV_TRACK_A * innov;
+                ll->adv_vel += CVBS_ADV_TRACK_B * innov;
+                ll->adv_agc += CVBS_ADV_AGC_A * (burst_amp - ll->adv_agc);
+            }
+            measured = true;
+        }
+    } else if (ll->adv_valid) {
+        ll->adv_ref += ll->adv_vel;   // hold through burst-less lines
+    }
+    if (!ll->adv_valid) return;
+    while (ll->adv_ref > M_PI) ll->adv_ref -= 2.0 * M_PI;
+    while (ll->adv_ref < -M_PI) ll->adv_ref += 2.0 * M_PI;
+
+    if (!picture_line && vs->field_view != GUI_VSCOPE_FIELD_WHOLE) return;
+
+    // Readouts from this line's burst.
+    if (measured) {
+        vs->m_lines++;
+        vs->m_burst_sum += burst_amp;
+        vs->m_jit_sq += innov * innov;
+        if (pal) {
+            double rel = burst_phase - ll->adv_ref;
+            while (rel > M_PI) rel -= 2.0 * M_PI;
+            while (rel < -M_PI) rel += 2.0 * M_PI;
+            if (vswitch > 0) { vs->m_vp_c += cos(rel); vs->m_vp_s += sin(rel); }
+            else { vs->m_vn_c += cos(rel); vs->m_vn_s += sin(rel); }
+        }
+        // Burst level in IRE, referenced to this line's sync height (tip
+        // interior 1.0-3.5 us vs the back porch after the burst): PAL sync
+        // = 300 mV = 42.86 IRE, NTSC 40 IRE - the waveform monitor's scale.
+        const int t0 = (int)ceil(x0 + 1.0 * spu), t1 = (int)floor(x0 + 3.5 * spu);
+        const int p0 = (int)ceil(x0 + profile->burst_end_us * spu + spc);
+        const int p1 = (int)floor(x0 + profile->active_start_us * spu) - 2;
+        if (t0 >= 0 && t1 > t0 + 4 && p0 > t1 && p1 > p0 + 4 && p1 <= n) {
+            double ts = 0.0, ps = 0.0;
+            for (int k = t0; k < t1; k++) ts += line[k];
+            for (int k = p0; k < p1; k++) ps += line[k];
+            const double swing = ps / (double)(p1 - p0) - ts / (double)(t1 - t0);
+            if (swing > 0.0 && burst_amp_raw > 0.0) {
+                vs->m_burst_ire_sum += burst_amp_raw / swing * (pal ? 300.0 / 7.0 : 40.0);
+                vs->m_ire_lines++;
+            }
+        }
+    }
+
+    // Rotation onto the flywheel's -U axis (the standard path's frame), no
+    // V-switch correction; the slow burst-referenced gain.
+    const double alpha = -M_PI / 2.0 - ll->adv_ref;
+    const double ca = cos(alpha), sa = sin(alpha);
+    const double gain = (pal ? 3.0 / 14.0 : 0.2) / (ll->adv_agc > 1e-9 ? ll->adv_agc : 1e-9);
+    enum { LL_HANN_MAX = 33 };
+    double hann[LL_HANN_MAX];
+    int hlen = 2 * (int)(spc + 0.5) + 1;
+    if (hlen > LL_HANN_MAX) hlen = LL_HANN_MAX;
+    const int hh = hlen / 2;
+    double hsum = 0.0;
+    for (int j = 0; j < hlen; j++) {
+        hann[j] = 0.5 - 0.5 * cos(2.0 * M_PI * (double)(j + 1) / (double)(hlen + 1));
+        hsum += hann[j];
+    }
+    const double hnorm = 2.0 / hsum;
+    const int lo = hh + 2 * d, hi = n - hh - 2 * d;
+    const int sys = pal ? GUI_VSCOPE_SYS_PAL : GUI_VSCOPE_SYS_NTSC;
+    int a0 = (int)ceil(x0 + profile->active_start_us * spu);
+    int a1 = (int)floor(x0 + profile->active_end_us * spu);
+    if (a0 < lo) a0 = lo;
+    if (a1 > hi) a1 = hi;
+    int k0, k1;
+    switch (vs->lines_view) {
+        case GUI_VSCOPE_LINES_BURST:
+            k0 = (int)floor(x0 + profile->burst_start_us * spu - spc);
+            k1 = (int)ceil(x0 + profile->burst_end_us * spu + spc);
+            break;
+        case GUI_VSCOPE_LINES_WHOLE:
+            k0 = lo;
+            k1 = hi;
+            break;
+        default:
+            k0 = a0;
+            k1 = a1;
+            break;
+    }
+    if (k0 < lo) k0 = lo;
+    if (k1 > hi) k1 = hi;
+    const bool chroma = picture_line && vs->lines_view != GUI_VSCOPE_LINES_BURST;
+    if (cvbs_vscope_ll_plot(ll, vs, sys, hann, hlen, hnorm, ca, sa, gain, gain, k0, k1,
+                            a0, a1, chroma ? &vs->m_chroma_sum : NULL, &vs->m_chroma_n) > 0) {
+        gui_vectorscope_count_line(vs);
     }
 }
 
 // A picture line (raw panel-rate samples, line[0] at global `anchor`):
-// demodulate its active chroma into the vectorscope.
+// demodulate its active chroma into the vectorscope. Advanced mode runs
+// every line (picture_line says which), keeping the oscillator and the burst
+// flywheel continuous through the vertical interval.
 static void cvbs_vscope_ll_line(cvbs_decoder_t *decoder, const int16_t *line,
-                                size_t count, uint64_t anchor, int32_t range) {
+                                size_t count, uint64_t anchor, int32_t range,
+                                bool picture_line) {
     cvbs_vscope_ll_t *ll = decoder->vscope_ll;
     if (!ll) {
         ll = (cvbs_vscope_ll_t *)calloc(1, sizeof(*ll));
@@ -2083,9 +2409,11 @@ static void cvbs_vscope_ll_line(cvbs_decoder_t *decoder, const int16_t *line,
         ll->pf_n = (double *)malloc(pf * sizeof(double));
         ll->pf_i = (double *)malloc(pf * sizeof(double));
         ll->pf_q = (double *)malloc(pf * sizeof(double));
+        ll->pf_cell = (int32_t *)malloc(pf * sizeof(int32_t));
         ll->hist = (int16_t *)malloc(CVBS_LL_HIST * sizeof(int16_t));
         decoder->vscope_ll = ll;
-        if (!ll->pf_s || !ll->pf_c || !ll->pf_n || !ll->pf_i || !ll->pf_q || !ll->hist) {
+        if (!ll->pf_s || !ll->pf_c || !ll->pf_n || !ll->pf_i || !ll->pf_q || !ll->pf_cell ||
+            !ll->hist) {
             cvbs_vscope_ll_free(decoder);
         }
         return;   // Edges are measured from now on
@@ -2243,19 +2571,52 @@ static void cvbs_vscope_ll_line(cvbs_decoder_t *decoder, const int16_t *line,
     // (PAL keeps ~6 cycles, NTSC ~5).
     int b0 = (int)ceil(x0 + profile->burst_start_us * spu + 2.0 * spc);
     int b1 = (int)floor(x0 + profile->burst_end_us * spu - 2.0 * spc);
-    if (b0 < 2 * d || b1 > n - 2 * d || b1 - b0 < 4) { ll->prev_valid = false; return; }
-    int n_cyc = (int)((double)(b1 - b0) / spc);
-    if (n_cyc < 1) { ll->prev_valid = false; return; }
-    b1 = b0 + (int)(n_cyc * spc + 0.5);
-    double bsi = 0.0, bsq = 0.0;
-    for (int k = b0; k < b1; k++) { bsi += pi[k]; bsq += pq[k]; }
-    double bi = bsi * 2.0 / (double)(b1 - b0);
-    double bq = bsq * 2.0 / (double)(b1 - b0);
-    double burst_amp = sqrt(bi * bi + bq * bq);
-    double burst_phase = atan2(bq, bi);
-    // Gate on the filtered burst against the range (bandpass gain at fsc
-    // is ~1 by the 1/4 normalisation).
-    if (burst_amp < 0.02 * (double)range) { ll->prev_valid = false; return; }
+    bool have_burst = !(b0 < 2 * d || b1 > n - 2 * d || b1 - b0 < 4);
+    double burst_amp = 0.0, burst_phase = 0.0;
+    if (have_burst) {
+        int n_cyc = (int)((double)(b1 - b0) / spc);
+        if (n_cyc < 1) {
+            have_burst = false;
+        } else {
+            b1 = b0 + (int)(n_cyc * spc + 0.5);
+            double bsi = 0.0, bsq = 0.0;
+            for (int k = b0; k < b1; k++) { bsi += pi[k]; bsq += pq[k]; }
+            double bi = bsi * 2.0 / (double)(b1 - b0);
+            double bq = bsq * 2.0 / (double)(b1 - b0);
+            burst_amp = sqrt(bi * bi + bq * bq);
+            burst_phase = atan2(bq, bi);
+            // Gate on the filtered burst against the range (bandpass gain
+            // at fsc is ~1 by the 1/4 normalisation).
+            if (burst_amp < 0.02 * (double)range) have_burst = false;
+        }
+    }
+    if (decoder->vscope->mode == GUI_VSCOPE_MODE_ADVANCED) {
+        // The burst LEVEL for the absolute readout from the un-combed
+        // band-pass: the comb's fractional (Catmull-Rom) line delay loses
+        // a few % of the delayed carrier at 4 samples a cycle, which the
+        // burst-referenced gain cancels but an absolute level does not
+        // (read 75-77% of the Test Gen's 79%).
+        double burst_amp_raw = 0.0;
+        if (have_burst) {
+            double si = 0.0, sq = 0.0;
+            double bc = cos(phase0 + w * (double)b0), bs = sin(phase0 + w * (double)b0);
+            for (int k = b0; k < b1; k++) {
+                const double v = 0.375 * line[k] - 0.25 * ((double)line[k - d] + line[k + d])
+                               + 0.0625 * ((double)line[k - 2 * d] + line[k + 2 * d]);
+                si += v * bc;
+                sq += v * bs;
+                const double nbc = bc * cd - bs * sd;
+                bs = bs * cd + bc * sd;
+                bc = nbc;
+            }
+            burst_amp_raw = 2.0 * sqrt(si * si + sq * sq) / (double)(b1 - b0);
+        }
+        cvbs_vscope_ll_advanced(decoder, ll, line, n, x0, spu, spc, d, pal, profile,
+                                have_burst, burst_amp, burst_amp_raw, burst_phase,
+                                consecutive, picture_line);
+        return;
+    }
+    if (!have_burst) { ll->prev_valid = false; return; }
 
     // PAL V-switch from the burst alternation between consecutive lines on
     // the continuous line-locked carrier (the picture path's convention).
@@ -2303,22 +2664,201 @@ static void cvbs_vscope_ll_line(cvbs_decoder_t *decoder, const int16_t *line,
     const int lo = hh + 2 * d, hi = n - hh - 2 * d;
     int sys = pal ? GUI_VSCOPE_SYS_PAL : GUI_VSCOPE_SYS_NTSC;
     // Burst, envelope included (its rise/fall draws the line from the
-    // centre, as on a hardware scope). V is NOT unflipped here: the PAL
-    // burst shows as its two vectors at 135 / 225 deg (the NTSC burst at
-    // 180 deg); the picture below is V-switched onto single targets.
+    // centre, as on a hardware scope), V-switched like the picture: the
+    // Standard view is the decoder's, one phase - every PAL burst at 135 deg
+    // (NTSC 180 deg). The Advanced mode shows both PAL phases (135 / 225).
     int q0 = (int)floor(x0 + profile->burst_start_us * spu - spc);
     int q1 = (int)ceil(x0 + profile->burst_end_us * spu + spc);
     if (q0 < lo) q0 = lo;
     if (q1 > hi) q1 = hi;
-    cvbs_vscope_ll_plot(decoder->vscope, sys, pi, pq, hann, hlen, hnorm, ca, sa,
-                        gain, gain, q0, q1);   // transmitted V (no V-switch)
+    uint64_t pts = cvbs_vscope_ll_plot(ll, decoder->vscope, sys, hann, hlen, hnorm, ca, sa,
+                                       gain, vsw_gain, q0, q1, 0, 0, NULL, NULL);
     // Active picture.
     int a0 = (int)ceil(x0 + profile->active_start_us * spu);
     int a1 = (int)floor(x0 + profile->active_end_us * spu);
     if (a0 < lo) a0 = lo;
     if (a1 > hi) a1 = hi;
-    cvbs_vscope_ll_plot(decoder->vscope, sys, pi, pq, hann, hlen, hnorm, ca, sa,
-                        gain, vsw_gain, a0, a1);
+    pts += cvbs_vscope_ll_plot(ll, decoder->vscope, sys, hann, hlen, hnorm, ca, sa,
+                               gain, vsw_gain, a0, a1, 0, 0, NULL, NULL);
+    if (pts > 0) gui_vectorscope_count_line(decoder->vscope);
+}
+
+// SECAM points at the panel rate: a Catmull-Rom curve through the decimated
+// u / v (au / av; NULL = 0, the Advanced view's single axis) over decimated
+// [i0, i1), neighbours clamped to [lo, hi], every stride-th panel sample -
+// the weights tabled once per call (they were recomputed per point), the
+// cells in one pass, then the shared count. Returns the points plotted.
+static uint64_t cvbs_vscope_secam_points(gui_vectorscope_t *vs, const float *au, const float *av,
+                                         int i0, int i1, int lo, int hi, int decim) {
+    static int32_t cell[FILTERED_LINE_MAX + 64];
+    enum { MAX_SUB = 64 };
+    gui_vectorscope_break(vs);
+    if (decim < 1) decim = 1;
+    if (decim > MAX_SUB) decim = MAX_SUB;
+    if (i1 - i0 < 2) return 0;
+    const int st = vs->stride > 1 ? 2 : 1;
+    // Weight tables for both phases of the stride (the first sub-sample
+    // with an even panel index: (d * decim + k) & 1 == 0).
+    double w[2][MAX_SUB][4];
+    int nk[2];
+    for (int ph = 0; ph < 2; ph++) {
+        nk[ph] = 0;
+        for (int k = st > 1 ? ph : 0; k < decim; k += st) {
+            const double f = (double)k / (double)decim, f2 = f * f, f3 = f2 * f;
+            w[ph][nk[ph]][0] = -0.5 * f3 + f2 - 0.5 * f;
+            w[ph][nk[ph]][1] = 1.5 * f3 - 2.5 * f2 + 1.0;
+            w[ph][nk[ph]][2] = -1.5 * f3 + 2.0 * f2 + 0.5 * f;
+            w[ph][nk[ph]][3] = 0.5 * f3 - 0.5 * f2;
+            nk[ph]++;
+        }
+    }
+    const double half = 0.5 * GUI_VSCOPE_GRID, kp = half / GUI_VSCOPE_FULL_SCALE;
+    int m = 0;
+    int xmin = GUI_VSCOPE_GRID, xmax = -1, ymin = GUI_VSCOPE_GRID, ymax = -1;
+    for (int d = i0; d < i1 - 1; d++) {
+        const int dm = d > lo ? d - 1 : d;
+        const int dp = d + 2 <= hi ? d + 2 : d + 1;
+        const double u0 = au ? au[dm] : 0.0, u1 = au ? au[d] : 0.0;
+        const double u2 = au ? au[d + 1] : 0.0, u3 = au ? au[dp] : 0.0;
+        const double v0 = av ? av[dm] : 0.0, v1 = av ? av[d] : 0.0;
+        const double v2 = av ? av[d + 1] : 0.0, v3 = av ? av[dp] : 0.0;
+        const int ph = st > 1 ? ((d * decim) & 1) : 0;
+        const double (*t)[4] = w[ph];
+        for (int j = 0; j < nk[ph]; j++) {
+            const double u = t[j][0] * u0 + t[j][1] * u1 + t[j][2] * u2 + t[j][3] * u3;
+            const double v = t[j][0] * v0 + t[j][1] * v1 + t[j][2] * v2 + t[j][3] * v3;
+            const int x = (int)(half + u * kp);
+            const int y = (int)(half - v * kp);
+            const bool in = (unsigned)x < GUI_VSCOPE_GRID && (unsigned)y < GUI_VSCOPE_GRID;
+            cell[m++] = in ? ((y << GUI_VSCOPE_GRID_SHIFT) | x) : -1;
+            const int xl = in ? x : GUI_VSCOPE_GRID, xh = in ? x : -1;
+            const int yl = in ? y : GUI_VSCOPE_GRID, yh = in ? y : -1;
+            xmin = xl < xmin ? xl : xmin;
+            xmax = xh > xmax ? xh : xmax;
+            ymin = yl < ymin ? yl : ymin;
+            ymax = yh > ymax ? yh : ymax;
+        }
+    }
+    return cvbs_vscope_count(vs, GUI_VSCOPE_SYS_SECAM, cell, m, xmin, xmax, ymin, ymax);
+}
+
+// The band low-pass's gain at the rest carriers, +-78.125 kHz from the
+// nominal block centre (a real symmetric FIR: even, real response). Its
+// Hamming skirts are not flat that far in: the porch envelope read ~11% low
+// (Test Gen 132 / 174 mV p-p as 118 / 157) until divided by it. Cached per
+// filter build.
+static double cvbs_secam_lp_gain_at_rest(const cvbs_decoder_t *decoder) {
+    static double gain = 1.0;
+    static unsigned gen = ~0u;
+    if (gen != g_secam_coeffs_gen) {
+        const double rate = cvbs_rate(decoder);
+        const double f = 0.5 * (CVBS_SECAM_FOR_HZ - CVBS_SECAM_FOB_HZ);
+        const int half = g_secam_lp_taps / 2;
+        double h = 0.0;
+        for (int t = 0; t < g_secam_lp_taps; t++) {
+            h += g_secam_lp[t] * cos(2.0 * M_PI * f * (double)(t - half) / rate);
+        }
+        gain = fabs(h) > 0.1 ? fabs(h) : 1.0;
+        gen = g_secam_coeffs_gen;
+    }
+    return gain;
+}
+
+// Advanced (transmitted) SECAM vectorscope line. decode-orc / tbc-analyse
+// have no SECAM composite scope (FM chroma, no burst); this is the
+// measurement view of what a SECAM line carries:
+//  - its OWN colour difference only - D'B lines along U, D'R lines along V -
+//    no receiver one-line pairing;
+//  - referenced to the field-tracked rest carrier, not this line's own porch,
+//    so a line's rest-carrier error shows as an offset (PAL Advanced's
+//    flywheel against per-line burst lock);
+//  - windows: Active (the picture demod: de-emphasised, concealed), Whole
+//    (that demod in the active window; elsewhere the bell-free carrier
+//    frequency where a carrier is present, the origin where it is blanked),
+//    Burst = the back-porch rest carrier. VBI lines (Field: Whole) plot the
+//    bell-free carrier frequency throughout (no picture demod runs there);
+//  - readouts per field: rest-carrier error and line-to-line jitter, porch
+//    carrier level against the line's sync, ident errors.
+static void cvbs_vscope_secam_advanced(cvbs_decoder_t *decoder, const int16_t *src, int n,
+                                       bool picture_line, int dec_count) {
+    gui_vectorscope_t *vs = decoder->vscope;
+    if (!picture_line && vs->field_view != GUI_VSCOPE_FIELD_WHOLE) return;
+    const bool red = g_secam_line.is_red;
+    const int c = red ? 1 : 0;
+    const int decim = g_secam_decim > 0 ? g_secam_decim : 1;
+    vs->m_secam = true;
+    if (g_secam_line.porch_ok) {
+        const double e = g_secam_line.porch_freq - (red ? CVBS_SECAM_FOR_HZ : CVBS_SECAM_FOB_HZ);
+        vs->m_s_n[c]++;
+        vs->m_s_sum[c] += e;
+        vs->m_s_sq[c] += e * e;
+        // Porch carrier peak-to-peak against this line's sync height
+        // (300 mV): the analytic magnitude is half the carrier's peak.
+        const int t0 = cvbs_us_to_samples(decoder, 1.0) - CVBS_SYNC_EDGE_DELAY_SAMPLES;
+        const int t1 = cvbs_us_to_samples(decoder, 3.5) - CVBS_SYNC_EDGE_DELAY_SAMPLES;
+        const int q0 = g_secam_line.p0 * decim, q1 = g_secam_line.p1 * decim;
+        if (t0 >= 0 && t1 > t0 + 4 && q0 > t1 && q1 > q0 + 4 && q1 <= n) {
+            double ts = 0.0, ps = 0.0;
+            for (int k = t0; k < t1; k++) ts += src[k];
+            for (int k = q0; k < q1; k++) ps += src[k];
+            const double swing = ps / (double)(q1 - q0) - ts / (double)(t1 - t0);
+            // The envelope's MEDIAN over the porch window (the decoder's
+            // porch_env is a mean, pulled ~11% low by the carrier's rise at
+            // the window start: Test Gen 132 / 174 mV read 118 / 156).
+            double env[40];
+            int ne = 0;
+            for (int i = g_secam_line.p0; i < g_secam_line.p1 && i < dec_count && ne < 40; i++) {
+                env[ne++] = hypot(g_secam_lpre[i], g_secam_lpim[i]);
+            }
+            if (swing > 0.0 && ne >= 5) {
+                vs->m_s_mv[c] += 4.0 * cvbs_secam_median(env, ne) / cvbs_secam_lp_gain_at_rest(decoder)
+                               / swing * 300.0;
+                vs->m_s_mv_n[c]++;
+            }
+        }
+        // Ident: consecutive lines must alternate D'R / D'B.
+        if (g_secam_line.ident_decisive) {
+            const int line = decoder->pll.current_line;
+            if (vs->m_s_last_line >= 0 && line == vs->m_s_last_line + 1 &&
+                red == vs->m_s_last_red) {
+                vs->m_s_ident_err++;
+            }
+            vs->m_s_last_line = line;
+            vs->m_s_last_red = red;
+        }
+    }
+
+    // This line's own component (u01 / v01 units) over the window.
+    const double dev = red ? CVBS_SECAM_DEV_DR_HZ : CVBS_SECAM_DEV_DB_HZ;
+    const double scale = red ? CVBS_SECAM_V_SCALE : CVBS_SECAM_U_SCALE;
+    const double ref = g_secam_line.field_zero;
+    // The picture demod is relative to this line's own rest: re-reference
+    // it to the field's (the de-emphasis passes DC at unity).
+    const double own_off = (g_secam_line.zero - ref) / dev * scale;
+    const double killer = g_secam_line.killer;
+    int i0, i1;
+    switch (vs->lines_view) {
+        case GUI_VSCOPE_LINES_BURST: i0 = g_secam_line.p0; i1 = g_secam_line.p1; break;
+        case GUI_VSCOPE_LINES_WHOLE: i0 = 0; i1 = dec_count; break;
+        default: i0 = g_secam_line.a0; i1 = g_secam_line.a1; break;
+    }
+    if (i0 < 0) i0 = 0;
+    if (i1 > dec_count) i1 = dec_count;
+    if (i1 - i0 < 2) return;
+    for (int i = i0; i < i1; i++) {
+        double val = 0.0;
+        if (picture_line && i >= g_secam_line.a0 && i < g_secam_line.a1) {
+            val = (red ? g_secam_v[i] : g_secam_u[i]) + own_off;
+        } else if (killer > 0.0 && hypot(g_secam_lpre[i], g_secam_lpim[i]) >= killer) {
+            val = (g_secam_fref[i] - ref) / dev * scale;
+        }
+        g_secam_adv[i] = (float)val;
+    }
+    // At the panel rate, as the Standard SECAM plot (one axis).
+    if (cvbs_vscope_secam_points(vs, red ? NULL : g_secam_adv, red ? g_secam_adv : NULL,
+                                 i0, i1, i0, i1 - 1, decim) > 0) {
+        gui_vectorscope_count_line(vs);
+    }
 }
 
 // Decode a single video line from samples to RGB24 pixels.
@@ -2542,35 +3082,28 @@ static void decode_line_to_pixels(cvbs_decoder_t *decoder,
         // at the panel rate instead - a Catmull-Rom curve through the
         // decimated points (the D'x signals are band-limited well inside the
         // decimated Nyquist), one point per panel sample like PAL/NTSC.
-        if (decoder->vscope && picture_line && secam_dec_count > 1 &&
-            decoder->secam.line_pair_valid) {
+        if (decoder->vscope && secam_dec_count > 1 &&
+            decoder->vscope->mode == GUI_VSCOPE_MODE_ADVANCED) {
+            cvbs_vscope_secam_advanced(decoder, src, n, picture_line, secam_dec_count);
+        } else if (decoder->vscope && picture_line && secam_dec_count > 1 &&
+                   decoder->secam.line_pair_valid) {
             int d0 = (s0 > 0 ? s0 : 0) / g_secam_decim;
             int d1 = (s1 > 0 ? s1 : 0) / g_secam_decim;
             if (d1 > secam_dec_count - 1) d1 = secam_dec_count - 1;
-            const int sub = g_secam_decim > 0 ? g_secam_decim : 1;
-            const double inv = 1.0 / (double)sub;
-            for (int d = d0; d < d1; d++) {
-                const int dm = d > 0 ? d - 1 : d;
-                const int dp = d + 2 < secam_dec_count ? d + 2 : d + 1;
-                const double u0 = g_secam_u[dm], u1 = g_secam_u[d], u2 = g_secam_u[d + 1], u3 = g_secam_u[dp];
-                const double v0 = g_secam_v[dm], v1 = g_secam_v[d], v2 = g_secam_v[d + 1], v3 = g_secam_v[dp];
-                for (int k = 0; k < sub; k++) {
-                    const double f = (double)k * inv, f2 = f * f, f3 = f2 * f;
-                    const double w0 = -0.5 * f3 + f2 - 0.5 * f;
-                    const double w1 = 1.5 * f3 - 2.5 * f2 + 1.0;
-                    const double w2 = -1.5 * f3 + 2.0 * f2 + 0.5 * f;
-                    const double w3 = 0.5 * f3 - 0.5 * f2;
-                    gui_vectorscope_add(decoder->vscope, GUI_VSCOPE_SYS_SECAM,
-                                        w0 * u0 + w1 * u1 + w2 * u2 + w3 * u3,
-                                        w0 * v0 + w1 * v1 + w2 * v2 + w3 * v3);
-                }
+            if (cvbs_vscope_secam_points(decoder->vscope, g_secam_u, g_secam_v, d0, d1 + 1,
+                                         0, secam_dec_count - 1, g_secam_decim) > 0) {
+                gui_vectorscope_count_line(decoder->vscope);
             }
         }
     }
     // Composite vectorscope: this picture line's line-locked chroma
     // demod (PAL/NTSC quadrature only - SECAM's FM chroma has no burst).
-    if (decoder->vscope && colour && picture_line) {
-        cvbs_vscope_ll_line(decoder, samples, sample_count, carrier_anchor, range);
+    // The Advanced mode runs every line (its flywheel and oscillator stay
+    // continuous through the VBI; the field range picks what plots).
+    if (decoder->vscope && colour &&
+        (picture_line || decoder->vscope->mode == GUI_VSCOPE_MODE_ADVANCED)) {
+        cvbs_vscope_ll_line(decoder, samples, sample_count, carrier_anchor, range,
+                            picture_line);
     }
     // Waveform monitor: this line on the monitor's fixed time grid. The
     // line buffer's 0H (the sync leading edge's 50% point) sits at
@@ -3867,7 +4400,7 @@ static void complete_field_pll(cvbs_decoder_t *decoder) {
     decoder->field_line_count[field_idx] = line_count;
     decoder->field_sequence++;
     decoder->field_last_update_seq[field_idx] = decoder->field_sequence;
-    if (decoder->vscope) gui_vectorscope_end_field(decoder->vscope);
+    if (decoder->vscope) gui_vectorscope_end_field_parity(decoder->vscope, field_idx);
     if (decoder->wfm) gui_wfm_end_field(decoder->wfm);
 
     // Deinterlace and display - works with one or both fields

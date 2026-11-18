@@ -37,6 +37,7 @@
 #include "../input/gui_playback.h"
 #include "../visualization/gui_text.h"
 #include "../visualization/gui_wfm_panel.h"
+#include "../visualization/gui_vectorscope_panel.h"
 #include "../input/gui_capture.h"
 #include "../processing/gui_extract.h"
 #include "../signal/gui_cvbs.h"
@@ -149,6 +150,14 @@ static void print_usage(const char *program_name) {
             "           channel=y|yc|c, range=active|frame, units=ire|mv,\n"
             "           phosphor=on|off, intensity=0.1..10, system=auto|pal|ntsc|\n"
             "           secam (any subset; defaults y, active, ire, off, 3.0, auto).\n"
+            "--vector <key=value,...> launch state of Vector (vectorscope) panels:\n"
+            "           mode=standard|advanced, lines=active|whole|burst|porch\n"
+            "           (porch: SECAM's burst window), field=active|whole,\n"
+            "           graticule=75|100|both|off,\n"
+            "           plot=points|density, colour=mono|multi|blend, trace=on|off,\n"
+            "           intensity=1..10, system=auto|pal|ntsc|secam (any subset;\n"
+            "           defaults standard, whole, active, 75, points, mono, on, 3,\n"
+            "           auto; lines/field apply to the Advanced mode).\n"
             "--auto-capture starts capture unattended ~1 s after launch (Local mode;\n"
             "           no --config required).\n"
             "--auto-record <seconds> runs a full unattended record cycle: start\n"
@@ -1002,6 +1011,18 @@ int main(int argc, char **argv) {
                 return 1;
             }
             if (!gui_wfm_panel_apply_launch_arg(argv[++i])) return 1;
+            continue;
+        }
+        if (strcmp(a, "--vector") == 0) {
+            // --vector <key=value,...>: launch state of new vectorscope
+            // panels (hard rule dev/gui_automation_flags_rules.md).
+            // Validated here, fail fast; applied before --panel-view
+            // creates any panel.
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--vector requires <key=value,...>\n");
+                return 1;
+            }
+            if (!gui_vectorscope_panel_apply_launch_arg(argv[++i])) return 1;
             continue;
         }
         if (strcmp(a, "--auto-capture") == 0) {

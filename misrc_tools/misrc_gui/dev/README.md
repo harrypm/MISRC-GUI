@@ -41,6 +41,7 @@ Use lowercase with underscores:
 | `self_contained_deps_rules.md` | HARD rule: all build deps self-contained from committed pinned `third_party/` trees; no build-time downloads; dep changes only via human-approved commits |
 | `prompt_vectorscope_smpte_readme.md` | Composite vectorscope panel + NTSC SMPTE SD bars Test Gen prompt log (UX sign-off record) |
 | `prompt_waveform_monitor_readme.md` | Composite waveform monitor panel (tbc-analyse WFM port): design, accuracy contract, CPU, open UX sign-off |
+| `prompt_vectorscope_advanced_readme.md` | Advanced (decode-orc composite measurement) vectorscope + beam renderer: both PAL phases, readouts, `--vector`, CPU vs baseline, open UX sign-off |
 | `docs_folder_rules.md` | HARD rule: user-facing sub-docs live in `docs/` (root keeps only README/CONTRIBUTING/INSTALLATION/TECHNICAL/UPDATE/LICENSE*); enforced by the docs layout CI guard |
 
 ### When starting a new prompt

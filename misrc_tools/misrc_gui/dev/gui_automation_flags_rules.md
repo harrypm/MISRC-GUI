@@ -70,11 +70,20 @@ GUI autoload trigger flag.**
   auto|pal|ntsc|secam; launch state of every WFM panel created after it;
   unknown keys/values print the accepted list and exit 1; logs
   `[AUTO] --wfm` and `[AUTO] WFM panel: ...` per panel). [2026-11-16]
+- Vector (vectorscope) panel System / Mode / Lines / Field / Graticule /
+  Plot / Colour / Trace / Intensity buttons (and the scroll-wheel
+  intensity): `--vector <key=value,...>` (mode=standard|advanced, lines=
+  active|whole|burst|porch (porch = SECAM's burst window), field=
+  active|whole, graticule=75|100|both|off, plot=
+  points|density, colour=mono|multi|blend, trace=on|off, intensity=1..10,
+  system=auto|pal|ntsc|secam; launch state of every Vector panel created
+  after it; unknown keys/values print the accepted list and exit 1; logs
+  `[AUTO] --vector` and `[AUTO] Vector panel: ...` per panel). Closes the
+  vectorscope System/Graticule/Plot/Colour known gap. [2026-11-17]
 
 ## Known gaps (backlog under this rule — do not grow this list)
 
-- Waveform Signal/Mode/Scale/Trig dropdowns, vectorscope System/Graticule/
-  Plot/Colour cycle buttons,
+- Waveform Signal/Mode/Scale/Trig dropdowns,
   waveform playback Res/Range render-resolution dropdowns (per-panel runtime
   state: `res_points`/`res_range`, no settings key),
   CVBS/RF decoder-mode cycle, OSD/Frame/Levels/Sync selectors: per-panel
