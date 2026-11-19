@@ -27,6 +27,7 @@ typedef enum {
     CUSTOM_LAYOUT_ELEMENT_TYPE_LOOP_ICON,
     CUSTOM_LAYOUT_ELEMENT_TYPE_PLAY_ICON,       // Transport play glyph (filled triangle)
     CUSTOM_LAYOUT_ELEMENT_TYPE_PAUSE_ICON,      // Transport pause glyph (two bars)
+    CUSTOM_LAYOUT_ELEMENT_TYPE_CUT_MARKER_ICON, // Cut markers glyph ([ | ], IN / OUT tinted when set)
     CUSTOM_LAYOUT_ELEMENT_TYPE_VERSION_ICON,    // Fixed left-side badge showing MISRC capture state
     CUSTOM_LAYOUT_ELEMENT_TYPE_SCROLL_ICON      // Metadata page icon
 } CustomLayoutElementType;
@@ -60,11 +61,16 @@ typedef struct {
 } CustomLayoutElement_VersionIcon;
 
 typedef struct {
+    bool has_in, has_out;   // tint the [ / ] in the IN / OUT colours
+} CustomLayoutElement_CutMarkerIcon;
+
+typedef struct {
     CustomLayoutElementType type;
     union {
         CustomLayoutElement_ChannelPanel channel_panel;
         CustomLayoutElement_VUMeter vu_meter;
         CustomLayoutElement_VersionIcon version_icon;
+        CustomLayoutElement_CutMarkerIcon cut_marker_icon;
     } customData;
 } CustomLayoutElement;
 

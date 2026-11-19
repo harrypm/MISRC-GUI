@@ -229,6 +229,8 @@ void gui_extract_prepare_stream(gui_app_t *app) {
     // (playback commit/detector raises a direct-domain 16-bit channel to 4096).
     atomic_store(&app->rf_display_full_scale[0],2048);
     atomic_store(&app->rf_display_full_scale[1],2048);
+    atomic_store(&app->rf_clip_rail_clamped[0],false);
+    atomic_store(&app->rf_clip_rail_clamped[1],false);
     // No extraction producer is running here. Clear pressure from the prior
     // session so a new capture does not inherit its frozen-preview state.
     const gui_rf_block_info_t empty_info[2] = {{0}};
@@ -254,9 +256,12 @@ static void independent_channel_stats(gui_app_t *app, int channel,
     // level-autostop helpers normalize against 2048), so native-domain peaks
     // are rescaled into that container for the meters only.
     float meter_scale = 2048.0f / (float)full_scale;
+    // A PASS-clamped playback source: the rail is the clamp, not a clip.
+    const bool count_clips = !atomic_load(&app->rf_clip_rail_clamped[channel == 1 ? 1 : 0]);
     for (size_t i = 0; i < num_samples; i++) {
         int16_t v = samples[i];
-        if (v >= clip_hi) clip_pos++;
+        if (!count_clips) {
+        } else if (v >= clip_hi) clip_pos++;
         else if (v <= clip_lo) clip_neg++;
         if (i < peak_samples) {
             if (v > 0 && (uint16_t)v > peak_pos) peak_pos = (uint16_t)v;
@@ -1125,14 +1130,19 @@ void gui_extract_update_stats(gui_app_t *app, const int16_t *buf_a,
     size_t dbg_idx[8];
     int16_t dbg_val[8];
     int dbg_n = 0;
+    // A PASS-clamped playback source: the rail is the clamp, not a clip
+    // (see gui_app.h rf_clip_rail_clamped).
+    const bool count_a = !atomic_load(&app->rf_clip_rail_clamped[0]);
+    const bool count_b = !atomic_load(&app->rf_clip_rail_clamped[1]);
 
      for (size_t i = 0; i < num_samples; i++) {
         int16_t sa = buf_a[i];
 
         // Clipping detection (12-bit ADC: +2047 is positive clip, -2048 is negative clip)
-        if (sa >= 2047) clip_a_pos++;
+        if (!count_a) {
+        } else if (sa >= 2047) clip_a_pos++;
         else if (sa <= -2048) clip_a_neg++;
-        if ((sa >= 2047 || sa <= -2048) && dbg_n < 8) {
+        if (count_a && (sa >= 2047 || sa <= -2048) && dbg_n < 8) {
             dbg_idx[dbg_n] = i;
             dbg_val[dbg_n] = sa;
             dbg_n++;
@@ -1148,7 +1158,8 @@ void gui_extract_update_stats(gui_app_t *app, const int16_t *buf_a,
         if (have_b) {
             int16_t sb = buf_b[i];
 
-            if (sb >= 2047) clip_b_pos++;
+            if (!count_b) {
+            } else if (sb >= 2047) clip_b_pos++;
             else if (sb <= -2048) clip_b_neg++;
 
             if (i < peak_samples) {

@@ -237,52 +237,67 @@ void Clay_Raylib_Render(Clay_RenderCommandArray renderCommands, Font* fonts)
                         break;
                     }
                     case CUSTOM_LAYOUT_ELEMENT_TYPE_LOOP_ICON: {
-                        // Circular repeat arrow icon (playback loop toggle).
-                        // Styled to match a classic thick loop arrow with
-                        // a left-side head and rounded tail.
+                        // Repeat glyph (playback loop toggle; harrypm
+                        // 2026-11-19 "fix the loop icon": the old ring
+                        // read as an "O" at 12-20 px). A rounded rectangle
+                        // opened at the top-right and bottom-left corners:
+                        // the top run ends in a right-pointing head, the
+                        // bottom run in a left-pointing head.
+                        float s = (boundingBox.width < boundingBox.height ? boundingBox.width : boundingBox.height);
                         float cx = boundingBox.x + boundingBox.width * 0.5f;
                         float cy = boundingBox.y + boundingBox.height * 0.5f;
-                        float size = (boundingBox.width < boundingBox.height ? boundingBox.width : boundingBox.height);
-                        float ring_outer = size * 0.46f;
-                        float ring_stroke = fmaxf(2.2f, size * 0.22f);
-                        float ring_inner = fmaxf(0.5f, ring_outer - ring_stroke);
+                        float t = fmaxf(1.6f, s * 0.14f);          // stroke
+                        float hw = s * 0.44f, hh = s * 0.27f;      // half box (centre line)
+                        float L = cx - hw, R = cx + hw, T = cy - hh, B = cy + hh;
+                        float r = fminf(hh * 0.9f, s * 0.20f);     // corner radius
+                        float ah = fmaxf(2.5f, s * 0.24f);         // head length
+                        float aw = fmaxf(2.2f, s * 0.22f);         // head half height
                         Color col = COLOR_TEXT;
-                        // Draw two arc segments so the intentional gap lands on the left,
-                        // where the arrowhead will sit.
-                        DrawRing((Vector2){cx, cy}, ring_inner, ring_outer,
-                                 228.0f, 360.0f, 56, col);
-                        DrawRing((Vector2){cx, cy}, ring_inner, ring_outer,
-                                 0.0f, 150.0f, 56, col);
-
-                        // Rounded tail cap at lower-left.
-                        float tail_ang = 228.0f * DEG2RAD;
-                        float mid_r = (ring_inner + ring_outer) * 0.5f;
-                        Vector2 tail = {
-                            cx + cosf(tail_ang) * mid_r,
-                            cy + sinf(tail_ang) * mid_r
-                        };
-                        DrawCircle((int)roundf(tail.x), (int)roundf(tail.y), ring_stroke * 0.52f, col);
-
-                        // Filled arrowhead on the left side.
-                        float tip_ang = 188.0f * DEG2RAD;
-                        Vector2 tip = {
-                            cx + cosf(tip_ang) * (ring_outer + ring_stroke * 0.30f),
-                            cy + sinf(tip_ang) * (ring_outer + ring_stroke * 0.30f)
-                        };
-                        float wing_radius = ring_outer - ring_stroke * 0.18f;
-                        float wing_offset = 0.72f;
-                        Vector2 wing_a = {
-                            cx + cosf(tip_ang + wing_offset) * wing_radius,
-                            cy + sinf(tip_ang + wing_offset) * wing_radius
-                        };
-                        Vector2 wing_b = {
-                            cx + cosf(tip_ang - wing_offset) * wing_radius,
-                            cy + sinf(tip_ang - wing_offset) * wing_radius
-                        };
-                        // Winding matches the dropdown arrows (negative
-                        // screen-space cross); the opposite order can be
-                        // backface-culled, which would drop the arrowhead.
-                        DrawTriangle(tip, wing_b, wing_a, col);
+                        // Top-left corner + left side up from mid; top run.
+                        DrawRing((Vector2){L + r, T + r}, r - t * 0.5f, r + t * 0.5f, 180.0f, 270.0f, 12, col);
+                        DrawLineEx((Vector2){L, cy + hh * 0.15f}, (Vector2){L, T + r}, t, col);
+                        float top_tip = R - r * 0.2f;
+                        DrawLineEx((Vector2){L + r, T}, (Vector2){top_tip - ah + 0.5f, T}, t, col);
+                        // Bottom-right corner + right side down from mid; bottom run.
+                        DrawRing((Vector2){R - r, B - r}, r - t * 0.5f, r + t * 0.5f, 0.0f, 90.0f, 12, col);
+                        DrawLineEx((Vector2){R, cy - hh * 0.15f}, (Vector2){R, B - r}, t, col);
+                        float bot_tip = L + r * 0.2f;
+                        DrawLineEx((Vector2){R - r, B}, (Vector2){bot_tip + ah - 0.5f, B}, t, col);
+                        // Heads. Counter-clockwise on screen (negative
+                        // screen-space cross, as the dropdown arrows):
+                        // the other order can be backface-culled.
+                        DrawTriangle((Vector2){top_tip, T}, (Vector2){top_tip - ah, T - aw},
+                                     (Vector2){top_tip - ah, T + aw}, col);
+                        DrawTriangle((Vector2){bot_tip, B}, (Vector2){bot_tip + ah, B + aw},
+                                     (Vector2){bot_tip + ah, B - aw}, col);
+                        break;
+                    }
+                    case CUSTOM_LAYOUT_ELEMENT_TYPE_CUT_MARKER_ICON: {
+                        // Cut markers glyph: [ | ] - a playhead between an
+                        // IN bracket and an OUT bracket, each tinted once set.
+                        CustomLayoutElement_CutMarkerIcon *ci = &customElement->customData.cut_marker_icon;
+                        float s = (boundingBox.width < boundingBox.height ? boundingBox.width : boundingBox.height);
+                        float cx = boundingBox.x + boundingBox.width * 0.5f;
+                        float cy = boundingBox.y + boundingBox.height * 0.5f;
+                        float t = fmaxf(1.6f, s * 0.14f);
+                        float T = cy - s * 0.44f, B = cy + s * 0.44f;
+                        float L = cx - s * 0.44f, R = cx + s * 0.44f;
+                        float serif = s * 0.24f;
+                        Color in_col = ci->has_in ? COLOR_CUT_IN : COLOR_TEXT;
+                        Color out_col = ci->has_out ? COLOR_CUT_OUT : COLOR_TEXT;
+                        DrawRectangleRec((Rectangle){L, T, t, B - T}, in_col);
+                        DrawRectangleRec((Rectangle){L, T, serif + t, t}, in_col);
+                        DrawRectangleRec((Rectangle){L, B - t, serif + t, t}, in_col);
+                        DrawRectangleRec((Rectangle){R - t, T, t, B - T}, out_col);
+                        DrawRectangleRec((Rectangle){R - t - serif, T, serif + t, t}, out_col);
+                        DrawRectangleRec((Rectangle){R - t - serif, B - t, serif + t, t}, out_col);
+                        // Playhead: thin line with a down-pointing head
+                        // (counter-clockwise on screen, see the loop icon).
+                        float ph = fmaxf(1.0f, t * 0.6f);
+                        DrawRectangleRec((Rectangle){cx - ph * 0.5f, T + s * 0.16f, ph, B - T - s * 0.16f}, COLOR_TEXT);
+                        float hw = s * 0.17f;
+                        DrawTriangle((Vector2){cx, T + s * 0.30f}, (Vector2){cx + hw, T},
+                                     (Vector2){cx - hw, T}, COLOR_TEXT);
                         break;
                     }
                     case CUSTOM_LAYOUT_ELEMENT_TYPE_PLAY_ICON: {

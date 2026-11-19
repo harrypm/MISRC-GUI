@@ -818,7 +818,11 @@ void gui_settings_save(const gui_settings_t *settings) {
     fprintf(f,"  \"monitor_local_save_enabled\": %s,\n",settings->monitor_local_save_enabled?"true":"false");
     gui_settings_write_string(f, "playback_file_a", settings->playback_file_a, true);
     gui_settings_write_string(f, "playback_file_b", settings->playback_file_b, true);
-    gui_settings_write_string(f, "playback_audio_file", settings->playback_audio_file, false);
+    gui_settings_write_string(f, "playback_audio_file", settings->playback_audio_file, true);
+    gui_settings_write_string(f, "panel_view_a", settings->panel_view_a, true);
+    gui_settings_write_string(f, "panel_view_b", settings->panel_view_b, true);
+    gui_settings_write_string(f, "video_decoder_a", settings->video_decoder_a, true);
+    gui_settings_write_string(f, "video_decoder_b", settings->video_decoder_b, false);
     fprintf(f, "}\n");
     
     fclose(f);
@@ -1527,6 +1531,18 @@ void gui_settings_load(gui_settings_t *settings) {
     }
     if ((value = find_value(content, "playback_audio_file")) != NULL) {
         gui_settings_load_string(settings->playback_audio_file, sizeof(settings->playback_audio_file), value);
+    }
+    if ((value = find_value(content, "panel_view_a")) != NULL) {
+        gui_settings_load_string(settings->panel_view_a, sizeof(settings->panel_view_a), value);
+    }
+    if ((value = find_value(content, "panel_view_b")) != NULL) {
+        gui_settings_load_string(settings->panel_view_b, sizeof(settings->panel_view_b), value);
+    }
+    if ((value = find_value(content, "video_decoder_a")) != NULL) {
+        gui_settings_load_string(settings->video_decoder_a, sizeof(settings->video_decoder_a), value);
+    }
+    if ((value = find_value(content, "video_decoder_b")) != NULL) {
+        gui_settings_load_string(settings->video_decoder_b, sizeof(settings->video_decoder_b), value);
     }
 
     // RTL-SDR settings

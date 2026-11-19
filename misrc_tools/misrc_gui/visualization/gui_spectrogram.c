@@ -32,6 +32,7 @@
 #include "gui_text.h"
 #include "../core/gui_app.h"
 #include "../input/gui_playback.h"
+#include "../input/gui_cut_markers.h"
 #include "../signal/gui_cvbs.h"   // gui_video_panel_sync_source
 #include "../ui/gui_ui.h"
 #include "../ui/gui_dropdown.h"  // gui_dropdown_option_color for the palette dropdown
@@ -560,7 +561,7 @@ static void spectro_write_slice_index(spectro_engine_t *e, int index) {
 // Fills the FULL history width with the window's slices (async: keeps the
 // last completed window until the worker publishes the new one).
 static void spectro_update_paused_window(spectro_engine_t *e, gui_app_t *app, int channel) {
-    uint64_t playhead = gui_playback_get_position_samples_channel(app, channel);
+    uint64_t playhead = gui_playback_get_cue_samples_channel(app, channel);
     // The file's true rate (the time axis's), for the window start in seconds
     // and the field snap.
     playback_file_info_t info = {0};
@@ -979,6 +980,44 @@ static void spectro_draw_field_marks(spectro_engine_t *e, double real_rate_hz, R
     }
 }
 
+// Cut markers (FLAC-Chop IN / OUT, set from the playback row's marker
+// button or I / O) across the paused window: a coloured line with a dark
+// edge and an IN / OUT tag, where the mark falls inside the window.
+static void spectro_draw_cut_marks(spectro_engine_t *e, gui_app_t *app, int channel,
+                                   double real_rate_hz, Rectangle bounds) {
+    if (!e->analysis_active || real_rate_hz <= 0.0 || e->analysis_span_seconds <= 0.0) return;
+    const char *path = channel == 1 ? app->settings.playback_file_b : app->settings.playback_file_a;
+    const gui_cut_marks_t m = gui_cut_marks_get(channel, path);
+    const double t0 = e->analysis_t0, win = e->analysis_span_seconds;
+    const bool tags = !gui_chrome_hide_hidden(&e->chrome_hide);
+    for (int k = 0; k < 2; k++) {
+        if (k == 0 ? !m.has_in : !m.has_out) continue;
+        const double t = (double)(k == 0 ? m.in : m.out) / real_rate_hz;
+        if (t < t0 || t > t0 + win) continue;
+        const float frac = (float)((t - t0) / win);
+        const Color c = k == 0 ? COLOR_CUT_IN : COLOR_CUT_OUT;
+        const Color edge = Fade(BLACK, 0.7f);
+        const char *tag = k == 0 ? "IN" : "OUT";
+        if (e->time_on_x) {
+            const float x = bounds.x + frac * bounds.width;
+            DrawRectangleRec((Rectangle){ x - 2.0f, bounds.y, 4.0f, bounds.height }, edge);
+            DrawRectangleRec((Rectangle){ x - 1.0f, bounds.y, 2.0f, bounds.height }, c);
+            if (tags) {
+                const float tx = k == 0 ? x + 4.0f : x - 4.0f - 22.0f;
+                gui_text_draw_mono(tag, tx, bounds.y + bounds.height - 40.0f, FONT_SIZE_OSC_SCALE, c);
+            }
+        } else {
+            const float y = bounds.y + (1.0f - frac) * bounds.height;   // newest at the top
+            DrawRectangleRec((Rectangle){ bounds.x, y - 2.0f, bounds.width, 4.0f }, edge);
+            DrawRectangleRec((Rectangle){ bounds.x, y - 1.0f, bounds.width, 2.0f }, c);
+            if (tags) {
+                const float ty = k == 0 ? y - FONT_SIZE_OSC_SCALE - 3.0f : y + 3.0f;
+                gui_text_draw_mono(tag, bounds.x + 30.0f, ty, FONT_SIZE_OSC_SCALE, c);
+            }
+        }
+    }
+}
+
 // Hover readout (harrypm 2026-11-19): the frequency and time under the
 // mouse, on the axes' own scales (rolling: seconds back from now; paused:
 // the file's absolute timecode). Statistics like the axis labels, but hidden
@@ -1275,6 +1314,7 @@ static void spectro_vtable_render(void *state_ptr, gui_app_t *app, int channel,
 
     spectro_draw_overlay(e, real_rate_hz, bounds, plot);
     spectro_draw_field_marks(e, real_rate_hz, bounds);
+    if (playback_selected) spectro_draw_cut_marks(e, app, channel, real_rate_hz, bounds);
     spectro_draw_hover(e, real_rate_hz, bounds);
 
     // Paused analysis indicator: window span + pending state. Every column

@@ -391,6 +391,14 @@ typedef struct {
     // Playback settings
     char playback_file_a[FILE_PATH_MAX];   // FLAC file for channel A playback
     char playback_file_b[FILE_PATH_MAX];   // FLAC file for channel B playback
+    // Per-channel panel setup restored at launch (harrypm 2026-11-19: keep
+    // the monitoring config, e.g. FM RF on A and CVBS on B). Same view names
+    // as --panel-view: "<left>[,<right>]"; video decoders per Video slot:
+    // "<cvbs|tape|rf>[,<cvbs|tape|rf>]" (left, right; "-" = not a Video panel).
+    char panel_view_a[48];
+    char panel_view_b[48];
+    char video_decoder_a[24];
+    char video_decoder_b[24];
     char playback_audio_file[FILE_PATH_MAX]; // Audio-rate file for the playback
                                              // monitor (drag-and-drop; the
                                              // position-synced feed in
@@ -529,6 +537,13 @@ typedef struct gui_app {
     // backends with a different container (DdD 512) publish their own scale
     // (see gui_app_level_autostop_full_scale).
     atomic_uint_fast32_t rf_display_full_scale[2];
+    // Playback channel whose 16-bit source is clamped INTO the 12-bit
+    // container (conv16 PASS: direct-value files peaking past +-2047, e.g.
+    // the Daimler NTSC tape FLAC at about +-2200 of its own +-32767). The
+    // container rail is then the clamp, not a source clip: the extractor
+    // does not count it (harrypm 2026-11-19: clip indicators lit on files
+    // that clearly are not clipping).
+    atomic_bool rf_clip_rail_clamped[2];
     atomic_uint_fast64_t rf_stream_epoch;
     atomic_uint_fast32_t audio_sample_rate;
     atomic_bool cxadc_audio_ready;

@@ -40,6 +40,7 @@
 #include "../visualization/gui_vectorscope_panel.h"
 #include "../visualization/gui_spectrogram.h"
 #include "../signal/gui_cvbs.h"   // gui_video_panel_sync_source (field step)
+#include "../input/gui_cut_markers.h"   // --markers preset
 #include "../input/gui_capture.h"
 #include "../processing/gui_extract.h"
 #include "../signal/gui_cvbs.h"
@@ -167,6 +168,11 @@ static void print_usage(const char *program_name) {
             "           2frames|3frames|5frames|10frames|25frames|1s|3s|10s|30s|60s\n"
             "           (the paused window; any subset; defaults horizontal,\n"
             "           heat, 1frame).\n"
+            "--markers <a|b>:in=<samples>,out=<samples>,menu=open|closed\n"
+            "           cut markers (FLAC-Chop IN / OUT) for the first file that\n"
+            "           channel plays, in real RF samples, and / or open its\n"
+            "           marker menu (any subset). In the GUI: the [ | ] button\n"
+            "           beside Play / Loop, or I / O at the playhead.\n"
             "--auto-capture starts capture unattended ~1 s after launch (Local mode;\n"
             "           no --config required).\n"
             "--auto-record <seconds> runs a full unattended record cycle: start\n"
@@ -888,11 +894,11 @@ static void gui_field_step(gui_app_t *app, int fields) {
         playback_file_info_t info = {0};
         if (!gui_playback_get_selected_file_info(app, ch, &info) || !(info.real_sample_rate_hz > 0.0) ||
             info.total_samples == 0) continue;
-        const double pos = (double)gui_playback_get_position_samples_channel(app, ch);
+        const double pos = (double)gui_playback_get_cue_samples_channel(app, ch);
         double next = pos + (double)fields * field_s * info.real_sample_rate_hz;
         if (next < 0.0) next = 0.0;
         if (next > (double)(info.total_samples - 1)) next = (double)(info.total_samples - 1);
-        gui_playback_seek_sample_channel(app, ch, (uint64_t)(next + 0.5));
+        gui_playback_step_sample_channel(app, ch, (uint64_t)(next + 0.5));
     }
 }
 
@@ -921,10 +927,90 @@ static void gui_field_step_keys(gui_app_t *app) {
         held_dir = 0;
         return;
     }
-    if (now >= next_at) {
+    // Held: the next frame only once the last step has landed on screen
+    // (a step-back lead-in holds the Video panel; see gui_playback.c).
+    if (now >= next_at && !gui_playback_display_hold_channel(app, 0) &&
+        !gui_playback_display_hold_channel(app, 1)) {
         gui_field_step(app, 2 * dir);
         next_at = now + FIELD_STEP_HOLD_PERIOD_S;
     }
+}
+
+// Cut markers from the keyboard: I / O set IN / OUT at the playhead of every
+// channel with a running playback file (the marker menu's Set IN / Set OUT).
+// Same gate as the field-step arrows; Ctrl / Cmd chords are left alone.
+static void gui_cut_marker_keys(gui_app_t *app) {
+    const bool playback_dev = app->selected_device >= 0 && app->selected_device < app->device_count &&
+                              app->devices[app->selected_device].type == DEVICE_TYPE_PLAYBACK;
+    if (!playback_dev || !app->is_capturing || !gui_playback_is_running(app) ||
+        app->settings_panel_open || gui_ui_keyboard_captured()) return;
+    if (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL) ||
+        IsKeyDown(KEY_LEFT_SUPER) || IsKeyDown(KEY_RIGHT_SUPER)) return;
+    const bool set_in = IsKeyPressed(KEY_I), set_out = IsKeyPressed(KEY_O);
+    if (set_in == set_out) return;
+    for (int ch = 0; ch < 2; ch++) {
+        const char *path = ch ? app->settings.playback_file_b : app->settings.playback_file_a;
+        if (!path[0]) continue;
+        (void)gui_ui_cut_marker_action(app, ch, set_in ? GUI_CUT_ACTION_SET_IN : GUI_CUT_ACTION_SET_OUT);
+    }
+}
+
+// --markers <a|b>:in=<samples>,out=<samples>,menu=open|closed (any subset):
+// launch cut markers for the first file the channel plays, and / or open its
+// marker menu (hard rule dev/gui_automation_flags_rules.md).
+static bool gui_parse_markers_arg(const char *arg) {
+    uint64_t in = UINT64_MAX, out = UINT64_MAX;
+    bool menu = false;
+    int ch = 0;
+    const char *p = arg;
+    if (!arg || !(tolower((unsigned char)arg[0]) == 'a' || tolower((unsigned char)arg[0]) == 'b') ||
+        arg[1] != ':' || !arg[2]) goto bad;
+    ch = tolower((unsigned char)arg[0]) == 'b';
+    p = arg + 2;
+    while (*p) {
+        const char *end = strchr(p, ',');
+        const size_t len = end ? (size_t)(end - p) : strlen(p);
+        char kv[64];
+        if (len == 0 || len >= sizeof(kv)) goto bad;
+        memcpy(kv, p, len);
+        kv[len] = '\0';
+        char *eq = strchr(kv, '=');
+        if (!eq) goto bad;
+        *eq = '\0';
+        const char *v = eq + 1;
+        if (strcmp(kv, "in") == 0 || strcmp(kv, "out") == 0) {
+            char *e = NULL;
+            if (!isdigit((unsigned char)v[0])) goto bad;
+            const unsigned long long n = strtoull(v, &e, 10);
+            if (!e || *e || n == ULLONG_MAX) goto bad;
+            if (kv[0] == 'i') in = (uint64_t)n; else out = (uint64_t)n;
+        } else if (strcmp(kv, "menu") == 0) {
+            if (strcmp(v, "open") == 0) menu = true;
+            else if (strcmp(v, "closed") == 0) menu = false;
+            else goto bad;
+        } else {
+            goto bad;
+        }
+        p = end ? end + 1 : p + len;
+    }
+    if (in != UINT64_MAX && out != UINT64_MAX && out <= in) {
+        fprintf(stderr, "--markers: out must be after in (got '%s')\n", arg);
+        return false;
+    }
+    if (in != UINT64_MAX || out != UINT64_MAX) gui_cut_marks_preset(ch, in, out);
+    if (menu) gui_ui_open_cut_marker_menu(ch);
+    {
+        char ib[24] = "unset", ob[24] = "unset";
+        if (in != UINT64_MAX) snprintf(ib, sizeof(ib), "%llu", (unsigned long long)in);
+        if (out != UINT64_MAX) snprintf(ob, sizeof(ob), "%llu", (unsigned long long)out);
+        fprintf(stderr, "[AUTO] --markers: channel %c IN %s OUT %s (samples), menu %s\n",
+                ch ? 'B' : 'A', ib, ob, menu ? "open" : "closed");
+    }
+    return true;
+bad:
+    fprintf(stderr, "--markers: expected <a|b>:in=<samples>,out=<samples>,menu=open|closed "
+                    "(any subset) (got '%s')\n", arg ? arg : "");
+    return false;
 }
 
 // "waterfall" (the merged Waterfall view, 2026-11-18) is accepted as Spectro
@@ -950,7 +1036,13 @@ static int gui_parse_panel_view_name(const char *name, size_t len, bool *vertica
     return -1;
 }
 
+static bool gui_apply_panel_view_spec(gui_app_t *app, const char *arg, const char *source);
+
 static bool gui_apply_panel_view_arg(gui_app_t *app, const char *arg) {
+    return gui_apply_panel_view_spec(app, arg, "--panel-view");
+}
+
+static bool gui_apply_panel_view_spec(gui_app_t *app, const char *arg, const char *source) {
     const char *usage = "--panel-view: expected <a|b>:<left>[,<right>] with views "
                         "waveform|fft|video|histogram|spectro|demod|vector|wfm "
                         "(waterfall = spectro, Dir Vertical)";
@@ -974,11 +1066,68 @@ static bool gui_apply_panel_view_arg(gui_app_t *app, const char *arg) {
     if (comma) panel_config_set_right_view(config, (panel_view_type_t)rv);
     if (lvert && config->left_state) gui_spectrogram_set_vertical(config->left_state, true);
     if (rvert && config->right_state) gui_spectrogram_set_vertical(config->right_state, true);
-    fprintf(stderr, "[AUTO] --panel-view: channel %c %s%s%s%s%s\n", ch == 'a' ? 'A' : 'B',
+    fprintf(stderr, "[AUTO] %s: channel %c %s%s%s%s%s\n", source, ch == 'a' ? 'A' : 'B',
             panel_view_type_name((panel_view_type_t)lv), lvert ? " (Dir Vertical)" : "",
             comma ? " | " : "",
             comma ? panel_view_type_name((panel_view_type_t)rv) : "", rvert ? " (Dir Vertical)" : "");
     return true;
+}
+
+// Saved panel setup (settings panel_view_* / video_decoder_*; harrypm
+// 2026-11-19: keep the per-channel monitoring config across launches).
+static const char *const s_video_decoder_keys[3] = { "cvbs", "tape", "rf" };
+
+static void gui_panel_settings_capture(gui_app_t *app) {
+    for (int ch = 0; ch < 2; ch++) {
+        const channel_panel_config_t *cfg = ch ? &app->panel_config_b : &app->panel_config_a;
+        char *views = ch ? app->settings.panel_view_b : app->settings.panel_view_a;
+        char *decs = ch ? app->settings.video_decoder_b : app->settings.video_decoder_a;
+        const size_t vsz = sizeof(app->settings.panel_view_a), dsz = sizeof(app->settings.video_decoder_a);
+        while (atomic_flag_test_and_set(&app->panel_config_lock)) {}
+        const panel_view_type_t lv = cfg->left_view, rv = cfg->right_view;
+        const bool split = cfg->split;
+        const int ld = lv == PANEL_VIEW_CVBS ? gui_video_panel_get_decoder(cfg->left_state) : -1;
+        const int rd = split && rv == PANEL_VIEW_CVBS ? gui_video_panel_get_decoder(cfg->right_state) : -1;
+        atomic_flag_clear(&app->panel_config_lock);
+        if (split) {
+            snprintf(views, vsz, "%s,%s", panel_view_type_name(lv), panel_view_type_name(rv));
+        } else {
+            snprintf(views, vsz, "%s", panel_view_type_name(lv));
+        }
+        const char *l = ld >= 0 && ld <= 2 ? s_video_decoder_keys[ld] : "-";
+        const char *r = rd >= 0 && rd <= 2 ? s_video_decoder_keys[rd] : "-";
+        if (split) snprintf(decs, dsz, "%s,%s", l, r);
+        else snprintf(decs, dsz, "%s", l);
+    }
+}
+
+static void gui_panel_settings_apply_decoder(void *state, const char *key, size_t len) {
+    for (int d = 0; d < 3; d++) {
+        if (strlen(s_video_decoder_keys[d]) == len && strncmp(key, s_video_decoder_keys[d], len) == 0) {
+            gui_video_panel_set_decoder(state, d);
+            return;
+        }
+    }
+}
+
+static void gui_panel_settings_apply(gui_app_t *app) {
+    for (int ch = 0; ch < 2; ch++) {
+        const char *views = ch ? app->settings.panel_view_b : app->settings.panel_view_a;
+        const char *decs = ch ? app->settings.video_decoder_b : app->settings.video_decoder_a;
+        if (!views[0]) continue;
+        char spec[64];
+        snprintf(spec, sizeof(spec), "%c:%s", ch ? 'b' : 'a', views);
+        if (!gui_apply_panel_view_spec(app, spec, "saved panels")) continue;   // stale names: keep defaults
+        channel_panel_config_t *cfg = ch ? &app->panel_config_b : &app->panel_config_a;
+        const char *comma = strchr(decs, ',');
+        const size_t llen = comma ? (size_t)(comma - decs) : strlen(decs);
+        if (cfg->left_view == PANEL_VIEW_CVBS && cfg->left_state)
+            gui_panel_settings_apply_decoder(cfg->left_state, decs, llen);
+        if (comma && cfg->split && cfg->right_view == PANEL_VIEW_CVBS && cfg->right_state)
+            gui_panel_settings_apply_decoder(cfg->right_state, comma + 1, strlen(comma + 1));
+        fprintf(stderr, "[AUTO] saved panels: channel %c video decoders %s\n", ch ? 'B' : 'A',
+                decs[0] ? decs : "(none)");
+    }
 }
 
 int main(int argc, char **argv) {
@@ -1112,6 +1261,14 @@ int main(int argc, char **argv) {
                 return 1;
             }
             if (!gui_vectorscope_panel_apply_launch_arg(argv[++i])) return 1;
+            continue;
+        }
+        if (strcmp(a, "--markers") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--markers requires <a|b>:in=<samples>,out=<samples>,menu=open|closed\n");
+                return 1;
+            }
+            if (!gui_parse_markers_arg(argv[++i])) return 1;
             continue;
         }
         if (strcmp(a, "--spectro") == 0) {
@@ -1401,8 +1558,10 @@ int main(int argc, char **argv) {
     // Initialize application
     gui_app_init(&app);
 
-    // --panel-view launch overrides (after gui_app_init built the default
-    // panels; before the first frame renders or processes them).
+    // Saved per-channel panel setup, then the --panel-view launch overrides
+    // (after gui_app_init built the default panels; before the first frame
+    // renders or processes them).
+    gui_panel_settings_apply(&app);
     for (int pv = 0; pv < panel_view_arg_count; pv++) {
         if (!gui_apply_panel_view_arg(&app, panel_view_args[pv])) return 1;
     }
@@ -1849,6 +2008,7 @@ int main(int argc, char **argv) {
             }
 
             gui_field_step_keys(&app);
+            gui_cut_marker_keys(&app);
 
             if (IsKeyPressed(KEY_SPACE) && !app.settings_panel_open) {
                 // Space = play/pause (DAW-style). In playback mode it toggles
@@ -2282,7 +2442,8 @@ int main(int argc, char **argv) {
         gui_app_stop_capture(&app);
     }
 
-    // Save settings before cleanup
+    // Save settings before cleanup (with the live per-channel panel setup)
+    gui_panel_settings_capture(&app);
     gui_settings_save(&app.settings);
     // Raylib output must be destroyed on the GUI thread before net cleanup.
     gui_monitor_audio_client_update(NULL);

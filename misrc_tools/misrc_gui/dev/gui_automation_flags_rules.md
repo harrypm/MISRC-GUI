@@ -90,6 +90,17 @@ GUI autoload trigger flag.**
   view is merged into Spectro as Dir Vertical: `--panel-view a:waterfall`
   still opens it (Spectro, Dir Vertical). The palette dropdown had no flag
   before (an unlisted gap). [2026-11-18]
+- Playback cut markers button ([ | ] beside Play / Loop on each timeline
+  row) and its menu (Set IN / Set OUT / Go to IN / Go to OUT / Clear / Copy
+  FLAC-Chop command): `--markers <a|b>:in=<samples>,out=<samples>,
+  menu=open|closed` (any subset; marks bind to the first file that channel
+  plays; out <= in, other keys or values print the accepted form and exit 1;
+  logs `[AUTO] --markers`). Keys I / O set IN / OUT at the playhead. The
+  copied command is also logged as `[CUT] ... FLAC-Chop command:`. [2026-11-19]
+- Saved per-channel panel setup (settings `panel_view_a/b`, `video_decoder_a/b`):
+  restored at launch before `--panel-view`, which still overrides it; logs
+  `[AUTO] saved panels: ...`. The Video decoder button has no own flag yet
+  (the saved `video_decoder_*` key is its launch state). [2026-11-19]
 
 ## Known gaps (backlog under this rule — do not grow this list)
 

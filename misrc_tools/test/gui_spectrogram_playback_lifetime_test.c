@@ -40,6 +40,10 @@ uint64_t gui_playback_get_position_samples_channel(gui_app_t *app, int channel) 
     return 42;
 }
 
+uint64_t gui_playback_get_cue_samples_channel(gui_app_t *app, int channel) {
+    return gui_playback_get_position_samples_channel(app, channel);
+}
+
 /* The paused window reads the file's true rate for its field snap; an
  * unknown rate (0) keeps the request centred on the playhead, unsnapped. */
 bool gui_playback_get_selected_file_info(gui_app_t *app, int channel,

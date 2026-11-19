@@ -19,6 +19,8 @@ bool gui_vhs_fm_init(vhs_fm_decoder_t *decoder) {
     memset(decoder, 0, sizeof(*decoder));
     atomic_init(&decoder->input_supported, true);
     decoder->format = VHS_FM_FORMAT_PAL;
+    // OSD (Stats) starts Off: 0 Full, 1 Basic, 2 Off (harrypm 2026-11-19).
+    decoder->overlay.stats_view = 2;
     decoder->bound_channel = -1;
     return true; // No RF allocation or worker until this panel selects VHS FM.
 }

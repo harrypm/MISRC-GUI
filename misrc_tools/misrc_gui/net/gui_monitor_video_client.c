@@ -533,7 +533,7 @@ void gui_monitor_video_client_draw(unsigned channel,Rectangle bounds) {
                 used=changed=true;
             }
             unsigned budget=mvd_ctl_get(ctl,MVD_CTL_BUDGET,7u);
-            snprintf(label,sizeof(label),"Budget: %.2f core (shared)",mvd_ctl_budget(ctl)/100.0);
+            snprintf(label,sizeof(label),"Cores : %.2f",mvd_ctl_budget(ctl)/100.0);
             if(mvd_option_button(bounds,&y,label,mouse,click)){
                 unsigned next=(budget+1)%6;
                 atomic_store(&g_mvd_client.global_budget,next);

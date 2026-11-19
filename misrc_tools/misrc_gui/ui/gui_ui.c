@@ -23,6 +23,7 @@
 #include "../signal/gui_cvbs.h"
 #include "../visualization/gui_panel.h"
 #include "../input/gui_playback.h"
+#include "../input/gui_cut_markers.h"
 #include "../input/gui_cxadc.h"
 #ifdef ENABLE_DDD
 #include "../input/gui_ddd_clockgen.h"
@@ -759,6 +760,8 @@ static float s_active_text_right_padding = 0.0f;
 static double s_active_text_last_click_time = -1.0;
 static Clay_ElementId s_active_text_last_click_element_id = { 0 };
 static double s_active_text_backspace_repeat_at = 0.0;
+
+#define DROPDOWN_CUT_MARKERS "CutMarkers"
 
 #ifdef ENABLE_RTLSDR
 #define DROPDOWN_RTLSDR_PRESET "RtlsdrPreset"
@@ -7415,6 +7418,176 @@ static void render_channel_stats(gui_app_t *app, int channel,
     }
 }
 
+// Playback cut markers (harrypm 2026-11-19: "add a marker option icon next
+// to the play/loop icon for cutting"). IN / OUT per channel in real RF
+// samples (the playhead's units; while paused that is the exact cue, see
+// gui_playback_get_position_samples_channel), handed to FLAC-Chop as
+// flac-chop --gui <file> --in N --out N --units samples.
+static const char *gui_ui_playback_path(const gui_app_t *app, int channel) {
+    return channel == 1 ? app->settings.playback_file_b : app->settings.playback_file_a;
+}
+
+static void gui_ui_format_cut_time(char *buf, size_t size, uint64_t samples, double rate_hz) {
+    if (!(rate_hz > 0.0)) {
+        snprintf(buf, size, "sample %" PRIu64, samples);
+        return;
+    }
+    const double t = (double)samples / rate_hz;
+    const uint64_t ms = (uint64_t)(t * 1000.0 + 0.5);
+    snprintf(buf, size, "%" PRIu64 ":%02u:%02u.%03u", ms / 3600000u, (unsigned)(ms / 60000u % 60u),
+             (unsigned)(ms / 1000u % 60u), (unsigned)(ms % 1000u));
+}
+
+bool gui_ui_cut_marker_action(gui_app_t *app, int channel, gui_cut_action_t action) {
+    if (!app) return false;
+    const int ch = channel == 1 ? 1 : 0;
+    const char *cn = ch ? "CH B" : "CH A";
+    const char *path = gui_ui_playback_path(app, ch);
+    static char msg[1280];
+    if (!path[0] || !app->is_capturing || !gui_playback_is_running(app)) {
+        snprintf(msg, sizeof(msg), "Cut markers: no playback file running on %s", cn);
+        gui_app_set_status(app, msg);
+        return false;
+    }
+    playback_file_info_t info = {0};
+    (void)gui_playback_get_selected_file_info(app, ch, &info);
+    const double rate = info.real_sample_rate_hz;
+    gui_cut_marks_t m = gui_cut_marks_get(ch, path);
+    char tb[32];
+    bool ok = true;
+    switch (action) {
+    case GUI_CUT_ACTION_SET_IN:
+    case GUI_CUT_ACTION_SET_OUT: {
+        const bool out = action == GUI_CUT_ACTION_SET_OUT;
+        const uint64_t pos = gui_playback_get_cue_samples_channel(app, ch);
+        const gui_cut_set_result_t r = gui_cut_marks_set(ch, path, out, pos);
+        gui_ui_format_cut_time(tb, sizeof(tb), pos, rate);
+        snprintf(msg, sizeof(msg), "%s %s at %s (sample %" PRIu64 ")%s", cn, out ? "OUT" : "IN", tb, pos,
+                 r == GUI_CUT_SET_DROPPED_OTHER ? (out ? " - IN was not before it, cleared"
+                                                       : " - OUT was not after it, cleared")
+                                                : "");
+        break;
+    }
+    case GUI_CUT_ACTION_GOTO_IN:
+    case GUI_CUT_ACTION_GOTO_OUT: {
+        const bool out = action == GUI_CUT_ACTION_GOTO_OUT;
+        if (out ? !m.has_out : !m.has_in) {
+            snprintf(msg, sizeof(msg), "%s has no %s mark", cn, out ? "OUT" : "IN");
+            ok = false;
+            break;
+        }
+        const uint64_t pos = out ? m.out : m.in;
+        gui_playback_seek_sample_channel(app, ch, pos);
+        gui_ui_format_cut_time(tb, sizeof(tb), pos, rate);
+        snprintf(msg, sizeof(msg), "%s at %s %s", cn, out ? "OUT" : "IN", tb);
+        break;
+    }
+    case GUI_CUT_ACTION_CLEAR:
+        if (!m.has_in && !m.has_out) {
+            snprintf(msg, sizeof(msg), "%s has no cut marks", cn);
+            ok = false;
+            break;
+        }
+        gui_cut_marks_clear(ch);
+        snprintf(msg, sizeof(msg), "%s cut marks cleared", cn);
+        break;
+    case GUI_CUT_ACTION_COPY_COMMAND: {
+        char cmd[1200];
+        if (!gui_cut_marks_flac_chop_command(&m, path, cmd, sizeof(cmd))) {
+            snprintf(msg, sizeof(msg), "%s: FLAC-Chop command too long for the clipboard buffer", cn);
+            ok = false;
+            break;
+        }
+        SetClipboardText(cmd);
+        snprintf(msg, sizeof(msg), "Copied: %s", cmd);
+        fprintf(stderr, "[CUT] %s FLAC-Chop command: %s\n", cn, cmd);
+        break;
+    }
+    default:
+        return false;
+    }
+    gui_app_set_status(app, msg);
+    return ok;
+}
+
+void gui_ui_open_cut_marker_menu(int channel) {
+    gui_dropdown_open(DROPDOWN_CUT_MARKERS, (uint32_t)(channel == 1 ? 1 : 0));
+}
+
+#define CUT_MENU_WIDTH 236
+
+// The marker menu: floating at the root, under (or over, near the bottom
+// edge) the channel's marker button.
+static void render_cut_marker_menu(gui_app_t *app, int ch, const gui_cut_marks_t *marks) {
+    static char text[2][GUI_CUT_ACTION_COUNT][64];
+    playback_file_info_t info = {0};
+    (void)gui_playback_get_selected_file_info(app, ch, &info);
+    char tb[32];
+    snprintf(text[ch][GUI_CUT_ACTION_SET_IN], 64, "Set IN at playhead   (I)");
+    snprintf(text[ch][GUI_CUT_ACTION_SET_OUT], 64, "Set OUT at playhead  (O)");
+    if (marks->has_in) gui_ui_format_cut_time(tb, sizeof(tb), marks->in, info.real_sample_rate_hz);
+    snprintf(text[ch][GUI_CUT_ACTION_GOTO_IN], 64, "Go to IN   %s", marks->has_in ? tb : "(not set)");
+    if (marks->has_out) gui_ui_format_cut_time(tb, sizeof(tb), marks->out, info.real_sample_rate_hz);
+    snprintf(text[ch][GUI_CUT_ACTION_GOTO_OUT], 64, "Go to OUT  %s", marks->has_out ? tb : "(not set)");
+    snprintf(text[ch][GUI_CUT_ACTION_CLEAR], 64, "Clear IN / OUT");
+    snprintf(text[ch][GUI_CUT_ACTION_COPY_COMMAND], 64, "Copy FLAC-Chop command");
+    Clay_ElementDeclaration menu = gui_ui_channel_menu(CLAY_IDI("PlaybackMarkerBtn", ch), CUT_MENU_WIDTH,
+                                                       GUI_CUT_ACTION_COUNT);
+    menu.floating.zIndex = 1;
+    CLAY(CLAY_IDI("CutMarkerMenu", ch), menu) {
+        for (int i = 0; i < GUI_CUT_ACTION_COUNT; i++) {
+            const Clay_ElementId id = CLAY_IDI("CutMarkerOpt", ch * 8 + i);
+            const bool live = (i == GUI_CUT_ACTION_GOTO_IN) ? marks->has_in
+                            : (i == GUI_CUT_ACTION_GOTO_OUT) ? marks->has_out
+                            : (i == GUI_CUT_ACTION_CLEAR) ? (marks->has_in || marks->has_out)
+                            : true;
+            Color tc = !live ? COLOR_TEXT_DIM
+                     : (i == GUI_CUT_ACTION_SET_IN || i == GUI_CUT_ACTION_GOTO_IN) ? COLOR_CUT_IN
+                     : (i == GUI_CUT_ACTION_SET_OUT || i == GUI_CUT_ACTION_GOTO_OUT) ? COLOR_CUT_OUT
+                     : COLOR_TEXT;
+            CLAY(id, {
+                .layout = {
+                    .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(20) },
+                    .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
+                    .padding = { 8, 8, 0, 0 }
+                },
+                .backgroundColor = to_clay_color(gui_dropdown_option_color(false, live && Clay_PointerOver(id)))
+            }) {
+                CLAY_TEXT(make_string(text[ch][i]), CLAY_TEXT_CONFIG({
+                    .fontSize = FONT_SIZE_DROPDOWN_OPT, .textColor = to_clay_color(tc),
+                    .wrapMode = CLAY_TEXT_WRAP_NONE
+                }));
+            }
+        }
+    }
+}
+
+// Marker button / menu clicks. Runs before the scrub-track hit test so a
+// menu floating over a timeline track never falls through into a seek.
+static bool gui_ui_cut_marker_handle_click(gui_app_t *app) {
+    for (int ch = 0; ch < 2; ch++) {
+        if (!gui_dropdown_is_open(DROPDOWN_CUT_MARKERS, (uint32_t)ch)) continue;
+        for (int i = 0; i < GUI_CUT_ACTION_COUNT; i++) {
+            if (!Clay_PointerOver(CLAY_IDI("CutMarkerOpt", ch * 8 + i))) continue;
+            gui_dropdown_close_all();
+            (void)gui_ui_cut_marker_action(app, ch, (gui_cut_action_t)i);
+            return true;
+        }
+        if (Clay_PointerOver(CLAY_IDI("CutMarkerMenu", ch))) return true;   // menu padding
+    }
+    for (int ch = 0; ch < 2; ch++) {
+        if (!Clay_PointerOver(CLAY_IDI("PlaybackMarkerBtn", ch))) continue;
+        if (app->is_capturing && gui_playback_is_running(app) && gui_ui_playback_path(app, ch)[0]) {
+            gui_ui_clear_text_edit();
+            gui_dropdown_toggle(DROPDOWN_CUT_MARKERS, (uint32_t)ch);
+        } else {
+            gui_app_set_status(app, "Playback is not running");
+        }
+        return true;
+    }
+    return false;
+}
+
 // Per-channel transport icon buttons (Play/Pause + Loop) beside the scrub
 // slider on each playback timeline row (user request 2026-11-03: icons, not
 // text labels).
@@ -7429,10 +7602,18 @@ static void render_channel_stats(gui_app_t *app, int channel,
 // handlers keep working unchanged. Non-stacked rows call this from inside
 // the timeline (directly after the scrub track); stacked narrow rows call it
 // as a row-level group at the right end (see render_playback_timeline_row).
-static void render_playback_transport_buttons(int channel_index, bool pb_active,
+static void render_playback_transport_buttons(gui_app_t *app, int channel_index, bool pb_active,
                                                bool pb_paused, bool pb_loop) {
     static CustomLayoutElement s_pause_icon[2];
     static CustomLayoutElement s_loop_icon[2];
+    static CustomLayoutElement s_marker_icon[2];
+    const gui_cut_marks_t marks = gui_cut_marks_get(channel_index, gui_ui_playback_path(app, channel_index));
+    const bool marker_menu_open = gui_dropdown_is_open(DROPDOWN_CUT_MARKERS, (uint32_t)channel_index);
+    s_marker_icon[channel_index].type = CUSTOM_LAYOUT_ELEMENT_TYPE_CUT_MARKER_ICON;
+    s_marker_icon[channel_index].customData.cut_marker_icon.has_in = marks.has_in;
+    s_marker_icon[channel_index].customData.cut_marker_icon.has_out = marks.has_out;
+    Color marker_bg = !pb_active ? ui_disabled_color(COLOR_BUTTON)
+        : (marker_menu_open ? COLOR_BUTTON_HOVER : COLOR_BUTTON);
     // Toolbar RecordButton convention: the Play glyph shows when paused or
     // not running; the Pause glyph only while actually playing.
     bool playing = pb_active && !pb_paused;
@@ -7478,6 +7659,22 @@ static void render_playback_transport_buttons(int channel_index, bool pb_active,
                 .custom = { .customData = &s_loop_icon[channel_index] }
             }) {}
         }
+        CLAY(CLAY_IDI("PlaybackMarkerBtn", channel_index), {
+            .layout = {
+                .sizing = { CLAY_SIZING_FIXED(PLAYBACK_TRANSPORT_BTN_W), CLAY_SIZING_FIXED(PLAYBACK_TRANSPORT_BTN_H) },
+                .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
+            },
+            .backgroundColor = to_clay_color(marker_bg),
+            .cornerRadius = CLAY_CORNER_RADIUS(4)
+        }) {
+            CLAY(CLAY_IDI("PlaybackMarkerIcon", channel_index), {
+                .layout = { .sizing = { CLAY_SIZING_FIXED(PLAYBACK_TRANSPORT_ICON_SIZE), CLAY_SIZING_FIXED(PLAYBACK_TRANSPORT_ICON_SIZE) } },
+                .custom = { .customData = &s_marker_icon[channel_index] }
+            }) {}
+        }
+    }
+    if (marker_menu_open) {
+        render_cut_marker_menu(app, channel_index, &marks);
     }
 }
 
@@ -7511,7 +7708,7 @@ static gui_playback_timeline_layout_t gui_ui_playback_timeline_layout(gui_app_t 
     // track and info tiers adapt instead of overflowing.
     {
         int transport_gap = spacing.horizontal_gap > 8 ? spacing.horizontal_gap : 8;
-        available -= PLAYBACK_TRANSPORT_BTN_W * 2 + 4 + transport_gap;
+        available -= PLAYBACK_TRANSPORT_BTN_W * 3 + 4 * 2 + transport_gap;   // Play, Loop, Markers
     }
     if (available < 1) available = 1;
     int track_width = screen_width < 900 ? 180 : (screen_width < 1150 ? 240 : 300);
@@ -7648,6 +7845,12 @@ static void render_playback_timeline_row(gui_app_t *app, int channel_index, char
     bool pb_loop = loaded && gui_playback_get_channel_loop(app, channel_index);
     bool show_length_status = loaded && (provisional || verification_failed);
     char *index_text = playback_index_display[channel_index == 1 ? 1 : 0];
+    // Cut markers on the scrub track: IN / OUT ticks and the span between.
+    const gui_cut_marks_t cut = gui_cut_marks_get(channel_index, gui_ui_playback_path(app, channel_index));
+    uint64_t cut_total = 0;
+    if (seekable && (cut.has_in || cut.has_out)) {
+        (void)gui_ui_playback_channel_timeline_info(app, channel_index, &cut_total, NULL, NULL, NULL);
+    }
     if (show_length_status) {
         if (verification_failed) {
             snprintf(index_text, sizeof(playback_index_display[0]), "Length unavailable");
@@ -7712,6 +7915,35 @@ static void render_playback_timeline_row(gui_app_t *app, int channel_index, char
                     .backgroundColor = to_clay_color(timeline_track_color),
                     .cornerRadius = CLAY_CORNER_RADIUS(5)
                 }) {
+                    if (cut_total > 0) {
+                        const float tw = (float)layout->track_width;
+                        const float x_in = cut.has_in ? tw * (float)((double)cut.in / (double)cut_total) : 0.0f;
+                        const float x_out = cut.has_out ? tw * (float)((double)cut.out / (double)cut_total) : tw;
+                        if (cut.has_in && cut.has_out && x_out - x_in >= 1.0f) {
+                            CLAY(CLAY_IDI("CutSpan", channel_index), {
+                                .layout = { .sizing = { CLAY_SIZING_FIXED(x_out - x_in), CLAY_SIZING_FIXED(2) } },
+                                .floating = { .attachTo = CLAY_ATTACH_TO_PARENT, .offset = { x_in, 11 },
+                                              .pointerCaptureMode = CLAY_POINTER_CAPTURE_MODE_PASSTHROUGH },
+                                .backgroundColor = to_clay_color(COLOR_TEXT)
+                            }) {}
+                        }
+                        for (int k = 0; k < 2; k++) {
+                            if (k == 0 ? !cut.has_in : !cut.has_out) continue;
+                            const float x = k == 0 ? x_in : x_out;
+                            CLAY(CLAY_IDI("CutTick", channel_index * 2 + k), {
+                                .layout = { .sizing = { CLAY_SIZING_FIXED(4), CLAY_SIZING_FIXED(16) },
+                                            .padding = { 1, 1, 1, 1 } },
+                                .floating = { .attachTo = CLAY_ATTACH_TO_PARENT, .offset = { x - 2.0f, -3 },
+                                              .pointerCaptureMode = CLAY_POINTER_CAPTURE_MODE_PASSTHROUGH },
+                                .backgroundColor = { 10, 10, 12, 230 }
+                            }) {
+                                CLAY(CLAY_IDI("CutTickInner", channel_index * 2 + k), {
+                                    .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) } },
+                                    .backgroundColor = to_clay_color(k == 0 ? COLOR_CUT_IN : COLOR_CUT_OUT)
+                                }) {}
+                            }
+                        }
+                    }
                     if (fill_w > 0) {
                         CLAY(CLAY_IDI("PlaybackTimelineFill", channel_index), {
                             .layout = { .sizing = { CLAY_SIZING_FIXED(fill_w), CLAY_SIZING_GROW(0) } },
@@ -7735,7 +7967,7 @@ static void render_playback_timeline_row(gui_app_t *app, int channel_index, char
             // 2026-11-03). Stacked narrow rows render them at the row's right
             // end instead — the vertical timeline would overflow the row.
             if (!layout->stacked) {
-                render_playback_transport_buttons(channel_index, pb_active, pb_paused, pb_loop);
+                render_playback_transport_buttons(app, channel_index, pb_active, pb_paused, pb_loop);
             }
 
             // Right-side file info line: [basename][bit-depth + rate][RAW/FLAC]
@@ -7798,7 +8030,7 @@ static void render_playback_timeline_row(gui_app_t *app, int channel_index, char
         // transport icons render here at the row's right end instead of
         // inside it (normal rows put them next to the scrub slider).
         if (layout->stacked) {
-            render_playback_transport_buttons(channel_index, pb_active, pb_paused, pb_loop);
+            render_playback_transport_buttons(app, channel_index, pb_active, pb_paused, pb_loop);
         }
 
         CLAY(CLAY_IDI("PlaybackTimelineRightPad", channel_index), {
@@ -7950,8 +8182,8 @@ static void render_channels_panel(gui_app_t *app, gui_ui_channel_spacing_t spaci
         snprintf(playback_timeline_display_a, sizeof(playback_timeline_display_a), "--:--:--/--:--:--");
         snprintf(playback_timeline_display_b, sizeof(playback_timeline_display_b), "--:--:--/--:--:--");
         if (playback_mode) {
-            uint64_t current_sample_a = gui_playback_get_position_samples_channel(app, 0);
-            uint64_t current_sample_b = gui_playback_get_position_samples_channel(app, 1);
+            uint64_t current_sample_a = gui_playback_get_cue_samples_channel(app, 0);
+            uint64_t current_sample_b = gui_playback_get_cue_samples_channel(app, 1);
             uint64_t total_samples_a = 0;
             uint64_t total_samples_b = 0;
             double duration_seconds_a = 0.0;
@@ -9697,7 +9929,7 @@ void gui_handle_interactions(gui_app_t *app) {
                         double rate_hz = (double)total / duration;
                         uint64_t step = (uint64_t)(s_wheel_step_s * rate_hz);
                         if (step == 0) step = 1;
-                        uint64_t pos = gui_playback_get_position_samples_channel(app, wheel_channel);
+                        uint64_t pos = gui_playback_get_cue_samples_channel(app, wheel_channel);
                         uint64_t target;
                         if (wheel > 0.0f) {
                             target = (pos > step) ? (pos - step) : 0;
@@ -10616,6 +10848,10 @@ void gui_handle_interactions(gui_app_t *app) {
                 s_version_info_window_open = false;
                 s_update_install_armed = false;
             }
+            gui_ui_set_click_consumed();
+            return;
+        }
+        if (gui_ui_cut_marker_handle_click(app)) {
             gui_ui_set_click_consumed();
             return;
         }

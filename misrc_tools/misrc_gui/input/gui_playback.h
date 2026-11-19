@@ -158,10 +158,22 @@ void gui_playback_toggle_pause(gui_app_t *app);
 void gui_playback_seek_normalized(gui_app_t *app, double position);
 void gui_playback_seek_sample(gui_app_t *app, uint64_t sample);
 void gui_playback_seek_sample_channel(gui_app_t *app, int channel, uint64_t sample); // channel: 0=A, 1=B
+// Field / frame step to sample: while paused, a short hop forward runs the
+// preview on to it (no rewind); otherwise a seek with a 0.2 s lead-in
+// instead of the scrub's 3 s / 256-batch one.
+void gui_playback_step_sample_channel(gui_app_t *app, int channel, uint64_t sample);
+// True while a step seek's lead-in (and its short settle) runs on the
+// channel: the Video panel keeps its previous picture instead of showing
+// the lead-in.
+bool gui_playback_display_hold_channel(gui_app_t *app, int channel);
 
 // Get current position
 uint64_t gui_playback_get_position_samples(gui_app_t *app);
 uint64_t gui_playback_get_position_samples_channel(gui_app_t *app, int channel); // channel: 0=A, 1=B
+// The user's playhead: while the channel is paused, the cued sample (the
+// seek target) rather than the preview preroll that runs up to it (and up
+// to one batch past it); playing, the same as the position above.
+uint64_t gui_playback_get_cue_samples_channel(gui_app_t *app, int channel);
 double gui_playback_get_position_normalized(gui_app_t *app);
 double gui_playback_get_position_seconds(gui_app_t *app);
 

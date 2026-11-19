@@ -185,6 +185,17 @@ typedef struct playback_ctx {
     atomic_uint_fast64_t seek_seq_a;  // Incremented on every successful CH A seek
     atomic_uint_fast64_t seek_seq_b;  // Incremented on every successful CH B seek
     atomic_uint_fast64_t pending_seek[2];
+    // Cue: the exact sample a paused seek asked for. A paused seek rewinds
+    // to target - preview window and plays a preroll up to (and up to one
+    // batch past) the target, so current_sample is not where the user put
+    // the playhead while paused. PLAYBACK_NO_SEEK while the channel plays.
+    atomic_uint_fast64_t cue_sample[2];
+    // Field / frame step requests (arrow keys): see the seek intake.
+    atomic_uint_fast64_t pending_step[2];
+    // Step-back lead-in in progress, and the end of its display settle
+    // (gui_playback_display_hold_channel).
+    atomic_bool step_lead_in[2];
+    atomic_uint_fast64_t step_hold_until_ms[2];
 
     // Position tracking
     atomic_uint_fast64_t current_sample;
@@ -206,7 +217,9 @@ typedef struct playback_ctx {
 
 // A valid seek is always below the file's total sample count.
 #define PLAYBACK_NO_SEEK UINT64_MAX
-static playback_ctx_t s_idle_playback = {.pending_seek = {PLAYBACK_NO_SEEK, PLAYBACK_NO_SEEK}};
+static playback_ctx_t s_idle_playback = {.pending_seek = {PLAYBACK_NO_SEEK, PLAYBACK_NO_SEEK},
+                                         .cue_sample = {PLAYBACK_NO_SEEK, PLAYBACK_NO_SEEK},
+                                         .pending_step = {PLAYBACK_NO_SEEK, PLAYBACK_NO_SEEK}};
 static playback_ctx_t *s_playback = &s_idle_playback;
 static atomic_uint_fast64_t s_rf_end_sequence;
 
@@ -1234,6 +1247,14 @@ static int16_t gui_playback_apply_conv16(int state, int32_t v) {
     return (int16_t)(v >> 4);
 }
 
+// Publish whether this channel's container rail is a PASS clamp (see
+// gui_app.h rf_clip_rail_clamped) once the sticky detector has decided.
+static void gui_playback_note_conv16(playback_ctx_t *ctx, int channel) {
+    if (!ctx || !ctx->app) return;
+    atomic_store(&ctx->app->rf_clip_rail_clamped[channel == 1 ? 1 : 0],
+                 ctx->conv16_state[channel == 1 ? 1 : 0] == PLAYBACK_CONV16_PASS);
+}
+
 // Map a signed sample of `bits` width (<= 12) into the 12-bit container by
 // left-justification (8-bit << 4, 10-bit << 2); wider depths take the top 12
 // bits (24-bit >> 12, 32-bit >> 20). Callers center unsigned formats first
@@ -1704,6 +1725,7 @@ static size_t gui_playback_raw_read(playback_ctx_t *ctx, int channel, int16_t *o
                         wide[i] = (int32_t)(int16_t)((uint16_t)buf[2 * i] | ((uint16_t)buf[2 * i + 1] << 8));
                     }
                     gui_playback_decide_conv16(&ctx->conv16_state[channel], wide, (uint32_t)items);
+                    gui_playback_note_conv16(ctx, channel);
                     for (size_t i = 0; i < items; i++) {
                         out[produced++] =
                             gui_playback_apply_conv16(ctx->conv16_state[channel], wide[i]);
@@ -3652,6 +3674,7 @@ static FLAC__StreamDecoderWriteStatus decoder_write_cb_a(
         // shared converter (recorder >>4 restore, container-domain raw
         // with rail clamp, full-range >>4 downscale).
         gui_playback_decide_conv16(&ctx->conv16_state[0], in, samples);
+        gui_playback_note_conv16(ctx, 0);
         if (ctx->conv16_state[0] != ctx->conv16_prev[0]) {
             if (misrc_debug_enabled() &&
                 (ctx->conv16_state[0] != PLAYBACK_CONV16_PENDING ||
@@ -3731,6 +3754,7 @@ static FLAC__StreamDecoderWriteStatus decoder_write_cb_b(
     // single shared converter.
     if (bps == 16) {
         gui_playback_decide_conv16(&ctx->conv16_state[1], in, samples);
+        gui_playback_note_conv16(ctx, 1);
         if (ctx->conv16_state[1] != ctx->conv16_prev[1]) {
             if (misrc_debug_enabled() &&
                 (ctx->conv16_state[1] != PLAYBACK_CONV16_PENDING ||
@@ -4648,6 +4672,16 @@ static void gui_playback_classify_job(playback_load_job_t *job) {
 // gui_spectrogram.c; keep in sync) and floored at one batch.
 #define PLAYBACK_PREVIEW_WINDOW_SECONDS 3.0
 #define PLAYBACK_PREVIEW_WINDOW_BATCHES 256
+// Field / frame steps (harrypm 2026-11-19: the 3 s / 256-batch scrub lead-in
+// replayed ~0.84 s through the panels on every arrow tap). A step seek keeps
+// 0.2 s (10 PAL fields) so the decoders lock; a forward step of up to 1 s
+// from where the paused preroll stopped just runs on, without a seek.
+#define PLAYBACK_STEP_PREVIEW_SECONDS 0.2
+#define PLAYBACK_STEP_FORWARD_MAX_SECONDS 1.0
+// After a step seek's lead-in completes, the Video panel keeps its previous
+// picture this much longer while the decoders drain the lead-in (harrypm
+// 2026-11-19: stepping back replayed the lead-in like the old 1 s loop).
+#define PLAYBACK_STEP_HOLD_SETTLE_MS 80
 
 #if LIBFLAC_ENABLED == 1
 // libFLAC seek synchronously supplies the exact target slice to write_cb.
@@ -4873,8 +4907,30 @@ static int playback_thread_func(void *ctx_ptr) {
     while (atomic_load(&ctx->running)) {
         // Seek while paused previews a preroll. Play always starts at its exact target.
         uint64_t requested_a = atomic_exchange(&ctx->pending_seek[0], PLAYBACK_NO_SEEK);
-        bool seek_a = requested_a != PLAYBACK_NO_SEEK;
         bool paused_a = gui_playback_transport_paused(ctx, 0);
+        if (!paused_a) atomic_store(&ctx->cue_sample[0], PLAYBACK_NO_SEEK);
+        // Field / frame step (gui_playback_step_sample_channel). A seek
+        // queued alongside wins. Paused and a short hop forward of the
+        // preroll's end: run the preroll on to the new target - no rewind,
+        // no discontinuity. Otherwise a seek with the short step lead-in.
+        bool step_a = false;
+        {
+            uint64_t step = atomic_exchange(&ctx->pending_step[0], PLAYBACK_NO_SEEK);
+            if (step != PLAYBACK_NO_SEEK && requested_a == PLAYBACK_NO_SEEK) {
+                const uint64_t at = atomic_load(&ctx->current_sample_a);
+                const uint64_t hop = (uint64_t)(PLAYBACK_STEP_FORWARD_MAX_SECONDS * ctx->channel_rate_hz[0]);
+                if (paused_a && step >= at && step - at <= hop && !ctx->seek_recovery_failed[0]) {
+                    ctx->backfill_active_a = ctx->backfill_resume_a = true;
+                    ctx->backfill_target_a = step;
+                    atomic_store(&ctx->cue_sample[0], step);
+                    deadline_us = 0;
+                    continue;
+                }
+                requested_a = step;
+                step_a = true;
+            }
+        }
+        bool seek_a = requested_a != PLAYBACK_NO_SEEK;
         bool resume_a = !seek_a && ctx->backfill_resume_a && !paused_a;
         if (seek_a || resume_a) {
             uint64_t target = seek_a ? requested_a : ctx->backfill_target_a;
@@ -4886,7 +4942,8 @@ static int playback_thread_func(void *ctx_ptr) {
             uint64_t seek_target = target;
 #if LIBFLAC_ENABLED == 1
             if (paused) {
-                uint64_t window = (uint64_t)(PLAYBACK_PREVIEW_WINDOW_SECONDS * ctx->channel_rate_hz[0]);
+                uint64_t window = (uint64_t)((step_a ? PLAYBACK_STEP_PREVIEW_SECONDS
+                                                     : PLAYBACK_PREVIEW_WINDOW_SECONDS) * ctx->channel_rate_hz[0]);
                 uint64_t cap = (uint64_t)PLAYBACK_PREVIEW_WINDOW_BATCHES * RAW_BUFFER_SAMPLES;
                 if (window > cap) window = cap;
                 if (window < RAW_BUFFER_SAMPLES) window = RAW_BUFFER_SAMPLES;
@@ -4918,10 +4975,12 @@ static int playback_thread_func(void *ctx_ptr) {
 #endif
             fprintf(stderr, "[DBGA] seek store %llu (state=%d)\n", (unsigned long long)seek_target, (int)atomic_load(&ctx->state));
             gui_playback_cancel_rf_end(ctx, 0);
+            atomic_store(&ctx->cue_sample[0], paused ? target : PLAYBACK_NO_SEEK);
             atomic_store(&ctx->current_sample_a, seek_target);
             if (seek_a) atomic_fetch_add(&ctx->seek_seq_a, 1);
             ctx->backfill_active_a = ctx->backfill_resume_a = paused;
             ctx->backfill_target_a = target;
+            atomic_store(&ctx->step_lead_in[0], paused && step_a);
             epochs[0] = atomic_fetch_add(&app->rf_stream_epoch, 1) + 1;
             rf_discontinuity[0] = true;
             ld_loop_drain_deadline[0] = 0;
@@ -4935,8 +4994,30 @@ static int playback_thread_func(void *ctx_ptr) {
         }
 
         uint64_t requested_b = atomic_exchange(&ctx->pending_seek[1], PLAYBACK_NO_SEEK);
-        bool seek_b = requested_b != PLAYBACK_NO_SEEK;
         bool paused_b = gui_playback_transport_paused(ctx, 1);
+        if (!paused_b) atomic_store(&ctx->cue_sample[1], PLAYBACK_NO_SEEK);
+        // Field / frame step (gui_playback_step_sample_channel). A seek
+        // queued alongside wins. Paused and a short hop forward of the
+        // preroll's end: run the preroll on to the new target - no rewind,
+        // no discontinuity. Otherwise a seek with the short step lead-in.
+        bool step_b = false;
+        {
+            uint64_t step = atomic_exchange(&ctx->pending_step[1], PLAYBACK_NO_SEEK);
+            if (step != PLAYBACK_NO_SEEK && requested_b == PLAYBACK_NO_SEEK) {
+                const uint64_t at = atomic_load(&ctx->current_sample_b);
+                const uint64_t hop = (uint64_t)(PLAYBACK_STEP_FORWARD_MAX_SECONDS * ctx->channel_rate_hz[1]);
+                if (paused_b && step >= at && step - at <= hop && !ctx->seek_recovery_failed[1]) {
+                    ctx->backfill_active_b = ctx->backfill_resume_b = true;
+                    ctx->backfill_target_b = step;
+                    atomic_store(&ctx->cue_sample[1], step);
+                    deadline_us = 0;
+                    continue;
+                }
+                requested_b = step;
+                step_b = true;
+            }
+        }
+        bool seek_b = requested_b != PLAYBACK_NO_SEEK;
         bool resume_b = !seek_b && ctx->backfill_resume_b && !paused_b;
         if (seek_b || resume_b) {
             uint64_t target = seek_b ? requested_b : ctx->backfill_target_b;
@@ -4948,7 +5029,8 @@ static int playback_thread_func(void *ctx_ptr) {
             uint64_t seek_target = target;
 #if LIBFLAC_ENABLED == 1
             if (paused) {
-                uint64_t window = (uint64_t)(PLAYBACK_PREVIEW_WINDOW_SECONDS * ctx->channel_rate_hz[1]);
+                uint64_t window = (uint64_t)((step_b ? PLAYBACK_STEP_PREVIEW_SECONDS
+                                                     : PLAYBACK_PREVIEW_WINDOW_SECONDS) * ctx->channel_rate_hz[1]);
                 uint64_t cap = (uint64_t)PLAYBACK_PREVIEW_WINDOW_BATCHES * RAW_BUFFER_SAMPLES;
                 if (window > cap) window = cap;
                 if (window < RAW_BUFFER_SAMPLES) window = RAW_BUFFER_SAMPLES;
@@ -4976,10 +5058,12 @@ static int playback_thread_func(void *ctx_ptr) {
             }
 #endif
             gui_playback_cancel_rf_end(ctx, 1);
+            atomic_store(&ctx->cue_sample[1], paused ? target : PLAYBACK_NO_SEEK);
             atomic_store(&ctx->current_sample_b, seek_target);
             if (seek_b) atomic_fetch_add(&ctx->seek_seq_b, 1);
             ctx->backfill_active_b = ctx->backfill_resume_b = paused;
             ctx->backfill_target_b = target;
+            atomic_store(&ctx->step_lead_in[1], paused && step_b);
             epochs[1] = atomic_fetch_add(&app->rf_stream_epoch, 1) + 1;
             rf_discontinuity[1] = true;
             ld_loop_drain_deadline[1] = 0;
@@ -4999,6 +5083,13 @@ static int playback_thread_func(void *ctx_ptr) {
         }
         if (ctx->backfill_active_b && atomic_load(&ctx->current_sample_b) > ctx->backfill_target_b) {
             ctx->backfill_active_b = false;
+        }
+        for (int c = 0; c < 2; c++) {
+            const bool active = c ? ctx->backfill_active_b : ctx->backfill_active_a;
+            if (!active && atomic_load(&ctx->step_lead_in[c])) {
+                atomic_store(&ctx->step_hold_until_ms[c], get_time_ms() + PLAYBACK_STEP_HOLD_SETTLE_MS);
+                atomic_store(&ctx->step_lead_in[c], false);
+            }
         }
 
 #if LIBFLAC_ENABLED == 1
@@ -6105,6 +6196,8 @@ static int gui_playback_commit_prepared(gui_app_t *app, playback_ctx_t *prepared
     // lands in the 12-bit container.
     atomic_store(&app->rf_display_full_scale[0], 2048);
     atomic_store(&app->rf_display_full_scale[1], 2048);
+    atomic_store(&app->rf_clip_rail_clamped[0], false);
+    atomic_store(&app->rf_clip_rail_clamped[1], false);
     // Independent mixed-rate mode (user request 2026-11-03: "Player should
     // run files independently"): both files with RESOLVED, DIFFERENT rates
     // run as per-channel FIFOs at their own true clocks, so the RF Preview
@@ -6165,6 +6258,10 @@ static int gui_playback_commit_prepared(gui_app_t *app, playback_ctx_t *prepared
     atomic_store(&s_playback->channel_loop[1], true);
     atomic_store(&s_playback->pending_seek[0], PLAYBACK_NO_SEEK);
     atomic_store(&s_playback->pending_seek[1], PLAYBACK_NO_SEEK);
+    atomic_store(&s_playback->cue_sample[0], PLAYBACK_NO_SEEK);
+    atomic_store(&s_playback->cue_sample[1], PLAYBACK_NO_SEEK);
+    atomic_store(&s_playback->pending_step[0], PLAYBACK_NO_SEEK);
+    atomic_store(&s_playback->pending_step[1], PLAYBACK_NO_SEEK);
     atomic_store(&s_playback->current_sample, 0);
     atomic_store(&s_playback->current_sample_a, 0);
     atomic_store(&s_playback->current_sample_b, 0);
@@ -6636,6 +6733,27 @@ void gui_playback_seek_sample_channel(gui_app_t *app, int channel, uint64_t samp
     atomic_store(&s_playback->pending_seek[channel_b], sample);
 }
 
+bool gui_playback_display_hold_channel(gui_app_t *app, int channel) {
+    (void)app;
+    const int c = channel == 1 ? 1 : 0;
+    if (atomic_load(&s_playback->pending_step[c]) != PLAYBACK_NO_SEEK) return true;
+    if (atomic_load(&s_playback->step_lead_in[c])) return true;
+    return get_time_ms() < atomic_load(&s_playback->step_hold_until_ms[c]);
+}
+
+void gui_playback_step_sample_channel(gui_app_t *app, int channel, uint64_t sample) {
+    (void)app;
+    bool channel_b = (channel == 1);
+    uint64_t total_samples = channel_b ? s_playback->info_b.total_samples : s_playback->info_a.total_samples;
+    if (total_samples == 0) {
+        return;
+    }
+    if (sample >= total_samples) {
+        sample = total_samples - 1;
+    }
+    atomic_store(&s_playback->pending_step[channel_b], sample);
+}
+
 void gui_playback_seek_sample(gui_app_t *app, uint64_t sample) {
     (void)app;
     if (s_playback->info_a.total_samples > 0) {
@@ -6644,6 +6762,19 @@ void gui_playback_seek_sample(gui_app_t *app, uint64_t sample) {
     if (s_playback->info_b.total_samples > 0) {
         gui_playback_seek_sample_channel(app, 1, sample);
     }
+}
+
+uint64_t gui_playback_get_cue_samples_channel(gui_app_t *app, int channel) {
+    // Paused: where the user put the playhead (a queued seek, else the cue),
+    // not the preroll that is still running up to it.
+    const int c = channel == 1 ? 1 : 0;
+    if (s_playback->app && gui_playback_transport_paused(s_playback, c)) {
+        uint64_t want = atomic_load(&s_playback->pending_seek[c]);
+        if (want == PLAYBACK_NO_SEEK) want = atomic_load(&s_playback->pending_step[c]);
+        if (want == PLAYBACK_NO_SEEK) want = atomic_load(&s_playback->cue_sample[c]);
+        if (want != PLAYBACK_NO_SEEK) return want;
+    }
+    return gui_playback_get_position_samples_channel(app, channel);
 }
 
 uint64_t gui_playback_get_position_samples_channel(gui_app_t *app, int channel) {

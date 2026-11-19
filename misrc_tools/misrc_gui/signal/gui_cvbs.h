@@ -660,6 +660,11 @@ void gui_cvbs_set_vectorscope_follow(void (*follow)(void *state, int system_sele
 // and its system's lines per frame (625 / 525). The Spectro panel keys its
 // paused window's field / frame markers to it.
 bool gui_video_panel_sync_source(const void *state, int *mode, int *lines_per_frame);
+// A Video panel's decoder (0 CVBS, 1 Tape Decode, 2 RF Preview; -1 no
+// state) and switching it, as the panel's decoder button does. Saved per
+// channel in the settings (video_decoder_a / _b).
+int gui_video_panel_get_decoder(const void *state);
+void gui_video_panel_set_decoder(void *state, int decoder);
 // Same hook for any other panel view driven by its own composite feed (the
 // waveform monitor).
 void gui_cvbs_set_feed_follow(panel_view_type_t view,

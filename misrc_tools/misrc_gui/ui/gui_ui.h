@@ -18,6 +18,9 @@
 #define COLOR_CHANNEL_B       (Color){ 220, 200, 80, 255 }
 #define COLOR_SYNC_GREEN      (Color){ 50, 200, 80, 255 }
 #define COLOR_SYNC_RED        (Color){ 200, 60, 60, 255 }
+// Playback cut markers (FLAC-Chop IN / OUT): scrub bar, Spectro, marker icon.
+#define COLOR_CUT_IN          (Color){ 90, 230, 130, 255 }
+#define COLOR_CUT_OUT         (Color){ 240, 80, 80, 255 }
 #define COLOR_CLIP_RED        (Color){ 255, 50, 50, 255 }
 #define COLOR_GRID            (Color){ 90, 90, 110, 130 }
 #define COLOR_GRID_MAJOR      (Color){ 130, 130, 160, 180 }
@@ -49,6 +52,22 @@ void gui_handle_interactions(gui_app_t *app);
 void gui_ui_sync_capture_mode_state(gui_app_t *app);
 // True while a text field / editor window owns the keyboard.
 bool gui_ui_keyboard_captured(void);
+
+// Playback cut markers (FLAC-Chop IN / OUT; marker button beside Play/Loop,
+// I / O keys, --markers). Sets the status line; false when the channel has
+// no running playback file or the action had nothing to act on.
+typedef enum {
+    GUI_CUT_ACTION_SET_IN,
+    GUI_CUT_ACTION_SET_OUT,
+    GUI_CUT_ACTION_GOTO_IN,
+    GUI_CUT_ACTION_GOTO_OUT,
+    GUI_CUT_ACTION_CLEAR,
+    GUI_CUT_ACTION_COPY_COMMAND,
+    GUI_CUT_ACTION_COUNT
+} gui_cut_action_t;
+bool gui_ui_cut_marker_action(gui_app_t *app, int channel, gui_cut_action_t action);
+// --markers <a|b>:...,menu=open - open that channel's marker menu.
+void gui_ui_open_cut_marker_menu(int channel);
 void gui_ui_net_mode_apply(gui_app_t *app, int mode);
 void gui_ui_sync_android_keyboard_state(void);
 

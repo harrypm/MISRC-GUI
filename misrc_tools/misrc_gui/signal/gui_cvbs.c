@@ -6364,7 +6364,8 @@ static bool video_panel_init_decoder_common(cvbs_decoder_t *decoder,
     if (!decoder) return false;
     if (!gui_cvbs_init(decoder)) return false;
 
-    decoder->osd_mode = CVBS_OSD_MINIMAL;
+    // CVBS opens with its OSD off (harrypm 2026-11-19); Tape Decode keeps Minimal.
+    decoder->osd_mode = mode == CVBS_DECODER_MODE_CVBS ? CVBS_OSD_OFF : CVBS_OSD_MINIMAL;
     decoder->frame_view_mode = CVBS_FRAME_VIEW_ACTIVE;
     decoder->decoder_mode = mode;
     decoder->tape_format = CVBS_TAPE_FORMAT_VHS;
@@ -6551,6 +6552,18 @@ static bool video_panel_chrome_toggle_on_click(video_panel_state_t *panel, Vecto
 }
 
 static void video_detach_rf(vhs_fm_decoder_t *decoder);
+
+static void video_panel_activate_plugin(video_panel_state_t *panel, video_plugin_kind_t plugin);
+
+int gui_video_panel_get_decoder(const void *state) {
+    if (!state) return -1;
+    return (int)atomic_load(&((const video_panel_state_t *)state)->active_plugin);
+}
+
+void gui_video_panel_set_decoder(void *state, int decoder) {
+    if (!state || decoder < VIDEO_PLUGIN_CVBS || decoder > VIDEO_PLUGIN_VHS_FM) return;
+    video_panel_activate_plugin((video_panel_state_t *)state, (video_plugin_kind_t)decoder);
+}
 
 static void video_panel_activate_plugin(video_panel_state_t *panel, video_plugin_kind_t plugin) {
     if (!panel) return;
@@ -7366,7 +7379,7 @@ static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *ap
         control_y += btn_h + row_gap;
     }
     int budget=vhs_budget_clamp(app->settings.rf_preview_budget_percent);
-    char budget_label[40]; snprintf(budget_label,sizeof(budget_label),"Budget: %.2f core (shared)",budget/100.0);
+    char budget_label[40]; snprintf(budget_label,sizeof(budget_label),"Cores : %.2f",budget/100.0);
     float budget_w=(float)gui_text_measure(budget_label,font_size)+16;
     decoder->overlay.budget_rect=(Rectangle){x_right-budget_w,control_y,budget_w,btn_h};
     DrawRectangleRounded(decoder->overlay.budget_rect,0.15f,4,COLOR_BUTTON_HOVER);
@@ -7446,18 +7459,21 @@ static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *ap
 
 static void cvbs_vtable_render(void *state, gui_app_t *app, int channel,
                                 Rectangle bounds, Color channel_color) {
-    (void)app;
-    (void)channel;
     (void)channel_color;
 
     video_panel_state_t *panel = (video_panel_state_t *)state;
     if (!panel) return;
 
-    // Keep all decoders updated while preserving independent state.
-    gui_cvbs_swap_buffers(&panel->cvbs.decoder);
-    gui_cvbs_swap_buffers(&panel->tape_decode.decoder);
+    // Keep all decoders updated while preserving independent state. A
+    // playback step-back lead-in is decoded but not shown: the previous
+    // picture stays until the step lands (gui_playback_display_hold_channel).
+    const bool hold = app && gui_playback_display_hold_channel(app, channel);
+    if (!hold) {
+        gui_cvbs_swap_buffers(&panel->cvbs.decoder);
+        gui_cvbs_swap_buffers(&panel->tape_decode.decoder);
+    }
     atomic_store(&panel->vhs_fm.decoder.input_supported,atomic_load(&app->rf_preview_input_supported));
-    gui_vhs_fm_swap_buffers(&panel->vhs_fm.decoder);
+    if (!hold) gui_vhs_fm_swap_buffers(&panel->vhs_fm.decoder);
 
     if (panel->active_plugin == VIDEO_PLUGIN_VHS_FM) {
         gui_vhs_fm_render_frame(&panel->vhs_fm.decoder, bounds.x, bounds.y,
