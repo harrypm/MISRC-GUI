@@ -39,6 +39,7 @@
 #include "../visualization/gui_wfm_panel.h"
 #include "../visualization/gui_vectorscope_panel.h"
 #include "../visualization/gui_spectrogram.h"
+#include "../signal/gui_cvbs.h"   // gui_video_panel_sync_source (field step)
 #include "../input/gui_capture.h"
 #include "../processing/gui_extract.h"
 #include "../signal/gui_cvbs.h"
@@ -162,8 +163,10 @@ static void print_usage(const char *program_name) {
             "--spectro <key=value,...> launch state of Spectro panels:\n"
             "           dir=horizontal|vertical (readout direction: time across,\n"
             "           newest right / time down, newest top - the former\n"
-            "           Waterfall), palette=phosphor|heat (any subset; defaults\n"
-            "           horizontal, phosphor).\n"
+            "           Waterfall), palette=phosphor|heat, span=1field|1frame|\n"
+            "           2frames|3frames|5frames|10frames|25frames|1s|3s|10s|30s|60s\n"
+            "           (the paused window; any subset; defaults horizontal,\n"
+            "           heat, 1frame).\n"
             "--auto-capture starts capture unattended ~1 s after launch (Local mode;\n"
             "           no --config required).\n"
             "--auto-record <seconds> runs a full unattended record cycle: start\n"
@@ -861,6 +864,69 @@ static int gui_run_role_headless_server(const char *config_path,
 // --panel-view <a|b>:<left>[,<right>] (see print_usage). View names are the
 // view picker's names, lower case ("video", "vector", ...). Unknown values
 // print the accepted names and fail (hard rule: flags fail fast + log).
+// Playback field step (harrypm 2026-11-19: "add arrow keys to move by field
+// on a tap and slow frame advance on hold"): Left / Right move every playing
+// channel's playhead one FIELD a tap; held (after 0.4 s) they advance a FRAME
+// every 150 ms. Playing playback pauses on the first press. The field length
+// follows channel A's Video panel system (625 / 525), else the Video System
+// setting. Stands down while an editor owns the keyboard.
+#define FIELD_STEP_HOLD_DELAY_S 0.40
+#define FIELD_STEP_HOLD_PERIOD_S 0.15
+
+static double gui_field_step_seconds(const gui_app_t *app) {
+    int lines = app->settings.video_system == 1 ? 525 : 625;
+    const channel_panel_config_t *cfg = &app->panel_config_a;
+    const void *video = cfg->left_view == PANEL_VIEW_CVBS ? cfg->left_state
+                      : (cfg->split && cfg->right_view == PANEL_VIEW_CVBS) ? cfg->right_state : NULL;
+    if (video) (void)gui_video_panel_sync_source(video, NULL, &lines);
+    return lines == 525 ? 1001.0 / 60000.0 : 1.0 / 50.0;
+}
+
+static void gui_field_step(gui_app_t *app, int fields) {
+    const double field_s = gui_field_step_seconds(app);
+    for (int ch = 0; ch < 2; ch++) {
+        playback_file_info_t info = {0};
+        if (!gui_playback_get_selected_file_info(app, ch, &info) || !(info.real_sample_rate_hz > 0.0) ||
+            info.total_samples == 0) continue;
+        const double pos = (double)gui_playback_get_position_samples_channel(app, ch);
+        double next = pos + (double)fields * field_s * info.real_sample_rate_hz;
+        if (next < 0.0) next = 0.0;
+        if (next > (double)(info.total_samples - 1)) next = (double)(info.total_samples - 1);
+        gui_playback_seek_sample_channel(app, ch, (uint64_t)(next + 0.5));
+    }
+}
+
+static void gui_field_step_keys(gui_app_t *app) {
+    static int held_dir = 0;
+    static double next_at = 0.0;
+    const bool playback_dev = app->selected_device >= 0 && app->selected_device < app->device_count &&
+                              app->devices[app->selected_device].type == DEVICE_TYPE_PLAYBACK;
+    if (!playback_dev || !app->is_capturing || !gui_playback_is_running(app) ||
+        app->settings_panel_open || gui_ui_keyboard_captured()) {
+        held_dir = 0;
+        return;
+    }
+    const bool right = IsKeyDown(KEY_RIGHT), left = IsKeyDown(KEY_LEFT);
+    const int dir = right == left ? 0 : (right ? 1 : -1);
+    const double now = GetTime();
+    if ((IsKeyPressed(KEY_RIGHT) || IsKeyPressed(KEY_LEFT)) && dir != 0) {
+        if (gui_playback_get_state(app) == PLAYBACK_STATE_PLAYING) gui_playback_pause(app);
+        gui_field_step(app, dir);
+        held_dir = dir;
+        next_at = now + FIELD_STEP_HOLD_DELAY_S;
+        gui_app_set_status(app, dir > 0 ? "Field +1 (hold: frame advance)" : "Field -1 (hold: frame back)");
+        return;
+    }
+    if (dir == 0 || dir != held_dir) {
+        held_dir = 0;
+        return;
+    }
+    if (now >= next_at) {
+        gui_field_step(app, 2 * dir);
+        next_at = now + FIELD_STEP_HOLD_PERIOD_S;
+    }
+}
+
 // "waterfall" (the merged Waterfall view, 2026-11-18) is accepted as Spectro
 // with Dir: Vertical; *vertical reports it.
 static int gui_parse_panel_view_name(const char *name, size_t len, bool *vertical) {
@@ -1781,6 +1847,8 @@ int main(int argc, char **argv) {
                     gui_dropdown_close_all();
                 }
             }
+
+            gui_field_step_keys(&app);
 
             if (IsKeyPressed(KEY_SPACE) && !app.settings_panel_open) {
                 // Space = play/pause (DAW-style). In playback mode it toggles

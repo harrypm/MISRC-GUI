@@ -654,6 +654,12 @@ void gui_cvbs_feed_set_pixels(gui_cvbs_feed_t *feed, bool wanted);
 // The composite vectorscope panel registers its Test Gen follow hook here
 // (queues a system change 0..2, applied on the panel's decode thread).
 void gui_cvbs_set_vectorscope_follow(void (*follow)(void *state, int system_select));
+
+// A Video panel's (PANEL_VIEW_CVBS state) active decoder mode as a field
+// locator input (GUI_FIELD_LOCATE_CVBS / _FM: RF Preview and Tape Decode)
+// and its system's lines per frame (625 / 525). The Spectro panel keys its
+// paused window's field / frame markers to it.
+bool gui_video_panel_sync_source(const void *state, int *mode, int *lines_per_frame);
 // Same hook for any other panel view driven by its own composite feed (the
 // waveform monitor).
 void gui_cvbs_set_feed_follow(panel_view_type_t view,

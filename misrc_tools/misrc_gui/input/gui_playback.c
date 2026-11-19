@@ -954,6 +954,7 @@ typedef struct playback_analysis_segment {
     size_t col_pos;              // Samples accumulated in the current column
     int64_t col_dc_sum;          // DC accumulator for the current column
     float *dst;                  // Target magnitude buffer (unpublished)
+    gui_field_locate_t *fl;      // Field locator fed this segment's samples (NULL = off)
     uint32_t errors_logged;
 } playback_analysis_segment_t;
 
@@ -968,6 +969,9 @@ typedef struct {
     uint64_t req_center;
     uint64_t req_span;           // Span in SAMPLES (computed from duration)
     uint64_t req_total;          // Render-thread length publication snapshot
+    int req_sync_mode;           // GUI_FIELD_LOCATE_* (0 = no field marks)
+    int req_lines;               // 625 / 525
+    double req_rate;             // The file's true rate (the locator's time base)
     atomic_bool locked;         // Short request/result publication critical section
     atomic_uint_fast64_t req_seq;
 
@@ -980,6 +984,10 @@ typedef struct {
     atomic_int publish_idx;      // Latest completed magnitude buffer
     int reader_idx;             // Pinned by render until the next successful poll
     float *mag_buf[3];          // Published, render-pinned, and worker buffers
+    // Field starts of each buffer's window (published with it)
+    gui_field_mark_t marks[3][64];
+    size_t mark_count[3];
+    gui_field_locate_t fl;      // Worker-owned locator (trace reused across windows)
     // Per-request bookkeeping (worker only)
     uint64_t win_start;
     uint64_t win_span;
@@ -6888,7 +6896,11 @@ bool gui_playback_get_channel_loop(gui_app_t *app, int channel) {
  */
 #if LIBFLAC_ENABLED == 1
 
-#define PLAYBACK_ANALYSIS_SPAN_MIN_SECONDS 0.1
+// Floor below one field (16.7 / 20 ms): the Spectro panel's frame / field
+// spans (1 field .. 25 frames) are requested as they are. It was 0.1 s, which
+// silently widened a 1-field / 1-frame request to 5 fields while the panel
+// labelled and marked the short span (harrypm 2026-11-19: markers off).
+#define PLAYBACK_ANALYSIS_SPAN_MIN_SECONDS 0.005
 #define PLAYBACK_ANALYSIS_SPAN_MAX_SECONDS 60.0
 
 // Segment seektable gap (the recorder's seektable point spacing — see
@@ -6953,6 +6965,10 @@ static FLAC__StreamDecoderWriteStatus gui_playback_analysis_write_cb(
         return FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE;
     }
     const FLAC__int32 *in = buffer[0];
+    if (s->fl && s->decoded < s->seg_span) {
+        uint64_t left = s->seg_span - s->decoded;
+        gui_field_locate_push(s->fl, in, left < samples ? (size_t)left : (size_t)samples);
+    }
     for (uint32_t i = 0; i < samples; i++) {
         if (s->slices_done >= s->slice_count) break;
         if (s->col_pos < s->hop) {
@@ -7085,6 +7101,9 @@ static int gui_playback_analysis_worker(void *arg) {
         uint64_t span = a->req_span;
         uint64_t center = a->req_center;
         uint64_t total = a->req_total;
+        const int sync_mode = a->req_sync_mode;
+        const int sync_lines = a->req_lines;
+        const double sync_rate = a->req_rate;
         gui_playback_analysis_unlock(a);
         if (req == 0 || req == atomic_load(&a->done_seq)) {
             thrd_sleep_ms(10);
@@ -7190,6 +7209,10 @@ static int gui_playback_analysis_worker(void *arg) {
                 break;
             }
         }
+        // Field starts (frame / field spans): one locator over the whole
+        // window, fed in order - so the decode stays sequential below.
+        const bool locate = sync_mode != 0 && sync_rate > 0.0 &&
+            gui_field_locate_begin(&a->fl, sync_mode, sync_rate, sync_lines, start, span);
         for (size_t i = 0; i < a->seg_count; i++) {
             playback_analysis_segment_t *s = &a->segs[i];
             if (s->slice_count == 0) continue;
@@ -7198,9 +7221,12 @@ static int gui_playback_analysis_worker(void *arg) {
             s->col_pos = 0;
             s->col_dc_sum = 0;
             s->dst = dst;
+            s->fl = locate ? &a->fl : NULL;
         }
+        a->mark_count[dst_idx] = 0;
 
         if (active == 0) {
+            for (size_t i = 0; i < a->seg_count; i++) a->segs[i].fl = NULL;
             gui_playback_analysis_lock(a);
             atomic_store(&a->publish_idx, dst_idx);
             atomic_store(&a->done_seq, req);
@@ -7212,7 +7238,7 @@ static int gui_playback_analysis_worker(void *arg) {
         // segment's seektable-gap forward decode; sequential for small
         // windows (the per-segment gap cost would exceed the window itself).
         bool parallel =
-            span > (2 * PLAYBACK_ANALYSIS_SEEK_GAP_SAMPLES) && active > 1;
+            !locate && span > (2 * PLAYBACK_ANALYSIS_SEEK_GAP_SAMPLES) && active > 1;
         thrd_t tids[PLAYBACK_ANALYSIS_DECODE_SEGMENTS];
         size_t spawned = 0;
         for (size_t i = 0; i < a->seg_count; i++) {
@@ -7230,6 +7256,10 @@ static int gui_playback_analysis_worker(void *arg) {
         for (size_t i = 0; i < spawned; i++) {
             thrd_join(tids[i], NULL);
         }
+        if (locate) {
+            a->mark_count[dst_idx] = gui_field_locate_finish(&a->fl, a->marks[dst_idx], 64);
+        }
+        for (size_t i = 0; i < a->seg_count; i++) a->segs[i].fl = NULL;
         gui_playback_analysis_lock(a);
         atomic_store(&a->publish_idx, dst_idx);
         atomic_store(&a->done_seq, req);
@@ -7250,6 +7280,7 @@ static void gui_playback_analysis_shutdown(playback_analysis_t *a) {
 }
 
 static void gui_playback_analysis_release(playback_analysis_t *a) {
+    gui_field_locate_free(&a->fl);
     if (!a) return;
     for (size_t i = 0; i < PLAYBACK_ANALYSIS_DECODE_SEGMENTS; i++) {
         playback_analysis_segment_t *s = &a->segs[i];
@@ -7388,6 +7419,12 @@ static bool gui_playback_analysis_init(playback_analysis_t *a) {
 void gui_playback_request_analysis_window(gui_app_t *app, int channel,
                                            uint64_t center_sample,
                                            double span_seconds) {
+    gui_playback_request_analysis_window_fields(app, channel, center_sample, span_seconds, 0, 625);
+}
+
+void gui_playback_request_analysis_window_fields(gui_app_t *app, int channel,
+                                                 uint64_t center_sample, double span_seconds,
+                                                 int sync_mode, int lines_per_frame) {
     (void)app;
     if (channel != 0 && channel != 1) return;
 #if LIBFLAC_ENABLED == 1
@@ -7442,11 +7479,36 @@ void gui_playback_request_analysis_window(gui_app_t *app, int channel,
     a->req_total = total;
     a->req_span = (uint64_t)(span_seconds * rate);
     if (a->req_span == 0) a->req_span = 1;
+    a->req_sync_mode = sync_mode;
+    a->req_lines = lines_per_frame == 525 ? 525 : 625;
+    a->req_rate = rate;
     atomic_fetch_add(&a->req_seq, 1);
     gui_playback_analysis_unlock(a);
 #else
     (void)center_sample;
     (void)span_seconds;
+    (void)sync_mode;
+    (void)lines_per_frame;
+#endif
+}
+
+size_t gui_playback_analysis_field_marks(gui_app_t *app, int channel,
+                                         gui_field_mark_t *out, size_t max) {
+    (void)app;
+    if ((channel != 0 && channel != 1) || !out || max == 0) return 0;
+#if LIBFLAC_ENABLED == 1
+    playback_analysis_t *a = &s_analysis[channel];
+    gui_playback_analysis_lock(a);
+    size_t n = 0;
+    if (a->reader_idx >= 0 && a->reader_idx < 3) {
+        n = a->mark_count[a->reader_idx];
+        if (n > max) n = max;
+        memcpy(out, a->marks[a->reader_idx], n * sizeof(*out));
+    }
+    gui_playback_analysis_unlock(a);
+    return n;
+#else
+    return 0;
 #endif
 }
 

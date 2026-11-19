@@ -32,6 +32,7 @@
 #include "gui_text.h"
 #include "../core/gui_app.h"
 #include "../input/gui_playback.h"
+#include "../signal/gui_cvbs.h"   // gui_video_panel_sync_source
 #include "../ui/gui_ui.h"
 #include "../ui/gui_dropdown.h"  // gui_dropdown_option_color for the palette dropdown
 #include "../ui/gui_chrome_hide.h"  // double-click overlay toggle (shared helper)
@@ -55,9 +56,9 @@
 // a duration-based window of the FILE around the playhead (gui_playback.c
 // analysis decoder — async, direct random access) across the full history
 // width, instead of the rolling live feed (which is 1:1-correct for playing
-// but only carries the last 65,536-sample display frames). Wheel over the
-// panel while paused adjusts the span (1 s .. 60 s).
-#define SPEC_PAUSED_WINDOW_SECONDS 3.0
+// but only carries the last 65,536-sample display frames). The span is set
+// by the span dropdown or the wheel (s_spans: 1 field .. 60 s; pausing opens
+// at 1 frame).
 
 #define SPEC_LABEL_H     16     // Vertical: bottom strip reserved for freq labels (px)
 #define SPEC_LABEL_W     34     // Horizontal: left strip reserved for freq labels (px)
@@ -107,7 +108,24 @@ typedef struct spectro_engine {
     bool analysis_requested;        // A window request is in flight
     bool analysis_rerequest;         // Span/palette changed; re-request on next render
     uint64_t analysis_playhead;      // Playhead sample of the last request
+    uint64_t analysis_req_center;    // Centre sample of the last request (snapped for field spans)
+    double analysis_t0;              // Window start (s) of the last request
+    double line_seconds;             // One line of the Video System setting (64 / 63.56 us)
+    // Field lock (harrypm 2026-11-19: "frame/field locked with the decoder
+    // mode that is active"): the field lattice is anchored at lattice_t0, the
+    // file time of a field-1 start found by the channel's Video decoder mode
+    // (0 = nominal: counted from the file start, until a detection lands).
+    int sync_mode;                   // GUI_FIELD_LOCATE_* of the channel's Video panel (CVBS default)
+    int sync_lines;                  // 625 / 525
+    double lattice_t0;
+    bool lattice_locked;
+    double mark_t[64];               // Detected field starts of the shown window (s)
+    int mark_field[64];              // 1 / 2 (0 = parity unresolved)
+    size_t mark_count;
     double analysis_span_seconds;    // Requested span (wheel adjustable)
+    int analysis_span_fields;        // > 0: the span is this many video fields (short spans)
+    int span_idx;                    // Paused span: index into s_spans
+    double field_seconds;            // One field of the Video System setting (625: 20 ms, 525: 16.68 ms)
     uint64_t analysis_seq;          // Last consumed analysis result seq
 
     // Palette dropdown (top-right): Phosphor / Heat. Changing the palette
@@ -122,6 +140,11 @@ typedef struct spectro_engine {
     Rectangle dir_btn_rect;
     Rectangle dir_opts_rect[2];
     bool dir_dropdown_open;
+
+    // Paused-window span dropdown (left of Dir, shown only while paused).
+    Rectangle span_btn_rect;
+    Rectangle span_opts_rect[12];
+    bool span_dropdown_open;
 
     // Double-click chrome-hide tracker (see ui/gui_chrome_hide.h): toggles
     // ALL overlay chrome (palette dropdown, axis labels, PAUSED indicator);
@@ -181,7 +204,7 @@ typedef enum {
     SPEC_PALETTE_HEAT               // Inferno-style red/purple contrasting heat map
 } spec_palette_t;
 
-static int s_spec_palette = SPEC_PALETTE_PHOSPHOR;
+static int s_spec_palette = SPEC_PALETTE_HEAT;   // Default Heat (harrypm 2026-11-19)
 
 // Inferno-style red/purple contrasting heat map (matplotlib "inferno"
 // control points): near-black -> deep purple -> magenta/red -> orange ->
@@ -259,24 +282,45 @@ static void resample_magnitude(const float *src, int n_src, float *dst, int n_ds
 //-----------------------------------------------------------------------------
 
 enum { SPEC_DIR_HORIZONTAL = 0, SPEC_DIR_VERTICAL = 1, SPEC_DIR_COUNT };
+
+// Paused-window spans (the span dropdown, the wheel and --spectro span=):
+// video fields, two a frame (harrypm 2026-11-19: "Frames / Fields as each
+// frame is 2 fields combined"), then seconds. Pausing opens at 1 frame.
+static const struct {
+    int fields;            // > 0: a span of fields
+    double secs;           // else seconds
+    const char *name;      // dropdown / label
+    const char *key;       // --spectro span=
+} s_spans[] = {
+    { 1, 0, "1 field", "1field" },     { 2, 0, "1 frame", "1frame" },
+    { 4, 0, "2 frames", "2frames" },   { 6, 0, "3 frames", "3frames" },
+    { 10, 0, "5 frames", "5frames" },  { 20, 0, "10 frames", "10frames" },
+    { 50, 0, "25 frames", "25frames" },
+    { 0, 1.0, "1 s", "1s" },   { 0, 3.0, "3 s", "3s" },   { 0, 10.0, "10 s", "10s" },
+    { 0, 30.0, "30 s", "30s" }, { 0, 60.0, "60 s", "60s" },
+};
+#define SPEC_SPAN_COUNT ((int)(sizeof(s_spans) / sizeof(s_spans[0])))
+#define SPEC_SPAN_DEFAULT 1   // 1 frame
 static const char *const s_dir_names[SPEC_DIR_COUNT] = { "Horizontal", "Vertical" };
 static const char *const s_palette_names[2] = { "Phosphor", "Heat" };
 
 // Launch state for new panels (hard rule dev/gui_automation_flags_rules.md).
 static struct {
     int dir;
+    int span;
     bool from_flag;
-} s_spec_launch = { SPEC_DIR_HORIZONTAL, false };
+} s_spec_launch = { SPEC_DIR_HORIZONTAL, SPEC_SPAN_DEFAULT, false };
 
 bool gui_spectrogram_apply_launch_arg(const char *arg) {
     static const char *usage =
         "--spectro: expected comma-separated key=value pairs: dir=horizontal|vertical, "
-        "palette=phosphor|heat";
+        "palette=phosphor|heat, span=1field|1frame|2frames|3frames|5frames|10frames|25frames|"
+        "1s|3s|10s|30s|60s (the paused window)";
     if (!arg || !*arg) {
         fprintf(stderr, "%s (got '')\n", usage);
         return false;
     }
-    int dir = s_spec_launch.dir, palette = s_spec_palette;
+    int dir = s_spec_launch.dir, palette = s_spec_palette, span = s_spec_launch.span;
     const char *p = arg;
     while (*p) {
         const char *comma = strchr(p, ',');
@@ -290,6 +334,13 @@ bool gui_spectrogram_apply_launch_arg(const char *arg) {
         if (eq && SPEC_IS(p, klen, "dir")) {
             if (SPEC_IS(val, vlen, "horizontal")) { dir = SPEC_DIR_HORIZONTAL; ok = true; }
             else if (SPEC_IS(val, vlen, "vertical")) { dir = SPEC_DIR_VERTICAL; ok = true; }
+        } else if (eq && SPEC_IS(p, klen, "span")) {
+            for (int i = 0; i < SPEC_SPAN_COUNT && !ok; i++) {
+                if (vlen == strlen(s_spans[i].key) && strncmp(val, s_spans[i].key, vlen) == 0) {
+                    span = i;
+                    ok = true;
+                }
+            }
         } else if (eq && SPEC_IS(p, klen, "palette")) {
             if (SPEC_IS(val, vlen, "phosphor")) { palette = SPEC_PALETTE_PHOSPHOR; ok = true; }
             else if (SPEC_IS(val, vlen, "heat")) { palette = SPEC_PALETTE_HEAT; ok = true; }
@@ -302,10 +353,11 @@ bool gui_spectrogram_apply_launch_arg(const char *arg) {
         p += len + (comma ? 1 : 0);
     }
     s_spec_launch.dir = dir;
+    s_spec_launch.span = span;
     s_spec_launch.from_flag = true;
     s_spec_palette = palette;   // the palette is shared by every Spectro panel
-    fprintf(stderr, "[AUTO] --spectro: dir=%s palette=%s\n", s_dir_names[dir],
-            s_palette_names[s_spec_palette]);
+    fprintf(stderr, "[AUTO] --spectro: dir=%s palette=%s span=%s\n", s_dir_names[dir],
+            s_palette_names[s_spec_palette], s_spans[span].name);
     return true;
 }
 
@@ -321,6 +373,19 @@ static void spectro_set_time_on_x(spectro_engine_t *e, bool time_on_x) {
     e->tex_recreate = true;
     e->needs_full_upload = true;
     if (e->analysis_active) e->analysis_rerequest = true;
+}
+
+// Select a paused-window span (s_spans index); field spans follow the
+// Video System setting's field length.
+static void spectro_set_span(spectro_engine_t *e, int idx) {
+    if (idx < 0) idx = 0;
+    if (idx >= SPEC_SPAN_COUNT) idx = SPEC_SPAN_COUNT - 1;
+    e->span_idx = idx;
+    e->analysis_span_fields = s_spans[idx].fields;
+    const double field_s = e->field_seconds > 0.0 ? e->field_seconds : 0.02;
+    e->analysis_span_seconds = s_spans[idx].fields > 0 ? (double)s_spans[idx].fields * field_s
+                                                       : s_spans[idx].secs;
+    e->analysis_rerequest = true;
 }
 
 void gui_spectrogram_set_vertical(void *state, bool vertical) {
@@ -372,8 +437,9 @@ static void *spectro_create(bool time_on_x) {
 static void *spectrograph_vtable_create(void) {
     void *state = spectro_create(s_spec_launch.dir == SPEC_DIR_HORIZONTAL);
     if (state && s_spec_launch.from_flag) {
-        fprintf(stderr, "[AUTO] Spectro panel: dir=%s palette=%s\n",
-                s_dir_names[s_spec_launch.dir], s_palette_names[s_spec_palette]);
+        fprintf(stderr, "[AUTO] Spectro panel: dir=%s palette=%s span=%s\n",
+                s_dir_names[s_spec_launch.dir], s_palette_names[s_spec_palette],
+                s_spans[s_spec_launch.span].name);
     }
     return state;
 }
@@ -495,14 +561,50 @@ static void spectro_write_slice_index(spectro_engine_t *e, int index) {
 // last completed window until the worker publishes the new one).
 static void spectro_update_paused_window(spectro_engine_t *e, gui_app_t *app, int channel) {
     uint64_t playhead = gui_playback_get_position_samples_channel(app, channel);
+    // The file's true rate (the time axis's), for the window start in seconds
+    // and the field snap.
+    playback_file_info_t info = {0};
+    (void)gui_playback_get_selected_file_info(app, channel, &info);
+    const double rate = info.real_sample_rate_hz;
+    // Frame / field spans (harrypm 2026-11-19: "scale locking at frame /
+    // field accurate to lines ... so it clicks on these points"): the window
+    // centred on the playhead, its START snapped to the nearest field
+    // boundary, so the field / frame markers stay put and the window moves a
+    // field at a time. Boundaries count from the file start (nominal until
+    // the field lock keys them to real syncs). A field is a whole number of
+    // lines, so the scale is exact to lines.
+    uint64_t center = playhead;
+    double t0 = 0.0;
+    if (rate > 0.0) {
+        const double span_samples = e->analysis_span_seconds * rate;
+        double start_t = (double)playhead / rate - e->analysis_span_seconds / 2.0;
+        if (e->analysis_span_fields > 0 && e->field_seconds > 0.0) {
+            // On the field lattice: whole frames for frame spans, fields for
+            // the 1-field span.
+            const double step = (e->analysis_span_fields % 2 == 0) ? 2.0 * e->field_seconds
+                                                                    : e->field_seconds;
+            start_t = e->lattice_t0 + floor((start_t - e->lattice_t0) / step + 0.5) * step;
+        }
+        double start = start_t * rate;
+        if (start < 0.0) start = 0.0;
+        center = (uint64_t)(start + span_samples / 2.0 + 0.5);
+        t0 = start / rate;
+    }
     if (!e->analysis_requested || e->analysis_rerequest ||
-        playhead != e->analysis_playhead) {
-        gui_playback_request_analysis_window(app, channel, playhead,
-                                              e->analysis_span_seconds);
+        center != e->analysis_req_center) {
+        if (e->analysis_span_fields > 0) {
+            gui_playback_request_analysis_window_fields(app, channel, center, e->analysis_span_seconds,
+                                                        e->sync_mode, e->sync_lines);
+        } else {
+            gui_playback_request_analysis_window(app, channel, center, e->analysis_span_seconds);
+        }
         e->analysis_requested = true;
         e->analysis_rerequest = false;
-        e->analysis_playhead = playhead;
+        e->analysis_req_center = center;
+        e->analysis_t0 = t0;
+        e->mark_count = 0;          // until this window's marks publish
     }
+    e->analysis_playhead = playhead;
 
     const float *mags = NULL;
     size_t slice_count = 0;
@@ -520,6 +622,30 @@ static void spectro_update_paused_window(spectro_engine_t *e, gui_app_t *app, in
             resample_magnitude(mags + i * bins, (int)bins, e->frame, e->freq_bins);
             e->frame_valid = true;
             spectro_write_slice_index(e, (int)i);
+        }
+        // This window's field starts (frame / field spans): the markers, and
+        // the lattice re-anchored on a detected field 1. A window that sat
+        // more than half a line off the real lattice is requested again.
+        gui_field_mark_t marks[64];
+        size_t nm = e->analysis_span_fields > 0
+            ? gui_playback_analysis_field_marks(app, channel, marks, 64) : 0;
+        e->mark_count = 0;
+        for (size_t i = 0; i < nm && rate > 0.0; i++) {
+            e->mark_t[e->mark_count] = (double)marks[i].pos / rate;
+            e->mark_field[e->mark_count] = marks[i].field;
+            e->mark_count++;
+        }
+        for (size_t i = 0; i < e->mark_count; i++) {
+            if (e->mark_field[i] != 1) continue;
+            const double frame_s = 2.0 * e->field_seconds;
+            const double off = e->mark_t[i] - e->lattice_t0;
+            const double drift = off - floor(off / frame_s + 0.5) * frame_s;
+            if (!e->lattice_locked || fabs(drift) > 0.5 * e->line_seconds) {
+                e->lattice_t0 = e->mark_t[i];
+                e->lattice_locked = true;
+                e->analysis_rerequest = true;
+            }
+            break;
         }
     }
 }
@@ -571,14 +697,54 @@ static void format_freq(char *buf, size_t bufsz, double hz) {
     else                  snprintf(buf, bufsz, "%.0f", hz);
 }
 
-// DAW-style absolute timecode: h:mm:ss.s / m:ss.s
-static void format_abs_timecode(char *buf, size_t bufsz, double secs) {
+// DAW-style absolute timecode: h:mm:ss.s / m:ss.s, or milliseconds
+// (m:ss.sss) for sub-second windows (frame / field spans).
+static void format_abs_timecode(char *buf, size_t bufsz, double secs, bool ms) {
     if (!(secs >= 0.0) || !isfinite(secs)) secs = 0.0;
     int h = (int)(secs / 3600.0);
     int m = (int)(secs / 60.0) % 60;
     double s = secs - (double)(h * 3600 + m * 60);
-    if (h > 0) snprintf(buf, bufsz, "%d:%02d:%04.1f", h, m, s);
-    else       snprintf(buf, bufsz, "%d:%04.1f", m, s);
+    if (ms)         snprintf(buf, bufsz, "%d:%06.3f", h * 60 + m, s);
+    else if (h > 0) snprintf(buf, bufsz, "%d:%02d:%04.1f", h, m, s);
+    else            snprintf(buf, bufsz, "%d:%04.1f", m, s);
+}
+
+// Frame.field position of a file time (harrypm 2026-11-19: frames / fields
+// position context): field index from the file start, two fields a frame.
+// Nominal until the field lock aligns the window to real syncs.
+// Frame / field / line position of a file time on the field lattice
+// (lattice_t0 = a field-1 start; frames numbered from the file start).
+static double spec_floor_mod(double x, double m) { return x - floor(x / m) * m; }
+
+// Frame line (1 .. 625 / 525, field 1 first) of a file time.
+static int frame_line_at(const spectro_engine_t *e, double secs) {
+    const double fs = e->field_seconds, ls = e->line_seconds;
+    if (fs <= 0.0 || ls <= 0.0) return 0;
+    const double in_frame = spec_floor_mod(secs - e->lattice_t0, 2.0 * fs);
+    return (int)floor(in_frame / ls + 1e-9) + 1;
+}
+
+static void format_frame_pos(char *buf, size_t bufsz, const spectro_engine_t *e, double secs) {
+    const double fs = e->field_seconds;
+    if (fs <= 0.0 || !isfinite(secs)) { snprintf(buf, bufsz, "-"); return; }
+    const double frame_s = 2.0 * fs;
+    const long n0 = (long)floor(e->lattice_t0 / frame_s + 0.5);       // the anchor frame's number
+    const long fi = (long)floor((secs - e->lattice_t0) / fs + 1e-9);  // fields from the anchor
+    const long frame = n0 + (long)floor((double)fi / 2.0);
+    const int field = (int)(fi - 2 * (long)floor((double)fi / 2.0)) + 1;
+    snprintf(buf, bufsz, "%ld.%d", frame, field);
+}
+
+// A time label on the paused window: frame.field for frame / field spans,
+// else the absolute timecode (ms under 1 s).
+static void format_window_time(char *buf, size_t bufsz, const spectro_engine_t *e, double secs,
+                               double window_s) {
+    if (e->analysis_span_fields > 0) format_frame_pos(buf, bufsz, e, secs);
+    else format_abs_timecode(buf, bufsz, secs, window_s < 1.0);
+}
+
+static void format_span(char *buf, size_t bufsz, const spectro_engine_t *e) {
+    snprintf(buf, bufsz, "%s", s_spans[e->span_idx].name);
 }
 
 static void spectro_draw_overlay(spectro_engine_t *e, double real_rate_hz,
@@ -605,7 +771,7 @@ static void spectro_draw_overlay(spectro_engine_t *e, double real_rate_hz,
         time_window_s = (double)e->time_bins * 65536.0 / real_rate_hz;
         if (time_absolute) {
             time_window_s = e->analysis_span_seconds;
-            time_center_s = (double)e->analysis_playhead / real_rate_hz;
+            time_center_s = e->analysis_t0 + time_window_s / 2.0;
         }
     }
 
@@ -638,7 +804,7 @@ static void spectro_draw_overlay(spectro_engine_t *e, double real_rate_hz,
                 double t = -time_window_s * (double)frac;
                 char tb[24];
                 if (time_absolute) {
-                    format_abs_timecode(tb, sizeof(tb), time_center_s - time_window_s / 2.0 + (double)(t_divs - d) / (double)t_divs * time_window_s);
+                    format_window_time(tb, sizeof(tb), e, time_center_s - time_window_s / 2.0 + (double)(t_divs - d) / (double)t_divs * time_window_s, time_window_s);
                 } else {
                     snprintf(tb, sizeof(tb), "%.2fs", t);
                 }
@@ -686,7 +852,7 @@ static void spectro_draw_overlay(spectro_engine_t *e, double real_rate_hz,
                 double t;
                 if (time_absolute) {
                     t = time_center_s - time_window_s / 2.0 + (double)frac * time_window_s;
-                    format_abs_timecode(tb, sizeof(tb), t);
+                    format_window_time(tb, sizeof(tb), e, t, time_window_s);
                 } else {
                     t = -time_window_s * (1.0 - (double)frac);
                     snprintf(tb, sizeof(tb), "%.2fs", t);
@@ -709,6 +875,158 @@ static void spectro_draw_overlay(spectro_engine_t *e, double real_rate_hz,
     }
 
     DrawRectangleLinesEx(bounds, 1, COLOR_GRID_MAJOR);
+}
+
+// Field / frame boundary markers on a paused frame / field span (harrypm
+// 2026-11-19: "I need field and frame boundry markers"): a thin line at each
+// field start, a brighter, thicker one at each frame start (field 1), and an
+// f1 / f2 tag in each field where it fits. Boundaries are counted from the
+// file start (nominal until the field lock aligns them to real syncs). The
+// lines are data like the grid; the tags hide with the chrome.
+static void spectro_draw_field_marks(spectro_engine_t *e, double real_rate_hz, Rectangle bounds) {
+    if (!e->analysis_active || e->analysis_span_fields <= 0 || real_rate_hz <= 0.0 ||
+        e->field_seconds <= 0.0) return;
+    const double win = e->analysis_span_seconds;
+    const double t0 = e->analysis_t0;
+    const double fs = e->field_seconds;
+    const bool tags = !gui_chrome_hide_hidden(&e->chrome_hide);
+    const Color frame_col = Fade(WHITE, 0.85f), field_col = Fade(WHITE, 0.45f);
+    const float len = e->time_on_x ? bounds.width : bounds.height;
+    const float px_per_field = (float)(fs / win) * len;
+
+    // Line ticks along the time edge (bottom / left), every 1 / 5 / 10 / 25 /
+    // 50 / 100 lines - the finest step at least 6 px apart - with every 5th
+    // tick longer. Counted from each frame start (frame lines 1..625 / 525).
+    const double ls = e->line_seconds;
+    if (ls > 0.0) {
+        static const int steps[] = { 1, 5, 10, 25, 50, 100 };
+        const double px_per_line = (double)len * ls / win;
+        int step = 0;
+        for (int i = 0; i < (int)(sizeof(steps) / sizeof(steps[0])); i++) {
+            if (px_per_line * steps[i] >= 6.0) { step = steps[i]; break; }
+        }
+        if (step > 0) {
+            const Color tc = Fade(WHITE, 0.55f);
+            const double frame_s = 2.0 * fs;
+            const double base = e->lattice_t0;
+            const long f0 = (long)floor((t0 - base) / frame_s);
+            const int lines_per_frame = (int)floor(frame_s / ls + 0.5);
+            for (long f = f0; base + (double)f * frame_s <= t0 + win; f++) {
+                for (int ln = 0; ln < lines_per_frame; ln += step) {
+                    const double t = base + (double)f * frame_s + (double)ln * ls;
+                    if (t < t0 || t > t0 + win) continue;
+                    const float frac = (float)((t - t0) / win);
+                    const float tl = ((ln / step) % 5 == 0) ? 8.0f : 4.0f;
+                    if (e->time_on_x) {
+                        const float x = bounds.x + frac * bounds.width;
+                        DrawLineV((Vector2){ x, bounds.y + bounds.height - tl },
+                                  (Vector2){ x, bounds.y + bounds.height }, tc);
+                    } else {
+                        const float y = bounds.y + (1.0f - frac) * bounds.height;
+                        DrawLineV((Vector2){ bounds.x, y }, (Vector2){ bounds.x + tl, y }, tc);
+                    }
+                }
+            }
+        }
+    }
+
+    // The boundaries: this window's detected field starts, or the lattice's.
+    double bt[96];
+    int bf[96];
+    size_t nb = 0;
+    if (e->mark_count > 0) {
+        for (size_t i = 0; i < e->mark_count && nb < 96; i++) {
+            bt[nb] = e->mark_t[i];
+            bf[nb] = e->mark_field[i];
+            nb++;
+        }
+    } else {
+        long k = (long)ceil((t0 - e->lattice_t0) / fs - 1e-9);
+        for (; e->lattice_t0 + (double)k * fs <= t0 + win + 1e-9 && nb < 96; k++) {
+            bt[nb] = e->lattice_t0 + (double)k * fs;
+            bf[nb] = (k - 2 * (long)floor((double)k / 2.0)) == 0 ? 1 : 2;
+            nb++;
+        }
+    }
+    for (size_t b = 0; b < nb; b++) {
+        if (bt[b] < t0 - 1e-9 || bt[b] > t0 + win + 1e-9) continue;
+        const float frac = (float)((bt[b] - t0) / win);   // 0 = window start (oldest)
+        const bool frame_start = bf[b] == 1;
+        const Color c = frame_start ? frame_col : field_col;
+        const float thick = frame_start ? 2.0f : 1.0f;
+        if (e->time_on_x) {
+            const float x = bounds.x + frac * bounds.width;
+            DrawLineEx((Vector2){ x, bounds.y }, (Vector2){ x, bounds.y + bounds.height }, thick, c);
+        } else {
+            const float y = bounds.y + (1.0f - frac) * bounds.height;   // newest at the top
+            DrawLineEx((Vector2){ bounds.x, y }, (Vector2){ bounds.x + bounds.width, y }, thick, c);
+        }
+        // Tag the field that starts here, if it has room on screen.
+        if (tags && px_per_field >= 22.0f && frac < 1.0f) {
+            const char *tag = bf[b] == 1 ? "f1" : bf[b] == 2 ? "f2" : "f?";
+            if (e->time_on_x) {
+                const float x = bounds.x + frac * bounds.width + 3.0f;
+                if (x + 14.0f < bounds.x + bounds.width) {
+                    gui_text_draw_mono(tag, x, bounds.y + 26.0f, FONT_SIZE_OSC_SCALE, c);
+                }
+            } else {
+                const float y = bounds.y + (1.0f - frac) * bounds.height - FONT_SIZE_OSC_SCALE - 2.0f;
+                if (y > bounds.y + 26.0f) {
+                    gui_text_draw_mono(tag, bounds.x + bounds.width - 22.0f, y, FONT_SIZE_OSC_SCALE, c);
+                }
+            }
+        }
+    }
+}
+
+// Hover readout (harrypm 2026-11-19): the frequency and time under the
+// mouse, on the axes' own scales (rolling: seconds back from now; paused:
+// the file's absolute timecode). Statistics like the axis labels, but hidden
+// with the chrome and while a dropdown is open.
+static void spectro_draw_hover(spectro_engine_t *e, double real_rate_hz, Rectangle bounds) {
+    if (gui_chrome_hide_hidden(&e->chrome_hide) || e->palette_dropdown_open || e->dir_dropdown_open ||
+        e->span_dropdown_open) return;
+    Vector2 m = gui_ui_get_mouse_position();
+    if (!CheckCollisionPointRec(m, bounds) || e->last_sample_rate == 0) return;
+    if (CheckCollisionPointRec(m, e->palette_btn_rect) || CheckCollisionPointRec(m, e->dir_btn_rect) ||
+        (e->analysis_active && CheckCollisionPointRec(m, e->span_btn_rect))) return;
+    const double fx = (m.x - bounds.x) / bounds.width, fy = (m.y - bounds.y) / bounds.height;
+    const double nyq = (double)e->last_sample_rate * 0.5;
+    // Frequency: Horizontal = Y (Nyquist at the top), Vertical = X.
+    const double hz = nyq * (e->time_on_x ? 1.0 - fy : fx);
+    // Time: the fraction of the window from its oldest edge.
+    const double tf = e->time_on_x ? fx : 1.0 - fy;
+    char fbuf[24], tbuf[24], line[64];
+    if (hz >= 1.0e6)      snprintf(fbuf, sizeof(fbuf), "%.3f MHz", hz / 1.0e6);
+    else if (hz >= 1.0e3) snprintf(fbuf, sizeof(fbuf), "%.1f kHz", hz / 1.0e3);
+    else                  snprintf(fbuf, sizeof(fbuf), "%.0f Hz", hz);
+    tbuf[0] = 0;
+    if (real_rate_hz > 0.0) {
+        if (e->analysis_active) {
+            const double win = e->analysis_span_seconds;
+            const double t = e->analysis_t0 + tf * win;
+            if (e->analysis_span_fields > 0) {
+                char fp[24];
+                format_frame_pos(fp, sizeof(fp), e, t);
+                const char *dot = strchr(fp, '.');
+                snprintf(tbuf, sizeof(tbuf), "frame %.*s f%s L%d", dot ? (int)(dot - fp) : (int)strlen(fp),
+                         fp, dot ? dot + 1 : "1", frame_line_at(e, t));
+            } else {
+                format_abs_timecode(tbuf, sizeof(tbuf), t, win < 1.0);
+            }
+        } else {
+            const double win = (double)e->time_bins * 65536.0 / real_rate_hz;
+            snprintf(tbuf, sizeof(tbuf), "%.3fs", -win * (1.0 - tf));
+        }
+    }
+    snprintf(line, sizeof(line), "%s  %s", fbuf, tbuf);
+    const int tw = gui_text_measure_mono(line, FONT_SIZE_OSC_SCALE);
+    const float pad = 3.0f, h = (float)FONT_SIZE_OSC_SCALE + 2 * pad;
+    float x = m.x + 14.0f, y = m.y + 14.0f;
+    if (x + tw + 2 * pad > bounds.x + bounds.width) x = m.x - 14.0f - tw - 2 * pad;
+    if (y + h > bounds.y + bounds.height) y = m.y - 14.0f - h;
+    DrawRectangleRec((Rectangle){ x, y, (float)tw + 2 * pad, h }, Fade(BLACK, 0.7f));
+    gui_text_draw_mono(line, x + pad, y + pad, FONT_SIZE_OSC_SCALE, COLOR_TEXT);
 }
 
 //-----------------------------------------------------------------------------
@@ -835,6 +1153,35 @@ static void spectro_vtable_render(void *state_ptr, gui_app_t *app, int channel,
          (pb_state == PLAYBACK_STATE_PLAYING &&
           atomic_load(&app->playback_channel_paused[channel])));
 
+    // One field of the Video System setting (the Video panel's System
+    // dropdown writes it): a field-unit span follows a system change.
+    // The channel's Video panel names the decoder mode (CVBS / RF Preview)
+    // and system the field lock follows; without one: CVBS on the Video
+    // System setting.
+    {
+        const channel_panel_config_t *cfg = channel == 1 ? &app->panel_config_b : &app->panel_config_a;
+        const void *video = NULL;
+        if (cfg->left_view == PANEL_VIEW_CVBS) video = cfg->left_state;
+        else if (cfg->split && cfg->right_view == PANEL_VIEW_CVBS) video = cfg->right_state;
+        int mode = GUI_FIELD_LOCATE_CVBS, lines = app->settings.video_system == 1 ? 525 : 625;
+        if (video) (void)gui_video_panel_sync_source(video, &mode, &lines);
+        if (mode != e->sync_mode || lines != e->sync_lines) {
+            e->sync_mode = mode;
+            e->sync_lines = lines;
+            e->lattice_locked = false;   // a new source: re-lock
+            e->analysis_rerequest = true;
+        }
+    }
+    e->field_seconds = (e->sync_lines == 525) ? 1001.0 / 60000.0 : 1.0 / 50.0;
+    e->line_seconds = 2.0 * e->field_seconds / (double)e->sync_lines;
+    if (e->analysis_span_fields > 0) {
+        const double want = (double)e->analysis_span_fields * e->field_seconds;
+        if (e->analysis_span_seconds != want) {
+            e->analysis_span_seconds = want;
+            e->analysis_rerequest = true;
+        }
+    }
+
     if (playback_paused) {
         // --- DAW-style paused analysis window (direct file render) ---
         // Playing stays the 1:1 live rolling feed; paused renders a real
@@ -847,7 +1194,10 @@ static void spectro_vtable_render(void *state_ptr, gui_app_t *app, int channel,
             e->analysis_rerequest = false;
             e->analysis_playhead = 0;
             e->analysis_seq = 0;
-            e->analysis_span_seconds = SPEC_PAUSED_WINDOW_SECONDS;
+            spectro_set_span(e, s_spec_launch.span);
+            e->lattice_t0 = 0.0;
+            e->lattice_locked = false;
+            e->mark_count = 0;
         }
         spectro_update_paused_window(e, app, channel);
         UpdateTexture(e->tex, e->pixels);
@@ -924,15 +1274,20 @@ static void spectro_vtable_render(void *state_ptr, gui_app_t *app, int channel,
     }
 
     spectro_draw_overlay(e, real_rate_hz, bounds, plot);
+    spectro_draw_field_marks(e, real_rate_hz, bounds);
+    spectro_draw_hover(e, real_rate_hz, bounds);
 
     // Paused analysis indicator: window span + pending state. Every column
     // of the paused window is ONE true FFT over that column's full contiguous
     // samples (full resolution; see gui_playback.c). Overlay chrome: hidden
     // with the panel's chrome toggle.
     if (e->analysis_active && !gui_chrome_hide_hidden(&e->chrome_hide)) {
-        char win_buf[64];
-        snprintf(win_buf, sizeof(win_buf), "PAUSED  %.2fs window%s",
-                 e->analysis_span_seconds,
+        char span_buf[32], win_buf[64];
+        format_span(span_buf, sizeof(span_buf), e);
+        const char *lock = e->analysis_span_fields <= 0 ? ""
+            : !e->lattice_locked ? "  nominal"
+            : e->sync_mode == GUI_FIELD_LOCATE_FM ? "  locked FM" : "  locked CVBS";
+        snprintf(win_buf, sizeof(win_buf), "PAUSED  %s%s%s", span_buf, lock,
                  e->analysis_requested ? "" : "  (rendering...)");
         gui_text_draw(win_buf, bounds.x + 38.0f, bounds.y + 3.0f,
                      FONT_SIZE_OSC_SCALE, COLOR_TEXT);
@@ -963,6 +1318,20 @@ static void spectro_vtable_render(void *state_ptr, gui_app_t *app, int channel,
                                   e->dir_dropdown_open, to_logical_w);
         spec_draw_dropdown_button(e->palette_btn_rect, s_palette_names[s_spec_palette],
                                   e->palette_dropdown_open, to_logical_w);
+        if (e->analysis_active) {
+            const char *span_names[SPEC_SPAN_COUNT];
+            for (int i = 0; i < SPEC_SPAN_COUNT; i++) span_names[i] = s_spans[i].name;
+            float span_w = spec_dropdown_width(span_names, SPEC_SPAN_COUNT, to_logical_w);
+            e->span_btn_rect = (Rectangle){ e->dir_btn_rect.x - gap - span_w, bounds.y + 6, span_w, btn_h };
+            spec_draw_dropdown_button(e->span_btn_rect, s_spans[e->span_idx].name,
+                                      e->span_dropdown_open, to_logical_w);
+            if (e->span_dropdown_open) {
+                spec_draw_dropdown_options(e->span_btn_rect, span_names, SPEC_SPAN_COUNT, e->span_idx,
+                                           e->span_opts_rect, to_logical_w);
+            }
+        } else {
+            e->span_dropdown_open = false;
+        }
         if (e->dir_dropdown_open) {
             spec_draw_dropdown_options(e->dir_btn_rect, s_dir_names, SPEC_DIR_COUNT,
                                        e->time_on_x ? SPEC_DIR_HORIZONTAL : SPEC_DIR_VERTICAL,
@@ -1002,6 +1371,17 @@ static bool spectro_handle_palette_click(spectro_engine_t *e, gui_app_t *app, in
         e->palette_dropdown_open = false;
         return true;
     }
+    if (e->span_dropdown_open) {
+        for (int i = 0; i < SPEC_SPAN_COUNT; i++) {
+            if (CheckCollisionPointRec(click, e->span_opts_rect[i])) {
+                if (e->span_idx != i) spectro_set_span(e, i);
+                e->span_dropdown_open = false;
+                return true;
+            }
+        }
+        e->span_dropdown_open = false;
+        return true;
+    }
     if (e->dir_dropdown_open) {
         for (int i = 0; i < SPEC_DIR_COUNT; i++) {
             if (CheckCollisionPointRec(click, e->dir_opts_rect[i])) {
@@ -1023,6 +1403,10 @@ static bool spectro_handle_palette_click(spectro_engine_t *e, gui_app_t *app, in
     }
     if (CheckCollisionPointRec(click, e->dir_btn_rect)) {
         e->dir_dropdown_open = true;
+        return true;
+    }
+    if (e->analysis_active && CheckCollisionPointRec(click, e->span_btn_rect)) {
+        e->span_dropdown_open = true;
         return true;
     }
     return false;
@@ -1054,28 +1438,23 @@ static bool spectro_vtable_handle_click(void *state_ptr, gui_app_t *app, int cha
     if (gui_chrome_hide_feed_click(&e->chrome_hide, click)) {
         e->palette_dropdown_open = false;
         e->dir_dropdown_open = false;
+        e->span_dropdown_open = false;
         return true;
     }
     return false;
 }
 
-// Wheel over the panel while the paused analysis window is active adjusts the
-// window span (x1.25 / :1.25 steps, 0.1 s .. 60 s; longer spans are also capped
-// by the full-resolution hop budget inside gui_playback.c — the span trades
-// time vs frequency resolution exactly like an FFT-size setting, never detail).
+// Wheel over the panel while the paused analysis window is active steps the
+// span through the span dropdown's list (1 field .. 60 s); longer spans are
+// also capped by the full-resolution hop budget inside gui_playback.c — the
+// span trades time vs frequency resolution like an FFT-size setting.
 static bool spectro_vtable_handle_scroll(void *state_ptr, float delta, Rectangle bounds) {
     if (!state_ptr || delta == 0.0f) return false;
     spectro_engine_t *e = (spectro_engine_t *)state_ptr;
     if (!e->analysis_active) return false;
     Vector2 mouse = gui_ui_get_mouse_position();
     if (!CheckCollisionPointRec(mouse, bounds)) return false;
-    double span = e->analysis_span_seconds;
-    if (delta > 0.0f) span /= 1.25;
-    else span *= 1.25;
-    if (span < 0.1) span = 0.1;
-    if (span > 60.0) span = 60.0;
-    e->analysis_span_seconds = span;
-    e->analysis_rerequest = true;
+    spectro_set_span(e, e->span_idx + (delta > 0.0f ? -1 : 1));
     return true;
 }
 

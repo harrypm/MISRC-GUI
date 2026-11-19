@@ -12,6 +12,7 @@
 #include "../output/gui_audio.h"
 #include "../output/gui_record.h"
 #include "gui_trigger.h"
+#include "gui_field_locate.h"
 #include "gui_vhs_fm.h"
 #include "gui_vhs_hifi.h"
 #include "gui_rf_preview_geometry.h"  // shared full-frame display aspect
@@ -6273,6 +6274,26 @@ typedef struct {
         float last_click_x, last_click_y;
     } chrome;
 } video_panel_state_t;
+
+bool gui_video_panel_sync_source(const void *state, int *mode, int *lines_per_frame) {
+    video_panel_state_t *p = (video_panel_state_t *)state;
+    if (!p) return false;
+    const int plugin = atomic_load(&p->active_plugin);
+    int lines = 625;
+    int m = GUI_FIELD_LOCATE_CVBS;
+    if (plugin == VIDEO_PLUGIN_VHS_FM) {
+        m = GUI_FIELD_LOCATE_FM;
+        lines = p->vhs_fm.decoder.overlay.selected_system == 1 ? 525 : 625;
+    } else if (plugin == VIDEO_PLUGIN_TAPE_DECODE) {
+        m = GUI_FIELD_LOCATE_FM;
+        lines = p->tape_decode.decoder.state.format == CVBS_FORMAT_NTSC ? 525 : 625;
+    } else {
+        lines = p->cvbs.decoder.state.format == CVBS_FORMAT_NTSC ? 525 : 625;
+    }
+    if (mode) *mode = m;
+    if (lines_per_frame) *lines_per_frame = lines;
+    return true;
+}
 
 static const char *video_plugin_name(video_plugin_kind_t plugin) {
     switch (plugin) {

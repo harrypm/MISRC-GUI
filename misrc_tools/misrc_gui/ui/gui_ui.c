@@ -2498,6 +2498,15 @@ static bool gui_ui_is_text_field_active(ui_text_field_t field)
     return s_active_text_field == field;
 }
 
+// True while the keyboard belongs to an editor (a focused text field, the
+// record-limit timecode, or the metadata / record-limit / version windows):
+// global key bindings (the playback field-step arrows) stand down.
+bool gui_ui_keyboard_captured(void)
+{
+    return s_active_text_field != UI_TEXT_FIELD_NONE || s_record_limit_timecode_edit ||
+           s_metadata_window_open || s_record_limit_window_open || s_version_info_window_open;
+}
+
 static void gui_ui_clear_text_edit(void)
 {
     s_active_text_field = UI_TEXT_FIELD_NONE;

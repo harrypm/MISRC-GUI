@@ -20,6 +20,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "../../common/file_utils.h"
+#include "../signal/gui_field_locate.h"
 
 // Forward declaration
 typedef struct gui_app gui_app_t;
@@ -269,6 +270,16 @@ bool gui_playback_get_channel_loop(gui_app_t *app, int channel);
 void gui_playback_request_analysis_window(gui_app_t *app, int channel,
                                            uint64_t center_sample,
                                            double span_seconds);
+// The same, also locating the window's field starts (sync_mode
+// GUI_FIELD_LOCATE_CVBS / _FM, 0 = off; lines_per_frame 625 / 525): the
+// Spectro panel's frame / field spans. The marks publish with the window.
+void gui_playback_request_analysis_window_fields(gui_app_t *app, int channel,
+                                                 uint64_t center_sample, double span_seconds,
+                                                 int sync_mode, int lines_per_frame);
+// The field starts of the window the last successful poll returned (copied
+// into out, at most max). 0 when none were requested or found.
+size_t gui_playback_analysis_field_marks(gui_app_t *app, int channel,
+                                         gui_field_mark_t *out, size_t max);
 // Returns true when a result newer than *io_seq is available; updates *io_seq
 // and points the outputs at the published per-slice magnitude frames: a
 // slice_count x BINS float array (normalized 0-1 intensities, max-hold across

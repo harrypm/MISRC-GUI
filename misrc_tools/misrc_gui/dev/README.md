@@ -46,6 +46,7 @@ Use lowercase with underscores:
 | `prompt_waveform_monitor_readme.md` | Composite waveform monitor panel (tbc-analyse WFM port): design, accuracy contract, CPU, open UX sign-off |
 | `prompt_vectorscope_advanced_readme.md` | Advanced (decode-orc composite measurement) vectorscope + beam renderer: both PAL phases, readouts, `--vector`, CPU vs baseline, open UX sign-off |
 | `prompt_spectro_direction_readme.md` | Waterfall merged into Spectro: Dir (Horizontal / Vertical) dropdown, `--spectro`, legacy `waterfall` alias; open UX sign-off |
+| `prompt_spectro_player_quickwins_readme.md` | Spectro player mode: frames / fields span dropdown, field lock to the active Video decoder mode (`signal/gui_field_locate.c`), boundary markers, line scale, hover readout, Heat default, arrow-key field step |
 | `docs_folder_rules.md` | HARD rule: user-facing sub-docs live in `docs/` (root keeps only README/CONTRIBUTING/INSTALLATION/TECHNICAL/UPDATE/LICENSE*); enforced by the docs layout CI guard |
 
 ### When starting a new prompt

@@ -516,6 +516,7 @@ if raylib_dep.found()
     'misrc_gui/input/gui_simulated.c',
     'misrc_gui/input/gui_playback.c',
     'misrc_gui/input/gui_playback_length_cache.c',
+    'misrc_gui/signal/gui_field_locate.c',
     # Processing
     'misrc_gui/processing/gui_extract.c',
     'misrc_gui/processing/gui_display_thread.c',
@@ -1014,6 +1015,7 @@ if raylib_dep.found()
         ['test/gui_playback_resolve_harness.c', 'test/gui_playback_audio_stub.c',
          'common/file_utils.c',
          'misrc_gui/input/gui_playback_length_cache.c',
+         'misrc_gui/signal/gui_field_locate.c',
          'misrc_gui/visualization/gui_fft.c',
          'misrc_gui/ui/gui_chrome_hide.c'],
         dependencies: overlay_test_deps + [flac_dep, fftw3f_dep, dependency('threads')],
@@ -1144,6 +1146,7 @@ if raylib_dep.found()
         ['test/gui_rf_playback_seek_test.c', 'test/gui_playback_audio_stub.c',
          'common/file_utils.c',
          'misrc_gui/input/gui_playback_length_cache.c',
+         'misrc_gui/signal/gui_field_locate.c',
          'misrc_gui/visualization/gui_fft.c',
          'misrc_gui/ui/gui_chrome_hide.c'],
         dependencies: overlay_test_deps + [flac_dep, fftw3f_dep],
@@ -1157,6 +1160,7 @@ if raylib_dep.found()
         ['test/gui_rf_playback_start_test.c', 'test/gui_playback_audio_stub.c',
          'common/file_utils.c',
          'misrc_gui/input/gui_playback_length_cache.c',
+         'misrc_gui/signal/gui_field_locate.c',
          'misrc_gui/visualization/gui_fft.c',
          'misrc_gui/ui/gui_chrome_hide.c'],
         dependencies: overlay_test_deps + [flac_dep, fftw3f_dep, dependency('threads')],
@@ -1175,6 +1179,7 @@ if raylib_dep.found()
         'common/file_utils.c',
         'misrc_gui/signal/gui_vectorscope.c', 'misrc_gui/signal/gui_wfm.c',
         'misrc_gui/input/gui_playback_length_cache.c',
+        'misrc_gui/signal/gui_field_locate.c',
         'misrc_gui/visualization/gui_fft.c',
         'misrc_gui/ui/gui_chrome_hide.c',
         'common/extract.c', 'common/ringbuffer.c',
@@ -1262,6 +1267,10 @@ rf_testgen_test = executable('gui_testgen_rf_test',
   rf_preview_sources + ['test/gui_testgen_rf_test.c', 'misrc_gui/signal/gui_testgen.c'],
   dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
 test('gui_testgen_rf', rf_testgen_test, timeout: 120)
+field_locate_test = executable('gui_field_locate_test',
+  ['test/gui_field_locate_test.c', 'misrc_gui/signal/gui_field_locate.c', 'misrc_gui/signal/gui_testgen.c'],
+  dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
+test('gui_field_locate', field_locate_test, timeout: 120)
 testgen_cvbs_test = executable('gui_testgen_cvbs_test', 'test/gui_testgen_cvbs_test.c',
   dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
 test('gui_testgen_cvbs', testgen_cvbs_test, timeout: 120)

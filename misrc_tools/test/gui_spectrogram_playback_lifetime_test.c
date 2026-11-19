@@ -40,6 +40,33 @@ uint64_t gui_playback_get_position_samples_channel(gui_app_t *app, int channel) 
     return 42;
 }
 
+/* The paused window reads the file's true rate for its field snap; an
+ * unknown rate (0) keeps the request centred on the playhead, unsnapped. */
+bool gui_playback_get_selected_file_info(gui_app_t *app, int channel,
+                                         playback_file_info_t *info) {
+    (void)app; (void)channel;
+    if (info) memset(info, 0, sizeof(*info));
+    return false;
+}
+
+void gui_playback_request_analysis_window_fields(gui_app_t *app, int channel,
+                                                 uint64_t center, double span,
+                                                 int sync_mode, int lines) {
+    (void)app; (void)center; (void)span; (void)sync_mode; (void)lines;
+    assert(channel == test_channel);
+}
+
+size_t gui_playback_analysis_field_marks(gui_app_t *app, int channel,
+                                         gui_field_mark_t *out, size_t max) {
+    (void)app; (void)channel; (void)out; (void)max;
+    return 0;
+}
+
+bool gui_video_panel_sync_source(const void *state, int *mode, int *lines) {
+    (void)state; (void)mode; (void)lines;
+    return false;
+}
+
 void gui_playback_request_analysis_window(gui_app_t *app, int channel,
                                           uint64_t center, double span) {
     (void)app; (void)center; (void)span;
