@@ -1,6 +1,6 @@
 project('MISRC', 'c',
         default_options: ['c_std=c11', 'buildtype=release', 'b_lto=true'],
-        meson_version: '>=0.55')
+        meson_version: '>=0.56')
 
 
 # Version string: git-version.py is the portable twin of git-version.sh.

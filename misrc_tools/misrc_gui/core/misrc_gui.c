@@ -63,12 +63,12 @@
 #include <string.h>
 #include <math.h>
 #include <ctype.h>
+#include <limits.h>
 #if defined(__linux__) && !defined(__ANDROID__)
 #include <signal.h>
 #endif
 #if defined(__APPLE__)
 #include <unistd.h>
-#include <limits.h>
 #include <spawn.h>
 #include <sys/wait.h>
 #include <mach-o/dyld.h>
