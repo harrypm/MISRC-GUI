@@ -151,6 +151,24 @@ struct gui_rf_preview_worker {
     uint64_t last_cpu_us;
     uint64_t last_budget_completion_us;
     bool have_cpu_baseline;
+    /* Decoder front-end helper (see rf_lane_adapt), owned by the worker
+     * thread (started and joined there). lane_cpu_us is the helper's
+     * cumulative thread CPU; the worker charges its growth to the shared
+     * preview budget. */
+    rf_mutex_t lane_mutex;
+#ifdef _WIN32
+    CONDITION_VARIABLE lane_cond;
+#else
+    pthread_cond_t lane_cond;
+#endif
+    thrd_t lane_thread;
+    bool lane_running, lane_pending, lane_done, lane_stop;
+    void (*lane_job)(void *arg);
+    void *lane_arg;
+    atomic_uint_fast64_t lane_cpu_us;
+    uint64_t lane_cpu_charged;
+    bool lane_engaged, lane_budget_waited;
+    unsigned lane_calm_blocks, lane_pressure_blocks;
 
     uint8_t *frame;
     int frame_width;
@@ -268,7 +286,11 @@ static bool rf_lower_thread_priority(void) {
     struct sched_param param = {0};
     (void)pthread_setschedparam(pthread_self(), SCHED_OTHER, &param);
     /* Linux nice is per-thread when addressed by TID. Never fall back to the
-     * process-wide setpriority(0) used by the common elevation helper. */
+     * process-wide setpriority(0) used by the common elevation helper.
+     * Nice 5, not 19: Windows only drops one level (BELOW_NORMAL). Nice 19
+     * carries ~1/200 the CFS weight of the nice -5 threads capture creates,
+     * so a decoder sharing a core with any of them was starved into queue
+     * drops. Nice 5 still yields to capture (~1/9 weight vs nice -5). */
 #if defined(SYS_gettid)
     pid_t tid = (pid_t)syscall(SYS_gettid);
 #elif defined(__NR_gettid)
@@ -276,13 +298,170 @@ static bool rf_lower_thread_priority(void) {
 #else
     pid_t tid = 0;
 #endif
-    return tid > 0 && setpriority(PRIO_PROCESS, (id_t)tid, 19) == 0;
+    return tid > 0 && setpriority(PRIO_PROCESS, (id_t)tid, 5) == 0;
 #else
     int minimum = sched_get_priority_min(SCHED_OTHER);
     struct sched_param param = {0};
     param.sched_priority = minimum < 0 ? 0 : minimum;
     return pthread_setschedparam(pthread_self(), SCHED_OTHER, &param) == 0;
 #endif
+}
+
+static void rf_lane_cond_wait(gui_rf_preview_worker_t *w) {
+#ifdef _WIN32
+    SleepConditionVariableCS(&w->lane_cond, &w->lane_mutex, INFINITE);
+#else
+    pthread_cond_wait(&w->lane_cond, &w->lane_mutex);
+#endif
+}
+static void rf_lane_cond_broadcast(gui_rf_preview_worker_t *w) {
+#ifdef _WIN32
+    WakeAllConditionVariable(&w->lane_cond);
+#else
+    pthread_cond_broadcast(&w->lane_cond);
+#endif
+}
+
+static bool rf_thread_cpu_us(uint64_t *cpu_us);
+
+static int rf_lane_thread(void *context) {
+    gui_rf_preview_worker_t *w = context;
+    (void)rf_lower_thread_priority();
+    uint64_t base = 0;
+    bool have_base = rf_thread_cpu_us(&base);
+    rf_mutex_lock(&w->lane_mutex);
+    for (;;) {
+        while (!w->lane_pending && !w->lane_stop) rf_lane_cond_wait(w);
+        if (!w->lane_pending) break;
+        void (*job)(void *) = w->lane_job;
+        void *arg = w->lane_arg;
+        w->lane_pending = false;
+        rf_mutex_unlock(&w->lane_mutex);
+#ifndef _WIN32
+        /* Same as the worker: capture startup can renice every thread. */
+        (void)rf_lower_thread_priority();
+#endif
+        job(arg);
+        uint64_t now = 0;
+        if (have_base && rf_thread_cpu_us(&now) && now >= base)
+            atomic_store_explicit(&w->lane_cpu_us, now - base, memory_order_release);
+        rf_mutex_lock(&w->lane_mutex);
+        w->lane_done = true;
+        rf_lane_cond_broadcast(w);
+    }
+    rf_mutex_unlock(&w->lane_mutex);
+    return 0;
+}
+
+static void rf_lane_start_job(void *context, void (*job)(void *arg), void *arg) {
+    gui_rf_preview_worker_t *w = context;
+    rf_mutex_lock(&w->lane_mutex);
+    w->lane_job = job; w->lane_arg = arg;
+    w->lane_done = false; w->lane_pending = true;
+    rf_lane_cond_broadcast(w);
+    rf_mutex_unlock(&w->lane_mutex);
+}
+
+static void rf_lane_wait_job(void *context) {
+    gui_rf_preview_worker_t *w = context;
+    rf_mutex_lock(&w->lane_mutex);
+    while (!w->lane_done) rf_lane_cond_wait(w);
+    rf_mutex_unlock(&w->lane_mutex);
+}
+
+/* Worker thread only. Without the helper the decoder keeps its single-thread
+ * path, so any failure here only costs the parallel speedup. */
+static void rf_lane_begin(gui_rf_preview_worker_t *w) {
+    atomic_init(&w->lane_cpu_us, 0);
+    w->lane_cpu_charged = 0;
+    if (!rf_mutex_init(&w->lane_mutex)) return;
+#ifdef _WIN32
+    InitializeConditionVariable(&w->lane_cond);
+#else
+    if (pthread_cond_init(&w->lane_cond, NULL) != 0) { rf_mutex_destroy(&w->lane_mutex); return; }
+#endif
+    w->lane_pending = w->lane_done = w->lane_stop = false;
+    if (thrd_create(&w->lane_thread, rf_lane_thread, w) != thrd_success) {
+#ifndef _WIN32
+        pthread_cond_destroy(&w->lane_cond);
+#endif
+        rf_mutex_destroy(&w->lane_mutex);
+        return;
+    }
+    w->lane_running = true;
+    w->lane_engaged = w->lane_budget_waited = false;
+    w->lane_calm_blocks = w->lane_pressure_blocks = 0;
+}
+
+/* Engage the helper only while the worker is falling behind. A decoder
+ * that keeps up stays on one hot core: two half-busy threads handing off
+ * every chunk migrate between cores and Linux/HWP then holds both at low
+ * clocks (measured 1.2-1.8 GHz vs 3.6 GHz on an i9-7980XE), which costs
+ * more CPU time and budget than it saves. Backlog counts queued input
+ * blocks including the one about to be decoded; it must persist, so a
+ * producer burst or a clock ramp does not engage it. Never while the shared
+ * budget is pacing this worker: the budget is then the limit and a second
+ * thread would only spend more of it. */
+#define RF_LANE_ENGAGE_BACKLOG 4u
+#define RF_LANE_ENGAGE_BLOCKS 16u
+#define RF_LANE_RELEASE_BLOCKS 64u
+#ifndef RF_LANE_TRACE
+#define RF_LANE_TRACE 0
+#endif
+static void rf_lane_set(gui_rf_preview_worker_t *w, bool engaged) {
+    if (engaged) {
+        const gui_rf_lane_runner_t runner = { rf_lane_start_job, rf_lane_wait_job, w };
+        gui_rf_decoder_set_lane_runner(w->decoder, &runner);
+    } else {
+        gui_rf_decoder_set_lane_runner(w->decoder, NULL);
+    }
+    w->lane_engaged = engaged;
+    w->lane_calm_blocks = w->lane_pressure_blocks = 0;
+    if (RF_LANE_TRACE) fprintf(stderr, "[RF lane] %s\n", engaged ? "engaged" : "released");
+}
+static void rf_lane_adapt(gui_rf_preview_worker_t *w, uint64_t backlog) {
+    if (!w->lane_running) return;
+    if (w->lane_budget_waited) {
+        w->lane_pressure_blocks = 0;
+        if (w->lane_engaged) rf_lane_set(w, false);
+        return;
+    }
+    if (!w->lane_engaged) {
+        if (backlog < RF_LANE_ENGAGE_BACKLOG) {
+            if (backlog <= 2u) w->lane_pressure_blocks = 0;
+            return;
+        }
+        if (++w->lane_pressure_blocks >= RF_LANE_ENGAGE_BLOCKS) rf_lane_set(w, true);
+        return;
+    }
+    if (backlog > 1u) { w->lane_calm_blocks = 0; return; }
+    if (++w->lane_calm_blocks >= RF_LANE_RELEASE_BLOCKS) rf_lane_set(w, false);
+}
+
+static void rf_lane_end(gui_rf_preview_worker_t *w) {
+    if (!w->lane_running) return;
+    gui_rf_decoder_set_lane_runner(w->decoder, NULL);
+    w->lane_engaged = false;
+    rf_mutex_lock(&w->lane_mutex);
+    w->lane_stop = true;
+    rf_lane_cond_broadcast(w);
+    rf_mutex_unlock(&w->lane_mutex);
+    thrd_join(w->lane_thread, NULL);
+#ifndef _WIN32
+    pthread_cond_destroy(&w->lane_cond);
+#endif
+    rf_mutex_destroy(&w->lane_mutex);
+    w->lane_running = false;
+}
+
+/* Helper CPU since the last charge (cumulative, so a coarse Windows counter
+ * that books late is still charged exactly once). */
+static uint64_t rf_lane_take_cpu(gui_rf_preview_worker_t *w) {
+    uint64_t total = atomic_load_explicit(&w->lane_cpu_us, memory_order_acquire);
+    if (total <= w->lane_cpu_charged) return 0;
+    uint64_t delta = total - w->lane_cpu_charged;
+    w->lane_cpu_charged = total;
+    return delta;
 }
 
 static bool rf_thread_cpu_us(uint64_t *cpu_us) {
@@ -666,6 +845,7 @@ static bool rf_acquire_budget(gui_rf_preview_worker_t *w, uint64_t control,
         w->have_cpu_baseline = rf_thread_cpu_us(&w->last_cpu_us);
     bool acquired = false;
     bool waited = false;
+    bool denied = false;
     for (;;) {
         if (atomic_load_explicit(&w->stop, memory_order_acquire) ||
             atomic_load_explicit(&w->control, memory_order_acquire) != control ||
@@ -675,6 +855,7 @@ static bool rf_acquire_budget(gui_rf_preview_worker_t *w, uint64_t control,
         if (!atomic_flag_test_and_set_explicit(&rf_budget_lock, memory_order_acquire)) {
             acquired = gui_rf_preview_policy_acquire(&rf_budget, (uintptr_t)w, rf_now_us(w), &wait_us);
             if (acquired) rf_budget_wake_head();
+            else denied = true;
             atomic_flag_clear_explicit(&rf_budget_lock, memory_order_release);
         }
         if (acquired) break;
@@ -689,6 +870,8 @@ static bool rf_acquire_budget(gui_rf_preview_worker_t *w, uint64_t control,
         atomic_flag_clear_explicit(&rf_budget_lock, memory_order_release);
     }
     atomic_store_explicit(&w->budget_waiting, false, memory_order_release);
+    /* The policy (not a momentary lock collision) paced this block. */
+    w->lane_budget_waited = denied;
     if (waited) {
         rf_mutex_lock(&w->frame_mutex);
         w->stats.budget_wait_ms += (double)(rf_now_us(w) - begin) / 1000.0;
@@ -707,6 +890,8 @@ static void rf_finish_budget(gui_rf_preview_worker_t *w, uint64_t begin_wall) {
      * lost altogether. This also charges the worker's small dispatch/check
      * overhead, while sleeping/waiting consumes no thread CPU time. */
     uint64_t cpu = actual_cpu ? end_cpu - w->last_cpu_us : wall;
+    /* The decoder's chroma lane ran concurrently on the helper thread. */
+    cpu += rf_lane_take_cpu(w);
     w->have_cpu_baseline = read_cpu;
     if (read_cpu) w->last_cpu_us = end_cpu;
     w->video_work_wall_us+=wall;w->video_accounted_cpu_us+=cpu;
@@ -1106,6 +1291,7 @@ static int rf_worker_thread(void *context) {
     rf_mutex_unlock(&w->frame_mutex);
     w->have_cpu_baseline = rf_thread_cpu_us(&w->last_cpu_us);
     w->last_budget_completion_us = rf_now_us(w);
+    rf_lane_begin(w);
     while (!atomic_load_explicit(&w->stop, memory_order_acquire)) {
         bool full_frame = atomic_load_explicit(&w->requested_full_frame, memory_order_acquire);
         if (full_frame != w->applied_full_frame) {
@@ -1171,6 +1357,7 @@ static int rf_worker_thread(void *context) {
             rf_discard_queue(w);
             continue;
         }
+        rf_lane_adapt(w, write - read);
         if (slot->control == w->applied_control) {
             if (slot->pause_control != pause_control) {
                 atomic_fetch_add_explicit(&w->pause_drops, 1, memory_order_relaxed);
@@ -1286,6 +1473,7 @@ release_slot:
         SetEvent(w->done_event);
 #endif
     }
+    rf_lane_end(w);
     rf_unregister_counter(w,false);
     return 0;
 }

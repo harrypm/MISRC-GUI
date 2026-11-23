@@ -140,4 +140,26 @@ void gui_rf_decoder_process(gui_rf_decoder_t *decoder, const float *samples,
 void gui_rf_decoder_get_status(const gui_rf_decoder_t *decoder,
                                gui_rf_decode_status_t *status);
 
+/* Optional second thread that pipelines the decoder: the runner computes the
+ * 20 MSPS front end (RF band, Y/C mixers and lowpass filters) of the next
+ * chunk while the caller's thread runs the 5 MSPS back end of the current
+ * one. start() must run job(arg) on another thread and return; wait()
+ * returns once that job has finished. Both are called only from inside
+ * gui_rf_decoder_process, on the caller's thread, strictly paired. Frame
+ * callbacks and all sync/field state stay on the caller's thread and each
+ * block still completes before process returns (no added latency). The
+ * staged front end runs with or without a runner on SSE2 builds (inline
+ * when absent), so x86 output never depends on thread availability; scalar
+ * (ARM) builds stage only while a runner is attached. Versus the older fused
+ * loop only last-bit float rounding moves (-ffast-math codegen, SSE2 4-lane
+ * IQ filters). Packed-SIMD Beta/SECAM and ED Beta keep their fused loop.
+ * NULL detaches; the caller owns the runner's lifetime. */
+typedef struct {
+    void (*start)(void *context, void (*job)(void *arg), void *arg);
+    void (*wait)(void *context);
+    void *context;
+} gui_rf_lane_runner_t;
+void gui_rf_decoder_set_lane_runner(gui_rf_decoder_t *decoder,
+                                    const gui_rf_lane_runner_t *runner);
+
 #endif

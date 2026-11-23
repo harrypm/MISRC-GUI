@@ -77,6 +77,7 @@ gui_rf_decoder_t *gui_rf_decoder_create(gui_rf_format_t format) {
 }
 void gui_rf_decoder_destroy(gui_rf_decoder_t *d) { free(d); }
 void gui_rf_decoder_set_frame_mode(gui_rf_decoder_t *d, bool full) { (void)d; (void)full; }
+void gui_rf_decoder_set_lane_runner(gui_rf_decoder_t *d, const gui_rf_lane_runner_t *r) { (void)d; (void)r; }
 gui_rf_decoder_t *gui_rf_decoder_create_profile(gui_rf_profile_t profile) {
     gui_rf_decoder_t *d=gui_rf_decoder_create(profile==GUI_RF_PROFILE_PAL_VHS ||
         profile==GUI_RF_PROFILE_PAL_SVHS ? GUI_RF_PAL : GUI_RF_NTSC);

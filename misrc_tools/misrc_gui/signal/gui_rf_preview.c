@@ -260,6 +260,19 @@ struct gui_rf_decoder {
     unsigned ready_fields;
     bool ready_color[2];
     gui_rf_decode_status_t status;
+    /* Pipelined front end (see gui_rf_decoder_set_lane_runner). lane_buf
+     * holds two chunk sets of decimated yi|yq|ci|cq, lane_cap floats per
+     * plane; the runner fills one set while the back end drains the other. */
+    gui_rf_lane_runner_t lane_runner;
+    bool have_lane_runner;
+    float *lane_buf;
+    size_t lane_cap;
+    const float *lane_samples;
+    size_t lane_count;
+    uint64_t lane_first;
+    unsigned lane_set;
+    size_t lane_produced[2];
+    uint64_t lane_first_pos[2];
 };
 
 static bool rf_laserdisc(const gui_rf_decoder_t *d) {
@@ -2171,9 +2184,16 @@ void gui_rf_decoder_reset_profile(gui_rf_decoder_t *d, gui_rf_profile_t profile)
         free(scratch);
         scratch = NULL;
     }
+    /* The lane runner and its scratch are owner wiring, not decode state. */
+    gui_rf_lane_runner_t lane_runner=d->lane_runner;
+    bool have_lane_runner=d->have_lane_runner;
+    float *lane_buf=d->lane_buf;
+    size_t lane_cap=d->lane_cap;
     memset(d,0,sizeof(*d));
     d->storage=storage; d->rgba=rgba;
     d->svhs_scratch = scratch;
+    d->lane_runner=lane_runner; d->have_lane_runner=have_lane_runner;
+    d->lane_buf=lane_buf; d->lane_cap=lane_cap;
     d->full_frame=full_frame;   /* Display mode survives resets/rebinds. */
     d->luma=storage; d->sync=storage+RF_RING_SIZE;
     d->ci=storage+2u*RF_RING_SIZE; d->cq=storage+3u*RF_RING_SIZE;
@@ -2348,6 +2368,7 @@ gui_rf_decoder_t *gui_rf_decoder_create(gui_rf_format_t format) {
 void gui_rf_decoder_destroy(gui_rf_decoder_t *d) {
     if (!d) return;
     free(d->svhs_scratch);
+    free(d->lane_buf);
     free(d->storage); free(d->rgba); free(d);
 }
 
@@ -2409,6 +2430,234 @@ static void rf_process_laserdisc(gui_rf_decoder_t *d, const float *samples, size
     }
 }
 
+void gui_rf_decoder_set_lane_runner(gui_rf_decoder_t *d, const gui_rf_lane_runner_t *runner) {
+    if (!d) return;
+    d->have_lane_runner=runner && runner->start && runner->wait;
+    if (d->have_lane_runner) d->lane_runner=*runner;
+    else memset(&d->lane_runner,0,sizeof(d->lane_runner));
+}
+
+/* Profiles that use the scalar (non-packed, non-ED) front end. Packed-SIMD
+ * Beta/SECAM and ED's four-phase schedule keep the fused single loop. */
+static bool rf_lane_split_eligible(const gui_rf_decoder_t *d) {
+    if (d->profile==GUI_RF_PROFILE_NTSC_ED_BETA) return false;
+#if GUI_RF_PACKED_IQ
+    if (d->p.beta_rotation || rf_secam_fm(d)) return false;
+#endif
+    return true;
+}
+
+#define RF_LANE_CHUNK 16384u
+
+/* 20M front end for one chunk (lane_samples/lane_count/lane_first) into
+ * buffer set lane_set: decimated yi|yq|ci|cq plus lane_produced/first_pos.
+ * It owns rf_hp/rf_lp, both oscillators, the chroma DC tracker and the
+ * yi/yq/ui/uq filters; the back end never reads them. Y and C stay in one
+ * loop so the core still overlaps their independent filter chains. State is
+ * local for the chunk so the two threads never write neighbouring fields
+ * per sample. Same operations, in the same order, as the scalar non-ED
+ * branch of the fused loop. */
+static void rf_front_end_job(void *arg) {
+    gui_rf_decoder_t *d=arg;
+    const float *samples=d->lane_samples;
+    const size_t count=d->lane_count;
+    const uint64_t first_sample=d->lane_first;
+    const bool svhs=d->profile==GUI_RF_PROFILE_PAL_SVHS || d->profile==GUI_RF_PROFILE_NTSC_SVHS;
+    const int hp_sections=d->p.rf_highpass_sections, sections=d->p.chroma_sections;
+    const uint64_t mask=d->raw_decimation-1u;
+    rf_biquad_t hp[6],lp=d->rf_lp,fyi[4],fyq[4],ui[4],uq[4];
+    memcpy(hp,d->rf_hp,sizeof hp); memcpy(fyi,d->yi,sizeof fyi); memcpy(fyq,d->yq,sizeof fyq);
+    memcpy(ui,d->ui,sizeof ui); memcpy(uq,d->uq,sizeof uq);
+    double y_cos=d->y_cos,y_sin=d->y_sin,c_cos=d->c_cos,c_sin=d->c_sin;
+    const double y_step_cos=d->y_step_cos,y_step_sin=d->y_step_sin;
+    const double c_step_cos=d->c_step_cos,c_step_sin=d->c_step_sin;
+    float chroma_dc=d->chroma_dc; bool chroma_dc_valid=d->chroma_dc_valid;
+    const float chroma_dc_alpha=d->chroma_dc_alpha;
+#if GUI_RF_PACKED_IQ
+    /* Load stages 0-1 of the four IQ chains into registers for the chunk. */
+    const bool packed=sections>=2;
+    __m128 pb0[2],pb1[2],pb2[2],pa1[2],pa2[2],pz1[2],pz2[2];
+    if (packed) for (int st=0;st<2;++st) {
+        const rf_biquad_t *l[4]={&fyi[st],&fyq[st],&ui[st],&uq[st]};
+        pb0[st]=_mm_setr_ps(l[0]->b0,l[1]->b0,l[2]->b0,l[3]->b0);
+        pb1[st]=_mm_setr_ps(l[0]->b1,l[1]->b1,l[2]->b1,l[3]->b1);
+        pb2[st]=_mm_setr_ps(l[0]->b2,l[1]->b2,l[2]->b2,l[3]->b2);
+        pa1[st]=_mm_setr_ps(l[0]->a1,l[1]->a1,l[2]->a1,l[3]->a1);
+        pa2[st]=_mm_setr_ps(l[0]->a2,l[1]->a2,l[2]->a2,l[3]->a2);
+        pz1[st]=_mm_setr_ps(l[0]->z1,l[1]->z1,l[2]->z1,l[3]->z1);
+        pz2[st]=_mm_setr_ps(l[0]->z2,l[1]->z2,l[2]->z2,l[3]->z2);
+    }
+#endif
+#if GUI_RF_PACKED_IQ
+    __m128d osc_cos=_mm_set_pd(c_cos,y_cos),osc_sin=_mm_set_pd(c_sin,y_sin);
+    const __m128d step_cos=_mm_set_pd(c_step_cos,y_step_cos),step_sin=_mm_set_pd(c_step_sin,y_step_sin);
+    const __m128d sign=_mm_set1_pd(-0.0);
+#endif
+    float *out=d->lane_buf+(size_t)d->lane_set*4u*d->lane_cap;
+    float *out_yi=out,*out_yq=out+d->lane_cap,*out_ci=out+2u*d->lane_cap,*out_cq=out+3u*d->lane_cap;
+    size_t k=0;
+    uint64_t first_pos=0;
+    for (size_t n=0; n<count; ++n) {
+        uint64_t raw_pos=first_sample+n;
+        float raw=isfinite(samples[n]) ? samples[n] : 0.0f;
+        float chroma_raw=raw;
+        if(svhs) {
+            if(!chroma_dc_valid) { chroma_dc=raw; chroma_dc_valid=true; }
+            chroma_dc+=chroma_dc_alpha*(raw-chroma_dc);
+            chroma_raw-=chroma_dc;
+        }
+        float band=raw;
+        for (int s=0;s<hp_sections;++s) band=rf_filter_sample(&hp[s],band);
+        band=rf_filter_sample(&lp,band);
+        float yi,yq,ci,cq;
+#if GUI_RF_PACKED_IQ
+        if (packed) {
+            /* Both mixers in one double pair: lane 0 = Y, lane 1 = C. Same
+             * per-lane products and rotation as the scalar code; negation is
+             * an exact sign flip. Unpack gives yi|yq|ci|cq. */
+            __m128d amp=_mm_set_pd((double)chroma_raw,(double)band);
+            __m128 mixed=_mm_unpacklo_ps(_mm_cvtpd_ps(_mm_mul_pd(amp,osc_cos)),
+                _mm_cvtpd_ps(_mm_xor_pd(_mm_mul_pd(amp,osc_sin),sign)));
+            __m128d next_cos=_mm_sub_pd(_mm_mul_pd(osc_cos,step_cos),_mm_mul_pd(osc_sin,step_sin));
+            osc_sin=_mm_add_pd(_mm_mul_pd(osc_sin,step_cos),_mm_mul_pd(osc_cos,step_sin));
+            osc_cos=next_cos;
+            if ((raw_pos&1023u)==0u) {
+                double cs[2],sn[2]; _mm_storeu_pd(cs,osc_cos); _mm_storeu_pd(sn,osc_sin);
+                double ym=hypot(cs[0],sn[0]), cm=hypot(cs[1],sn[1]);
+                if (ym>0.0) { cs[0]/=ym; sn[0]/=ym; }
+                if (cm>0.0) { cs[1]/=cm; sn[1]/=cm; }
+                osc_cos=_mm_loadu_pd(cs); osc_sin=_mm_loadu_pd(sn);
+            }
+            /* Stages 0-1 of yi|yq|ci|cq as one 4-lane biquad each: per lane
+             * the same y=b0x+z1, z1=(b1x-a1y)+z2, z2=b2x-a2y as the scalar
+             * filter. Further chroma-only stages stay scalar. */
+            __m128 x=mixed;
+            __m128 y=_mm_add_ps(_mm_mul_ps(pb0[0],x),pz1[0]);
+            pz1[0]=_mm_add_ps(_mm_sub_ps(_mm_mul_ps(pb1[0],x),_mm_mul_ps(pa1[0],y)),pz2[0]);
+            pz2[0]=_mm_sub_ps(_mm_mul_ps(pb2[0],x),_mm_mul_ps(pa2[0],y));
+            x=y;
+            y=_mm_add_ps(_mm_mul_ps(pb0[1],x),pz1[1]);
+            pz1[1]=_mm_add_ps(_mm_sub_ps(_mm_mul_ps(pb1[1],x),_mm_mul_ps(pa1[1],y)),pz2[1]);
+            pz2[1]=_mm_sub_ps(_mm_mul_ps(pb2[1],x),_mm_mul_ps(pa2[1],y));
+            float lanes[4]; _mm_storeu_ps(lanes,y);
+            yi=lanes[0]; yq=lanes[1]; ci=lanes[2]; cq=lanes[3];
+            for (int s=2;s<sections;++s) { ci=rf_filter_sample(&ui[s],ci); cq=rf_filter_sample(&uq[s],cq); }
+        } else
+#endif
+        {
+            yi=(float)(band*y_cos); yq=(float)(-band*y_sin);
+            ci=(float)(chroma_raw*c_cos); cq=(float)(-chroma_raw*c_sin);
+            for (int s=0; s<2; ++s) { yi=rf_filter_sample(&fyi[s],yi); yq=rf_filter_sample(&fyq[s],yq); }
+            for (int s=0;s<sections;++s) { ci=rf_filter_sample(&ui[s],ci); cq=rf_filter_sample(&uq[s],cq); }
+            double yc=y_cos*y_step_cos-y_sin*y_step_sin;
+            y_sin=y_sin*y_step_cos+y_cos*y_step_sin; y_cos=yc;
+            double cc=c_cos*c_step_cos-c_sin*c_step_sin;
+            c_sin=c_sin*c_step_cos+c_cos*c_step_sin; c_cos=cc;
+            if ((raw_pos&1023u)==0u) {
+                double ym=hypot(y_cos,y_sin), cm=hypot(c_cos,c_sin);
+                if (ym>0.0) { y_cos/=ym; y_sin/=ym; }
+                if (cm>0.0) { c_cos/=cm; c_sin/=cm; }
+            }
+        }
+        if ((raw_pos&mask)!=0u) continue;
+        if (!k) first_pos=raw_pos/d->raw_decimation;
+        out_yi[k]=yi; out_yq[k]=yq; out_ci[k]=ci; out_cq[k]=cq; ++k;
+    }
+#if GUI_RF_PACKED_IQ
+    if (packed) {
+        double cs[2],sn[2]; _mm_storeu_pd(cs,osc_cos); _mm_storeu_pd(sn,osc_sin);
+        y_cos=cs[0]; c_cos=cs[1]; y_sin=sn[0]; c_sin=sn[1];
+    }
+    if (packed) for (int st=0;st<2;++st) {
+        rf_biquad_t *l[4]={&fyi[st],&fyq[st],&ui[st],&uq[st]};
+        float z1[4],z2[4]; _mm_storeu_ps(z1,pz1[st]); _mm_storeu_ps(z2,pz2[st]);
+        for (int lane=0;lane<4;++lane) { l[lane]->z1=z1[lane]; l[lane]->z2=z2[lane]; }
+    }
+#endif
+    memcpy(d->rf_hp,hp,sizeof hp); d->rf_lp=lp;
+    memcpy(d->yi,fyi,sizeof fyi); memcpy(d->yq,fyq,sizeof fyq);
+    memcpy(d->ui,ui,sizeof ui); memcpy(d->uq,uq,sizeof uq);
+    d->y_cos=y_cos; d->y_sin=y_sin; d->c_cos=c_cos; d->c_sin=c_sin;
+    d->chroma_dc=chroma_dc; d->chroma_dc_valid=chroma_dc_valid;
+    d->lane_produced[d->lane_set]=k; d->lane_first_pos[d->lane_set]=first_pos;
+}
+
+/* Per-sample envelope magnitude. glibc >= 2.35 hypotf is a correctly
+ * rounded library call that is measurably slow at 5 MSPS; widening to double
+ * and rounding once gives the same result for the finite values used here
+ * (the front end zeroes non-finite input) without the call. */
+static inline float rf_hypotf(float x, float y) {
+    double dx=x, dy=y;
+    return (float)sqrt(dx*dx+dy*dy);
+}
+
+/* Everything after the 20M front end, at the 5M video clock. Shared by the
+ * single-thread loop and the split-lane path so both run identical math. */
+static inline void rf_backend_sample(gui_rf_decoder_t *d,uint64_t pos,float yi,float yq,
+                                     float ci,float cq,bool ed,bool svhs,
+                                     gui_rf_frame_callback_t callback,void *context) {
+    double cross=(double)d->prev_i*yq-(double)d->prev_q*yi;
+    double dot=(double)d->prev_i*yi+(double)d->prev_q*yq;
+    /* ED and S-VHS use a full-quadrant bounded approximation; MESECAM keeps
+     * its small-angle path. Other profiles retain atan2f. */
+    double yphase=d->profile==GUI_RF_PROFILE_MESECAM_VHS
+        ? rf_mesecam_phase(cross,dot) : (ed || svhs) ? gui_rf_preview_phase(cross,dot)
+            : atan2f((float)cross,(float)dot);
+    double frequency=d->fm_center+yphase*(RF_VIDEO_RATE/(2.0*RF_PI));
+    d->prev_i=yi; d->prev_q=yq;
+    if (!isfinite(frequency)) frequency=d->p.blank_hz;
+    float x=(float)(frequency-d->fm_center);
+    float y=d->deemph_b0*x+d->deemph_b1*d->deemph_x-d->deemph_a1*d->deemph_y;
+    d->deemph_x=x; d->deemph_y=y;
+    float luma=d->use_shelf_deemph ? rf_filter_sample(&d->luma_deemph,x) : y;
+    y+=(float)d->fm_center;
+    /* Beta record emphasis requires its matched inverse shelf for timing too.
+     * The VHS legacy plane fragments real Beta EQ/broad pulses, losing
+     * fields despite a valid display luma signal. Preserve VHS timing. */
+    float sync_input=d->p.beta_rotation ? luma+(float)d->fm_center : y;
+    d->sync_y=d->sync_alpha*d->sync_y+(1.0f-d->sync_alpha)*sync_input;
+    unsigned at=(unsigned)(pos&RF_RING_MASK);
+    d->luma[at]=luma+(float)d->fm_center; d->sync[at]=d->sync_y;
+    d->sync_luma[at]=sync_input;
+    if(d->profile==GUI_RF_PROFILE_MESECAM_VHS) {
+        d->mesecam_i[at]=ci;d->mesecam_q[at]=cq;
+        /* Field preparation fills only the buffered, bounded interval.
+         * Any unavailable margin remains explicitly without carrier. */
+        d->secam_fm[at]=(float)d->p.carrier_hz;
+        d->ci[at]=(float)d->p.carrier_hz;d->cq[at]=0.0f;
+    } else if(rf_secam_fm(d)) {
+        double ccross=(double)d->secam_prev_i*cq-(double)d->secam_prev_q*ci;
+        double cdot=(double)d->secam_prev_i*ci+(double)d->secam_prev_q*cq;
+        /* Most deviations are small around the mixed-down centre.
+         * atan(r) through r^7 has error <= 4.3e-7 rad for |r|<=.25
+         * (under .35Hz at 5MSPS). Keep atan2 for fades/clicks/quadrants. */
+        double phase;
+        if(cdot>0.0 && fabs(ccross)<=.25*cdot) {
+            double r=ccross/cdot,r2=r*r;
+            phase=r*(1.0+r2*(-1.0/3.0+r2*(1.0/5.0-r2/7.0)));
+        } else phase=atan2f((float)ccross,(float)cdot);
+        double cf=d->p.carrier_hz+phase*(RF_VIDEO_RATE/(2.0*RF_PI));
+        d->secam_prev_i=ci;d->secam_prev_q=cq;
+        /* Clamp in the recorded carrier domain before LF recovery.
+         * MESECAM inverts the studio rails, native divides by four. */
+        double low=rf_native_secam(d) ? 975000.0 : 304321.875;
+        double high=rf_native_secam(d) ? 1189062.5 : 1160571.875;
+        /* Unclipped frequency makes a quiet reference independent of
+         * the limiter, LF network, post-filter and active content. */
+        if(!rf_native_secam(d)) d->secam_fm[at]=(float)cf;
+        float cx=(float)(rf_clamp(cf,low,high)-d->p.carrier_hz);
+        float cy=d->secam_b0*cx+d->secam_b1*d->secam_deemph_x
+            -d->secam_a1*d->secam_deemph_y;
+        d->secam_deemph_x=cx;d->secam_deemph_y=cy;
+        for(int stage=0;stage<2;++stage) cy=rf_filter_sample(&d->secam_video_lp[stage],cy);
+        d->ci[at]=cy+(float)d->p.carrier_hz;
+        d->cq[at]=rf_hypotf(ci,cq);
+    } else {d->ci[at]=ci;d->cq[at]=cq;}
+    d->envelope[at]=(ed || d->profile==GUI_RF_PROFILE_MESECAM_VHS)
+        ? rf_mesecam_magnitude(yi,yq) : rf_hypotf(yi,yq);
+    rf_process_sync(d,pos,callback,context);
+}
+
 void gui_rf_decoder_process(gui_rf_decoder_t *d, const float *samples, size_t count,
                             uint64_t first_sample, gui_rf_frame_callback_t callback,
                             void *context) {
@@ -2424,6 +2673,47 @@ void gui_rf_decoder_process(gui_rf_decoder_t *d, const float *samples, size_t co
     }
     const bool ed=d->profile==GUI_RF_PROFILE_NTSC_ED_BETA;
     const bool svhs=d->profile==GUI_RF_PROFILE_PAL_SVHS || d->profile==GUI_RF_PROFILE_NTSC_SVHS;
+    /* Two-stage pipeline: the runner computes the 20M front end of chunk i+1
+     * while this thread runs the 5M back end (sync, fields, callbacks) of
+     * chunk i. The whole block still completes before returning. With SSE2
+     * the staged front end is faster even on one thread, so without a runner
+     * (or for a short block) the same stages run inline and x86 output never
+     * depends on thread availability or block size. Scalar builds (ARM) only
+     * stage while a runner is attached; inline they keep the fused loop. */
+    if (rf_lane_split_eligible(d) && (GUI_RF_PACKED_IQ || d->have_lane_runner)) {
+        size_t need=RF_LANE_CHUNK/d->raw_decimation+1u;
+        if (need>d->lane_cap) {
+            float *grown=realloc(d->lane_buf,need*8u*sizeof(float));
+            if (grown) { d->lane_buf=grown; d->lane_cap=need; }
+        }
+        if (need<=d->lane_cap) {
+            const bool threaded=d->have_lane_runner && count>=2u*RF_LANE_CHUNK;
+            const size_t chunks=(count+RF_LANE_CHUNK-1u)/RF_LANE_CHUNK;
+            for (size_t i=0;i<=chunks;++i) {
+                if (i<chunks) {
+                    size_t at=i*RF_LANE_CHUNK;
+                    d->lane_samples=samples+at;
+                    d->lane_count=count-at<RF_LANE_CHUNK ? count-at : RF_LANE_CHUNK;
+                    d->lane_first=first_sample+at;
+                    d->lane_set=(unsigned)(i&1u);
+                    if (threaded) d->lane_runner.start(d->lane_runner.context,rf_front_end_job,d);
+                    else rf_front_end_job(d);
+                }
+                if (i) {
+                    const unsigned set=(unsigned)((i-1u)&1u);
+                    const float *in=d->lane_buf+(size_t)set*4u*d->lane_cap;
+                    const size_t produced=d->lane_produced[set];
+                    const uint64_t first_pos=d->lane_first_pos[set];
+                    for (size_t k=0;k<produced;++k)
+                        rf_backend_sample(d,first_pos+k,in[k],in[d->lane_cap+k],in[2u*d->lane_cap+k],
+                                          in[3u*d->lane_cap+k],false,svhs,callback,context);
+                }
+                if (i<chunks && threaded) d->lane_runner.wait(d->lane_runner.context);
+            }
+            rf_acquire_beta_levels(d);
+            return;
+        }
+    }
     /* 20M -> 5M uses an absolute four-phase schedule.
      * Derive it once per call so arbitrary block splits retain the same
      * absolute phase without a 64-bit division on every input sample. */
@@ -2532,66 +2822,7 @@ void gui_rf_decoder_process(gui_rf_decoder_t *d, const float *samples, size_t co
             if ((raw_pos&(d->raw_decimation-1u))!=0u) continue;
             pos=raw_pos/d->raw_decimation;
         }
-        double cross=(double)d->prev_i*yq-(double)d->prev_q*yi;
-        double dot=(double)d->prev_i*yi+(double)d->prev_q*yq;
-        /* ED and S-VHS use a full-quadrant bounded approximation; MESECAM keeps
-         * its small-angle path. Other profiles retain atan2f. */
-        double yphase=d->profile==GUI_RF_PROFILE_MESECAM_VHS
-            ? rf_mesecam_phase(cross,dot) : (ed || svhs) ? gui_rf_preview_phase(cross,dot)
-                : atan2f((float)cross,(float)dot);
-        double frequency=d->fm_center+yphase*(RF_VIDEO_RATE/(2.0*RF_PI));
-        d->prev_i=yi; d->prev_q=yq;
-        if (!isfinite(frequency)) frequency=d->p.blank_hz;
-        float x=(float)(frequency-d->fm_center);
-        float y=d->deemph_b0*x+d->deemph_b1*d->deemph_x-d->deemph_a1*d->deemph_y;
-        d->deemph_x=x; d->deemph_y=y;
-        float luma=d->use_shelf_deemph ? rf_filter_sample(&d->luma_deemph,x) : y;
-        y+=(float)d->fm_center;
-        /* Beta record emphasis requires its matched inverse shelf for timing too.
-         * The VHS legacy plane fragments real Beta EQ/broad pulses, losing
-         * fields despite a valid display luma signal. Preserve VHS timing. */
-        float sync_input=d->p.beta_rotation ? luma+(float)d->fm_center : y;
-        d->sync_y=d->sync_alpha*d->sync_y+(1.0f-d->sync_alpha)*sync_input;
-        unsigned at=(unsigned)(pos&RF_RING_MASK);
-        d->luma[at]=luma+(float)d->fm_center; d->sync[at]=d->sync_y;
-        d->sync_luma[at]=sync_input;
-        if(d->profile==GUI_RF_PROFILE_MESECAM_VHS) {
-            d->mesecam_i[at]=ci;d->mesecam_q[at]=cq;
-            /* Field preparation fills only the buffered, bounded interval.
-             * Any unavailable margin remains explicitly without carrier. */
-            d->secam_fm[at]=(float)d->p.carrier_hz;
-            d->ci[at]=(float)d->p.carrier_hz;d->cq[at]=0.0f;
-        } else if(rf_secam_fm(d)) {
-            double ccross=(double)d->secam_prev_i*cq-(double)d->secam_prev_q*ci;
-            double cdot=(double)d->secam_prev_i*ci+(double)d->secam_prev_q*cq;
-            /* Most deviations are small around the mixed-down centre.
-             * atan(r) through r^7 has error <= 4.3e-7 rad for |r|<=.25
-             * (under .35Hz at 5MSPS). Keep atan2 for fades/clicks/quadrants. */
-            double phase;
-            if(cdot>0.0 && fabs(ccross)<=.25*cdot) {
-                double r=ccross/cdot,r2=r*r;
-                phase=r*(1.0+r2*(-1.0/3.0+r2*(1.0/5.0-r2/7.0)));
-            } else phase=atan2f((float)ccross,(float)cdot);
-            double cf=d->p.carrier_hz+phase*(RF_VIDEO_RATE/(2.0*RF_PI));
-            d->secam_prev_i=ci;d->secam_prev_q=cq;
-            /* Clamp in the recorded carrier domain before LF recovery.
-             * MESECAM inverts the studio rails, native divides by four. */
-            double low=rf_native_secam(d) ? 975000.0 : 304321.875;
-            double high=rf_native_secam(d) ? 1189062.5 : 1160571.875;
-            /* Unclipped frequency makes a quiet reference independent of
-             * the limiter, LF network, post-filter and active content. */
-            if(!rf_native_secam(d)) d->secam_fm[at]=(float)cf;
-            float cx=(float)(rf_clamp(cf,low,high)-d->p.carrier_hz);
-            float cy=d->secam_b0*cx+d->secam_b1*d->secam_deemph_x
-                -d->secam_a1*d->secam_deemph_y;
-            d->secam_deemph_x=cx;d->secam_deemph_y=cy;
-            for(int stage=0;stage<2;++stage) cy=rf_filter_sample(&d->secam_video_lp[stage],cy);
-            d->ci[at]=cy+(float)d->p.carrier_hz;
-            d->cq[at]=hypotf(ci,cq);
-        } else {d->ci[at]=ci;d->cq[at]=cq;}
-        d->envelope[at]=(ed || d->profile==GUI_RF_PROFILE_MESECAM_VHS)
-            ? rf_mesecam_magnitude(yi,yq) : hypotf(yi,yq);
-        rf_process_sync(d,pos,callback,context);
+        rf_backend_sample(d,pos,yi,yq,ci,cq,ed,svhs,callback,context);
     }
 #if GUI_RF_PACKED_IQ
     if(ed) {

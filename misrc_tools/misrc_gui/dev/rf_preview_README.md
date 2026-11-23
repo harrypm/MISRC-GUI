@@ -155,8 +155,32 @@ All video and Hi-Fi consumers share a soft CPU-time budget, with a
 machine-scaled default and FIFO arbitration. The concurrent processing limit
 is the ceiling of the configured budget, capped at eight; one core or less
 retains a single active permit. Budget waits occur only inside consumers.
-Windows uses thread CPU time and requests below-normal
-priority; unavailable thread accounting falls back to processing wall time.
+Consumers use thread CPU time and request a mild background priority:
+Windows below-normal, Linux nice 5 (it was nice 19, which left a decoder
+sharing a core with capture's nice -5 threads at ~1/200 of the CFS weight
+and starved it into queue drops). Unavailable thread accounting falls back
+to processing wall time.
+
+## Decoder pipeline and helper thread
+
+VHS and S-VHS (every profile on scalar/ARM builds) run the decoder in two
+stages: the 20 MSPS front end (RF band filters, Y/C mixers, IQ lowpass) over
+16k-sample chunks, then the unchanged 5 MSPS back end (FM demod, sync,
+fields, callbacks). On SSE2 builds the front end packs the four IQ chains
+into 4-lane biquads and both mixers into one double pair; inline this is
+~1.55x faster than the old fused loop on an i9-7980XE. Packed Beta/SECAM
+and ED Beta keep their fused loop. Versus the fused loop only last-bit float
+rounding moves (measured: 0.0015% of colour values differ, by 1 of 255).
+
+Each worker owns a helper thread that runs the front end of chunk i+1 while
+the worker runs the back end of chunk i (~1.8x total). It engages only when
+the input backlog stays at 4+ blocks for 16 blocks, never while the budget
+is pacing the worker, and releases after 64 calm blocks. Engaging it for a
+decoder that keeps up is counter-productive: two half-busy threads hand off
+every chunk, migrate between cores, and Linux/HWP then holds both at
+1.2-1.8 GHz instead of ~3.6 GHz. Helper CPU is charged to the shared budget.
+Frame callbacks always stay on the worker thread, and each block completes
+before `gui_rf_decoder_process` returns.
 
 This allowance covers preview processing, not the entire GUI or an OS-enforced
 quota. The bounded CPU token balance includes reservations reconciled against
