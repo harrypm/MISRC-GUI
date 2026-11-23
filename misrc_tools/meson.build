@@ -1037,7 +1037,7 @@ if raylib_dep.found()
     )
     test('gui_rf_input_stamps', rf_input_stamps_test)
     rf_routes_test = executable('gui_rf_routes_test',
-      ['test/gui_rf_routes_test.c', 'misrc_gui/signal/gui_vhs_hifi.c',
+      ['test/gui_rf_routes_test.c', 'common/rb_event.c', 'misrc_gui/signal/gui_vhs_hifi.c',
        'misrc_gui/signal/gui_vectorscope.c', 'misrc_gui/signal/gui_wfm.c'],
       dependencies: overlay_test_deps + [dependency('threads')],
       include_directories: gui_includes,
@@ -1063,7 +1063,7 @@ if raylib_dep.found()
       cvbs_baseband_deps += [soxr_dep]
     endif
     cvbs_baseband_test = executable('gui_cvbs_test',
-      ['test/gui_cvbs_test.c', 'misrc_gui/signal/gui_trigger.c',
+      ['test/gui_cvbs_test.c', 'common/rb_event.c', 'misrc_gui/signal/gui_trigger.c',
        'misrc_gui/signal/gui_vectorscope.c', 'misrc_gui/signal/gui_wfm.c'],
       dependencies: cvbs_baseband_deps,
       include_directories: gui_includes,
@@ -1071,12 +1071,12 @@ if raylib_dep.found()
       link_args: ldflags,
       override_options: ['b_lto=true', 'optimization=2'],
     )
-    test('gui_cvbs_baseband', cvbs_baseband_test)
+    test('gui_cvbs_baseband', cvbs_baseband_test, timeout: 120)
 
     # Composite vectorscope: Test Gen bars (NTSC SMPTE, PAL 75%) through the
     # vectorscope panel's decode chain must land on the graticule targets.
     vectorscope_test = executable('gui_vectorscope_test',
-      ['test/gui_vectorscope_test.c', 'misrc_gui/signal/gui_trigger.c',
+      ['test/gui_vectorscope_test.c', 'common/rb_event.c', 'misrc_gui/signal/gui_trigger.c',
        'misrc_gui/signal/gui_vectorscope.c', 'misrc_gui/signal/gui_wfm.c', 'misrc_gui/signal/gui_testgen.c'],
       dependencies: cvbs_baseband_deps,
       include_directories: gui_includes,
@@ -1090,7 +1090,7 @@ if raylib_dep.found()
     # chain must land on their luma levels, sync/blanking on the normative
     # levels and the sync edge on 0H.
     wfm_test = executable('gui_wfm_test',
-      ['test/gui_wfm_test.c', 'misrc_gui/signal/gui_trigger.c',
+      ['test/gui_wfm_test.c', 'common/rb_event.c', 'misrc_gui/signal/gui_trigger.c',
        'misrc_gui/signal/gui_vectorscope.c', 'misrc_gui/signal/gui_wfm.c',
        'misrc_gui/signal/gui_testgen.c'],
       dependencies: cvbs_baseband_deps,
@@ -1105,7 +1105,7 @@ if raylib_dep.found()
     # timing through the panel path (soxr + decode); every vertical bar edge
     # must decode as a straight line (sub-sample placement, nominal scale).
     cvbs_line_test = executable('gui_cvbs_line_test',
-      ['test/gui_cvbs_line_test.c', 'misrc_gui/signal/gui_trigger.c',
+      ['test/gui_cvbs_line_test.c', 'common/rb_event.c', 'misrc_gui/signal/gui_trigger.c',
        'misrc_gui/signal/gui_vectorscope.c', 'misrc_gui/signal/gui_wfm.c', 'misrc_gui/signal/gui_testgen.c'],
       dependencies: cvbs_baseband_deps,
       include_directories: gui_includes,

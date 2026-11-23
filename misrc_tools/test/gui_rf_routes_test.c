@@ -51,6 +51,8 @@ static struct {
     bool awaiting_label;
 } overlay_draw;
 
+void TraceLog(int level, const char *message, ...) { (void)level; (void)message; }
+void UnloadTexture(Texture2D texture) { (void)texture; }
 float gui_ui_get_scale_factor(void) { return overlay_draw.scale; }
 Vector2 gui_ui_get_mouse_position(void) { return (Vector2){-1,-1}; }
 bool CheckCollisionPointRec(Vector2 point, Rectangle rect) {
@@ -1276,7 +1278,32 @@ static void test_rtlsdr_routes(void) {
     atomic_store(&route_app.rf_source_is_rtlsdr, false);
 }
 
+static void test_cvbs_generator_follow_50ohms(void) {
+    video_panel_state_t *panel = new_panel();
+    cvbs_decoder_t *decoder = &panel->cvbs.decoder;
+    assert(gui_cvbs_init(decoder));
+    route_app.panel_config_a.left_view = PANEL_VIEW_CVBS;
+    route_app.panel_config_a.left_state = panel;
+    assert(gui_cvbs_set_50ohms(decoder, true));
+    for (int system = 2; system <= 3; system++) {
+        gui_video_follow_generator_system(&route_app, 1);
+        assert(decoder->state.format == CVBS_FORMAT_NTSC && decoder->state.total_lines == 525);
+        gui_video_follow_generator_system(&route_app, system);
+        assert(decoder->receiver && decoder->state.format == CVBS_FORMAT_PAL);
+        assert(decoder->overlay.selected_system == 0 && decoder->state.total_lines == 625);
+        assert(decoder->frame_height == CVBS_PAL_FULL_HEIGHT);
+        assert(panel->tape_decode.decoder.state.format == CVBS_FORMAT_SECAM);
+    }
+    assert(gui_cvbs_set_50ohms(decoder, false));
+    gui_video_follow_generator_system(&route_app, 2);
+    assert(decoder->overlay.selected_system == 2 && decoder->state.format == CVBS_FORMAT_SECAM);
+    gui_cvbs_cleanup(decoder);
+    route_app.panel_config_a.left_state = NULL;
+    free(panel);
+}
+
 int main(void) {
+    test_cvbs_generator_follow_50ohms();
     atomic_store(&route_app.rf_source_rate_hz[0], 40000000);
     atomic_store(&route_app.rf_source_rate_hz[1], 40000000);
     video_panel_state_t *left=new_panel(), *right=new_panel(), *b=new_panel();

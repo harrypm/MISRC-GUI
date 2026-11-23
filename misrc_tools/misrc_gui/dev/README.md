@@ -25,6 +25,7 @@ Use lowercase with underscores:
 | File | Description |
 |------|-------------|
 | `dev_notes_README.md` | General dev notes and capture-path constraints |
+| [`prompt_cvbs_50ohms_readme.md`](prompt_cvbs_50ohms_readme.md) | DdD 50 Ω CVBS preview, NTSC temporal separation, field statistics and verification |
 | `prompt_server_client_readme.md` | Server/client networking feature prompt log |
 | `prompt_statusbar_readme.md` | Status bar compaction / toolbar scaling prompt log |
 | `prompt_waveform_readout_bug.md` | Waveform readout bug prompt log |

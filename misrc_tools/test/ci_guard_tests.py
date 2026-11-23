@@ -2371,7 +2371,7 @@ def check_secam_mode_contract(repo_root: Path) -> int:
         ("noise_mad", "the concealment noise term"),
         ("one-line hold", "the causal hold"),
         ("\"PAL\", \"NTSC\", \"SECAM\"", "the System selector options"),
-        ("gui_cvbs_set_format(decoder, sys_values[i])", "the System dropdown click wiring"),
+        ("gui_cvbs_set_format(decoder, i)", "the System dropdown click wiring"),
         ("gui_cvbs_get_secam_diag(decoder", "the OSD Stats SECAM diag readout"),
     ]
     for snippet, label in wiring:
