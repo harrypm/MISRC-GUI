@@ -1516,8 +1516,11 @@ int main(int argc, char **argv) {
 
     // Load embedded Inter font directly from memory (Apache 2.0 licensed)
     // Font data is ~342KB and embedded as a C array for complete portability
+    int inter_codepoints[257];
+    for (int i = 0; i < 256; i++) inter_codepoints[i] = i + 32;
+    inter_codepoints[256] = 0x03A9;  // Ω, CVBS 50-ohm control
     fonts[0] = LoadFontFromMemory(".ttf", inter_font_data, inter_font_data_size,
-                                  UI_FONT_ATLAS_SIZE, NULL, 256);
+                                  UI_FONT_ATLAS_SIZE, inter_codepoints, 257);
     if (fonts[0].texture.id == 0) {
         fprintf(stderr, "Error: Failed to load embedded Inter font data\n");
         CloseWindow();

@@ -217,6 +217,25 @@ typedef struct {
     int    fields_nominal;
 } cvbs_secam_state_t;
 
+// Short, uniformly sampled ADC windows for raw rolling preview.
+typedef struct {
+    int16_t samples[6 * 256];      // Six 64 us lines at up to 4 MSPS
+    int count;
+    unsigned skip;
+    size_t last_end, last_window, last_match;
+    uint16_t matched_windows;
+    uint16_t picture_windows;
+    uint16_t noisy_windows; // Failed ADC windows without a quiet pulse-width interval
+    bool reacquiring_slice;
+    bool reslice_on_train; // Raw field ended without credible horizontal sync
+    size_t last_depth_pos, last_edge;
+    int tip_width; // In decimated samples at the current probe rate
+    int last_depth;  // ADC counts from the most recent matching window
+    size_t previous_line_end;
+    int16_t previous_line_means[64]; // Binned ADC line preceding a free-running field boundary
+    bool previous_line_h;
+} cvbs_raw_h_probe_t;
+
 // VBI / field sync state (persistent across buffers). Ported from the
 // verified VHS FM decoder model (gui_rf_preview.c): pulses are classified
 // by WIDTH (EQ 2.35us / H 4.7us / broad ~27.3us), field parity comes from the
@@ -237,6 +256,9 @@ typedef struct {
                                    // the converged line period carries the
                                    // quantization bias
     size_t last_h_pos;             // Start of the last classified H pulse
+    cvbs_raw_h_probe_t raw_h_probe;
+    uint32_t lines_with_h;         // One bit per PLL line with at least one classified H pulse
+    uint32_t lines_at_h_cadence;   // H edges separated by one physical line
     size_t last_classified_pos;    // Start of the last EQ-or-H classified pulse
                                    // (rate self-calibration spacing source; any
                                    // classified pulse counts because a wrong
@@ -317,6 +339,8 @@ typedef struct {
 #define CVBS_LINE_BUFFER_SIZE   13100
 
 // Main decoder structure
+typedef struct cvbs_receiver cvbs_receiver_t;
+
 typedef struct cvbs_decoder {
     // Track whether we've received each field for the current frame
     bool field_ready[2];
@@ -325,6 +349,9 @@ typedef struct cvbs_decoder {
     uint64_t field_sequence;          // Monotonic sequence number for completed fields
     uint64_t field_last_update_seq[2];// Last sequence value written to each field buffer
     // Frame state
+    struct cvbs_ntsc_history *ntsc_history;
+    bool ntsc_wait_for_anchor;
+    cvbs_receiver_t *receiver;     // Opt-in NTSC/PAL 50-ohm receiver
     cvbs_frame_state_t state;
 
     // Decoder configuration
@@ -360,6 +387,7 @@ typedef struct cvbs_decoder {
     uint8_t *display_front;        // Front buffer - read by render thread
     uint8_t *display_back;         // Back buffer - written by display thread
     atomic_int display_ready;      // 1 when back buffer has new frame to swap
+    bool hold_frame_for_relock;    // Keep the front buffer through a 50-ohm switch
 
     /* Optional borrowed RGB24 frame callback; set only while decode is stopped. */
     void (*monitor_frame_sink)(void *context, const uint8_t *rgb,
@@ -505,6 +533,7 @@ typedef struct cvbs_decoder {
         Rectangle frame_btn_rect;      // Hit box for frame mode button
         Rectangle level_btn_rect;      // Hit box for levels mode button
         Rectangle sync_btn_rect;       // Hit box for sync mode button
+        Rectangle receiver_btn_rect;
         Rectangle colour_btn_rect;    // Hit box for colour mode button
         Rectangle system_btn_rect;     // Hit box for system selector button
         Rectangle tape_btn_rect;       // Hit box for tape family selector button
@@ -550,6 +579,10 @@ void gui_cvbs_cleanup(cvbs_decoder_t *decoder);
 
 // Reset decoder state (clear frame, reset sync)
 void gui_cvbs_reset(cvbs_decoder_t *decoder);
+
+// Enable the software 50-ohm receiver for NTSC/PAL CVBS. SECAM switches to PAL.
+// Serialize with sample processing and other decoder configuration changes.
+bool gui_cvbs_set_50ohms(cvbs_decoder_t *decoder, bool enabled);
 
 //-----------------------------------------------------------------------------
 // Decoding

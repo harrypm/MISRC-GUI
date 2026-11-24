@@ -135,6 +135,7 @@ plugin and the hidden Tape Decode plugin):
 | Tape family (`cvbs_tape_format_t`) | VHS, S-VHS, Betamax, Video8, Hi8, U-matic | Selectable; biases luma kernel sharpness and PLL lock thresholds (S-VHS/Hi8 sharper, U-matic softer). Baseband decode only — these are not RF demodulation profiles |
 | Tape speed (`cvbs_tape_mode_t`) | SP, LP, ELP | Selectable; PLL tuning + smoothing presets |
 | Colour (`cvbs_colour_mode_t`) | OFF (grayscale) / AUTO | Working — burst-gated baseband chroma; SECAM uses the FM-chroma port below |
+| 50 Ω | Off (default) / On | Software correction for PAL and NTSC CVBS captured with the Domesday Duplicator. Enabling it on SECAM selects PAL. SECAM is available again when correction is off. |
 | Levels (`cvbs_level_mode_t`) | AUTO (per-field adaptive) / FIXED (latched after lock) | Working |
 | Sync (`cvbs_sync_mode_t`) | AUTO / FIXED (frozen line period after lock) | Working — default is FIXED |
 | OSD (`cvbs_osd_mode_t`) | OFF / MINIMAL / STATS | Working |
