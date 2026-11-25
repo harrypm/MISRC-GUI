@@ -337,6 +337,13 @@ bool phosphor_rt_init(phosphor_rt_t *prt, int logical_width,
     SetTextureFilter(prt->rt[0].texture, TEXTURE_FILTER_BILINEAR);
     SetTextureFilter(prt->rt[1].texture, TEXTURE_FILTER_BILINEAR);
 
+    // Clamp, not raylib's default REPEAT: the composite/opacity shaders
+    // sample up to 4 texels past each pixel (blur/bloom) and bilinear
+    // filtering reads one more, so with REPEAT a trace pinned to one edge
+    // (a clipping signal on the top rail) bleeds onto the opposite edge.
+    SetTextureWrap(prt->rt[0].texture, TEXTURE_WRAP_CLAMP);
+    SetTextureWrap(prt->rt[1].texture, TEXTURE_WRAP_CLAMP);
+
     // EndTextureMode() resets raylib's model-view matrix. Preserve an outer UI
     // camera when initialization happens during a Clay custom render command.
     Matrix outer_modelview = rlGetMatrixModelview();
