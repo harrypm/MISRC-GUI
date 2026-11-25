@@ -40,6 +40,7 @@
 #include "../visualization/gui_histogram_panel.h"
 #include "../visualization/gui_vectorscope_panel.h"
 #include "../visualization/gui_wfm_panel.h"
+#include "../visualization/gui_hifi_panel.h"
 #include "../visualization/gui_spectrogram.h"
 #include "../signal/gui_cvbs.h"
 #include "../signal/gui_demod.h"
@@ -1117,6 +1118,7 @@ void gui_app_init(gui_app_t *app) {
         gui_demod_panel_register();
         gui_vectorscope_panel_register();
         gui_wfm_panel_register();
+        gui_hifi_panel_register();
     }
 
     // Initialize per-channel display buffers

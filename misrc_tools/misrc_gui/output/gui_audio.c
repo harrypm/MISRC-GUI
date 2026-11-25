@@ -951,6 +951,8 @@ static void audio_update_peaks(gui_app_t *app, const uint8_t *buf, size_t len)
     for (int ch = 0; ch < 4; ch++) {
         atomic_store(&app->audio_peak[ch], peak[ch]);
     }
+    // Device audio is arriving: real CH3/4 for the Hi-Fi takeover rule.
+    atomic_store(&app->audio_rx_ms, get_time_ms());
 }
 
 
@@ -1489,6 +1491,21 @@ void gui_audio_update_playback(gui_app_t *app)
     // File playback/DDD can run without gui_audio_start. Honor a persisted
     // Audio Mon setting there too, and propagate any settings-only change.
     const bool enabled = app->settings.audio_monitor_playback;
+    static int s_trace = -1;
+    if (s_trace < 0) s_trace = getenv("MISRC_AUDIO_TRACE") != NULL;
+    if (s_trace) {   // diagnostics: MISRC_AUDIO_TRACE=1 prints the pump state on change
+        static char last[256];
+        char now[256];
+        snprintf(now, sizeof(now), "en=%d cap=%d sess=%d dev=%d inited=%d epoch=%zu stream_epoch=%zu src=%p legacy=%d unavail=%zu",
+                 (int)enabled, (int)app->is_capturing, (int)atomic_load(&s_monitor_session_active),
+                 (int)s_audio_device_inited, (int)s_play_stream_inited, (size_t)atomic_load(&s_monitor_epoch),
+                 (size_t)s_play_stream_epoch, (void *)atomic_load(&s_hifi_source),
+                 (int)monitor_legacy_selected(), (size_t)s_unavailable_output_epoch);
+        if (strcmp(now, last) != 0) {
+            fprintf(stderr, "[TRACE] audio pump %s\n", now);
+            memcpy(last, now, sizeof(last));
+        }
+    }
     if (atomic_exchange(&s_playback_enabled, enabled) != enabled) monitor_invalidate();
     if (!app->is_capturing) {
         // DDD/file-playback stops need not run gui_audio_stop(). Observe the

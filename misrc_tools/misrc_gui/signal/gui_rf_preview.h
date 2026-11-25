@@ -84,6 +84,7 @@ typedef struct {
     uint64_t hsync_count;
     uint64_t vsync_count;
     uint64_t fields_decoded;
+    int last_field_parity;   // parity of the newest rendered field (0 = even frame rows)
     double line_period_us;
     uint64_t frames_decoded;
     /* Reset-scoped diagnostic events. A V candidate is three consecutive
@@ -112,6 +113,10 @@ typedef void (*gui_rf_frame_callback_t)(void *context, const uint8_t *rgba,
 
 /* Invalid profiles are rejected; reset_profile leaves existing state intact. */
 gui_rf_decoder_t *gui_rf_decoder_create_profile(gui_rf_profile_t profile);
+/* ITU field 1's parity (frame rows y*2+parity) - the Spectro's f1 - and the
+ * Split / Field texture row of a frame row with top_parity's rows on top. */
+int gui_rf_field1_parity(gui_rf_profile_t profile);
+int gui_rf_split_row(int row, int frame_rows, int top_parity, int *top_rows);
 void gui_rf_decoder_reset_profile(gui_rf_decoder_t *decoder, gui_rf_profile_t profile);
 // RF input rate required by the decoder. All profiles use 20 MSPS; ED Beta
 // and S-VHS use a wide-passband converter before reduced-rate preview filters.

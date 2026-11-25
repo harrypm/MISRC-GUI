@@ -35,7 +35,19 @@ static const char* s_view_names[] = {
     [PANEL_VIEW_DEMOD] = "Demod",
     [PANEL_VIEW_VECTORSCOPE] = "Vector",
     [PANEL_VIEW_WFM] = "WFM",
+    [PANEL_VIEW_HIFI] = "HiFi",
 };
+
+// View picker order (harrypm 2026-11-25: HiFi right under Video). Ids stay
+// as they are (saved settings / flags use names; tables use ids).
+panel_view_type_t panel_view_menu_order(int index) {
+    static const panel_view_type_t order[PANEL_VIEW_COUNT] = {
+        PANEL_VIEW_WAVEFORM, PANEL_VIEW_FFT, PANEL_VIEW_CVBS, PANEL_VIEW_HIFI,
+        PANEL_VIEW_HISTOGRAM, PANEL_VIEW_WATERFALL, PANEL_VIEW_SPECTROGRAPH,
+        PANEL_VIEW_DEMOD, PANEL_VIEW_VECTORSCOPE, PANEL_VIEW_WFM,
+    };
+    return (index >= 0 && index < PANEL_VIEW_COUNT) ? order[index] : PANEL_VIEW_WAVEFORM;
+}
 
 const char* panel_view_type_name(panel_view_type_t type) {
     if (type < PANEL_VIEW_COUNT) return s_view_names[type];
@@ -49,6 +61,7 @@ bool panel_view_type_available(panel_view_type_t type) {
         case PANEL_VIEW_HISTOGRAM:
         case PANEL_VIEW_VECTORSCOPE:
         case PANEL_VIEW_WFM:
+        case PANEL_VIEW_HIFI:
             return true;
         case PANEL_VIEW_FFT:
             return gui_fft_available();

@@ -6,6 +6,7 @@
 
 #include "gui_trigger.h"
 #include "gui_headswitch_lock.h"
+#include "gui_hs_trigger.h"
 
 //-----------------------------------------------------------------------------
 // CVBS Signal Level Analysis (Histogram-Based)
@@ -308,6 +309,12 @@ ssize_t trigger_find_from_config_multi(const int16_t *buf_ch1,
             return trigger_find_cvbs_hsync(
                 (trig->trigger_source == TRIGGER_SOURCE_CH2) ? buf_ch2 : buf_ch1,
                 count, min_index);
+        case TRIGGER_MODE_HEADSWITCH:
+            // Tape RF head switch from the RF itself (no CH3 signal needed).
+            if (trig->trigger_source == TRIGGER_SOURCE_CH3) return -1;
+            return gui_hs_trigger_find(
+                (trig->trigger_source == TRIGGER_SOURCE_CH2) ? buf_ch2 : buf_ch1,
+                count, min_index, count, rf_sample_rate_hz, GUI_HS_TRIGGER_RATIO);
         default:
             if (trig->trigger_source == TRIGGER_SOURCE_CH3) return -1;
             return trigger_find_rising_edge(

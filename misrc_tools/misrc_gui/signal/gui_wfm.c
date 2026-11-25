@@ -100,8 +100,10 @@ bool gui_wfm_init(gui_wfm_t *w) {
     if (!w) return false;
     memset(w, 0, sizeof(*w));
     w->acc = (uint16_t *)calloc(WFM_CELLS, sizeof(uint16_t));
+    w->mid = (uint16_t *)calloc(WFM_CELLS, sizeof(uint16_t));
     w->pub = (uint16_t *)calloc(WFM_CELLS, sizeof(uint16_t));
-    if (!w->acc || !w->pub) {
+    atomic_flag_clear(&w->swap_lock);
+    if (!w->acc || !w->mid || !w->pub) {
         gui_wfm_free(w);
         return false;
     }
@@ -116,8 +118,9 @@ bool gui_wfm_init(gui_wfm_t *w) {
 void gui_wfm_free(gui_wfm_t *w) {
     if (!w) return;
     free(w->acc);
+    free(w->mid);
     free(w->pub);
-    w->acc = w->pub = NULL;
+    w->acc = w->mid = w->pub = NULL;
 }
 
 void gui_wfm_reset(gui_wfm_t *w) {
@@ -279,8 +282,7 @@ void gui_wfm_add_line(gui_wfm_t *w, const gui_wfm_line_t *in) {
     w->acc_meta.lines++;
 }
 
-void gui_wfm_end_field(gui_wfm_t *w) {
-    if (!w || !w->acc) return;
+static void wfm_field_swing(gui_wfm_t *w) {
     if (w->swing_n >= 16) {
         double m = w->swing_sum / (double)w->swing_n;
         w->swing_ref = w->swing_valid ? 0.5 * (w->swing_ref + m) : m;
@@ -288,30 +290,73 @@ void gui_wfm_end_field(gui_wfm_t *w) {
     }
     w->swing_sum = 0.0;
     w->swing_n = 0;
-    if (!w->acc_started) return;
-    // tbc plots a frame: publish every second field.
-    if (++w->fields_in_acc < 2) return;
+}
+
+// Publish acc (latest wins) and start a fresh accumulation.
+static void wfm_publish(gui_wfm_t *w) {
     w->fields_in_acc = 0;
-    atomic_fetch_add(&w->frames, 1u);
-    // Renderer still holds the previous frame: drop this one (the decoder
-    // never waits on the render thread).
-    if (w->acc_meta.lines > 0 &&
-        atomic_load_explicit(&w->pub_ready, memory_order_acquire) == 0) {
-        uint16_t *swap = w->pub;
-        w->pub = w->acc;
+    if (w->acc_meta.lines > 0) {
+        atomic_fetch_add(&w->frames, 1u);
+        while (atomic_flag_test_and_set_explicit(&w->swap_lock, memory_order_acquire)) {}
+        uint16_t *swap = w->mid;
+        w->mid = w->acc;
         w->acc = swap;
-        w->pub_meta = w->acc_meta;
+        w->mid_meta = w->acc_meta;
         atomic_store_explicit(&w->pub_ready, 1, memory_order_release);
+        atomic_flag_clear_explicit(&w->swap_lock, memory_order_release);
     }
     memset(w->acc, 0, WFM_CELLS * sizeof(uint16_t));
     w->acc_started = false;   // The next line re-reads the UI's settings
 }
 
+void gui_wfm_end_field(gui_wfm_t *w) {
+    if (!w || !w->acc) return;
+    wfm_field_swing(w);
+    if (!w->acc_started) return;
+    // tbc plots a frame: publish every second field.
+    if (++w->fields_in_acc < 2) return;
+    wfm_publish(w);
+}
+
+void gui_wfm_end_field_locked(gui_wfm_t *w, int parity, int field1_parity, bool single_field) {
+    if (!w || !w->acc) return;
+    wfm_field_swing(w);
+    if (!w->acc_started) return;
+    if (single_field) {
+        wfm_publish(w);
+        return;
+    }
+    if (w->fields_in_acc == 0) {
+        if (parity != field1_parity) {
+            // Started on field 2: not a frame. Drop it; field 1 starts one.
+            memset(w->acc, 0, WFM_CELLS * sizeof(uint16_t));
+            w->acc_started = false;
+            return;
+        }
+        w->fields_in_acc = 1;
+        return;
+    }
+    if (parity == field1_parity) {
+        // Two field 1s in a row (a field was lost): restart on this one.
+        memset(w->acc, 0, WFM_CELLS * sizeof(uint16_t));
+        w->acc_started = false;
+        w->fields_in_acc = 0;
+        return;
+    }
+    wfm_publish(w);   // field 1 + field 2 of one frame
+}
+
 bool gui_wfm_take(gui_wfm_t *w, uint16_t *dst, gui_wfm_meta_t *meta) {
     if (!w || !w->pub || !dst) return false;
     if (atomic_load_explicit(&w->pub_ready, memory_order_acquire) == 0) return false;
+    while (atomic_flag_test_and_set_explicit(&w->swap_lock, memory_order_acquire)) {}
+    uint16_t *swap = w->pub;
+    w->pub = w->mid;
+    w->mid = swap;
+    w->pub_meta = w->mid_meta;
+    atomic_store_explicit(&w->pub_ready, 0, memory_order_release);
+    atomic_flag_clear_explicit(&w->swap_lock, memory_order_release);
     memcpy(dst, w->pub, WFM_CELLS * sizeof(uint16_t));
     if (meta) *meta = w->pub_meta;
-    atomic_store_explicit(&w->pub_ready, 0, memory_order_release);
     return true;
 }

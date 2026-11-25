@@ -35,7 +35,7 @@ struct gui_rf_resampler {
     uint32_t input_rate_hz, output_rate_hz;
     unsigned factor;
     bool ed_beta;
-    rf_halfband_t stages[2];
+    rf_halfband_t stages[3];
 #if LIBSOXR_ENABLED
     soxr_t soxr;
     bool failed;
@@ -83,7 +83,8 @@ static bool input_rate_valid(uint32_t rate, uint32_t min_rate) {
 }
 
 static bool output_rate_valid(uint32_t rate) {
-    return rate == RF_OUTPUT_RATE_HZ || rate == RF_WIDE_OUTPUT_RATE_HZ;
+    return rate == RF_OUTPUT_RATE_HZ || rate == RF_WIDE_OUTPUT_RATE_HZ ||
+           rate == GUI_RF_HIFI_NARROW_RATE_HZ;
 }
 
 gui_rf_resampler_t *gui_rf_resampler_create(uint32_t input_rate_hz) {
@@ -105,6 +106,9 @@ static gui_rf_resampler_t *rf_resampler_create(uint32_t input_rate_hz,
         resampler->factor = 2u;
     } else if (!ed_beta && input_rate_hz == output_rate_hz * 4u) {
         resampler->factor = 4u;
+    } else if (!ed_beta && output_rate_hz == GUI_RF_HIFI_NARROW_RATE_HZ &&
+               input_rate_hz == output_rate_hz * 8u) {
+        resampler->factor = 8u;   // 40 -> 5 MSPS (Hi-Fi narrow only; 160 -> 20 stays soxr)
     } else {
 #if LIBSOXR_ENABLED
         soxr_error_t error = NULL;
@@ -114,7 +118,9 @@ static gui_rf_resampler_t *rf_resampler_create(uint32_t input_rate_hz,
         /* ED preserves its 9.3 MHz white carrier with a 9.5/10 MHz transition.
          * Keep legacy 20 MSPS and explicit 40 MSPS responses unchanged. */
         const double passband_hz = output_rate_hz == RF_WIDE_OUTPUT_RATE_HZ
-            ? 16000000.0 : ed_beta ? 9500000.0 : 8000000.0;
+            ? 16000000.0 :
+            output_rate_hz == GUI_RF_HIFI_NARROW_RATE_HZ ? 2100000.0 :   // Hi-Fi carriers + deviation
+            ed_beta ? 9500000.0 : 8000000.0;
         quality.passband_end = fmin(0.95, passband_hz / nyquist);
         quality.stopband_begin = 1.0;
         quality.phase_response = 50.0;
@@ -172,6 +178,8 @@ static size_t rf_output_capacity(uint32_t input_rate_hz, uint32_t output_rate_hz
     if (input_rate_hz == output_rate_hz) return input_count;
     if (!ed_beta && input_rate_hz == output_rate_hz * 2u) return input_count / 2u + (input_count % 2u != 0);
     if (!ed_beta && input_rate_hz == output_rate_hz * 4u) return input_count / 4u + (input_count % 4u != 0);
+    if (!ed_beta && output_rate_hz == GUI_RF_HIFI_NARROW_RATE_HZ && input_rate_hz == output_rate_hz * 8u)
+        return input_count / 8u + (input_count % 8u != 0);
 #if LIBSOXR_ENABLED
     /* Divide before multiplying, so even a caller's oversized count cannot
      * wrap this allocation bound. All rates here are expressed in Hz. */
@@ -201,6 +209,16 @@ size_t gui_rf_resampler_output_capacity_ed_beta(uint32_t input_rate_hz, size_t i
     return rf_output_capacity(input_rate_hz, RF_OUTPUT_RATE_HZ, input_count, true, RF_MIN_INPUT_RATE_HZ);
 }
 
+gui_rf_resampler_t *gui_rf_resampler_create_hifi_narrow(uint32_t input_rate_hz) {
+    return rf_resampler_create(input_rate_hz, GUI_RF_HIFI_NARROW_RATE_HZ, false,
+                               GUI_VHS_HIFI_LOW_RF_MIN_RATE_HZ);
+}
+
+size_t gui_rf_resampler_output_capacity_hifi_narrow(uint32_t input_rate_hz, size_t input_count) {
+    return rf_output_capacity(input_rate_hz, GUI_RF_HIFI_NARROW_RATE_HZ, input_count, false,
+                              GUI_VHS_HIFI_LOW_RF_MIN_RATE_HZ);
+}
+
 size_t gui_rf_resampler_output_capacity_hifi(uint32_t input_rate_hz, size_t input_count) {
     if (input_rate_hz > GUI_VHS_HIFI_LOW_RF_MAX_RATE_HZ) return 0;
     return rf_output_capacity(input_rate_hz, RF_OUTPUT_RATE_HZ, input_count, false,
@@ -225,7 +243,9 @@ bool gui_rf_resampler_process(gui_rf_resampler_t *resampler,
             float value = (float)input[index] * (1.0f / 32768.0f);
             if (resampler->factor >= 2u && !halfband_push(&resampler->stages[0], value, &value))
                 continue;
-            if (resampler->factor == 4u && !halfband_push(&resampler->stages[1], value, &value))
+            if (resampler->factor >= 4u && !halfband_push(&resampler->stages[1], value, &value))
+                continue;
+            if (resampler->factor == 8u && !halfband_push(&resampler->stages[2], value, &value))
                 continue;
             output[produced++] = value;
         }

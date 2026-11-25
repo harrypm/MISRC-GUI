@@ -66,6 +66,22 @@ size_t gui_playback_analysis_field_marks(gui_app_t *app, int channel,
     return 0;
 }
 
+bool gui_playback_analysis_field_info(gui_app_t *app, int channel, int *mode, int *lines) {
+    (void)app; (void)channel; (void)mode; (void)lines;
+    return false;
+}
+
+int gui_playback_measured_lines(gui_app_t *app, int channel) {
+    (void)app; (void)channel;
+    return 0;
+}
+
+size_t gui_playback_analysis_head_switches(gui_app_t *app, int channel, uint64_t *pos, int *head,
+                                           size_t max) {
+    (void)app; (void)channel; (void)pos; (void)head; (void)max;
+    return 0;
+}
+
 bool gui_video_panel_sync_source(const void *state, int *mode, int *lines) {
     (void)state; (void)mode; (void)lines;
     return false;

@@ -5572,7 +5572,11 @@ static void complete_field_pll(cvbs_decoder_t *decoder) {
     decoder->field_sequence++;
     decoder->field_last_update_seq[field_idx] = decoder->field_sequence;
     if (decoder->vscope) gui_vectorscope_end_field_parity(decoder->vscope, field_idx);
-    if (decoder->wfm) gui_wfm_end_field(decoder->wfm);
+    // WFM locked to this decoder's fields: a frame is field 1 + field 2 of
+    // one frame; in the Video panel's Field view, each field alone.
+    if (decoder->wfm)
+        gui_wfm_end_field_locked(decoder->wfm, field_idx, gui_cvbs_field1_parity(decoder),
+                                 decoder->field_view == CVBS_FIELD_VIEW_FIELD);
 
     // Deinterlace and display - works with one or both fields
     // Bob mode is used until both fields are available, then weave takes over
@@ -5587,6 +5591,7 @@ static void complete_field_pll(cvbs_decoder_t *decoder) {
         // Copy deinterlaced frame to back buffer (display thread writes here)
         memcpy(decoder->display_back, decoder->frame_buffer,
                (size_t)frame_w * 3u * (size_t)frame_h);
+        decoder->display_back_field = field_idx;
         // Signal that new frame is ready for the render thread
         atomic_store(&decoder->display_ready, 1);
         /* No network or encoder work here: optional bounded frame handoff only.
@@ -7697,6 +7702,7 @@ void gui_cvbs_swap_buffers(cvbs_decoder_t *decoder) {
         if (frame_w < 1) return;
         memcpy(decoder->display_front, decoder->display_back,
                (size_t)frame_w * 3u * (size_t)frame_h);
+        decoder->display_front_field = decoder->display_back_field;
     }
 }
 
@@ -7818,6 +7824,38 @@ static void cvbs_blit_rgb24_to_color(const uint8_t *src, Color *dst,
     }
 }
 
+// ITU field 1's parity in this decoder's numbering (field_buffer index),
+// the Spectro's f1 (gui_field_locate.c). Measured on the Test Gen (every
+// frame opens with field 1's pre-EQ train) by gui_cvbs_field_order_test:
+// parity 0 for PAL and NTSC (cvbs_vbi_first_eq's half-line phase rule).
+int gui_cvbs_field1_parity(const cvbs_decoder_t *decoder) {
+    (void)decoder;
+    return 0;
+}
+
+// The weave (deinterlace_fields): field_buffer[1] fills frame rows 0,2,4..,
+// field_buffer[0] rows 1,3,5..
+int gui_cvbs_row_parity(int row) {
+    return (row & 1) ? 0 : 1;
+}
+
+// Split / Field row order: frame row -> texture row, with the rows of
+// top_parity's field as the top block (in order) and the other field's rows
+// below. *top_rows (optional) receives the top block's height.
+int gui_cvbs_split_row(int row, int frame_rows, int top_parity, int *top_rows) {
+    const int odd_rows = frame_rows / 2, even_rows = frame_rows - odd_rows;
+    const int top = top_parity == 1 ? even_rows : odd_rows;   // parity 1 = even rows
+    if (top_rows) *top_rows = top;
+    const int in_field = row >> 1;
+    return gui_cvbs_row_parity(row) == top_parity ? in_field : top + in_field;
+}
+
+// The parity whose rows the Split view draws on top: field 1 (harrypm
+// 2026-11-19: first field on top, second below - enforced by the test).
+int gui_cvbs_split_top_parity(const cvbs_decoder_t *decoder) {
+    return gui_cvbs_field1_parity(decoder);
+}
+
 // Render core shared by the public render (always with OSD) and the panel
 // chrome-hide path: draw_osd=false keeps the decoded picture but hides the
 // OSD text chrome with the rest of the controls.
@@ -7878,9 +7916,27 @@ static void gui_cvbs_render_frame_impl(cvbs_decoder_t *decoder,
     // incident (dev/gui_output_verification_rules.md). The row pitch is the
     // image width (MAX_WIDTH) so NTSC (frame_w < MAX_WIDTH) does not shear.
     // Grayscale mode decoded R=G=B so the layout is shared.
-    cvbs_blit_rgb24_to_color(decoder->display_front,
-                             (Color *)decoder->frame_image.data,
-                             frame_w, field_h, decoder->frame_image.width);
+    // Split / Field view (like tbc-analyse): the same blit writes the woven
+    // rows in field order - field 1's rows (the Spectro's f1) as the top
+    // block, field 2's below (gui_cvbs_split_row; enforced by
+    // gui_cvbs_field_order_test) - so the views cost nothing over the frame.
+    const int field_view = decoder->field_view;
+    const int top_parity = gui_cvbs_split_top_parity(decoder);   // field 1 on top
+    int top_rows = 0;
+    (void)gui_cvbs_split_row(0, field_h, top_parity, &top_rows);
+    if (field_view == CVBS_FIELD_VIEW_FRAME) {
+        cvbs_blit_rgb24_to_color(decoder->display_front,
+                                 (Color *)decoder->frame_image.data,
+                                 frame_w, field_h, decoder->frame_image.width);
+    } else {
+        Color *img = (Color *)decoder->frame_image.data;
+        const int pitch = decoder->frame_image.width;
+        for (int r = 0; r < field_h; r++) {
+            const int dr = gui_cvbs_split_row(r, field_h, top_parity, NULL);
+            cvbs_blit_rgb24_to_color(decoder->display_front + (size_t)r * (size_t)frame_w * 3u,
+                                     img + (size_t)dr * (size_t)pitch, frame_w, 1, pitch);
+        }
+    }
 
     // Upload to GPU
     UpdateTexture(decoder->frame_texture, decoder->frame_image.data);
@@ -7927,7 +7983,25 @@ static void gui_cvbs_render_frame_impl(cvbs_decoder_t *decoder,
         src = (Rectangle){0.0f, 0.0f, (float)frame_w, (float)field_h};
     }
     Rectangle dst = {draw_x, draw_y, draw_w, draw_h};
-    DrawTexturePro(decoder->frame_texture, src, dst, (Vector2){0, 0}, 0, WHITE);
+    if (field_view == CVBS_FIELD_VIEW_FRAME) {
+        DrawTexturePro(decoder->frame_texture, src, dst, (Vector2){0, 0}, 0, WHITE);
+    } else {
+        // The same picture window in field rows: top block / bottom block.
+        const float fy = src.y * 0.5f, fh = src.height * 0.5f;
+        const Rectangle top = {src.x, fy, src.width, fh};
+        const Rectangle bottom = {src.x, (float)top_rows + fy, src.width, fh};
+        if (field_view == CVBS_FIELD_VIEW_SPLIT) {
+            DrawTexturePro(decoder->frame_texture, top,
+                           (Rectangle){dst.x, dst.y, dst.width, dst.height * 0.5f}, (Vector2){0, 0}, 0, WHITE);
+            DrawTexturePro(decoder->frame_texture, bottom,
+                           (Rectangle){dst.x, dst.y + dst.height * 0.5f, dst.width, dst.height * 0.5f},
+                           (Vector2){0, 0}, 0, WHITE);
+        } else {
+            // Field: the newest field, stretched to the frame height.
+            const bool top_field = decoder->display_front_field == top_parity;
+            DrawTexturePro(decoder->frame_texture, top_field ? top : bottom, dst, (Vector2){0, 0}, 0, WHITE);
+        }
+    }
 
     // Draw OSD overlay (mode-controlled)
     if (draw_osd) gui_cvbs_render_osd(decoder, draw_x, draw_y, draw_w, draw_h);
@@ -8066,6 +8140,10 @@ static cvbs_receiver_t *cvbs_switch_receiver(cvbs_decoder_t *decoder,
     return retired;
 }
 
+// DdD source query (gui_source_meta.c, registered by the app): gates the
+// 50 Ω control. NULL (tests, tools): no DdD source, control hidden.
+static bool (*s_ddd_query)(gui_app_t *app, int channel);
+
 bool gui_cvbs_set_50ohms(cvbs_decoder_t *decoder, bool enabled) {
     if (!decoder || (enabled && decoder->decoder_mode != CVBS_DECODER_MODE_CVBS)) return false;
     if (enabled == (decoder->receiver != NULL)) return true;
@@ -8093,7 +8171,8 @@ bool gui_cvbs_set_50ohms(cvbs_decoder_t *decoder, bool enabled) {
 //                                  [Sync]
 //                                  [System]
 static void render_cvbs_system_overlay(cvbs_decoder_t *decoder,
-                                        float panel_x, float panel_y, float panel_w) {
+                                        float panel_x, float panel_y, float panel_w,
+                                        bool allow_50ohm) {
     if (!decoder) return;
 
     decoder->overlay.is_visible = true;
@@ -8144,6 +8223,9 @@ static void render_cvbs_system_overlay(cvbs_decoder_t *decoder,
     const char *frame_label = (decoder->frame_view_mode == CVBS_FRAME_VIEW_FULL)
                               ? "Frame: Full"
                               : "Frame: Active";
+    static const char *const field_view_labels[3] = {"View: Frame", "View: Split", "View: Field"};
+    const char *fields_label = field_view_labels[decoder->field_view >= 0 && decoder->field_view <= 2
+                                                 ? decoder->field_view : 0];
     char level_label[40];
     char sync_label[40];
     char colour_label[40];
@@ -8174,6 +8256,9 @@ static void render_cvbs_system_overlay(cvbs_decoder_t *decoder,
     float frame_text_w = (float)gui_text_measure(frame_label, FONT_SIZE_DROPDOWN_OPT);
     float frame_btn_w = frame_text_w + 16.0f;
     if (frame_btn_w < 110.0f) frame_btn_w = 110.0f;
+    float fields_text_w = (float)gui_text_measure(fields_label, FONT_SIZE_DROPDOWN_OPT);
+    float fields_btn_w = fields_text_w + 16.0f;
+    if (fields_btn_w < 110.0f) fields_btn_w = 110.0f;
     float level_text_w = (float)gui_text_measure(level_label, FONT_SIZE_DROPDOWN_OPT);
     float level_btn_w = level_text_w + 16.0f;
     if (level_btn_w < 120.0f) level_btn_w = 120.0f;
@@ -8209,6 +8294,7 @@ static void render_cvbs_system_overlay(cvbs_decoder_t *decoder,
     if (show_tape_controls && tape_mode_btn_w > col_btn_w) col_btn_w = tape_mode_btn_w;
     if (osd_btn_w > col_btn_w) col_btn_w = osd_btn_w;
     if (frame_btn_w > col_btn_w) col_btn_w = frame_btn_w;
+    if (fields_btn_w > col_btn_w) col_btn_w = fields_btn_w;
     if (level_btn_w > col_btn_w) col_btn_w = level_btn_w;
     if (sync_btn_w > col_btn_w) col_btn_w = sync_btn_w;
     if (colour_btn_w > col_btn_w) col_btn_w = colour_btn_w;
@@ -8216,9 +8302,13 @@ static void render_cvbs_system_overlay(cvbs_decoder_t *decoder,
 
     float col_x = x_right - col_btn_w;
 
+    // Column order (harrypm 2026-11-19): Decoder, then the TV System box
+    // right under it, ..., OSD last.
     int row = 0;
     float dec_btn_x = col_x + (col_btn_w - dec_btn_w);
     float dec_btn_y = btn_y0 + row_step * row++;
+    float sys_btn_x = col_x + (col_btn_w - sys_btn_w);
+    float sys_btn_y = btn_y0 + row_step * row++;
 
     float tape_btn_x = col_x + (col_btn_w - tape_btn_w);
     float tape_btn_y = btn_y0 + row_step * row;
@@ -8232,22 +8322,24 @@ static void render_cvbs_system_overlay(cvbs_decoder_t *decoder,
     float tape_mode_btn_y = btn_y0 + row_step * row;
     if (show_tape_controls) row++;
 
-    float osd_btn_x = col_x + (col_btn_w - osd_btn_w);
-    float osd_btn_y = btn_y0 + row_step * row++;
     float frame_btn_x = col_x + (col_btn_w - frame_btn_w);
     float frame_btn_y = btn_y0 + row_step * row++;
+    float fields_btn_x = col_x + (col_btn_w - fields_btn_w);
+    float fields_btn_y = btn_y0 + row_step * row++;
     float level_btn_x = col_x + (col_btn_w - level_btn_w);
     float level_btn_y = btn_y0 + row_step * row++;
     float sync_btn_x = col_x + (col_btn_w - sync_btn_w);
     float sync_btn_y = btn_y0 + row_step * row++;
     float colour_btn_x = col_x + (col_btn_w - colour_btn_w);
     float colour_btn_y = btn_y0 + row_step * row++;
-    if (!show_tape_controls) {
+    // 50 Ω (DdD input correction): only for a DdD device or a DdD file
+    // (harrypm 2026-11-25; gui_source_meta.c), never Test Gen / other inputs.
+    if (!show_tape_controls && allow_50ohm) {
         decoder->overlay.receiver_btn_rect =
             (Rectangle){colour_btn_x, btn_y0 + row_step * row++, colour_btn_w, btn_h};
     }
-    float sys_btn_x = col_x + (col_btn_w - sys_btn_w);
-    float sys_btn_y = btn_y0 + row_step * row;
+    float osd_btn_x = col_x + (col_btn_w - osd_btn_w);
+    float osd_btn_y = btn_y0 + row_step * row++;
 
     // Store hit boxes for click detection
     decoder->overlay.decoder_btn_rect = (Rectangle){dec_btn_x, dec_btn_y, dec_btn_w, btn_h};
@@ -8258,6 +8350,7 @@ static void render_cvbs_system_overlay(cvbs_decoder_t *decoder,
     }
     decoder->overlay.osd_btn_rect     = (Rectangle){osd_btn_x, osd_btn_y, osd_btn_w, btn_h};
     decoder->overlay.frame_btn_rect   = (Rectangle){frame_btn_x, frame_btn_y, frame_btn_w, btn_h};
+    decoder->overlay.fields_btn_rect  = (Rectangle){fields_btn_x, fields_btn_y, fields_btn_w, btn_h};
     decoder->overlay.level_btn_rect   = (Rectangle){level_btn_x, level_btn_y, level_btn_w, btn_h};
     decoder->overlay.sync_btn_rect    = (Rectangle){sync_btn_x, sync_btn_y, sync_btn_w, btn_h};
     decoder->overlay.colour_btn_rect  = (Rectangle){colour_btn_x, colour_btn_y, colour_btn_w, btn_h};
@@ -8343,6 +8436,12 @@ static void render_cvbs_system_overlay(cvbs_decoder_t *decoder,
     float frame_text_x = frame_btn_x + (frame_btn_w - frame_text_w) / 2.0f;
     float frame_text_y = frame_btn_y + (btn_h - FONT_SIZE_DROPDOWN_OPT) / 2.0f;
     gui_text_draw(frame_label, frame_text_x, frame_text_y, FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+
+    // Field view button (Frame / Split / Field)
+    DrawRectangleRounded(decoder->overlay.fields_btn_rect, 0.15f, 4,
+                         decoder->field_view != CVBS_FIELD_VIEW_FRAME ? COLOR_BUTTON_HOVER : COLOR_BUTTON);
+    gui_text_draw(fields_label, fields_btn_x + (fields_btn_w - fields_text_w) / 2.0f,
+                  fields_btn_y + (btn_h - FONT_SIZE_DROPDOWN_OPT) / 2.0f, FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
 
     // Levels mode button (Auto/Fixed)
     Color level_bg = COLOR_BUTTON;
@@ -8650,7 +8749,8 @@ static bool video_panel_init_decoder_common(cvbs_decoder_t *decoder,
     decoder->tape_format = CVBS_TAPE_FORMAT_VHS;
     decoder->tape_mode = CVBS_TAPE_MODE_SP;
     decoder->level_mode = CVBS_LEVEL_MODE_AUTO;
-    decoder->sync_mode = CVBS_SYNC_MODE_FIXED;
+    // CVBS opens in Sync: Auto (harrypm 2026-11-19); Tape Decode keeps Fixed.
+    decoder->sync_mode = mode == CVBS_DECODER_MODE_CVBS ? CVBS_SYNC_MODE_AUTO : CVBS_SYNC_MODE_FIXED;
     decoder->fixed_levels_valid = false;
     cvbs_reset_fixed_sync_lock(decoder);
 
@@ -8834,9 +8934,102 @@ static void video_detach_rf(vhs_fm_decoder_t *decoder);
 
 static void video_panel_activate_plugin(video_panel_state_t *panel, video_plugin_kind_t plugin);
 
+static int s_default_field_view = CVBS_FIELD_VIEW_FRAME;
+
+bool gui_video_apply_field_view_arg(const char *value) {
+    static const char *const names[3] = {"frame", "split", "field"};
+    for (int i = 0; i < 3; i++) {
+        if (value && strcmp(value, names[i]) == 0) {
+            s_default_field_view = i;
+            fprintf(stderr, "[AUTO] --video-fields: %s\n", names[i]);
+            return true;
+        }
+    }
+    fprintf(stderr, "--video-fields: expected frame|split|field (got '%s')\n", value ? value : "");
+    return false;
+}
+
 int gui_video_panel_get_decoder(const void *state) {
     if (!state) return -1;
     return (int)atomic_load(&((const video_panel_state_t *)state)->active_plugin);
+}
+
+static const char *const s_video_sys_names[4] = { "pal", "ntsc", "secam", "mesecam" };
+static const char *const s_video_family_names[GUI_RF_FAMILY_COUNT] = { "vhs", "betamax", "laserdisc" };
+static const char *const s_video_view_names[3] = { "frame", "split", "field" };
+static const char *const s_video_decoder_names[3] = { "cvbs", "tape", "rf" };
+static const char *const s_video_frame_names[2] = { "active", "full" };
+
+void gui_video_panel_describe(const void *state, char *buf, size_t size) {
+    if (!buf || size == 0) return;
+    buf[0] = '\0';
+    if (!state) return;
+    const video_panel_state_t *panel = (const video_panel_state_t *)state;
+    int d = (int)atomic_load(&panel->active_plugin);
+    if (d < 0 || d > 2) d = 0;
+    if (d == VIDEO_PLUGIN_VHS_FM) {
+        const vhs_fm_decoder_t *v = &panel->vhs_fm.decoder;
+        int sys = v->overlay.selected_system, fam = (int)v->overlay.selected_tape, view = v->overlay.field_view;
+        snprintf(buf, size, "rf:%s:%s:%s:%s", s_video_sys_names[sys >= 0 && sys <= 3 ? sys : 0],
+                 s_video_family_names[fam >= 0 && fam < GUI_RF_FAMILY_COUNT ? fam : 0],
+                 s_video_view_names[view >= 0 && view <= 2 ? view : 0],
+                 s_video_frame_names[v->overlay.frame_mode == 1 ? 1 : 0]);
+    } else {
+        const cvbs_decoder_t *c = d == VIDEO_PLUGIN_TAPE_DECODE ? &panel->tape_decode.decoder : &panel->cvbs.decoder;
+        int sys = c->overlay.selected_system, view = c->field_view;
+        snprintf(buf, size, "%s:%s:-:%s:%s", s_video_decoder_names[d], s_video_sys_names[sys >= 0 && sys <= 2 ? sys : 0],
+                 s_video_view_names[view >= 0 && view <= 2 ? view : 0],
+                 s_video_frame_names[c->frame_view_mode == CVBS_FRAME_VIEW_FULL ? 1 : 0]);
+    }
+}
+
+static int video_spec_lookup(const char *tok, size_t len, const char *const *names, int count) {
+    for (int i = 0; i < count; i++)
+        if (strlen(names[i]) == len && strncmp(tok, names[i], len) == 0) return i;
+    return -1;
+}
+
+bool gui_video_panel_restore(void *state, const char *spec, size_t len) {
+    if (!state || !spec) return false;
+    video_panel_state_t *panel = (video_panel_state_t *)state;
+    const char *tok[5] = {0};
+    size_t tl[5] = {0};
+    int n = 0;
+    for (size_t i = 0, b = 0; i <= len && n < 5; i++) {
+        if (i == len || spec[i] == ':') { tok[n] = spec + b; tl[n] = i - b; n++; b = i + 1; }
+    }
+    const int d = n > 0 ? video_spec_lookup(tok[0], tl[0], s_video_decoder_names, 3) : -1;
+    if (d < 0) return false;
+    video_panel_activate_plugin(panel, (video_plugin_kind_t)d);
+    const int sys = n > 1 ? video_spec_lookup(tok[1], tl[1], s_video_sys_names, 4) : -1;
+    const int fam = n > 2 ? video_spec_lookup(tok[2], tl[2], s_video_family_names, GUI_RF_FAMILY_COUNT) : -1;
+    const int view = n > 3 ? video_spec_lookup(tok[3], tl[3], s_video_view_names, 3) : -1;
+    const int frame = n > 4 ? video_spec_lookup(tok[4], tl[4], s_video_frame_names, 2) : -1;
+    if (d == VIDEO_PLUGIN_VHS_FM) {
+        vhs_fm_decoder_t *v = &panel->vhs_fm.decoder;
+        if (fam >= 0) v->overlay.selected_tape = (gui_rf_family_t)fam;
+        if (sys >= 0 || fam >= 0) gui_vhs_fm_set_format(v, sys >= 0 ? sys : v->overlay.selected_system);
+        if (view >= 0) v->overlay.field_view = view;
+        if (frame >= 0) gui_vhs_fm_set_frame_mode(v, frame);
+    } else if (d == VIDEO_PLUGIN_TAPE_DECODE) {
+        cvbs_decoder_t *c = &panel->tape_decode.decoder;
+        if (sys >= 0 && sys <= 2) {
+            c->overlay.selected_system = sys;
+            c->overlay.selected_tape_format = sys;
+            video_tape_apply_runtime_args(&panel->tape_decode, "saved_panels");
+        }
+        if (view >= 0) c->field_view = view;
+        if (frame >= 0) gui_cvbs_set_frame_view_mode(c, frame ? CVBS_FRAME_VIEW_FULL : CVBS_FRAME_VIEW_ACTIVE);
+    } else {
+        cvbs_decoder_t *c = &panel->cvbs.decoder;
+        if (sys >= 0 && sys <= 2) {
+            c->overlay.selected_system = sys;
+            gui_cvbs_set_format(c, sys);
+        }
+        if (view >= 0) c->field_view = view;
+        if (frame >= 0) gui_cvbs_set_frame_view_mode(c, frame ? CVBS_FRAME_VIEW_FULL : CVBS_FRAME_VIEW_ACTIVE);
+    }
+    return true;
 }
 
 void gui_video_panel_set_decoder(void *state, int decoder) {
@@ -8869,6 +9062,9 @@ static unsigned s_rf_references[2][GUI_RF_PROFILE_COUNT];
 static vhs_fm_decoder_t *s_rf_bindings[4];
 static gui_rf_preview_worker_t *s_rf_audio_source;
 static bool s_rf_audio_audible;
+// Hi-Fi on CH3/4 hooks (set once at startup, before capture threads run).
+static gui_video_rf_tap_fn s_rf_tap;
+static gui_rf_preview_worker_t *(*s_rf_monitor_override)(gui_app_t *app);
 static void video_rf_audio(void *context, const float *stereo, size_t frames, uint64_t end_sample) {
     if (!stereo || !frames) {
         gui_audio_reset_hifi(context);
@@ -9069,6 +9265,15 @@ void gui_video_update_rf_routes(gui_app_t *app) {
                     desired[j]->overlay.ld_audio=selected->overlay.ld_audio;
         }
     }
+    // Hi-Fi on CH3/4 (gui_hifi34.c): while CH3/4 is the monitor pair and
+    // Hi-Fi owns it, its worker is the monitor source instead of a panel's.
+    gui_rf_preview_worker_t *hifi34 = s_rf_monitor_override ? s_rf_monitor_override(app) : NULL;
+    if (hifi34) {
+        audio_source = hifi34;
+        burst_audio = false;
+        ld_source = false;
+        audio_paused = false;
+    }
     // A replacement worker or track must not inherit an older tail on the same channel.
     if (file_playback && (!s_rf_audio_source || audio_source != s_rf_audio_source || track_changed))
         gui_playback_set_ld_audio_channel(app, -1);
@@ -9168,7 +9373,22 @@ void gui_video_submit_rf(gui_app_t *app, const int16_t *samples_a, const int16_t
                          bool input_supported) {
     /* The RTL-SDR producer supplies original I/Q independently of channel mapping. */
     if (!app || atomic_load(&app->rf_source_is_rtlsdr)) return;
+    if (s_rf_tap) s_rf_tap(app, samples_a, samples_b, count_a, count_b, info, input_supported);
     video_submit_rf(app, samples_a, samples_b, count_a, count_b, info, input_supported, NULL);
+}
+
+void gui_video_set_rf_tap(gui_video_rf_tap_fn tap,
+                          gui_rf_preview_worker_t *(*monitor_override)(gui_app_t *app)) {
+    s_rf_tap = tap;
+    s_rf_monitor_override = monitor_override;
+}
+
+void gui_video_forget_rf_audio_source(const void *worker) {
+    if (worker && (const void *)s_rf_audio_source == worker) {
+        s_rf_audio_source = NULL;
+        s_rf_audio_audible = false;
+        gui_audio_set_hifi_source(NULL);
+    }
 }
 
 void gui_video_reset_rtlsdr(gui_app_t *app) {
@@ -9213,6 +9433,9 @@ static void *cvbs_vtable_create(void) {
     }
 
     atomic_init(&panel->active_plugin, VIDEO_PLUGIN_CVBS);
+    panel->cvbs.decoder.field_view = s_default_field_view;
+    panel->tape_decode.decoder.field_view = s_default_field_view;
+    panel->vhs_fm.decoder.overlay.field_view = s_default_field_view;
     return panel;
 }
 
@@ -9526,7 +9749,7 @@ static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *ap
     // Text measurements and rectangles use the same logical units.
     // The panel renderer scales both the glyphs and the controls.
     bool audio_only = gui_rf_profile_is_audio_only(gui_vhs_fm_get_profile(decoder));
-    const int rows = audio_only ? 6 : 7;
+    const int rows = audio_only ? 6 : 8;   // picture layouts: + View (Frame / Split / Field)
     const float pad_y = fminf(8.0f, bounds.height / 8.0f);
     const float pane_top = bounds.y + pad_y;
     const float pane_bottom = bounds.y + bounds.height - pad_y;
@@ -9657,6 +9880,25 @@ static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *ap
                       text_y, font_size, COLOR_TEXT);
         control_y += btn_h + row_gap;
     }
+    // Field view (Frame / Split / Field), as the CVBS decoders: its own row
+    // under Frame in the control column (harrypm 2026-11-19). The row budget
+    // above counts it, so short panes still fit (gui_rf_routes_test).
+    decoder->overlay.fields_rect = (Rectangle){0};
+    if (!audio_only) {
+        static const char *const fv_labels[3] = {"View: Frame", "View: Split", "View: Field"};
+        int fv = decoder->overlay.field_view;
+        if (fv < 0 || fv > 2) fv = 0;
+        float fv_w = (float)gui_text_measure(fv_labels[fv], font_size) + 24;
+        if (fv_w < 118.0f) fv_w = 118.0f;
+        const float fv_y = control_y;
+        decoder->overlay.fields_rect = (Rectangle){x_right - fv_w, fv_y, fv_w, btn_h};
+        DrawRectangleRounded(decoder->overlay.fields_rect, 0.15f, 4,
+                             fv ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON_HOVER);
+        float tw = (float)gui_text_measure(fv_labels[fv], font_size);
+        gui_text_draw(fv_labels[fv], decoder->overlay.fields_rect.x + (fv_w - tw) * 0.5f,
+                      fv_y + (btn_h - font_size) * 0.5f, font_size, COLOR_TEXT);
+        control_y += btn_h + row_gap;
+    }
     int budget=vhs_budget_clamp(app->settings.rf_preview_budget_percent);
     char budget_label[40]; snprintf(budget_label,sizeof(budget_label),"Cores : %.2f",budget/100.0);
     float budget_w=(float)gui_text_measure(budget_label,font_size)+16;
@@ -9762,6 +10004,15 @@ static void cvbs_vtable_render(void *state, gui_app_t *app, int channel,
     }
 
     cvbs_decoder_t *decoder = video_panel_active_decoder(panel);
+    // 50 Ω mode only on a DdD source; a mode left on (e.g. the device or
+    // file changed) is switched off, not left running hidden.
+    const bool allow_50ohm = app && s_ddd_query && s_ddd_query(app, channel);
+    if (decoder && !allow_50ohm && decoder->receiver) {
+        while (atomic_flag_test_and_set(&app->panel_config_lock)) thrd_sleep_ms(1);
+        cvbs_receiver_t *retired = cvbs_switch_receiver(decoder, NULL);
+        atomic_flag_clear(&app->panel_config_lock);
+        cvbs_receiver_destroy(retired);
+    }
     if (!decoder) {
         const char *msg = "Video Decoder Not Available";
         int w = MeasureText(msg, 12);
@@ -9779,8 +10030,12 @@ static void cvbs_vtable_render(void *state, gui_app_t *app, int channel,
         // No controls rendered this frame: keep click gating consistent.
         decoder->overlay.is_visible = false;
     } else {
-        render_cvbs_system_overlay(decoder, bounds.x, bounds.y, bounds.width);
+        render_cvbs_system_overlay(decoder, bounds.x, bounds.y, bounds.width, allow_50ohm);
     }
+}
+
+void gui_cvbs_set_ddd_query(bool (*query)(gui_app_t *app, int channel)) {
+    s_ddd_query = query;
 }
 
 //-----------------------------------------------------------------------------
@@ -9908,6 +10163,12 @@ static bool cvbs_vtable_handle_click(void *state, gui_app_t *app, int channel,
             gui_vhs_fm_set_frame_mode(vhs, vhs->overlay.frame_mode == 1 ? 0 : 1);
             return true;
         }
+        if (chrome_visible && CheckCollisionPointRec(mouse_pos, vhs->overlay.fields_rect)) {
+            panel->chrome.last_click_ms = 0;
+            vhs->overlay.field_view = (vhs->overlay.field_view + 1) % 3;
+            vhs->texture_dirty = true;   // re-upload the current frame in the new row order
+            return true;
+        }
 
         // Double-click anywhere else on the panel toggles ALL overlay
         // chrome (buttons + stats) for a clean video preview — and restores
@@ -9931,6 +10192,44 @@ static bool cvbs_vtable_handle_click(void *state, gui_app_t *app, int channel,
     // guards skip all control checks and the click falls through to the
     // shared double-click restore at the bottom.
     bool chrome_visible = decoder->overlay.is_visible && !panel->chrome.controls_hidden;
+    // System dropdown options (0=PAL, 1=NTSC, 2=SECAM - the same value
+    // space as gui_cvbs_set_format and the tape format selector). Checked
+    // FIRST: System is the top control, so its open list lies over the
+    // buttons below it and must own clicks there (harrypm 2026-11-19).
+    if (chrome_visible && decoder->overlay.system_dropdown_open) {
+        int option_count = cvbs_system_option_count(decoder);
+        for (int i = 0; i < option_count; i++) {
+            if (CheckCollisionPointRec(mouse_pos, decoder->overlay.system_options_rect[i])) {
+                panel->chrome.last_click_ms = 0;
+                while (atomic_flag_test_and_set(&app->panel_config_lock)) thrd_sleep_ms(1);
+                decoder->overlay.selected_system = i;
+                if (tape_ui) {
+                    // Keep the tape format selector in sync (identical value
+                    // space); apply_runtime_args re-derives everything.
+                    decoder->overlay.selected_tape_format = i;
+                    video_tape_apply_runtime_args(tape_plugin, "overlay_system_click");
+                } else {
+                    gui_cvbs_set_format(decoder, i);
+                    // Persist the user's pick BOTH ways: the app setting
+                    // (the budget button's pattern - the exit-time save
+                    // writes it, and the next launch's panels start in this
+                    // system) and the live session default (so a panel
+                    // re-created mid-session - e.g. a genuinely fresh view
+                    // state after a cache eviction - also starts in it).
+                    if (app) app->settings.video_system = i;
+                    gui_cvbs_set_default_system(i);
+                }
+                atomic_flag_clear(&app->panel_config_lock);
+                decoder->overlay.system_dropdown_open = false;
+                return true;
+            }
+        }
+        // Click outside the list closes it (the System button's own
+        // toggle below handles a click on the button).
+        if (!CheckCollisionPointRec(mouse_pos, decoder->overlay.system_btn_rect))
+            decoder->overlay.system_dropdown_open = false;
+    }
+
     // Decoder button: cycle between independent plugin decoders.
     if (chrome_visible && CheckCollisionPointRec(mouse_pos, decoder->overlay.decoder_btn_rect)) {
         panel->chrome.last_click_ms = 0;
@@ -10089,6 +10388,16 @@ static bool cvbs_vtable_handle_click(void *state, gui_app_t *app, int channel,
         return true;
     }
 
+    // Field view button: cycle Frame -> Split -> Field
+    if (chrome_visible && CheckCollisionPointRec(mouse_pos, decoder->overlay.fields_btn_rect)) {
+        panel->chrome.last_click_ms = 0;
+        decoder->overlay.system_dropdown_open = false;
+        decoder->overlay.tape_dropdown_open = false;
+        decoder->overlay.tape_format_dropdown_open = false;
+        decoder->field_view = (decoder->field_view + 1) % 3;
+        return true;
+    }
+
     // Levels mode button: toggle Auto <-> Fixed
     if (chrome_visible && CheckCollisionPointRec(mouse_pos, decoder->overlay.level_btn_rect)) {
         panel->chrome.last_click_ms = 0;
@@ -10127,40 +10436,6 @@ static bool cvbs_vtable_handle_click(void *state, gui_app_t *app, int channel,
         decoder->overlay.tape_dropdown_open = false;
         decoder->overlay.tape_format_dropdown_open = false;
         return true;
-    }
-
-    // System dropdown options (0=PAL, 1=NTSC, 2=SECAM - the same value
-    // space as gui_cvbs_set_format and the tape format selector)
-    if (chrome_visible && decoder->overlay.system_dropdown_open) {
-        int option_count = cvbs_system_option_count(decoder);
-        for (int i = 0; i < option_count; i++) {
-            if (CheckCollisionPointRec(mouse_pos, decoder->overlay.system_options_rect[i])) {
-                panel->chrome.last_click_ms = 0;
-                while (atomic_flag_test_and_set(&app->panel_config_lock)) thrd_sleep_ms(1);
-                decoder->overlay.selected_system = i;
-                if (tape_ui) {
-                    // Keep the tape format selector in sync (identical value
-                    // space); apply_runtime_args re-derives everything.
-                    decoder->overlay.selected_tape_format = i;
-                    video_tape_apply_runtime_args(tape_plugin, "overlay_system_click");
-                } else {
-                    gui_cvbs_set_format(decoder, i);
-                    // Persist the user's pick BOTH ways: the app setting
-                    // (the budget button's pattern - the exit-time save
-                    // writes it, and the next launch's panels start in this
-                    // system) and the live session default (so a panel
-                    // re-created mid-session - e.g. a genuinely fresh view
-                    // state after a cache eviction - also starts in it).
-                    if (app) app->settings.video_system = i;
-                    gui_cvbs_set_default_system(i);
-                }
-                atomic_flag_clear(&app->panel_config_lock);
-                decoder->overlay.system_dropdown_open = false;
-                return true;
-            }
-        }
-        // Click outside dropdown closes it
-        decoder->overlay.system_dropdown_open = false;
     }
 
     // Double-click anywhere else on the panel toggles ALL overlay chrome

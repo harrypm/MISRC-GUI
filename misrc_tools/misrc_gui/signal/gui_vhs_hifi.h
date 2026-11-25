@@ -16,7 +16,8 @@ static inline bool gui_vhs_hifi_is_native_low_rate(uint32_t rate) {
 }
 
 /* The TV system and input rate are fixed for the lifetime of the decoder.
- * Supports 20 MSPS and the native low rates above. */
+ * Supports 20 MSPS, 5 MSPS (the front-end rate: the GUI's dedicated Hi-Fi
+ * path, GUI_RF_HIFI_NARROW_RATE_HZ) and the native low rates above. */
 gui_vhs_hifi_decoder_t *gui_vhs_hifi_create(gui_rf_format_t format, uint32_t rf_rate_hz);
 /* Check both carrier bands against the input edge guard and any narrower
  * processing passband, measured as a frequency offset from the I/Q center. */

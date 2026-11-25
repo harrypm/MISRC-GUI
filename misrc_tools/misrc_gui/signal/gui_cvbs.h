@@ -360,6 +360,7 @@ typedef struct cvbs_decoder {
     cvbs_tape_mode_t tape_mode;         // SP/LP/ELP
     cvbs_osd_mode_t osd_mode;           // Off / Minimal / Stats
     cvbs_frame_view_t frame_view_mode;  // Active-only vs full-frame view
+    int field_view;                     // CVBS_FIELD_VIEW_*: Frame / Split / Field
     cvbs_level_mode_t level_mode;       // Auto-adaptive vs fixed video levels
     cvbs_sync_mode_t sync_mode;         // Auto-adaptive vs fixed H/V sync behavior
     bool fixed_levels_valid;            // Fixed mode has latched levels from signal
@@ -388,6 +389,8 @@ typedef struct cvbs_decoder {
     uint8_t *display_back;         // Back buffer - written by display thread
     atomic_int display_ready;      // 1 when back buffer has new frame to swap
     bool hold_frame_for_relock;    // Keep the front buffer through a 50-ohm switch
+    int display_back_field;        // field_buffer index of the field that completed display_back
+    int display_front_field;       // ... and of display_front (Field view picks its rows)
 
     /* Optional borrowed RGB24 frame callback; set only while decode is stopped. */
     void (*monitor_frame_sink)(void *context, const uint8_t *rgb,
@@ -531,6 +534,7 @@ typedef struct cvbs_decoder {
         Rectangle decoder_btn_rect;    // Hit box for decoder mode button
         Rectangle osd_btn_rect;        // Hit box for OSD mode button
         Rectangle frame_btn_rect;      // Hit box for frame mode button
+        Rectangle fields_btn_rect;     // Hit box for the field view button
         Rectangle level_btn_rect;      // Hit box for levels mode button
         Rectangle sync_btn_rect;       // Hit box for sync mode button
         Rectangle receiver_btn_rect;
@@ -583,6 +587,10 @@ void gui_cvbs_reset(cvbs_decoder_t *decoder);
 // Enable the software 50-ohm receiver for NTSC/PAL CVBS. SECAM switches to PAL.
 // Serialize with sample processing and other decoder configuration changes.
 bool gui_cvbs_set_50ohms(cvbs_decoder_t *decoder, bool enabled);
+// The Video panel shows the 50 Ω control only where query(app, channel)
+// says the channel's source is a DdD (device or DdD file); without a query
+// it is hidden (harrypm 2026-11-25). App: gui_source_is_ddd.
+void gui_cvbs_set_ddd_query(bool (*query)(gui_app_t *app, int channel));
 
 //-----------------------------------------------------------------------------
 // Decoding
@@ -697,7 +705,30 @@ bool gui_video_panel_sync_source(const void *state, int *mode, int *lines_per_fr
 // state) and switching it, as the panel's decoder button does. Saved per
 // channel in the settings (video_decoder_a / _b).
 int gui_video_panel_get_decoder(const void *state);
+// ITU field 1's parity (field_buffer index) in this decoder - the Spectro's
+// f1 - and the parity Split draws on top (field 1; gui_cvbs_field_order_test).
+int gui_cvbs_field1_parity(const cvbs_decoder_t *decoder);
+int gui_cvbs_split_top_parity(const cvbs_decoder_t *decoder);
+// Weave row -> parity, and the Split / Field texture row of a frame row.
+int gui_cvbs_row_parity(int row);
+int gui_cvbs_split_row(int row, int frame_rows, int top_parity, int *top_rows);
+// Field view of the Video panel decoders (harrypm 2026-11-19, like
+// tbc-analyse): Frame = the woven frame; Split = the two fields stacked
+// (the frame-top field above the other, each at field height); Field = the
+// newest field alone, stretched (line-doubled) to the frame height.
+#define CVBS_FIELD_VIEW_FRAME 0
+#define CVBS_FIELD_VIEW_SPLIT 1
+#define CVBS_FIELD_VIEW_FIELD 2
+// --video-fields frame|split|field: launch state of new Video panels.
+bool gui_video_apply_field_view_arg(const char *value);
 void gui_video_panel_set_decoder(void *state, int decoder);
+// A Video slot's saved setup as "<cvbs|tape|rf>:<pal|ntsc|secam|mesecam>:
+// <vhs|betamax|laserdisc|->:<frame|split|field>:<active|full>" (the active
+// decoder's system, RF format family, field view and Frame mode), and
+// restoring one (missing or unknown parts keep the panel's defaults; older
+// shorter specs and a bare "rf" still load).
+void gui_video_panel_describe(const void *state, char *buf, size_t size);
+bool gui_video_panel_restore(void *state, const char *spec, size_t len);
 // Same hook for any other panel view driven by its own composite feed (the
 // waveform monitor).
 void gui_cvbs_set_feed_follow(panel_view_type_t view,
@@ -713,4 +744,15 @@ void gui_video_submit_rtlsdr(gui_app_t *app, const uint8_t *iq, size_t count,
 void gui_video_submit_rf(gui_app_t *app, const int16_t *samples_a, const int16_t *samples_b,
                           size_t count_a, size_t count_b, const gui_rf_block_info_t info[2],
                           bool input_supported);
+// Hi-Fi on CH3/4 (processing/gui_hifi34.c). The tap sees every RF block
+// gui_video_submit_rf gets (extraction thread, must not wait); the monitor
+// override (main thread, per frame) names the worker that replaces the
+// panels' RF audio source, or NULL. Set once at startup.
+typedef void (*gui_video_rf_tap_fn)(gui_app_t *app, const int16_t *samples_a,
+                                    const int16_t *samples_b, size_t count_a, size_t count_b,
+                                    const gui_rf_block_info_t info[2], bool input_supported);
+void gui_video_set_rf_tap(gui_video_rf_tap_fn tap,
+                          gui_rf_preview_worker_t *(*monitor_override)(gui_app_t *app));
+// Before destroying a worker that may be the monitor source (main thread).
+void gui_video_forget_rf_audio_source(const void *worker);
 #endif // GUI_CVBS_H

@@ -43,6 +43,10 @@ void gui_waveform_apply_generator_defaults(gui_app_t *app);
 // feed-driven panels (Vector, WFM) follow the generator's system while it
 // holds.
 bool gui_waveform_test_mode_active(gui_app_t *app);
+// --wave <key=value,...>: launch state of new Waveform panels: zoom=<1..128>
+// (samples per pixel), lock=line|hs (the paused player-mode Lock button:
+// the playhead's line start, or the current field's FM head switch).
+bool gui_waveform_apply_launch_arg(const char *arg);
 
 //-----------------------------------------------------------------------------
 // Cleanup

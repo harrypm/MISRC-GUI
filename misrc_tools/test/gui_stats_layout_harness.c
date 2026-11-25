@@ -58,9 +58,14 @@ const char *panel_view_type_name(panel_view_type_t type)
 {
     static const char *names[] = {
         "Waveform", "FFT", "Video", "Histogram", "Waterfall", "Spectro", "Demod",
-        "Vector", "WFM"
+        "Vector", "WFM", "HiFi"
     };
     return type >= 0 && type < PANEL_VIEW_COUNT ? names[type] : "Unknown";
+}
+
+panel_view_type_t panel_view_menu_order(int index)
+{
+    return index >= 0 && index < PANEL_VIEW_COUNT ? (panel_view_type_t)index : PANEL_VIEW_WAVEFORM;
 }
 
 bool panel_view_type_available(panel_view_type_t type)

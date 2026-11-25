@@ -327,7 +327,59 @@ static void run(int system_select) {
     }
 }
 
+// Field / frame lock and the latest-wins hand-off (harrypm 2026-11-19: fix
+// pause and field/frame lock of the WFM). One stand-in "field" = one line
+// marked with an id in cell 0.
+static void lock_field(gui_wfm_t *w, int parity, uint16_t id, bool single) {
+    if (!w->acc_started) {
+        w->acc_meta.lines = 0;
+        w->acc_started = true;
+    }
+    w->acc_meta.lines++;
+    w->acc[0] = (uint16_t)(w->acc[0] * 16u + id);
+    gui_wfm_end_field_locked(w, parity, 0, single);
+}
+
+static void check_lock_contract(void) {
+    gui_wfm_t w;
+    assert(gui_wfm_init(&w));
+    uint16_t *grid = malloc(CELLS * sizeof(uint16_t));
+    gui_wfm_meta_t meta;
+    assert(grid);
+    int bad = 0;
+    // Starts on field 2 (parity 1): no frame.
+    lock_field(&w, 1, 1, false);
+    if (atomic_load(&w.frames) != 0 || gui_wfm_take(&w, grid, &meta)) bad++;
+    // Field 1 + field 2: one frame holding both (ids 2 then 3).
+    lock_field(&w, 0, 2, false);
+    lock_field(&w, 1, 3, false);
+    if (!gui_wfm_take(&w, grid, &meta) || meta.lines != 2 || grid[0] != 2 * 16 + 3) bad++;
+    // Two field 1s in a row: the frame restarts on the second.
+    lock_field(&w, 0, 4, false);
+    lock_field(&w, 0, 5, false);
+    lock_field(&w, 0, 6, false);
+    lock_field(&w, 1, 7, false);
+    if (!gui_wfm_take(&w, grid, &meta) || grid[0] != 6 * 16 + 7) bad++;
+    // Latest wins: two frames before the renderer takes -> it gets the
+    // second (a paused playhead's frame is never the one dropped).
+    lock_field(&w, 0, 8, false);
+    lock_field(&w, 1, 9, false);
+    lock_field(&w, 0, 10, false);
+    lock_field(&w, 1, 11, false);
+    if (!gui_wfm_take(&w, grid, &meta) || grid[0] != 10 * 16 + 11) bad++;
+    if (gui_wfm_take(&w, grid, &meta)) bad++;   // nothing newer waits
+    // Field view: every field alone.
+    lock_field(&w, 1, 12, true);
+    if (!gui_wfm_take(&w, grid, &meta) || meta.lines != 1 || grid[0] != 12) bad++;
+    printf("WFM lock: field 2 start dropped, f1+f2 frames, restart on f1, latest wins, single field: %s\n",
+           bad ? "FAIL" : "ok");
+    if (bad) failures++;
+    gui_wfm_free(&w);
+    free(grid);
+}
+
 int main(void) {
+    check_lock_contract();
     run(0);
     run(1);
     run(2);

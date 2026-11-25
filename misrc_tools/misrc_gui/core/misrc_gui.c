@@ -38,9 +38,13 @@
 #include "../visualization/gui_text.h"
 #include "../visualization/gui_wfm_panel.h"
 #include "../visualization/gui_vectorscope_panel.h"
+#include "../visualization/gui_hifi_panel.h"
+#include "../processing/gui_hifi34.h"
+#include "../input/gui_source_meta.h"
 #include "../visualization/gui_spectrogram.h"
 #include "../signal/gui_cvbs.h"   // gui_video_panel_sync_source (field step)
 #include "../input/gui_cut_markers.h"   // --markers preset
+#include "../visualization/gui_oscilloscope.h"   // --wave
 #include "../input/gui_capture.h"
 #include "../processing/gui_extract.h"
 #include "../signal/gui_cvbs.h"
@@ -146,13 +150,17 @@ static void print_usage(const char *program_name) {
             "           betamax|video8|hi8 (or 0-4). Mirrors the Fmt button on\n"
             "           FM RF waveform panels (the RF modulation family).\n"
             "--panel-view <a|b>:<left>[,<right>] set a channel's panel view(s) at\n"
-            "           launch: waveform|fft|video|histogram|spectro|demod|vector|wfm\n"
+            "           launch: waveform|fft|video|histogram|spectro|demod|vector|wfm|hifi\n"
             "           (waterfall = spectro with Dir Vertical). One view = single\n"
             "           panel, two = split. Repeatable for both channels.\n"
             "--wfm <key=value,...> launch state of WFM (waveform monitor) panels:\n"
             "           channel=y|yc|c, range=active|frame, units=ire|mv,\n"
             "           phosphor=on|off, intensity=0.1..10, system=auto|pal|ntsc|\n"
             "           secam (any subset; defaults y, active, ire, off, 3.0, auto).\n"
+            "--hifi <key=value,...> Hi-Fi audio decode on CH3/4 + HiFi panels:\n"
+            "           src=auto|a|b (RF channel; auto = carrier probe),\n"
+            "           fmt=auto|pal|ntsc|beta (auto = VHS PAL / NTSC carrier pair),\n"
+            "           span=10|20|50|100|250|500|1000|2000 (HiFi panel ms).\n"
             "--vector <key=value,...> launch state of Vector (vectorscope) panels:\n"
             "           mode=standard|advanced, lines=active|whole|burst|porch\n"
             "           (porch: SECAM's burst window), field=active|whole,\n"
@@ -168,6 +176,13 @@ static void print_usage(const char *program_name) {
             "           2frames|3frames|5frames|10frames|25frames|1s|3s|10s|30s|60s\n"
             "           (the paused window; any subset; defaults horizontal,\n"
             "           heat, 1frame).\n"
+            "--video-fields frame|split|field  launch field view of Video panels\n"
+            "           (Frame = woven frame, Split = the two fields stacked,\n"
+            "           Field = the newest field stretched; the View button).\n"
+            "--wave <key=value,...>  launch state of Waveform panels: zoom=<1..128>\n"
+            "           (samples per pixel), lock=line|hs (paused player-mode Lock).\n"
+            "--auto-pause <seconds>  pause playback once, that long after it starts\n"
+            "           (the transport Pause; for paused-view automation).\n"
             "--markers <a|b>:in=<samples>,out=<samples>,menu=open|closed\n"
             "           cut markers (FLAC-Chop IN / OUT) for the first file that\n"
             "           channel plays, in real RF samples, and / or open its\n"
@@ -740,6 +755,7 @@ static int gui_parse_gen_format(const char *text)
 static Clay_RenderCommandArray app_build_render_commands(gui_app_t *app)
 {
     Clay_BeginLayout();
+    gui_hifi34_update(app);   // before the routes: it may own the CH3/4 monitor source
     gui_video_update_rf_routes(app);
     gui_render_layout(app);
     return Clay_EndLayout();
@@ -1044,7 +1060,7 @@ static bool gui_apply_panel_view_arg(gui_app_t *app, const char *arg) {
 
 static bool gui_apply_panel_view_spec(gui_app_t *app, const char *arg, const char *source) {
     const char *usage = "--panel-view: expected <a|b>:<left>[,<right>] with views "
-                        "waveform|fft|video|histogram|spectro|demod|vector|wfm "
+                        "waveform|fft|video|histogram|spectro|demod|vector|wfm|hifi "
                         "(waterfall = spectro, Dir Vertical)";
     char ch = arg ? (char)tolower((unsigned char)arg[0]) : 0;
     if ((ch != 'a' && ch != 'b') || arg[1] != ':') {
@@ -1075,7 +1091,6 @@ static bool gui_apply_panel_view_spec(gui_app_t *app, const char *arg, const cha
 
 // Saved panel setup (settings panel_view_* / video_decoder_*; harrypm
 // 2026-11-19: keep the per-channel monitoring config across launches).
-static const char *const s_video_decoder_keys[3] = { "cvbs", "tape", "rf" };
 
 static void gui_panel_settings_capture(gui_app_t *app) {
     for (int ch = 0; ch < 2; ch++) {
@@ -1086,28 +1101,26 @@ static void gui_panel_settings_capture(gui_app_t *app) {
         while (atomic_flag_test_and_set(&app->panel_config_lock)) {}
         const panel_view_type_t lv = cfg->left_view, rv = cfg->right_view;
         const bool split = cfg->split;
-        const int ld = lv == PANEL_VIEW_CVBS ? gui_video_panel_get_decoder(cfg->left_state) : -1;
-        const int rd = split && rv == PANEL_VIEW_CVBS ? gui_video_panel_get_decoder(cfg->right_state) : -1;
+        char l[48] = "-", r[48] = "-";
+        if (lv == PANEL_VIEW_CVBS && cfg->left_state) gui_video_panel_describe(cfg->left_state, l, sizeof(l));
+        if (split && rv == PANEL_VIEW_CVBS && cfg->right_state)
+            gui_video_panel_describe(cfg->right_state, r, sizeof(r));
+        if (!l[0]) snprintf(l, sizeof(l), "-");
+        if (!r[0]) snprintf(r, sizeof(r), "-");
         atomic_flag_clear(&app->panel_config_lock);
         if (split) {
             snprintf(views, vsz, "%s,%s", panel_view_type_name(lv), panel_view_type_name(rv));
         } else {
             snprintf(views, vsz, "%s", panel_view_type_name(lv));
         }
-        const char *l = ld >= 0 && ld <= 2 ? s_video_decoder_keys[ld] : "-";
-        const char *r = rd >= 0 && rd <= 2 ? s_video_decoder_keys[rd] : "-";
         if (split) snprintf(decs, dsz, "%s,%s", l, r);
         else snprintf(decs, dsz, "%s", l);
     }
 }
 
 static void gui_panel_settings_apply_decoder(void *state, const char *key, size_t len) {
-    for (int d = 0; d < 3; d++) {
-        if (strlen(s_video_decoder_keys[d]) == len && strncmp(key, s_video_decoder_keys[d], len) == 0) {
-            gui_video_panel_set_decoder(state, d);
-            return;
-        }
-    }
+    if (len == 0 || (len == 1 && key[0] == '-')) return;
+    (void)gui_video_panel_restore(state, key, len);
 }
 
 static void gui_panel_settings_apply(gui_app_t *app) {
@@ -1141,11 +1154,14 @@ int main(int argc, char **argv) {
     bool has_capture_arg = false;
     const char *config_path = NULL;  /* --config <path> override */
     const char *select_device_arg = NULL;  /* --select-device <index-or-name> */
+    int hifi_src_arg = -1, hifi_fmt_arg = -1;   /* --hifi src= / fmt= (applied after settings load) */
     const char *gen_system_arg = NULL;    /* --gen-system <pal|ntsc|secam|mesecam|0-3> */
     const char *gen_format_arg = NULL;    /* --gen-format <vhs|svhs|betamax|video8|hi8|0-4> */
     const char *panel_view_args[2] = {0}; /* --panel-view <a|b>:<left>[,<right>] */
     int panel_view_arg_count = 0;
     bool auto_capture = false;             /* --auto-capture */
+    double auto_pause_s = -1.0;            /* --auto-pause <seconds> */
+    double auto_step_at = -1.0;            /* MISRC_DEBUG_AUTOSTEP schedule */
     bool auto_record_given = false;        /* --auto-record <seconds> seen */
     int auto_record_seconds = 0;           /* --auto-record seconds */
     gui_update_cli_mode_t update_cli_mode = GUI_UPDATE_CLI_NONE; /* headless update CLI */
@@ -1251,6 +1267,17 @@ int main(int argc, char **argv) {
             if (!gui_wfm_panel_apply_launch_arg(argv[++i])) return 1;
             continue;
         }
+        if (strcmp(a, "--hifi") == 0) {
+            // --hifi <key=value,...>: Hi-Fi on CH3/4 source / format
+            // (settings, applied after the settings load) and the HiFi
+            // panel span (hard rule dev/gui_automation_flags_rules.md).
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--hifi requires <key=value,...>\n");
+                return 1;
+            }
+            if (!gui_hifi_panel_apply_launch_arg(argv[++i], &hifi_src_arg, &hifi_fmt_arg)) return 1;
+            continue;
+        }
         if (strcmp(a, "--vector") == 0) {
             // --vector <key=value,...>: launch state of new vectorscope
             // panels (hard rule dev/gui_automation_flags_rules.md).
@@ -1261,6 +1288,22 @@ int main(int argc, char **argv) {
                 return 1;
             }
             if (!gui_vectorscope_panel_apply_launch_arg(argv[++i])) return 1;
+            continue;
+        }
+        if (strcmp(a, "--video-fields") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--video-fields requires frame|split|field\n");
+                return 1;
+            }
+            if (!gui_video_apply_field_view_arg(argv[++i])) return 1;
+            continue;
+        }
+        if (strcmp(a, "--wave") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--wave requires key=value[,...]\n");
+                return 1;
+            }
+            if (!gui_waveform_apply_launch_arg(argv[++i])) return 1;
             continue;
         }
         if (strcmp(a, "--markers") == 0) {
@@ -1284,6 +1327,20 @@ int main(int argc, char **argv) {
         }
         if (strcmp(a, "--auto-capture") == 0) {
             auto_capture = true;
+            continue;
+        }
+        if (strcmp(a, "--auto-pause") == 0) {
+            // --auto-pause <seconds>: pause playback once, that long after it
+            // starts (the Pause control's launch state; automated paused-view
+            // checks - dev/gui_automation_flags_rules.md).
+            char *end = NULL;
+            if (i + 1 >= argc || (auto_pause_s = strtod(argv[i + 1], &end), !end || *end) ||
+                !(auto_pause_s >= 0.0) || auto_pause_s > 3600.0) {
+                fprintf(stderr, "--auto-pause requires <seconds> (0..3600)\n");
+                return 1;
+            }
+            i++;
+            fprintf(stderr, "[AUTO] --auto-pause: %.2f s after playback starts\n", auto_pause_s);
             continue;
         }
         if (strcmp(a, "--auto-record") == 0) {
@@ -1475,6 +1532,12 @@ int main(int argc, char **argv) {
     // in the user's last-selected system instead of hardcoded PAL
     // (MESECAM: composite decoders start in SECAM, RF preview in MESECAM).
     gui_cvbs_set_default_system(app.settings.video_system);
+    if (hifi_src_arg >= 0) app.settings.hifi34_source = hifi_src_arg;
+    if (hifi_fmt_arg >= 0) app.settings.hifi34_format = hifi_fmt_arg;
+    // 50 ohm CVBS mode only on a DdD source (device or DdD file), and the
+    // Hi-Fi on CH3/4 decoder's RF tap / monitor hooks.
+    gui_cvbs_set_ddd_query(gui_source_is_ddd);
+    gui_hifi34_init(&app);
 
     // Capture limit should not persist across relaunches.
     app.settings.capture_limit_seconds = 0;
@@ -2011,6 +2074,34 @@ int main(int argc, char **argv) {
             }
 
             gui_field_step_keys(&app);
+            // Diagnostics only (no GUI control): MISRC_DEBUG_AUTOSTEP=<n> steps
+            // forward one field per second n times after --auto-pause, as the
+            // Right arrow does - for paused-view jump traces without input.
+            {
+                static int steps_left = -1;
+                if (steps_left < 0) {
+                    const char *ev = getenv("MISRC_DEBUG_AUTOSTEP");
+                    steps_left = ev ? atoi(ev) : 0;
+                }
+                if (steps_left > 0 && auto_step_at > 0.0 && GetTime() >= auto_step_at) {
+                    gui_field_step(&app, 1);
+                    fprintf(stderr, "[TRACE] autostep: field +1 (%d left)\n", steps_left - 1);
+                    steps_left--;
+                    auto_step_at = GetTime() + 1.0;
+                }
+            }
+            if (auto_pause_s >= 0.0) {
+                static double playing_since = -1.0;
+                if (gui_playback_is_running(&app) && gui_playback_get_state(&app) == PLAYBACK_STATE_PLAYING) {
+                    if (playing_since < 0.0) playing_since = GetTime();
+                    if (GetTime() - playing_since >= auto_pause_s) {
+                        gui_playback_pause(&app);
+                        fprintf(stderr, "[AUTO] --auto-pause: playback paused\n");
+                        auto_pause_s = -1.0;
+                        auto_step_at = GetTime() + 2.0;   // MISRC_DEBUG_AUTOSTEP (diagnostics)
+                    }
+                }
+            }
             gui_cut_marker_keys(&app);
 
             if (IsKeyPressed(KEY_SPACE) && !app.settings_panel_open) {
@@ -2376,6 +2467,63 @@ int main(int argc, char **argv) {
         // Monitor & Remote Opus audio is a separate client-owned output.
         // Release it before the legacy Local/Client audio pump starts.
         gui_monitor_audio_client_update(&app);
+        // Diagnostics only (no GUI control): MISRC_DEBUG_RECONNECT=<n> runs the
+        // Connect button's Disconnect / Connect n times (stop, 1.5 s, start,
+        // 4 s) from 8 s after launch, for traces of capture restarts.
+        {
+            static int reconnects_left = -1;
+            static double reconnect_at = 0.0;
+            if (reconnects_left < 0) {
+                const char *ev = getenv("MISRC_DEBUG_RECONNECT");
+                reconnects_left = ev ? atoi(ev) : 0;
+                reconnect_at = GetTime() + 8.0;
+            }
+            if (reconnects_left > 0 && GetTime() >= reconnect_at) {
+                if (app.is_capturing) {
+                    fprintf(stderr, "[TRACE] reconnect: Disconnect\n");
+                    gui_app_stop_capture(&app);
+                    const char *gap = getenv("MISRC_DEBUG_RECONNECT_GAP");   // seconds, default 1.5
+                    reconnect_at = GetTime() + (gap ? atof(gap) : 1.5);
+                } else {
+                    fprintf(stderr, "[TRACE] reconnect: Connect (%d left)\n", reconnects_left - 1);
+                    (void)gui_app_start_capture(&app);
+                    reconnects_left--;
+                    reconnect_at = GetTime() + 4.0;
+                }
+            }
+        }
+        // Diagnostics only: MISRC_DEBUG_DEVSWAP=<n> switches the device n times
+        // between the selected one and Simulated every 4 s, exactly as the
+        // device dropdown does (stop + start in the same frame).
+        {
+            static int swaps_left = -1;
+            static double swap_at = 0.0;
+            static int home_device = -1;
+            if (swaps_left < 0) {
+                const char *ev = getenv("MISRC_DEBUG_DEVSWAP");
+                swaps_left = ev ? atoi(ev) : 0;
+                swap_at = GetTime() + 10.0;
+            }
+            if (swaps_left > 0 && app.is_capturing && GetTime() >= swap_at) {
+                int sim = -1;
+                for (int d = 0; d < app.device_count; d++)
+                    if (app.devices[d].type == DEVICE_TYPE_SIMULATED) sim = d;
+                if (home_device < 0) home_device = app.selected_device;
+                const int next = app.selected_device == sim ? home_device : sim;
+                if (sim >= 0 && next >= 0) {
+                    fprintf(stderr, "[TRACE] devswap: %s -> %s (%d left)\n",
+                            app.devices[app.selected_device].name, app.devices[next].name, swaps_left - 1);
+                    gui_app_stop_capture(&app);
+                    app.selected_device = next;
+                    gui_ui_sync_capture_mode_state(&app);
+                    app.reconnect_pending = false;
+                    app.reconnect_attempts = 0;
+                    (void)gui_app_start_capture(&app);
+                }
+                swaps_left--;
+                swap_at = GetTime() + 4.0;
+            }
+        }
         // Pump audio playback monitoring (system output)
         gui_audio_update_playback(&app);
 
@@ -2450,6 +2598,7 @@ int main(int argc, char **argv) {
     gui_settings_save(&app.settings);
     // Raylib output must be destroyed on the GUI thread before net cleanup.
     gui_monitor_audio_client_update(NULL);
+    gui_hifi34_shutdown();
     
     gui_app_cleanup(&app);
     free(clay_memory);

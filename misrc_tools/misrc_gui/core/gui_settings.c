@@ -570,6 +570,8 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     // Audio monitoring defaults
     settings->audio_monitor_playback = false;
     settings->audio_monitor_ch34 = false;  // Default to CH1/2
+    settings->hifi34_source = 0;           // Hi-Fi on CH3/4: Auto channel
+    settings->hifi34_format = 0;           // Auto VHS NTSC / PAL (carrier pair)
     settings->misrc_mode = true;           // Default to MISRC mode (A/B swapped)
     settings->misrc_v15_v25_ab_swap = false;
     settings->stop_on_dropout = false;
@@ -723,6 +725,8 @@ void gui_settings_save(const gui_settings_t *settings) {
     fprintf(f, "  \"enable_audio_2ch_34\": %s,\n", settings->enable_audio_2ch_34 ? "true" : "false");
     fprintf(f, "  \"audio_monitor_playback\": %s,\n", settings->audio_monitor_playback ? "true" : "false");
     fprintf(f, "  \"audio_monitor_ch34\": %s,\n", settings->audio_monitor_ch34 ? "true" : "false");
+    fprintf(f, "  \"hifi34_source\": %d,\n", settings->hifi34_source);
+    fprintf(f, "  \"hifi34_format\": %d,\n", settings->hifi34_format);
     fprintf(f, "  \"misrc_mode\": %s,\n", settings->misrc_mode ? "true" : "false");
     fprintf(f, "  \"misrc_v15_v25_ab_swap\": %s,\n", settings->misrc_v15_v25_ab_swap ? "true" : "false");
     fprintf(f, "  \"stop_on_dropout\": %s,\n", settings->stop_on_dropout ? "true" : "false");
@@ -1451,6 +1455,14 @@ void gui_settings_load(gui_settings_t *settings) {
     }
     if ((value = find_value(content, "audio_monitor_ch34")) != NULL) {
         settings->audio_monitor_ch34 = (strcmp(value, "true") == 0);
+    }
+    if ((value = find_value(content, "hifi34_source")) != NULL) {
+        int v = atoi(value);
+        if (v >= 0 && v <= 2) settings->hifi34_source = v;
+    }
+    if ((value = find_value(content, "hifi34_format")) != NULL) {
+        int v = atoi(value);
+        if (v >= 0 && v <= 3) settings->hifi34_format = v;
     }
     if ((value = find_value(content, "misrc_mode")) != NULL) {
         settings->misrc_mode = (strcmp(value, "true") == 0);

@@ -21,6 +21,7 @@
 #include "gui_text.h"
 #include "gui_oscilloscope.h"   // gui_waveform_test_mode_active
 #include "../signal/gui_testgen.h"  // gui_testgen_clamp_system
+#include "../input/gui_playback.h"   // paused hold / step-back display hold
 #include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -88,6 +89,8 @@ typedef struct {
 
     Rectangle btn[WF_BTN_COUNT];
     gui_chrome_hide_t chrome_hide;
+    bool pause_refreshed;          // Paused with no frame: re-cue requested once
+    bool refeed;                   // A decode setting changed: re-cue while paused
 } wfm_panel_t;
 
 //-----------------------------------------------------------------------------
@@ -517,7 +520,6 @@ static float wf_layout_buttons(wfm_panel_t *s, Rectangle bounds, float title_w) 
 
 static void wf_render(void *state_ptr, gui_app_t *app, int channel,
                       Rectangle bounds, Color channel_color) {
-    (void)channel;
     wfm_panel_t *s = state_ptr;
     if (!s) {
         DrawRectangleRec(bounds, COLOR_METER_BG);
@@ -526,11 +528,35 @@ static void wf_render(void *state_ptr, gui_app_t *app, int channel,
     wf_follow_generator(s, app);
     DrawRectangleRec(bounds, wf_back(s));
 
+    // Paused playback (harrypm 2026-11-19 "fix pause ... of the WFM"): the
+    // feed stops on purpose, so the last frame - the one at the playhead -
+    // stays instead of blanking as a lost feed. A step-back lead-in is
+    // decoded but not shown (as the Video panel): no take until it lands.
+    const bool pb = app && gui_playback_is_running(app);
+    const bool paused = pb && (gui_playback_get_state(app) != PLAYBACK_STATE_PLAYING ||
+                               gui_playback_is_channel_paused(app, channel));
+    const bool step_hold = pb && gui_playback_display_hold_channel(app, channel);
     double now = GetTime();
-    if (gui_wfm_take(&s->wfm, s->grid, &s->meta)) {
+    if (!step_hold && gui_wfm_take(&s->wfm, s->grid, &s->meta)) {
         s->have_data = s->meta.cols > 0;
         s->last_frame_time = now;
         s->image_dirty = true;
+    } else if (paused || step_hold) {
+        s->last_frame_time = now;   // hold the shown frame
+    }
+    // Enabled (or emptied) while paused: this panel's own decoder has had no
+    // feed - re-cue the channel once so the lead-in brings the paused frame.
+    // A decode setting picked while paused (System / ...) only applies when
+    // the panel's decoder sees samples: re-cue once so the lead-in replays
+    // through it (harrypm 2026-11-19: "can't cycle TV System on vectorscope
+    // in player mode").
+    if (!paused) {
+        s->pause_refreshed = false;
+        s->refeed = false;
+    } else if (!step_hold && (s->refeed || (!s->have_data && !s->pause_refreshed))) {
+        gui_playback_refresh_channel(app, channel);
+        s->pause_refreshed = true;
+        s->refeed = false;
     } else if (s->have_data && now - s->last_frame_time > 0.5) {
         s->have_data = false;      // feed stopped / lock lost: blank the trace
         s->image_dirty = true;
@@ -760,6 +786,7 @@ static bool wf_handle_click(void *state_ptr, gui_app_t *app, int channel,
             if (s->btn[b].width <= 0.0f || !CheckCollisionPointRec(click, s->btn[b])) continue;
             switch (b) {
                 case WF_BTN_SYSTEM:
+                    s->refeed = true;
                     // Auto -> PAL -> NTSC -> SECAM -> Auto (the Vector panel's cycle).
                     if (atomic_load(&s->auto_system)) {
                         atomic_store(&s->auto_system, false);
@@ -775,10 +802,12 @@ static bool wf_handle_click(void *state_ptr, gui_app_t *app, int channel,
                     s->channel = s->channel == GUI_WFM_CH_Y ? GUI_WFM_CH_YC
                                : s->channel == GUI_WFM_CH_YC ? GUI_WFM_CH_C : GUI_WFM_CH_Y;
                     atomic_store(&s->wfm.want_channel, s->channel);
+                    s->refeed = true;
                     break;
                 case WF_BTN_RANGE:
                     s->range = s->range == GUI_WFM_RANGE_FRAME ? GUI_WFM_RANGE_ACTIVE : GUI_WFM_RANGE_FRAME;
                     atomic_store(&s->wfm.want_range, s->range);
+                    s->refeed = true;
                     break;
                 case WF_BTN_UNITS: s->mv = !s->mv; break;
                 case WF_BTN_PHOSPHOR: s->phosphor = !s->phosphor; break;

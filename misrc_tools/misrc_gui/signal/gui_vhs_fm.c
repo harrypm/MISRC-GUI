@@ -34,6 +34,7 @@ bool gui_vhs_fm_bind_worker(vhs_fm_decoder_t *decoder, gui_rf_preview_worker_t *
         if (decoder->texture_valid) UnloadTexture(decoder->texture);
         decoder->texture_valid = false;
         free(decoder->rgba); decoder->rgba = NULL;
+        free(decoder->rgba_view); decoder->rgba_view = NULL;
     }
     decoder->worker = worker;
     // Re-apply the stored frame display mode to each newly bound worker
@@ -56,6 +57,8 @@ void gui_vhs_fm_cleanup(vhs_fm_decoder_t *decoder) {
     // Pool teardown releases the borrowed worker before this UI-only cleanup.
     if (decoder->texture_valid) UnloadTexture(decoder->texture);
     free(decoder->rgba);
+    free(decoder->rgba_view);
+    decoder->rgba_view = NULL;
     decoder->worker = NULL;
     decoder->rgba = NULL;
     decoder->texture_valid = false;
@@ -279,17 +282,36 @@ void gui_vhs_fm_render_frame(vhs_fm_decoder_t *decoder, float x, float y,
                                                         : (Color){255,220,120,255});
         return;
     }
+    const int field_view = decoder->overlay.field_view;
+    // Field 1 (the Spectro's f1) on top in Split (gui_rf_field_order_test).
+    const int top_parity = gui_rf_field1_parity(gui_vhs_fm_get_profile(decoder));
+    int top_rows = 0;
+    (void)gui_rf_split_row(0, decoder->height, top_parity, &top_rows);
     if (decoder->texture_dirty && decoder->width > 0 && decoder->height > 0) {
+        // Split / Field: upload the rows in field order (field 1's rows as
+        // the top block, field 2's below), like the CVBS path.
+        uint8_t *pixels = decoder->rgba;
+        if (field_view != 0 && decoder->rgba) {
+            if (!decoder->rgba_view) decoder->rgba_view = malloc(RF_RGBA_BYTES);
+            if (decoder->rgba_view) {
+                const size_t row = (size_t)decoder->width * 4u;
+                for (int r = 0; r < decoder->height; r++) {
+                    const int dr = gui_rf_split_row(r, decoder->height, top_parity, NULL);
+                    memcpy(decoder->rgba_view + (size_t)dr * row, decoder->rgba + (size_t)r * row, row);
+                }
+                pixels = decoder->rgba_view;
+            }
+        }
         if (!decoder->texture_valid || decoder->texture.width != decoder->width ||
             decoder->texture.height != decoder->height) {
             if (decoder->texture_valid) UnloadTexture(decoder->texture);
-            Image image = {.data = decoder->rgba, .width = decoder->width, .height = decoder->height,
+            Image image = {.data = pixels, .width = decoder->width, .height = decoder->height,
                            .mipmaps = 1, .format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
             decoder->texture = LoadTextureFromImage(image);
             decoder->texture_valid = decoder->texture.id != 0;
             if (decoder->texture_valid) SetTextureFilter(decoder->texture, TEXTURE_FILTER_BILINEAR);
         } else {
-            UpdateTexture(decoder->texture, decoder->rgba);
+            UpdateTexture(decoder->texture, pixels);
         }
         decoder->texture_dirty = false;
         decoder->ld_tail_latched = false;
@@ -317,8 +339,16 @@ void gui_vhs_fm_render_frame(vhs_fm_decoder_t *decoder, float x, float y,
         }
         /* Full widens the sampled horizontal window as well as adding VBI.
          * Correct its display pixels so the active picture keeps its shape. */
-        DrawTexturePro(decoder->texture,
-                       (Rectangle){0, 0, (float)decoder->width, (float)decoder->height},
+        // Frame and Split draw the whole texture (Split's rows are already
+        // in field order); Field stretches the newest field's block.
+        Rectangle src = {0, 0, (float)decoder->width, (float)decoder->height};
+        if (field_view == 2) {
+            const bool top_field = decoder->stats.decode.last_field_parity == top_parity;
+            src = top_field ? (Rectangle){0, 0, (float)decoder->width, (float)top_rows}
+                            : (Rectangle){0, (float)top_rows, (float)decoder->width,
+                                          (float)(decoder->height - top_rows)};
+        }
+        DrawTexturePro(decoder->texture, src,
                        (Rectangle){frame.x, frame.y, frame.width, frame.height},
                        (Vector2){0, 0}, 0, WHITE);
     }

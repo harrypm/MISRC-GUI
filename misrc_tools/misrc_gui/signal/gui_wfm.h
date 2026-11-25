@@ -103,11 +103,18 @@ typedef struct {
 typedef struct gui_wfm {
     // Rasters, row-major by amplitude bin: [bin * GUI_WFM_COLS + col]
     // (a line's increments at one level walk contiguous memory).
+    // Latest-wins hand-off (harrypm 2026-11-19, WFM pause fix): the decoder
+    // fills acc and swaps it with the mailbox (mid); the renderer swaps the
+    // mailbox with pub and copies pub. Only the pointer swaps sit under
+    // swap_lock, so neither side waits on the other's work, and the newest
+    // frame - the one at a paused playhead - is never dropped.
     uint16_t *acc;         // Decoder thread: the frame being accumulated
-    uint16_t *pub;         // Handed to the renderer
-    gui_wfm_meta_t acc_meta, pub_meta;
-    atomic_int pub_ready;  // 1 = pub holds a frame the renderer has not taken
-    atomic_uint frames;    // Frames published or dropped (diagnostics / tests)
+    uint16_t *mid;         // Mailbox: the newest published frame
+    uint16_t *pub;         // Render thread: the frame being copied out
+    gui_wfm_meta_t acc_meta, mid_meta, pub_meta;
+    atomic_flag swap_lock;
+    atomic_int pub_ready;  // 1 = the mailbox holds a frame the renderer has not taken
+    atomic_uint frames;    // Frames published (diagnostics / tests)
 
     // UI requests, applied at the next frame start.
     atomic_int want_range;
@@ -138,7 +145,13 @@ void gui_wfm_reset(gui_wfm_t *w);
 
 // Decoder thread.
 void gui_wfm_add_line(gui_wfm_t *w, const gui_wfm_line_t *line);
+// Unlocked: publish every second field, whatever they are.
 void gui_wfm_end_field(gui_wfm_t *w);
+// Field / frame lock (harrypm 2026-11-19): `parity` is the ending field's,
+// `field1_parity` ITU field 1's (the Spectro's f1). single_field publishes
+// every field alone; otherwise a frame is field 1 + field 2 of the SAME
+// frame (an accumulation that starts on field 2 is discarded).
+void gui_wfm_end_field_locked(gui_wfm_t *w, int parity, int field1_parity, bool single_field);
 
 // Render thread: copy the latest published frame into dst (GUI_WFM_COLS *
 // GUI_WFM_BINS counts, row-major; meta->cols columns used). False when

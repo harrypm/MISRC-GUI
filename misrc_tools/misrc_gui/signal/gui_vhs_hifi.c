@@ -229,7 +229,8 @@ static gui_vhs_hifi_decoder_t *vhs_create(gui_rf_format_t format, uint32_t rf_ra
 
 gui_vhs_hifi_decoder_t *gui_vhs_hifi_create(gui_rf_format_t format, uint32_t rf_rate_hz) {
     if (format != GUI_RF_PAL && format != GUI_RF_NTSC) return NULL;
-    if (rf_rate_hz != GUI_RF_DECODE_RATE_HZ && !gui_vhs_hifi_is_native_low_rate(rf_rate_hz))
+    if (rf_rate_hz != GUI_RF_DECODE_RATE_HZ && rf_rate_hz != VHS_RF_RATE &&
+        !gui_vhs_hifi_is_native_low_rate(rf_rate_hz))
         return NULL;
     return vhs_create(format, rf_rate_hz, 0);
 }

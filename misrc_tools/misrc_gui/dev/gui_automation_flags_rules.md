@@ -83,6 +83,7 @@ GUI autoload trigger flag.**
 - Spectro panel direction, palette and (paused) span dropdowns: `--spectro
   <key=value,...>` (dir=horizontal|vertical, palette=phosphor|heat, span=
   1field|1frame|2frames|3frames|5frames|10frames|25frames|1s|3s|10s|30s|60s
+  [marks=on|off added 2026-11-25: the paused Marks toggle]
   [span added 2026-11-19; the wheel steps the same list]; launch
   state of every Spectro panel created after it, the palette shared by all;
   unknown keys/values print the accepted list and exit 1; logs
@@ -101,6 +102,30 @@ GUI autoload trigger flag.**
   restored at launch before `--panel-view`, which still overrides it; logs
   `[AUTO] saved panels: ...`. The Video decoder button has no own flag yet
   (the saved `video_decoder_*` key is its launch state). [2026-11-19]
+- Hi-Fi on CH3/4 + HiFi panel (Source / Format / Span buttons):
+  - Flag: `--hifi <key=value,...>`.
+    - `src=auto|a|b`: settings `hifi34_source`, 0 to 2.
+    - `fmt=auto|pal|ntsc|beta`: settings `hifi34_format`, 0 to 3.
+    - `span=10|20|50|100|250|500|1000|2000`: HiFi panel span in ms, for panels created after it.
+  - Logs `[AUTO] --hifi`. Bad keys or values print the accepted form and exit 1.
+  - The panel view is `hifi` (`--panel-view b:hifi,waveform`).
+  - The CH3/4 monitor toggle (`audio_monitor_ch34`) is the existing settings key.
+  - The decoder logs `[HIFI34] decoding RF <A|B> as <format>`.
+  - Added 2026-11-25.
+- Video panel View button (Frame / Split / Field, all three decoders):
+  `--video-fields frame|split|field` (launch state of new Video panels;
+  logs `[AUTO] --video-fields`; anything else prints the accepted list and
+  exits 1). [2026-11-19]
+- Transport Pause (partial, for paused-view automation): `--auto-pause
+  <seconds>` pauses playback once, that long after it starts (logs
+  `[AUTO] --auto-pause`). Used to verify the paused Waveform file window
+  and its field / line marks. [2026-11-19]
+- Waveform launch state and the paused player-mode Lock button (Line / HS):
+  `--wave <key=value,...>` with zoom=<1..128> (samples per pixel),
+  trig=off|rise|fall|sync|cvbs|hs (the Trig dropdown; hs = Head SW),
+  marks=on|off (the paused Marks toggle: field / line wireframe) and
+  lock=line|hs (logs `[AUTO] --wave`; anything else prints the accepted list
+  and exits 1). The Waveform zoom had no flag before (an unlisted gap). [2026-11-19]
 
 ## Known gaps (backlog under this rule — do not grow this list)
 

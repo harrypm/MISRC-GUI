@@ -5983,6 +5983,8 @@ static const char *toolbar_audio_channel_label(const gui_app_t *app,
 #else
     (void)cxadc_mode;
 #endif
+    if (app->settings.audio_monitor_ch34 && atomic_load(&app->hifi34_owns_ch34))
+        return compact ? "HiFi" : "Hi-Fi";   // CH3/4 = decoded Hi-Fi (gui_hifi34.c)
     return app->settings.audio_monitor_ch34
         ? (compact ? "3/4" : "CH3/4")
         : (compact ? "1/2" : "CH1/2");
@@ -6053,8 +6055,12 @@ static void render_toolbar_audio_group(gui_app_t *app,
             .backgroundColor = to_clay_color((Color){25,25,30,255}),
             .cornerRadius = CLAY_CORNER_RADIUS(4)
         }) {
+            const bool hifi34 = atomic_load(&app->hifi34_owns_ch34);
             for (int i = 0; i < 4; i++) {
-                uint32_t p = atomic_load(&app->audio_peak[i]);
+                // CH3/4 = decoded Hi-Fi L / R when the device has no real
+                // CH3/4 audio (processing/gui_hifi34.c).
+                uint32_t p = (hifi34 && i >= 2) ? (uint32_t)atomic_load(&app->hifi34_peak[i - 2])
+                                                : (uint32_t)atomic_load(&app->audio_peak[i]);
                 float frac = (p > 0) ? (float)p / 8388607.0f : 0.0f;
                 if (frac > 1.0f) frac = 1.0f;
                 int fill_w = (int)(frac * (float)audio_meter_width);
@@ -6072,6 +6078,8 @@ static void render_toolbar_audio_group(gui_app_t *app,
                     }
                 }) {
                     if (show_audio_meter_labels) {
+                        // Meter names stay CH1..CH4, also while CH3/4 carries
+                        // decoded Hi-Fi (harrypm 2026-11-25).
                         snprintf(audio_ch_label[i], sizeof(audio_ch_label[i]), "CH%d", i + 1);
                         CLAY(CLAY_IDI("AudioChLabel", i), { .layout = { .sizing = { CLAY_SIZING_FIT(0), CLAY_SIZING_FIT(0) } } }) {
                             CLAY_TEXT(make_string(audio_ch_label[i]),
@@ -6328,8 +6336,12 @@ static const char *gui_ui_toolbar_mode_label(bool mode_misrc,
                                              bool fx3_mode,
                                              bool ddd_mode,
                                              bool ddd_clockgen_mode,
-                                             int tier)
+                                             int tier,
+                                             bool player)
 {
+    // The playback device is a player, not a capture mode (harrypm
+    // 2026-11-19: "mode selector should say Player ... in player mode").
+    if (player) return tier >= GUI_UI_TOOLBAR_TIER_TINY ? "Play" : "Player";
     if (tier >= GUI_UI_TOOLBAR_TIER_TINY) {
         if (cxadc_mode) {
             return cxadc_clockgen_mode
@@ -6473,7 +6485,8 @@ static void render_toolbar(gui_app_t *app, bool ddd_compact_labels) {
                                                                fx3_mode,
                                                                ddd_mode,
                                                                ddd_clockgen_mode,
-                                                               tier);
+                                                               tier,
+            gui_ui_selected_device_is_playback(app));
             int mode_w = gui_ui_measure_button_width(app,
                                                      tier_label,
                                                      p.text_size,
@@ -6589,7 +6602,8 @@ static void render_toolbar(gui_app_t *app, bool ddd_compact_labels) {
                                                        fx3_mode,
                                                        ddd_mode,
                                                        ddd_clockgen_mode,
-                                                       chosen_tier);
+                                                       chosen_tier,
+            gui_ui_selected_device_is_playback(app));
     int mode_toggle_width = gui_ui_measure_button_width(app,
                                                         mode_label,
                                                         toolbar_text_size,
@@ -7349,12 +7363,13 @@ static void render_channel_stats(gui_app_t *app, int channel,
         if (gui_dropdown_is_open(DROPDOWN_LEFT_VIEW, channel)) {
             CLAY(CLAY_IDI("LeftViewOpts", channel),
                  gui_ui_channel_menu(CLAY_IDI("LeftViewBtn", channel), view_width, view_count)) {
-                for (int vt = 0; vt < PANEL_VIEW_COUNT; vt++) {
+                for (int vi = 0; vi < PANEL_VIEW_COUNT; vi++) {
+                    const int vt = (int)panel_view_menu_order(vi);   // HiFi under Video
                     if (!panel_view_type_available((panel_view_type_t)vt)) continue;
-                    // Use channel * 10 + vt to create unique IDs per channel
-                    bool opt_hover = Clay_PointerOver(CLAY_IDI("LeftViewOpt", channel * 10 + vt));
+                    // channel * 32 + vt: unique per channel (view ids exceed 9)
+                    bool opt_hover = Clay_PointerOver(CLAY_IDI("LeftViewOpt", channel * 32 + vt));
                     Color opt_color = gui_dropdown_option_color(left_view == vt, opt_hover);
-                    CLAY(CLAY_IDI("LeftViewOpt", channel * 10 + vt), {
+                    CLAY(CLAY_IDI("LeftViewOpt", channel * 32 + vt), {
                         .layout = {
                             .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(20) },
                             .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
@@ -7395,12 +7410,13 @@ static void render_channel_stats(gui_app_t *app, int channel,
             if (gui_dropdown_is_open(DROPDOWN_RIGHT_VIEW, channel)) {
                 CLAY(CLAY_IDI("RightViewOpts", channel),
                      gui_ui_channel_menu(CLAY_IDI("RightViewBtn", channel), view_width, view_count)) {
-                    for (int vt = 0; vt < PANEL_VIEW_COUNT; vt++) {
+                    for (int vi = 0; vi < PANEL_VIEW_COUNT; vi++) {
+                        const int vt = (int)panel_view_menu_order(vi);   // HiFi under Video
                         if (!panel_view_type_available((panel_view_type_t)vt)) continue;
-                        // Use channel * 10 + vt to create unique IDs per channel
-                        bool opt_hover = Clay_PointerOver(CLAY_IDI("RightViewOpt", channel * 10 + vt));
+                        // channel * 32 + vt: unique per channel (view ids exceed 9)
+                        bool opt_hover = Clay_PointerOver(CLAY_IDI("RightViewOpt", channel * 32 + vt));
                         Color opt_color = gui_dropdown_option_color(right_view == vt, opt_hover);
-                        CLAY(CLAY_IDI("RightViewOpt", channel * 10 + vt), {
+                        CLAY(CLAY_IDI("RightViewOpt", channel * 32 + vt), {
                             .layout = {
                                 .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(20) },
                                 .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }

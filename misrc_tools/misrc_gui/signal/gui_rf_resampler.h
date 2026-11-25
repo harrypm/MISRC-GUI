@@ -18,6 +18,14 @@ gui_rf_resampler_t *gui_rf_resampler_create_rate(uint32_t input_rate_hz,
  * Hi-Fi converter response unchanged. Non-native rates require libsoxr. */
 gui_rf_resampler_t *gui_rf_resampler_create_ed_beta(uint32_t input_rate_hz);
 size_t gui_rf_resampler_output_capacity_ed_beta(uint32_t input_rate_hz, size_t input_count);
+/* Dedicated (audio-only) VHS Hi-Fi: any real RF from 8 to 200 MSPS to 5 MSPS,
+ * the Hi-Fi decoder's own front-end rate (carriers 1.3 - 1.8 MHz, 2.1 MHz
+ * passband). 10 / 20 / 40 MSPS use exact halfband stages, other rates soxr.
+ * harrypm 2026-11-25: dedicated Hi-Fi formats sample at 5 MSPS, not 20;
+ * Video8 / Hi8 / Betamax / LaserDisc audio share the video RF and stay. */
+#define GUI_RF_HIFI_NARROW_RATE_HZ 5000000u
+gui_rf_resampler_t *gui_rf_resampler_create_hifi_narrow(uint32_t input_rate_hz);
+size_t gui_rf_resampler_output_capacity_hifi_narrow(uint32_t input_rate_hz, size_t input_count);
 /* VHS Hi-Fi real RF at custom rates from 8 to 10 MSPS. Output is 20 MSPS. */
 gui_rf_resampler_t *gui_rf_resampler_create_hifi(uint32_t input_rate_hz);
 size_t gui_rf_resampler_output_capacity_hifi(uint32_t input_rate_hz, size_t input_count);

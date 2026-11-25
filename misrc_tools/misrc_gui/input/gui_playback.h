@@ -166,6 +166,34 @@ void gui_playback_step_sample_channel(gui_app_t *app, int channel, uint64_t samp
 // channel: the Video panel keeps its previous picture instead of showing
 // the lead-in.
 bool gui_playback_display_hold_channel(gui_app_t *app, int channel);
+// Paused raw window (Waveform player-mode position marks): samples
+// [start, start+count) read from the file in the playback display container,
+// plus the field starts the field locator (GUI_FIELD_LOCATE_*; 0 = none)
+// finds from field_lead samples before start. Non-blocking: the request
+// goes to a per-channel worker; poll returns the newest result not yet seen
+// (seq != seen_seq). FLAC files only.
+#define GUI_PLAYBACK_RAWWIN_MARKS 16
+typedef struct {
+    uint64_t start;
+    size_t count;
+    double rate;
+    uint64_t seq;
+    size_t mark_count;
+    gui_field_mark_t marks[GUI_PLAYBACK_RAWWIN_MARKS];
+    int found_mode, found_lines;   // What the locator locked to (0 = no lock)
+    // FM head switches in the decoded stretch (absolute samples; head 0 / 1).
+    uint64_t hs_pos[GUI_FIELD_LOCATE_MAX_HS];
+    int hs_head[GUI_FIELD_LOCATE_MAX_HS];
+    size_t hs_n;
+} gui_playback_raw_window_t;
+void gui_playback_request_raw_window(gui_app_t *app, int channel, uint64_t start, size_t count,
+                                     size_t field_lead, int sync_mode, int lines_per_frame);
+bool gui_playback_poll_raw_window(gui_app_t *app, int channel, uint64_t seen_seq,
+                                  int16_t *dst, size_t cap, gui_playback_raw_window_t *info);
+// Paused: replay the lead-in up to the current cue (same frame) so a panel
+// enabled while paused - its own decoder fed nothing yet - shows the frame
+// at the playhead (harrypm 2026-11-19).
+void gui_playback_refresh_channel(gui_app_t *app, int channel);
 
 // Get current position
 uint64_t gui_playback_get_position_samples(gui_app_t *app);
@@ -290,6 +318,16 @@ void gui_playback_request_analysis_window_fields(gui_app_t *app, int channel,
                                                  int sync_mode, int lines_per_frame);
 // The field starts of the window the last successful poll returned (copied
 // into out, at most max). 0 when none were requested or found.
+// The mode (GUI_FIELD_LOCATE_CVBS / _FM) and system (625 / 525) the paused
+// window's field locator locked to; false while nothing locked.
+bool gui_playback_analysis_field_info(gui_app_t *app, int channel, int *mode, int *lines);
+// The TV system (625 / 525) a field locator measured on this channel this
+// session, from any panel's paused reads; 0 = none yet.
+int gui_playback_measured_lines(gui_app_t *app, int channel);
+// The FM head switches the paused window's locator found (absolute samples,
+// head 0 / 1 in hs_head); the count.
+size_t gui_playback_analysis_head_switches(gui_app_t *app, int channel, uint64_t *pos, int *head,
+                                           size_t max);
 size_t gui_playback_analysis_field_marks(gui_app_t *app, int channel,
                                          gui_field_mark_t *out, size_t max);
 // Returns true when a result newer than *io_seq is available; updates *io_seq

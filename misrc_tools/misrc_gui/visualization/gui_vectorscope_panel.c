@@ -33,6 +33,7 @@
 #include "gui_text.h"
 #include "gui_oscilloscope.h"   // gui_waveform_test_mode_active
 #include "../signal/gui_testgen.h"  // gui_testgen_clamp_system
+#include "../input/gui_playback.h"   // paused hold / step-back display hold
 #include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -76,6 +77,7 @@ typedef struct {
     gui_cvbs_feed_t *feed;
     gui_vectorscope_t scope;
     atomic_int pending_system;     // -1 none, else 0=PAL 1=NTSC 2=SECAM
+    atomic_bool release_hold;      // Test Gen mode ended: drop the follow hold
     atomic_int decoder_system;     // The decoder's current pick (for the UI)
     atomic_bool auto_system;       // Auto: 50 Hz fields -> PAL, 59.94 -> NTSC
     uint32_t seen_measures;        // Display thread: last vsync measurement read
@@ -112,6 +114,8 @@ typedef struct {
     bool tex_valid;
     bool image_dirty;
     bool have_data;
+    bool pause_refreshed;          // Paused with no trace: re-cue requested once
+    bool refeed;                   // A decode setting changed: re-cue while paused
     double last_field_time;
 
     // Options (tbc-analyse's Basic / Advanced controls; decode-orc's gain).
@@ -424,6 +428,17 @@ static void vs_process(void *state_ptr, const int16_t *samples, size_t count,
         gui_vectorscope_reset(&s->scope);
         atomic_store(&s->decoder_system, pending);
     }
+    // The generator follow's hold only protects a Test Gen system switch.
+    // Once a real source runs (playback / capture started), Auto votes at
+    // once: on first file load the render's pre-playback frames counted as
+    // test mode and followed the saved Video System (NTSC), and the hold
+    // kept a PAL file on NTSC for 250 fields - "No burst-locked colour"
+    // for ~5 s (harrypm 2026-11-25 "in split mode vectorscope does not
+    // engage on file first load").
+    if (atomic_exchange(&s->release_hold, false)) {
+        s->follow_hold = 0;
+        s->votes = 0;
+    }
     gui_cvbs_feed_process(s->feed, samples, count, sample_rate);
 
     // Auto system: a real source carries no Test Gen system to follow, and a
@@ -483,6 +498,7 @@ static void vs_follow_system(void *state_ptr, int system_select) {
 // panels' decoders. MESECAM (RF only) is SECAM on the composite side.
 static void vs_follow_generator(vectorscope_panel_t *s, gui_app_t *app) {
     if (!gui_waveform_test_mode_active(app)) {
+        if (s->gen_seen != -1) atomic_store(&s->release_hold, true);
         s->gen_seen = -1;   // re-sync on the next entry into test mode
         return;
     }
@@ -909,7 +925,9 @@ static void vs_draw_graticule(const vectorscope_panel_t *s, int system, bool adv
                    major ? fmaxf(1.0f, 2.0f * sc) : 1.0f, line);
     }
 
-    if (system == GUI_VSCOPE_SYS_NTSC) {
+    // I/Q axes on NTSC and PAL (harrypm 2026-11-25: the I / Q / -Q / -I
+    // corner marks went missing on PAL playback); SECAM's Db/Dr view has none.
+    if (system != GUI_VSCOPE_SYS_SECAM) {
         // I/Q axes, inner 20% to the edge, at the standard angles.
         static const struct { const char *text; double deg, off; } axes[] = {
             { "I", 123.0, 4.0 }, { "-I", 303.0, -4.0 },
@@ -1019,21 +1037,43 @@ static void vs_draw_graticule(const vectorscope_panel_t *s, int system, bool adv
 
 static void vs_render(void *state_ptr, gui_app_t *app, int channel,
                       Rectangle bounds, Color channel_color) {
-    (void)channel;
     (void)channel_color;
     vectorscope_panel_t *s = state_ptr;
     DrawRectangleRec(bounds, COLOR_METER_BG);
     if (!s) return;
     vs_follow_generator(s, app);
+    // Paused playback (harrypm 2026-11-19, as the WFM): the feed stops on
+    // purpose, so the last trace stays instead of blanking as a lost feed;
+    // a step-back lead-in is decoded but not shown until the step lands.
+    const bool pb = app && gui_playback_is_running(app);
+    const bool paused = pb && (gui_playback_get_state(app) != PLAYBACK_STATE_PLAYING ||
+                               gui_playback_is_channel_paused(app, channel));
+    const bool step_hold = pb && gui_playback_display_hold_channel(app, channel);
 
     int system = atomic_load(&s->decoder_system) == 1 ? GUI_VSCOPE_SYS_NTSC
                : atomic_load(&s->decoder_system) == 2 ? GUI_VSCOPE_SYS_SECAM
                : GUI_VSCOPE_SYS_PAL;
     double now = GetTime();
-    if (vs_take_fields(s)) {
+    if (!step_hold && vs_take_fields(s)) {
         s->have_data = true;
         s->last_field_time = now;
         s->image_dirty = true;
+    } else if (paused || step_hold) {
+        s->last_field_time = now;   // hold the shown trace
+    }
+    // Enabled (or emptied) while paused: this panel's own decoder has had no
+    // feed - re-cue the channel once so the lead-in brings the paused frame.
+    // A decode setting picked while paused (System / ...) only applies when
+    // the panel's decoder sees samples: re-cue once so the lead-in replays
+    // through it (harrypm 2026-11-19: "can't cycle TV System on vectorscope
+    // in player mode").
+    if (!paused) {
+        s->pause_refreshed = false;
+        s->refeed = false;
+    } else if (!step_hold && (s->refeed || (!s->have_data && !s->pause_refreshed))) {
+        gui_playback_refresh_channel(app, channel);
+        s->pause_refreshed = true;
+        s->refeed = false;
     } else if (s->have_data && now - s->last_field_time > 0.5) {
         vs_clear(s);      // feed stopped / lock lost: blank the trace
     }
@@ -1213,6 +1253,7 @@ static bool vs_handle_click(void *state_ptr, gui_app_t *app, int channel,
             if (s->btn[b].width <= 0.0f || !CheckCollisionPointRec(click, s->btn[b])) continue;
             switch (b) {
                 case VS_BTN_SYSTEM: {
+                    s->refeed = true;
                     // Auto -> PAL -> NTSC -> SECAM -> Auto.
                     if (atomic_load(&s->auto_system)) {
                         atomic_store(&s->auto_system, false);
@@ -1225,12 +1266,13 @@ static bool vs_handle_click(void *state_ptr, gui_app_t *app, int channel,
                     break;
                 }
                 case VS_BTN_MODE:
+                    s->refeed = true;
                     s->mode = s->mode == GUI_VSCOPE_MODE_ADVANCED ? GUI_VSCOPE_MODE_STANDARD
                                                                   : GUI_VSCOPE_MODE_ADVANCED;
                     vs_clear(s);
                     break;
-                case VS_BTN_LINES: s->lines_view = (s->lines_view + 1) % 3; break;
-                case VS_BTN_FIELD: s->field_view = s->field_view == GUI_VSCOPE_FIELD_WHOLE
+                case VS_BTN_LINES: s->lines_view = (s->lines_view + 1) % 3; s->refeed = true; break;
+                case VS_BTN_FIELD: s->refeed = true; s->field_view = s->field_view == GUI_VSCOPE_FIELD_WHOLE
                                                    ? GUI_VSCOPE_FIELD_ACTIVE : GUI_VSCOPE_FIELD_WHOLE; break;
                 case VS_BTN_GRAT: s->graticule = (s->graticule + 1) % VS_GRAT_COUNT; break;
                 case VS_BTN_PLOT: s->plot = (s->plot + 1) % VS_PLOT_COUNT; break;

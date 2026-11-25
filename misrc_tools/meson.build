@@ -518,12 +518,13 @@ if raylib_dep.found()
     'misrc_gui/input/gui_playback_length_cache.c',
     'misrc_gui/signal/gui_field_locate.c',
     'misrc_gui/input/gui_cut_markers.c',
+    'misrc_gui/input/gui_source_meta.c',
     # Processing
     'misrc_gui/processing/gui_extract.c',
     'misrc_gui/processing/gui_display_thread.c',
     # Signal
     'misrc_gui/signal/gui_headswitch_lock.c',
-    'misrc_gui/signal/gui_trigger.c',
+    'misrc_gui/signal/gui_trigger.c', 'misrc_gui/signal/gui_hs_trigger.c',
     'misrc_gui/signal/gui_cvbs.c',
     'misrc_gui/signal/gui_vectorscope.c', 'misrc_gui/signal/gui_wfm.c',
     'misrc_gui/signal/gui_vhs_fm.c',
@@ -532,6 +533,7 @@ if raylib_dep.found()
     'misrc_gui/processing/gui_rf_preview_policy.c',
     'misrc_gui/processing/gui_rf_preview_pressure.c',
     'misrc_gui/processing/gui_rf_stream_marks.c',
+    'misrc_gui/processing/gui_hifi34.c', 'misrc_gui/signal/gui_hifi_probe.c',
     'misrc_gui/signal/gui_histogram.c',
     'misrc_gui/signal/gui_demod.c',
     # Test Gen: on-demand PAL/NTSC/SECAM test signal (hacktv values)
@@ -544,6 +546,7 @@ if raylib_dep.found()
     'misrc_gui/visualization/gui_histogram_panel.c',
     'misrc_gui/visualization/gui_vectorscope_panel.c',
     'misrc_gui/visualization/gui_wfm_panel.c',
+    'misrc_gui/visualization/gui_hifi_panel.c',
     'misrc_gui/visualization/gui_spectrogram.c',
     'misrc_gui/visualization/gui_text.c',
     'misrc_gui/visualization/gui_vu_meter.c',
@@ -1063,7 +1066,7 @@ if raylib_dep.found()
       cvbs_baseband_deps += [soxr_dep]
     endif
     cvbs_baseband_test = executable('gui_cvbs_test',
-      ['test/gui_cvbs_test.c', 'common/rb_event.c', 'misrc_gui/signal/gui_trigger.c',
+      ['test/gui_cvbs_test.c', 'common/rb_event.c', 'misrc_gui/signal/gui_trigger.c', 'misrc_gui/signal/gui_hs_trigger.c',
        'misrc_gui/signal/gui_vectorscope.c', 'misrc_gui/signal/gui_wfm.c'],
       dependencies: cvbs_baseband_deps,
       include_directories: gui_includes,
@@ -1071,12 +1074,23 @@ if raylib_dep.found()
       link_args: ldflags,
       override_options: ['b_lto=true', 'optimization=2'],
     )
-    test('gui_cvbs_baseband', cvbs_baseband_test, timeout: 120)
+        test('gui_cvbs_baseband', cvbs_baseband_test, timeout: 120)
+    cvbs_field_order_test = executable('gui_cvbs_field_order_test',
+      ['test/gui_cvbs_field_order_test.c', 'common/rb_event.c', 'misrc_gui/signal/gui_trigger.c', 'misrc_gui/signal/gui_hs_trigger.c',
+       'misrc_gui/signal/gui_vectorscope.c', 'misrc_gui/signal/gui_wfm.c',
+       'misrc_gui/signal/gui_testgen.c'],
+      dependencies: cvbs_baseband_deps,
+      include_directories: gui_includes,
+      c_args: gui_cflags,
+      link_args: ldflags,
+      override_options: ['b_lto=true', 'optimization=2'],
+    )
+    test('gui_cvbs_field_order', cvbs_field_order_test, timeout: 120)
 
     # Composite vectorscope: Test Gen bars (NTSC SMPTE, PAL 75%) through the
     # vectorscope panel's decode chain must land on the graticule targets.
     vectorscope_test = executable('gui_vectorscope_test',
-      ['test/gui_vectorscope_test.c', 'common/rb_event.c', 'misrc_gui/signal/gui_trigger.c',
+      ['test/gui_vectorscope_test.c', 'common/rb_event.c', 'misrc_gui/signal/gui_trigger.c', 'misrc_gui/signal/gui_hs_trigger.c',
        'misrc_gui/signal/gui_vectorscope.c', 'misrc_gui/signal/gui_wfm.c', 'misrc_gui/signal/gui_testgen.c'],
       dependencies: cvbs_baseband_deps,
       include_directories: gui_includes,
@@ -1090,7 +1104,7 @@ if raylib_dep.found()
     # chain must land on their luma levels, sync/blanking on the normative
     # levels and the sync edge on 0H.
     wfm_test = executable('gui_wfm_test',
-      ['test/gui_wfm_test.c', 'common/rb_event.c', 'misrc_gui/signal/gui_trigger.c',
+      ['test/gui_wfm_test.c', 'common/rb_event.c', 'misrc_gui/signal/gui_trigger.c', 'misrc_gui/signal/gui_hs_trigger.c',
        'misrc_gui/signal/gui_vectorscope.c', 'misrc_gui/signal/gui_wfm.c',
        'misrc_gui/signal/gui_testgen.c'],
       dependencies: cvbs_baseband_deps,
@@ -1105,7 +1119,7 @@ if raylib_dep.found()
     # timing through the panel path (soxr + decode); every vertical bar edge
     # must decode as a straight line (sub-sample placement, nominal scale).
     cvbs_line_test = executable('gui_cvbs_line_test',
-      ['test/gui_cvbs_line_test.c', 'common/rb_event.c', 'misrc_gui/signal/gui_trigger.c',
+      ['test/gui_cvbs_line_test.c', 'common/rb_event.c', 'misrc_gui/signal/gui_trigger.c', 'misrc_gui/signal/gui_hs_trigger.c',
        'misrc_gui/signal/gui_vectorscope.c', 'misrc_gui/signal/gui_wfm.c', 'misrc_gui/signal/gui_testgen.c'],
       dependencies: cvbs_baseband_deps,
       include_directories: gui_includes,
@@ -1272,6 +1286,10 @@ rf_testgen_test = executable('gui_testgen_rf_test',
   rf_preview_sources + ['test/gui_testgen_rf_test.c', 'misrc_gui/signal/gui_testgen.c'],
   dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
 test('gui_testgen_rf', rf_testgen_test, timeout: 120)
+rf_field_order_test = executable('gui_rf_field_order_test',
+  ['test/gui_rf_field_order_test.c', 'misrc_gui/signal/gui_ld_rf_demod.c', 'misrc_gui/signal/gui_testgen.c'],
+  dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
+test('gui_rf_field_order', rf_field_order_test, timeout: 120)
 field_locate_test = executable('gui_field_locate_test',
   ['test/gui_field_locate_test.c', 'misrc_gui/signal/gui_field_locate.c', 'misrc_gui/signal/gui_testgen.c'],
   dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
@@ -1280,6 +1298,14 @@ cut_markers_test = executable('gui_cut_markers_test',
   ['test/gui_cut_markers_test.c', 'misrc_gui/input/gui_cut_markers.c'],
   dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
 test('gui_cut_markers', cut_markers_test, timeout: 60)
+hifi_probe_test = executable('gui_hifi_probe_test',
+  ['test/gui_hifi_probe_test.c', 'misrc_gui/signal/gui_hifi_probe.c'],
+  dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
+test('gui_hifi_probe', hifi_probe_test, timeout: 60)
+source_meta_test = executable('gui_source_meta_test',
+  ['test/gui_source_meta_test.c', 'misrc_gui/input/gui_source_meta.c', 'common/file_utils.c'],
+  dependencies: rf_test_deps, c_args: rf_test_cflags + ['-DGUI_SOURCE_META_FILE_ONLY'], link_args: ldflags)
+test('gui_source_meta', source_meta_test, timeout: 60)
 testgen_cvbs_test = executable('gui_testgen_cvbs_test', 'test/gui_testgen_cvbs_test.c',
   dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
 test('gui_testgen_cvbs', testgen_cvbs_test, timeout: 120)
@@ -1287,6 +1313,10 @@ rf_resampler_test = executable('gui_rf_resampler_test',
   ['test/gui_rf_resampler_test.c', 'misrc_gui/signal/gui_rf_resampler.c'],
   dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
 test('gui_rf_resampler', rf_resampler_test)
+hifi_narrow_test = executable('gui_hifi_narrow_test',
+  ['test/gui_hifi_narrow_test.c', 'misrc_gui/signal/gui_rf_resampler.c'],
+  dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
+test('gui_hifi_narrow', hifi_narrow_test, timeout: 60)
 sdr_rf_test = executable('gui_sdr_rf_test', 'test/gui_sdr_rf_harness.c',
   dependencies: rf_test_deps, c_args: cflags + ['-fno-fast-math'], link_args: ldflags)
 test('gui_sdr_rf', sdr_rf_test)

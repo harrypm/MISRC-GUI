@@ -61,7 +61,10 @@ typedef struct vhs_fm_decoder {
         gui_rf_ld_audio_t ld_audio;
         int stats_view;               // 0 = All, 1 = Basic, 2 = Off (OSD view)
         int frame_mode;               // 0 = Active, 1 = Full (VBI + burst view)
+        int field_view;               // CVBS_FIELD_VIEW_*: 0 Frame, 1 Split, 2 Field
+        Rectangle fields_rect;        // Field view button hit box
     } overlay;
+    uint8_t *rgba_view;               // Split / Field: rgba rows in field order
     // controls_hidden + the double-click tracker live on video_panel_state_t
     // (gui_cvbs.c) so the hidden state is shared by all three decoder modes
     // and survives decoder-mode cycling; render_frame receives the flag.

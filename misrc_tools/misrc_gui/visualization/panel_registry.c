@@ -174,7 +174,7 @@ static const char *const s_prof_names[PANEL_VIEW_COUNT] = {
     [PANEL_VIEW_CVBS] = "video", [PANEL_VIEW_HISTOGRAM] = "hist",
     [PANEL_VIEW_WATERFALL] = "wfall", [PANEL_VIEW_SPECTROGRAPH] = "spectro",
     [PANEL_VIEW_DEMOD] = "demod", [PANEL_VIEW_VECTORSCOPE] = "vector",
-    [PANEL_VIEW_WFM] = "wfm",
+    [PANEL_VIEW_WFM] = "wfm", [PANEL_VIEW_HIFI] = "hifi",
 };
 static uint64_t s_prof_us[PANEL_VIEW_COUNT];
 static uint32_t s_prof_calls[PANEL_VIEW_COUNT];

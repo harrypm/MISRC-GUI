@@ -18,6 +18,8 @@
 
 // Get human-readable name for a view type (for dropdowns)
 const char* panel_view_type_name(panel_view_type_t type);
+// View picker display order: index 0..PANEL_VIEW_COUNT-1 -> view id (HiFi under Video).
+panel_view_type_t panel_view_menu_order(int index);
 
 // Check if a view type is available (e.g., FFT requires FFTW)
 bool panel_view_type_available(panel_view_type_t type);

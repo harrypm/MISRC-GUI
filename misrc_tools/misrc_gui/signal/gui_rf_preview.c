@@ -1841,6 +1841,7 @@ static void rf_vertical_start(gui_rf_decoder_t *d, double first_eq,
         double field_lines=(start-d->field_start)/cadence_period;
         double expected=d->format==GUI_RF_PAL ? 312.5 : 262.5;
         if (fabs(field_lines-expected)<cadence_tolerance && parity!=d->field_parity) {
+            d->status.last_field_parity=d->field_parity;   // published with this field's frame
             rf_render_field(d,d->field_start,d->field_parity,
                             (uint64_t)llround(start*4.0),callback,context);
         } else {
@@ -2348,6 +2349,24 @@ void gui_rf_decoder_reset_profile(gui_rf_decoder_t *d, gui_rf_profile_t profile)
 
 void gui_rf_decoder_reset(gui_rf_decoder_t *d, gui_rf_format_t format) {
     gui_rf_decoder_reset_profile(d,format==GUI_RF_NTSC ? GUI_RF_PROFILE_NTSC_VHS : GUI_RF_PROFILE_PAL_VHS);
+}
+
+/* ITU field 1's parity in this decoder (rows y*2+parity), the Spectro's f1.
+ * Measured on the Test Gen by gui_rf_field_order_test: parity 0 (the even
+ * frame rows) for PAL, NTSC and SECAM VHS; the decoder publishes each
+ * frame as its field 1 completes. */
+int gui_rf_field1_parity(gui_rf_profile_t profile) {
+    (void)profile;
+    return 0;
+}
+
+/* Split / Field row order: frame row -> texture row, top_parity's rows
+ * (row & 1 == top_parity) as the top block, the other field's below. */
+int gui_rf_split_row(int row, int frame_rows, int top_parity, int *top_rows) {
+    const int odd_rows = frame_rows / 2, even_rows = frame_rows - odd_rows;
+    const int top = top_parity == 0 ? even_rows : odd_rows;
+    if (top_rows) *top_rows = top;
+    return (row & 1) == top_parity ? row >> 1 : top + (row >> 1);
 }
 
 gui_rf_decoder_t *gui_rf_decoder_create_profile(gui_rf_profile_t profile) {

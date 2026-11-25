@@ -1,0 +1,298 @@
+# Prompt log: Video panel field view (2026-11-19)
+
+Branch `video-field-view`, from main f7649a7.
+
+## Input (harrypm)
+
+"now for the final key thing add a field view mode to the Decoders split and single field streched like what tbc-analyse does"
+
+## Reference (tbc-tools `src/tbc-analyse`)
+
+From `tbcsource.cpp` / `mainwindow.cpp` (`ViewMode::FRAME_VIEW`, `SPLIT_VIEW`, `FIELD_VIEW`, `getStretchField`):
+
+- **Split:** first field in the top half, second field in the bottom half, each at field height.
+- **Field:** one field; "stretch" line-doubles it to the frame height.
+
+## Output
+
+A **View** button (Frame / Split / Field) under Frame: Active/Full, on all three decoders (CVBS, Tape Decode, RF Preview), and the flag `--video-fields frame|split|field`.
+
+- **CVBS / Tape Decode:**
+  - The render blit, which runs every UI frame anyway, writes the woven rows in field order: frame rows 0,2,4 (`field_buffer[1]`) form the top block and rows 1,3,5 form the block below. There is no extra pass.
+  - Split draws the two blocks in the top and bottom halves of the picture rect. Field stretches the newest field's block.
+  - The decoder records which field completed each published frame (`display_back_field` → `display_front_field`). Field view therefore follows the newest field, so stepping one field changes the picture, as in tbc-analyse.
+- **RF Preview:**
+  - When the mode is not Frame, the frame is uploaded with its rows in field order (`rgba_view` scratch). The decoder writes field rows as `y*2+parity`.
+  - Field picks the block of the newest field's parity (`gui_rf_decode_status_t.last_field_parity`, set before the field's frame is published).
+  - Toggling the view re-uploads the current frame.
+
+## Verification
+
+- Suite 60/61; `update_cli` is environmental. Getting there took three rounds on `gui_rf_routes_test` (RF overlay layout contract):
+  - The label counts gained the View label in picture layouts (10 to 11). Audio-only Hi-Fi is unchanged (9).
+  - A new `OVERLAY_FIELD_VIEW` flag asserts that the label is drawn.
+  - The first placement, a new row, pushed the bottom button out of the small 346x288 @1.5x panel. The RF Preview View button now sits on the Frame row, left of Frame, so the column height is unchanged. The CVBS overlay keeps its own row (as in the screenshots).
+- Recaptured after the move (scratchpad `fv2-split.png`): RF Preview Split on the Daimler tape, with the button beside Frame.
+- Test Gen PAL, CVBS decoder: Frame / Split / Field screenshots (scratchpad `fv-*.png`).
+- Daimler NTSC VHS RF, RF Preview (scratchpad `fvpb-*.png`):
+  - Split shows two complete fields stacked;
+  - Field shows one field at full picture height;
+  - Frame is unchanged.
+- The same captures showed the saved RF Preview decoder restored on channel B, OSD: Off, the "Cores : 3.00" label, and CH B clip counts staying 0 during Daimler playback.
+
+## Not yet
+
+- The View mode is not saved per channel. It could join `video_decoder_*`.
+- Not yet confirmed by harrypm.
+
+## Round 2 (same day)
+
+### Input (harrypm)
+
+- "make system config persistent also (i.g system NTSC or PAL etc) add view to the vertical column not side stack it to the left."
+- "Sync --> Auto instead of fixed for CVBS also move OSD to the bottom and system to the top of its selection drop downs"
+- "Field order also first on the spectrogram should be top and second bottom in split view modes ensure this is enforced"
+- "fix pause and field/frame lock of the WFM for CVBS"
+
+### Output
+
+- **Field order, measured and enforced:**
+  - New tests `gui_cvbs_field_order` and `gui_rf_field_order` decode Test Gen frames (each opens with field 1's pre-EQ train, the definition `gui_field_locate_test` pins the Spectro's f1 to).
+  - ITU field 1 is parity 0 in both decoders, for PAL, NTSC (and SECAM RF), at 40 and 20 MS/s.
+    - CVBS: parity 0 is `field_buffer[0]`, which the weave puts on the ODD frame rows, so the first Split showed field 2 on top.
+    - RF Preview: parity 0 is the even rows (`y*2+parity`). It publishes each frame as field 1 completes.
+  - Split now puts field 1 on top through `gui_cvbs_split_row` / `gui_rf_split_row`. The tests check the CVBS weave rule against `deinterlace_fields` and that every field 1 row lands in the top block.
+- **System persistence:** `video_decoder_a/b` now hold per slot `decoder:system:format:view` (for example `rf:ntsc:vhs:split`, `cvbs:pal:-:field`), through `gui_video_panel_describe` / `gui_video_panel_restore`. Bare decoder names from the previous build still load.
+  - Round trip on a scratch config: run 1 saved `cvbs:ntsc:-:split` / `rf:ntsc:vhs:split`.
+  - With A edited to `cvbs:pal:-:field`, run 2 restored both channels, even with the global `video_system` left at NTSC.
+- **RF Preview View:** its own row under Frame. The row budget went from 7 to 8 so short panes still fit; `gui_rf_routes` passes.
+- **CVBS:**
+  - Sync opens Auto; Tape Decode keeps Fixed.
+  - The column now runs System (top), Decoder, Frame, View, Levels, Sync, Colour, OSD (bottom).
+  - The System option clicks are checked first, because the open list lies over the buttons below it.
+- **WFM:**
+  - Pause: the panel blanked the trace after 0.5 s without frames ("feed stopped"), so paused playback emptied it. It now holds the last frame while the channel is paused, and takes no frames during a step-back lead-in.
+  - Hand-off: three buffers, latest wins (`mid` mailbox, pointer swaps under a `swap_lock` flag). It previously dropped the newest frame while the renderer held the last one, which was often the frame at a paused playhead.
+  - Lock: `gui_wfm_end_field_locked`. A frame is field 1 + field 2 of the same frame; an accumulation starting on field 2 is dropped; two field 1s restart. A single-field mode exists in the code, but the WFM decodes its own feed, so the Video panel's View does not drive it; no WFM control selects it yet.
+  - The `gui_wfm` test gained a lock and hand-off contract check.
+- Suite 62/63; `update_cli` is environmental. Screenshot `r3-run2.png` shows the new columns and restored systems.
+
+- **Vectorscope** (harrypm: "same bug with vectorscope in playback mode"):
+  - The panel blanked after 0.5 s without fields, so paused playback emptied it. It now holds while the channel is paused and takes nothing during a step-back lead-in, as the WFM does.
+  - Its field hand-off still drops a new field while the renderer holds the previous one. Left as is: the per-field slots and dirty-row clearing make a latest-wins rewrite riskier, and the blanking was the visible bug.
+- Suite 62/63 after the vectorscope change.
+- **Panels enabled while paused** (harrypm: "Vectorscope and waveform are not loading from the current state/frame when enabled in playback mode ... blank until the file pos is moved"):
+  - Both panels decode their own feed, which a paused player never fills.
+  - New `gui_playback_refresh_channel`: a step to the cue itself, with the forward-hop test now `step > at`, so it seeks with the 0.2 s lead-in and lands on the same frame.
+  - The WFM and vectorscope call it once when paused with nothing shown (`pause_refreshed`); the flag resets on play.
+  - Suite 62/63. Not seen in the real app yet: it needs a paused session, and no launch flag starts one.
+- **Frame mode persistence** (harrypm: "frame mode should be persistent as well (i.g full-frame mode)"):
+  - The slot spec gained a fifth part, `active|full`, for example `cvbs:pal:-:split:full`. Restore goes through `gui_cvbs_set_frame_view_mode` (CVBS / Tape Decode) and `gui_vhs_fm_set_frame_mode` (RF Preview).
+  - Round trip on a scratch config: run 1 saved `...:active`. With the file edited to `full`, run 2 restored Full on both channels and saved `full` back.
+  - Screenshot `fm-run2.png`: CVBS Full shows sync and burst; both overlays read Frame: Full.
+  - Suite 62/63.
+
+### Not yet confirmed by harrypm
+
+- WFM and vectorscope pause behaviour in the real app.
+- The column order.
+- Split field order on his captures.
+- **Waveform paused position marks** (harrypm: "use field data to also add pos markings for waveform in player mode"; chose "Paused-only on-trace marks"):
+  - Paused in player mode, the trace is a window read from the file around the playhead. New per-channel raw-window reader in `gui_playback.c` (`gui_playback_request_raw_window` / `_poll_raw_window`): its own FLAC decoder, the playback container conversion, and the Spectro's field locator over one field of lead-in.
+  - The window goes through the normal processing (trigger, zoom and Res still apply). `waveform_process_display` records the sample-to-point mapping, so the marks are exact.
+  - Marks:
+    - f1 / f2 boundary lines;
+    - a tick at every line start, labelled with ITU frame lines (thinned to 1/5/10/25/50/100 when crowded);
+    - a yellow playhead line;
+    - a readout like "f1 L191 from file (paused)".
+  - The locator mode comes from the channel's Video panel (as the Spectro), else the Waveform's Signal type.
+  - Fix found while verifying: field 2 opens half a line into line 313 (525: 263), so the line grid runs from field 1's start (field-2 marks anchor 312.5 / 262.5 lines back). Before that, every field-2 tick sat half a line before its sync.
+  - Verified on screen with new `--auto-pause <s>`, using the EBU PAL CVBS and Daimler NTSC RF files: f1 L191, f1 L260 and f2 L413 pauses; ticks on the sync leading edges in zoomed crops.
+- **Toolbar mode selector:** reads "Player" ("Play" at the tiny tier) on the playback device (harrypm: "mode selector should say Player instead of MISRC/HSDAOH in player mode").
+- Suite 62/63.
+- **Format-agnostic field lock** (harrypm, with a screenshot of channel B as Spectro | Waveform with no Video panel on the NTSC Daimler RF: "alignment is off but should be easy to detect based off headswitch peaks (rather than format targeted dependency)"):
+  - Cause: without a Video panel both panels assumed CVBS + the Video System setting (PAL). On NTSC FM RF that found no fields; the Spectro showed the nominal lattice and the Waveform "no field lock".
+  - New `GUI_FIELD_LOCATE_AUTO` with `lines_per_frame` 0:
+    - It traces the run both ways (FM carrier frequency and CVBS level).
+    - It measures the system from the vertical-sync train spacing (20 ms is 625, 16.68 ms is 525). The broad-pulse thresholds barely differ between 64 and 63.56 us lines.
+    - It keeps the candidate whose consecutive field starts repeat at one field period, and reports `found_mode` / `found_lines`.
+  - The Spectro and the Waveform now always request AUTO. The Video panel / Video System only seed the nominal lattice. The Spectro label shows what it locked to ("locked FM 525").
+  - Head switching was considered: it marks the field rate too, but sits about 6.5 +-1.5 lines before V sync depending on the deck. The sync trains are line-exact, so they are the anchor.
+  - `gui_field_locate_test`: each case also runs as AUTO. PAL / NTSC, CVBS / VHS RF, 20 / 40 MS/s all found the right mode and system, 0.00 lines off, parity correct.
+  - Real files with no Video panels and `video_system` forced to PAL: EBU PAL CVBS locked CVBS 625, Daimler NTSC RF locked FM 525. f2 lines sit on the visible V-sync interval (scratchpad `auto2.png`).
+  - Suite 62/63.
+- **Head switches and Waveform line lock** (harrypm, with a screenshot of the Waveform at 20 us/div not H-locked: "headswitch peaks are an absolute irrespective of format so allow for an easy clear ref point of the FM without pre-setting the TV system"):
+  - Measured on 2 s of the Daimler NTSC VHS RF (scratchpad `hsprobe.c`, `hsfold.c`):
+    - The RF envelope steps where the heads hand over.
+    - The stronger head's step repeats exactly once per frame (33.367 ms). The weaker head is lost among picture steps in a plain peak pick.
+    - Folding the step measure over 100 ms at the NTSC frame gives both heads at 9-16x / 6-10x the mean, 16.680 ms apart. At the PAL frame the second head is ~3x and 19-20 ms off.
+  - `fl_head_switches` in the locator (FM): RF envelope trace, 6 us step measure, fold per system, accept the system whose two head phases sit half a frame (+-0.15 ms) apart. Each switch is the local peak within +-0.15 ms (+-0.5 ms caught picture steps).
+  - The HS system now drives the line-exact V-sync search; train spacing is the fallback.
+  - Real-data harness `hsreal.c` (5 runs x 100 ms): HS system 525 every run. Head 0 precedes f1, head 1 precedes f2. All 30 switches sit 5.75-5.85 lines before their field start (VHS spec 6.5 +-1.5).
+  - Head switches are carried by the analysis worker (`gui_playback_analysis_head_switches`) and the raw window (`hs_pos` / `hs_head`). Both panels draw dashed cyan HS1 / HS2 marks.
+  - Paused Waveform line lock: processed from a tenth of a span before the start of the playhead's line (`waveform_pw_line_start`), so H sync sits at the same place on every step. The window gets ~105 ms of lead-in for the fold.
+  - Suite 62/63 (the lifetime test gained stubs for the two new analysis calls).
+  - NOT verified on screen: GL windows render white on this machine now, the 16 Nov build too (PrintWindow and screen grab both white). It is environmental, as before. Awaiting harrypm's view.
+- **1-field glitch** (harrypm GIF: Spectro + Waveform paused at 1 field "glitches out"):
+  - A 1-field window holds one V-sync train and no head-switch pair, so nothing can be measured. The locator still reported its 625 default as found.
+  - The Spectro adopted it, re-requested a PAL-length window, measured 525, and flipped back and forth.
+  - Now the locator reports a system only when measured (head switches, else train spacing). A given line count is just a hint for unmeasurable runs. With neither, it reports 0 (`found_measured`).
+  - The system measured on a channel this session is shared (`gui_playback_measured_lines`; any panel's paused read; reset on a new session) and used as the hint.
+  - New test case: a 1-field NTSC RF run reports 0 without a hint, and 525 / 0.00 lines off / f1 with the hint.
+  - On screen at `--spectro span=1field`: "locked FM 525" stable across captures.
+- **Vectorscope TV System would not cycle in player mode** (harrypm): a pick is queued and applied when the panel's decoder next sees samples, which never happens while paused. System / Mode / Lines / Field clicks (and WFM System / Channel / Range) now set `refeed`. While paused, the panel re-cues the channel once, so the lead-in replays through the new setting. Not click-tested here (no input is sent to the GUI).
+- Screenshots render again on this machine; the white-window state passed.
+- Suite 62/63.
+- **Waveform Lock: Line / HS** (harrypm: "waveform is still not locking on the clear dip/peak of headswitch pos", then chose "Both, selectable"):
+  - The paused Waveform's Lock button (left of Range, shown while the file window is up).
+  - Line places the playhead's line start a tenth in, as before. HS places the current field's head switch (the last at or before the playhead) a tenth in.
+  - The window request centres on the switch.
+  - New `--wave zoom=,lock=`.
+  - Screens: at `zoom=128 lock=hs` and `zoom=8 lock=hs`, HS2 sits on the envelope step at the tenth mark.
+- **Spectro glitch "breaks with waveform when zooming out":**
+  - Shared-state flip ruled out: the system is measured correctly at run lengths 35 ms - 1 s, never wrong, CVBS never wins (`hslen.c`). 20 ms runs measure nothing and use the hint.
+  - Not reproduced at fixed zooms 8 and 128 in both locks: Spectro "locked FM 525" in every capture.
+  - The shared measured system (`gui_playback_measured_lines`) landed after the build harrypm reported on. Awaiting a retest with live scroll-zooming.
+- Suite 62/63.
+- **Paused jumping, Spectro and HS lock** (harrypm: "spectro is still jumping", "HS now also causes jumping"). Traced with new env-gated logging: `MISRC_PAUSED_TRACE=1` logs every paused-window request and re-anchor; `MISRC_DEBUG_AUTOSTEP=<n>` steps n fields after `--auto-pause`, for traces without input. Four feedback loops:
+  1. HS lock: each read refines the switch peak a few samples apart, and the window followed it. 122 requests in 16 s idle, the target cycling 298 / 303 / 308 / 313. Fix: hysteresis, holding the switch unless the estimate is > 0.5 ms away.
+  2. Shared system flip: the head-switch fold accepted a 1-frame NTSC window (0.8 frame minimum), and a partial PAL fold won by chance. The shared system went to 625 and the Spectro lattice oscillated 103 lines for ever. Fix: a system is eligible only when the run holds 1.5 of its frames (50 ms minimum), plus hysteresis on the shared value (a change needs two agreeing reads).
+  3. Spectro parity misread: a field 2 start labelled f1 re-anchored the lattice one field, +-261 lines, then back. Fix: once locked, a "field 1" one field off the lattice is ignored.
+  4. Spectro step drift: small drifts re-anchor quietly; only a gross one (> 10 lines) or no lock re-requests.
+  - HS lock also stayed on the first switch through 12 steps, because the window did not reach the moved playhead. Fix: the HS target is valid only while the window covers the playhead, and the HS-lock window extends to it.
+  - Result, 12 field steps: Spectro 11 requests with only the start-up re-requests; HS lock 2 requests per step (read at the playhead, then the switch window) and none between steps. The screen after the steps shows HS1 a tenth in on the envelope step, and the Spectro locked FM 525.
+- Suite 62/63.
+- **Head SW trigger mode** (harrypm: "I want this lock mode to be like a sync trigger mode so I can lock onto the envelope properly while playing also"):
+  - New `TRIGGER_MODE_HEADSWITCH` ("Head SW" / "HS" in the Trig menu) and `signal/gui_hs_trigger.c`. Per display frame it finds the RF envelope step (6 us either side, relative to level) above 8x the frame's median step, and refines it to the sharpest 2 us edge. Frames without one hold the last triggered trace.
+  - Dropout guard: a dip that recovers is not a switch. The level change must hold over 6-30 us either side.
+  - Measured on the Daimler NTSC VHS RF (scratchpad `hstrig.c`, truth = the locator's folded switches, 114):
+    - 64 k frames: 168 / 181 frames with a switch hit, 35 false triggers in ~1,200 frames (~3%), 0.4 us mean error;
+    - 400 k frames: 168 / 184 hit, 17 false.
+    - Without the dropout guard there were 228 false triggers on 64 k frames.
+  - Live (`--wave zoom=8,trig=hs`, playing): three captures a second apart all have the envelope step at the t=0 trigger point.
+  - Fixed alongside: the paused file window searched the shared display-frame trigger buffers instead of itself (`s_trigger_self`).
+  - `--wave` gained `trig=off|rise|fall|sync|cvbs|hs` (the Trig dropdown was a listed gap).
+  - `gui_waveform_overlay` test: the short-panel heights now derive from the trigger-menu height (180 was hard-coded) and sweep 2 px steps. The "Channel header over a button" case can no longer occur with the taller menu, so it is reported as a note.
+  - Suite 62/63.
+- **Span back-scroll jump at 2-3 frames** (harrypm: "backscrolling from 3 frames still causes the bug ... 2 - 3 frames I should say"):
+  - Traced with a new diagnostic, `MISRC_DEBUG_SPANSTEP=<n>`, which steps the paused span down a notch every 1.5 s.
+  - At 3 frames the field-1 estimate came back exactly +-1 line apart depending on the window position.
+  - The quiet re-anchor moved the lattice by that line, the snapped centre moved, the window was re-read, and it moved back: centre 46331379 <-> 46332651 for ever.
+  - Fixes:
+    - a 2.5-line re-anchor dead band;
+    - a centre move under 2 lines no longer re-reads by itself (steps and span changes still do).
+  - Traces:
+    - span 3 frames -> 2 -> 1 -> 1 field at two pause points: one read per change, none between;
+    - 8 field steps at 2 frames: Spectro 8 reads total, HS-lock Waveform 2 per step.
+  - Suite 62/63.
+  - The scroll wheel reached the test window during one trace (span to 60 s): the test window can take harrypm's mouse input, so traces now rely only on the env-driven steps.
+- **Marks toggles** (harrypm 2026-11-25: "It would be nice to have a toggle for the wire frames for the field frame info"):
+  - Spectro: a Marks: On / Off button, left of the paused span dropdown. Off hides the field / frame lines, f1 / f2 tags, line ticks and HS marks. IN / OUT cut markers and the hover readout stay.
+  - Paused Waveform: the same button, left of Lock. Off hides the field / line ticks, HS marks, playhead line and readout.
+  - Per panel. Flags `--spectro marks=on|off`, `--wave marks=on|off`.
+  - Capture with both off: buttons read Marks: Off, no wireframe.
+  - Suite 62/63.
+- **Hi-Fi audio FM Spectro jitter** (harrypm 2026-11-25: "on the hifi-audio fm file its a bit glitchy same issue still"; confirmed "fixed!"):
+  - Trace: the paused Spectro cycled through 3 windows for ever. Each window put field 1 at +10 / -160 / +149 lines from the last, and each gross re-anchor triggered a re-read. A Hi-Fi audio carrier has no video fields, so the locator's field-1 marks are noise.
+  - Fixes (`gui_spectrogram.c`):
+    - The lattice anchors only on a coherent window: most field-1 marks agree on one frame lattice within 3 lines. Trace: `marks incoherent (3 of 22 field 1 agree): lattice kept`.
+    - Locked, a gross miss (> 10 lines) must show up in two windows in a row (`lattice_pending`). The first sighting never re-reads.
+    - `spectro_set_span`: a wheel tick past either span end (clamped, same index) no longer re-reads. Trace: repeated same-centre reads at 1 field.
+  - Restore point: `Documents/AI Notebook/restore-points/MISRC-GUI-restore-2026-11-25-video-field-view-hifi-fix.{zip,patch,files,md}` (pre-upstream).
+- **Upstream merge 2026-11-25:** fast-forward f7649a7 -> origin/main 3aba807 (PR #31 DdD 50-ohm CVBS, RF preview perf, Linux CI fix). Uncommitted work re-applied via stash; stash kept.
+  - meson: unions of upstream `common/rb_event.c` and `gui_hs_trigger.c`; the new `gui_cvbs_field_order_test` links rb_event too.
+  - `gui_cvbs.h`: both overlay fields kept (`hold_frame_for_relock` + `display_*_field`).
+  - `gui_cvbs.c`:
+    - Column order: Decoder, System, ..., Colour, then the upstream 50-ohm receiver row (CVBS only), then OSD last.
+    - Click handling: the receiver handler and the Field view handler both kept.
+    - The System dropdown handler stays at the top; upstream's `cvbs_system_option_count` and `panel_config_lock` were ported into it.
+  - Full rebuild (exe 03:19), suite 62/63.
+- **Vectorscope blank on first file load** (harrypm 2026-11-25: "in split mode vectorscope does not engage on file first load"):
+  - Repro: saved panels A = Vector | Video on the EBU PAL file showed `System: Auto (NTSC)` and "No burst-locked colour" for ~5 s.
+  - Trace (temporary `MISRC_VS_TRACE`, removed):
+    - The scope was fed normally and measured 20000 us fields (PAL).
+    - But `follow_hold=250` from the first block kept it on NTSC.
+    - The render's pre-playback frames count as Test Gen mode, so `vs_follow_generator` followed the saved Video System (NTSC). That queues a 250-field hold, meant only for a Test Gen system switch.
+  - Fix (`gui_vectorscope_panel.c`): leaving Test Gen mode sets `release_hold`, so the next process call drops the hold and the Auto vote switches after 3 fields.
+  - Trace after the fix: `hold=0`, PAL by about 1 s into playback. Capture: `Auto (PAL)` with the bars on target.
+  - Full rebuild (exe 03:30), suite 62/63.
+- **50 ohm only for DdD, Hi-Fi on CH3/4, HiFi waveform panel** (harrypm 2026-11-25).
+  - Request: "Remove the 50Ohm mode from player/test gen for the cvbs-decoder it should only be enabled if a DdD device is being used or a DdD metadata noted file is being used. Add HiFi-Decoding to Ch3/4 on player mode and on capture modes (if there is no input/stream from a MISRC V2.5 or HSDAOH with 4ch input). Add a realtime waveform readout to the decoded hifi-audio".
+  - Answers to the design questions: auto-detect the channel; Auto VHS PAL/NTSC plus a Beta option; a new HiFi panel view; decode only when used.
+  - **50 ohm gate:**
+    - New `input/gui_source_meta.c`. `gui_source_is_ddd(app, ch)` is true for:
+      - a DdD device;
+      - a playback file that is `.lds` or `.ldf`;
+      - a file with a DdD JSON sidecar (`<name>.json` with `captureInfo` and `transferCount`; the format is from the DdD app's `mainwindow.cpp`);
+      - a file whose MISRC capture log `<base>_<timestamp>_misrc_capture.log` says `capture_device_type: ddd`.
+    - `gui_cvbs.c` asks through `gui_cvbs_set_ddd_query`. The button is hidden otherwise, and a mode left on is switched off under the panel lock.
+  - **Carrier probe:**
+    - New `signal/gui_hifi_probe.c`: a 4096-sample Hann Goertzel bank over 0.9 to 2.2 MHz. It scores the share in plus or minus 45 kHz windows at the VHS NTSC (1.3 / 1.7 MHz), VHS PAL (1.4 / 1.8 MHz) and Beta NTSC (1.38 / 1.53 / 1.68 / 1.83 MHz) carriers.
+    - Real data, 0.2 s, 40 blocks:
+      - Hi-Fi RF file: NTSC 0.856 mean (0.001 minimum), PAL 0.002.
+      - Daimler video RF: NTSC 0.099, PAL 0.102.
+    - Threshold 0.45; the scores are smoothed.
+  - **CH3/4 decoder:**
+    - New `processing/gui_hifi34.c`: one audio-only RF preview worker (VHS Hi-Fi profile, or Beta Hi-Fi), fed by an RF tap on `gui_video_submit_rf`.
+    - When it runs: during playback or capture, and only while CH3/4 is the monitor pair (and no real CH3/4) or a HiFi panel is shown.
+    - Real CH3/4 means the device is HSDAOH (MISRC V2.5 4-ch audio) or CXADC (clockgen CH3 head switch), and device audio arrived in the last 1.5 s (`audio_rx_ms`).
+    - Hysteresis: a rival channel or format must beat the current pick by 0.15 for 1 s.
+    - Monitor: `gui_video_update_rf_routes` takes the worker as the RF audio source while CH3/4 is selected.
+    - Toolbar: the CH3/4 button reads `Hi-Fi`; the meters read `HiL` / `HiR`.
+  - **HiFi panel:**
+    - New `visualization/gui_hifi_panel.c`.
+    - L / R lanes: a min / max envelope per pixel, or a line trace at short spans; peak dBFS, and -6 dBFS grid lines.
+    - Status: channel, format, lock, CPU.
+    - Buttons: Source / Format (saved to the settings) and Span (also the mouse wheel).
+  - **Verified in the app:**
+    - Playback of the EBU PAL file (A) plus the Hi-Fi file (B): `[HIFI34] decoding RF B as VHS NTSC`; the panel reads Locked, CPU 17 to 27%; real waveforms at -5 dBFS; HiL / HiR meters live.
+    - 50 ohm button: hidden in Test Gen and on the EBU file; shown on a scratchpad copy with a DdD JSON sidecar.
+  - **Tests:** new `gui_hifi_probe` (synthetic pairs at 20 / 40 MSPS, video / noise / lone-tone rejection) and `gui_source_meta`. Suite 64/65.
+  - **Not tested on hardware:**
+    - HSDAOH / MISRC V2.5 real CH3/4 audio (stays CH3/4, no takeover);
+    - Beta Hi-Fi (manual format; runs the Beta video plus Hi-Fi profile);
+    - an audible check of the monitor output.
+- **Meters keep CH1..CH4 names; dedicated Hi-Fi at 5 MSPS** (harrypm 2026-11-25: "do not rename the level meaters, change sampling from 20msps to 5msps for all HiFi dedicated formats, excluding intergrated Video8/Hi8/Betamax NTSC/Laserdisc"):
+  - Toolbar meters are back to CH3 / CH4. They still show the decoded Hi-Fi levels when Hi-Fi owns CH3/4; the CH3/4 button still reads Hi-Fi.
+  - New `gui_rf_resampler_create_hifi_narrow` takes any 8 - 200 MSPS input to 5 MSPS (`GUI_RF_HIFI_NARROW_RATE_HZ`):
+    - 10, 20 and 40 MSPS inputs use the existing halfband stages (1, 2 or 3 stages; the 8:1 path applies to the 5 MSPS output only);
+    - other rates use soxr with a 2.1 MHz passband.
+  - The worker uses it for audio-only (dedicated VHS Hi-Fi) profiles. The audio slots, `output_sample` and the decoder run at 5 MSPS, and timestamps are still rescaled to 20 MSPS.
+  - Unchanged: Beta Hi-Fi and LaserDisc stay at 20 MSPS (integrated); native 8 / 8.192 / 10 MSPS and I/Q keep their native rates.
+  - `gui_vhs_hifi_create` accepts 5 MSPS (front end with no RF decimation).
+  - A/B on 3 s of the real Hi-Fi RF file (NTSC), same code:
+    - PCM identical: L correlation 0.99997 (42.7 dB difference SNR), R 0.99983 (34.6 dB); RMS -18.3 / -17.8 dBFS on both paths; both stereo locked.
+    - DSP CPU is not lower: 15.0% (20 MSPS) vs 15.8% (5 MSPS) of a core, best of 5. The decoder already front-ended at 5 MSPS (a 47-tap 4:1 filter), so the cascade costs the same multiplies.
+    - The saving is in the worker's audio-queue traffic, 4x fewer floats (20 M -> 5 M per second).
+  - Anti-alias response vs the old in-decoder filter:
+    - carriers 1.2 - 1.95 MHz: -0.3 dB worst (old -0.4);
+    - 3.1 MHz edge: -33 dB (old -30);
+    - 3.4 / 3.8 / 4.4 MHz luma FM: -71 / -76 / -91 dB (old -74 / -73 / -75);
+    - 28.636 MSPS through soxr: -91 dB.
+  - New test `gui_hifi_narrow`. `gui_rf_preview_worker` now expects 5 MSPS for custom-rate Hi-Fi, and its stub resampler gained the two new calls.
+  - Fixed during the change: the 8:1 fast path first also caught 160 -> 20 MSPS (`gui_rf_resampler` stopband test failed), so it is now limited to the 5 MSPS output.
+  - App: `[HIFI34] decoder input 5.000 MSPS (source 20.000 MSPS)`. Suite 65/66 (`update_cli` is environmental).
+- **Vectorscope I / Q / -Q / -I on PAL** (harrypm 2026-11-25: "the corner symbols are missing on the vectorscope graticule ... in playback mode"):
+  - The I/Q axes and labels were drawn only for NTSC, so Auto (PAL) on the EBU playback hid them.
+  - They are now drawn for NTSC and PAL; SECAM (Db/Dr view) has none. Capture: Auto (PAL) shows all four.
+  - HiFi panel: Searching now shows the carrier scores of the selected format. A forced VHS PAL on the NTSC Hi-Fi file read B 0.89 before, 0.00 now.
+  - Full rebuild; suite 65/66.
+- **HiFi under Video in the view picker; audio after Connect / Disconnect** (harrypm 2026-11-25: "Move HiFi under video on the dropdown selection, also there is a bug of audio not outputting when cycling connect/disconnect").
+  - **Picker order:**
+    - `panel_view_menu_order()` (`gui_panel.c`) gives Waveform, FFT, Video, HiFi, Histogram, Spectro, Demod, Vector, WFM. The ids are unchanged.
+    - Found and fixed with it: option IDs were `ch * 10 + vt`. HiFi is id 10, so channel A's HiFi option had the same Clay id as channel B's Waveform option. The stride is now 32 in `gui_ui.c` and `gui_dropdown.c`.
+    - The stats-layout harness stub gained `panel_view_menu_order`.
+  - **Audio after Connect / Disconnect:**
+    - New diagnostics:
+      - `MISRC_AUDIO_TRACE=1`: the monitor pump state on change (enabled, capturing, session, stream, epoch, source).
+      - `MISRC_DEBUG_RECONNECT=<n>` (with `MISRC_DEBUG_RECONNECT_GAP=<s>`): the Connect button's Disconnect / Connect.
+      - `MISRC_DEBUG_DEVSWAP=<n>`: the device dropdown's same-frame stop and start, to Simulated and back.
+    - Reproduction runs, with Audio Mon on and CH3/4 Hi-Fi, using temporary push / device-callback counters (now removed):
+      - 2 cycles at 1.5 s, 6 at 0.2 s, 3 at 0.3 s, and 4 device swaps.
+      - Every new session reopened the output stream ("callback" mode on the new Hi-Fi worker), and Hi-Fi PCM reached the device: 43 - 46k of 48k frames/s, the same as before any cycle.
+    - harrypm's session log (`user4.err`): after the Playback -> Simulated -> Playback switch, no output stream was opened again for the rest of the session, though Hi-Fi decoding and capture ran. No raylib audio warnings.
+    - The only path that does that with capture running is Audio Mon off. The settings saved at 09:30:14 in that session record `audio_monitor_playback: false`; only the Audio Mon button writes it.
+    - The button's on and off colours are close: (95,95,110) vs (65,65,75).
+    - Not reproduced. Asked harrypm to confirm Audio Mon's state when it goes silent; the app is relaunched with `MISRC_AUDIO_TRACE=1`.
+    - Also seen: the device plays 43 - 46k of 48k frames/s, so the Hi-Fi monitor runs about 5% short (playback speed vs decode). Not yet investigated.
+  - Full rebuild; suite 65/66.

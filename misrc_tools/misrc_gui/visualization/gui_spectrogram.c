@@ -116,10 +116,16 @@ typedef struct spectro_engine {
     // mode that is active"): the field lattice is anchored at lattice_t0, the
     // file time of a field-1 start found by the channel's Video decoder mode
     // (0 = nominal: counted from the file start, until a detection lands).
-    int sync_mode;                   // GUI_FIELD_LOCATE_* of the channel's Video panel (CVBS default)
+    int sync_mode;                   // GUI_FIELD_LOCATE_* requested (AUTO: format-agnostic)
+    int found_mode, found_lines;     // What the field lock found (0 = not yet)
+    double hs_t[32];                 // FM head switches in the window (seconds)
+    int hs_head[32];
+    size_t hs_count;
     int sync_lines;                  // 625 / 525
     double lattice_t0;
     bool lattice_locked;
+    double lattice_pending_t0;       // Gross miss seen once, awaiting a second window
+    bool lattice_pending;
     double mark_t[64];               // Detected field starts of the shown window (s)
     int mark_field[64];              // 1 / 2 (0 = parity unresolved)
     size_t mark_count;
@@ -146,6 +152,8 @@ typedef struct spectro_engine {
     Rectangle span_btn_rect;
     Rectangle span_opts_rect[12];
     bool span_dropdown_open;
+    bool marks_hidden;               // Marks toggle: field / frame wireframe off
+    Rectangle marks_btn_rect;
 
     // Double-click chrome-hide tracker (see ui/gui_chrome_hide.h): toggles
     // ALL overlay chrome (palette dropdown, axis labels, PAUSED indicator);
@@ -305,23 +313,34 @@ static const struct {
 static const char *const s_dir_names[SPEC_DIR_COUNT] = { "Horizontal", "Vertical" };
 static const char *const s_palette_names[2] = { "Phosphor", "Heat" };
 
+// Marks toggle (harrypm 2026-11-25: "a toggle for the wire frames for the
+// field frame info"): a plain on/off button, highlighted while the marks show.
+static void spec_draw_toggle_button(Rectangle r, const char *label, bool on, float to_logical_w) {
+    DrawRectangleRounded(r, 0.15f, 4, on ? COLOR_BUTTON_HOVER : COLOR_BUTTON);
+    const float tw = (float)gui_text_measure(label, FONT_SIZE_DROPDOWN_OPT) * to_logical_w;
+    gui_text_draw(label, r.x + (r.width - tw) * 0.5f, r.y + (r.height - FONT_SIZE_DROPDOWN_OPT) * 0.5f,
+                  FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+}
+
 // Launch state for new panels (hard rule dev/gui_automation_flags_rules.md).
 static struct {
     int dir;
     int span;
     bool from_flag;
-} s_spec_launch = { SPEC_DIR_HORIZONTAL, SPEC_SPAN_DEFAULT, false };
+    bool marks_off;
+} s_spec_launch = { SPEC_DIR_HORIZONTAL, SPEC_SPAN_DEFAULT, false, false };
 
 bool gui_spectrogram_apply_launch_arg(const char *arg) {
     static const char *usage =
         "--spectro: expected comma-separated key=value pairs: dir=horizontal|vertical, "
         "palette=phosphor|heat, span=1field|1frame|2frames|3frames|5frames|10frames|25frames|"
-        "1s|3s|10s|30s|60s (the paused window)";
+        "1s|3s|10s|30s|60s (the paused window), marks=on|off (field / frame marks)";
     if (!arg || !*arg) {
         fprintf(stderr, "%s (got '')\n", usage);
         return false;
     }
     int dir = s_spec_launch.dir, palette = s_spec_palette, span = s_spec_launch.span;
+    bool marks_off = s_spec_launch.marks_off;
     const char *p = arg;
     while (*p) {
         const char *comma = strchr(p, ',');
@@ -345,6 +364,9 @@ bool gui_spectrogram_apply_launch_arg(const char *arg) {
         } else if (eq && SPEC_IS(p, klen, "palette")) {
             if (SPEC_IS(val, vlen, "phosphor")) { palette = SPEC_PALETTE_PHOSPHOR; ok = true; }
             else if (SPEC_IS(val, vlen, "heat")) { palette = SPEC_PALETTE_HEAT; ok = true; }
+        } else if (eq && SPEC_IS(p, klen, "marks")) {
+            if (SPEC_IS(val, vlen, "on")) { marks_off = false; ok = true; }
+            else if (SPEC_IS(val, vlen, "off")) { marks_off = true; ok = true; }
         }
         #undef SPEC_IS
         if (!ok) {
@@ -355,10 +377,11 @@ bool gui_spectrogram_apply_launch_arg(const char *arg) {
     }
     s_spec_launch.dir = dir;
     s_spec_launch.span = span;
+    s_spec_launch.marks_off = marks_off;
     s_spec_launch.from_flag = true;
     s_spec_palette = palette;   // the palette is shared by every Spectro panel
-    fprintf(stderr, "[AUTO] --spectro: dir=%s palette=%s span=%s\n", s_dir_names[dir],
-            s_palette_names[s_spec_palette], s_spans[span].name);
+    fprintf(stderr, "[AUTO] --spectro: dir=%s palette=%s span=%s marks=%s\n", s_dir_names[dir],
+            s_palette_names[s_spec_palette], s_spans[span].name, marks_off ? "off" : "on");
     return true;
 }
 
@@ -381,6 +404,9 @@ static void spectro_set_time_on_x(spectro_engine_t *e, bool time_on_x) {
 static void spectro_set_span(spectro_engine_t *e, int idx) {
     if (idx < 0) idx = 0;
     if (idx >= SPEC_SPAN_COUNT) idx = SPEC_SPAN_COUNT - 1;
+    // A wheel tick past either end clamps to the same span: no re-read
+    // (traced: every tick below 1 field re-read the same window).
+    if (idx == e->span_idx && e->analysis_span_seconds > 0.0) return;
     e->span_idx = idx;
     e->analysis_span_fields = s_spans[idx].fields;
     const double field_s = e->field_seconds > 0.0 ? e->field_seconds : 0.02;
@@ -437,6 +463,7 @@ static void *spectro_create(bool time_on_x) {
 
 static void *spectrograph_vtable_create(void) {
     void *state = spectro_create(s_spec_launch.dir == SPEC_DIR_HORIZONTAL);
+    if (state) ((spectro_engine_t *)state)->marks_hidden = s_spec_launch.marks_off;
     if (state && s_spec_launch.from_flag) {
         fprintf(stderr, "[AUTO] Spectro panel: dir=%s palette=%s span=%s\n",
                 s_dir_names[s_spec_launch.dir], s_palette_names[s_spec_palette],
@@ -591,11 +618,22 @@ static void spectro_update_paused_window(spectro_engine_t *e, gui_app_t *app, in
         center = (uint64_t)(start + span_samples / 2.0 + 0.5);
         t0 = start / rate;
     }
-    if (!e->analysis_requested || e->analysis_rerequest ||
-        center != e->analysis_req_center) {
+    // A centre move under 2 lines alone (a re-anchor's sub-line wobble) does
+    // not re-read: at 2-3 frames that wobble alternated the window one line
+    // each read (traced: centre 46331379 <-> 46332651 for ever = the jump).
+    const double center_tol = rate > 0.0 && e->line_seconds > 0.0 ? 2.0 * e->line_seconds * rate : 0.0;
+    const bool center_moved = fabs((double)center - (double)e->analysis_req_center) > center_tol;
+    if (!e->analysis_requested || e->analysis_rerequest || center_moved) {
+        if (getenv("MISRC_PAUSED_TRACE"))
+            fprintf(stderr, "[TRACE] spectro ch%d request center=%llu (prev %llu) rereq=%d lattice_t0=%.6f lines=%d span=%.4f\n",
+                    channel, (unsigned long long)center, (unsigned long long)e->analysis_req_center,
+                    (int)e->analysis_rerequest, e->lattice_t0, e->sync_lines, e->analysis_span_seconds);
         if (e->analysis_span_fields > 0) {
             gui_playback_request_analysis_window_fields(app, channel, center, e->analysis_span_seconds,
-                                                        e->sync_mode, e->sync_lines);
+                                                        GUI_FIELD_LOCATE_AUTO,
+                                                        gui_playback_measured_lines(app, channel)
+                                                            ? gui_playback_measured_lines(app, channel)
+                                                            : e->found_lines ? e->found_lines : e->sync_lines);
         } else {
             gui_playback_request_analysis_window(app, channel, center, e->analysis_span_seconds);
         }
@@ -630,21 +668,126 @@ static void spectro_update_paused_window(spectro_engine_t *e, gui_app_t *app, in
         gui_field_mark_t marks[64];
         size_t nm = e->analysis_span_fields > 0
             ? gui_playback_analysis_field_marks(app, channel, marks, 64) : 0;
+        // Head switches (FM): drawn as HS marks (format-independent reference).
+        {
+            uint64_t hp[32];
+            int hh[32];
+            size_t nh = e->analysis_span_fields > 0
+                ? gui_playback_analysis_head_switches(app, channel, hp, hh, 32) : 0;
+            e->hs_count = 0;
+            for (size_t i = 0; i < nh && rate > 0.0; i++) {
+                e->hs_t[e->hs_count] = (double)hp[i] / rate;
+                e->hs_head[e->hs_count] = hh[i];
+                e->hs_count++;
+            }
+        }
+        // Format-agnostic lock (harrypm 2026-11-19): the locator measured the
+        // mode and system from the file; adopt its line count.
+        {
+            int fm = 0, fln = 0;
+            if (nm && gui_playback_analysis_field_info(app, channel, &fm, &fln) && fln) {
+                e->found_mode = fm;
+                if (fln != e->found_lines || fln != e->sync_lines) {
+                    e->found_lines = fln;
+                    if (fln != e->sync_lines) {
+                        if (getenv("MISRC_PAUSED_TRACE"))
+                            fprintf(stderr, "[TRACE] spectro ch%d system %d -> %d (found)\n", channel, e->sync_lines, fln);
+                        e->sync_lines = fln;
+                        e->lattice_locked = false;
+                        e->lattice_pending = false;
+                        e->analysis_rerequest = true;
+                    }
+                }
+            }
+        }
         e->mark_count = 0;
         for (size_t i = 0; i < nm && rate > 0.0; i++) {
             e->mark_t[e->mark_count] = (double)marks[i].pos / rate;
             e->mark_field[e->mark_count] = marks[i].field;
             e->mark_count++;
         }
-        for (size_t i = 0; i < e->mark_count; i++) {
+        // Coherence (harrypm 2026-11-25 "on the hifi-audio fm file its a bit
+        // glitchy"): a Hi-Fi audio carrier has no video fields, so the
+        // window's "field 1" marks land anywhere (traced: each window put
+        // field 1 10 / -160 / +149 lines off the last, every one a gross
+        // re-anchor + re-read, for ever). Anchor only on a field 1 that most
+        // of the window's field 1 marks agree with (same frame lattice within
+        // 3 lines); a window with no such majority leaves the lattice alone.
+        const double frame_s = 2.0 * e->field_seconds;
+        size_t anchor = e->mark_count;
+        {
+            size_t n_f1 = 0, best = 0;
+            for (size_t i = 0; i < e->mark_count; i++) {
+                if (e->mark_field[i] != 1) continue;
+                n_f1++;
+                size_t agree = 0;
+                for (size_t j = 0; j < e->mark_count; j++) {
+                    if (e->mark_field[j] != 1) continue;
+                    const double d = e->mark_t[j] - e->mark_t[i];
+                    if (fabs(d - floor(d / frame_s + 0.5) * frame_s) < 3.0 * e->line_seconds) agree++;
+                }
+                if (agree > best) { best = agree; anchor = i; }
+            }
+            if (n_f1 >= 3 && best * 2 <= n_f1) {
+                if (getenv("MISRC_PAUSED_TRACE"))
+                    fprintf(stderr, "[TRACE] spectro ch%d marks incoherent (%zu of %zu field 1 agree): lattice kept\n",
+                            channel, best, n_f1);
+                anchor = e->mark_count;
+            }
+        }
+        for (size_t i = anchor; i < e->mark_count; i++) {
             if (e->mark_field[i] != 1) continue;
-            const double frame_s = 2.0 * e->field_seconds;
             const double off = e->mark_t[i] - e->lattice_t0;
             const double drift = off - floor(off / frame_s + 0.5) * frame_s;
-            if (!e->lattice_locked || fabs(drift) > 0.5 * e->line_seconds) {
+            // Locked, a "field 1" one FIELD off the lattice is a parity misread
+            // of a field 2 start (tape RF H-sync phase wobble; traced: the
+            // lattice flipped +-261 lines between windows): ignore it.
+            if (e->lattice_locked &&
+                fabs(fabs(drift) - e->field_seconds) < 15.0 * e->line_seconds) {
+                if (getenv("MISRC_PAUSED_TRACE"))
+                    fprintf(stderr, "[TRACE] spectro ch%d ignore parity misread (drift %.2f lines)\n",
+                            channel, drift / e->line_seconds);
+                break;
+            }
+            // Dead band 2.5 lines: the field-1 estimate wobbles by a line with
+            // the window position (traced +-1.00 line at 2-3 frames); only a
+            // real drift beyond that moves the lattice.
+            if (!e->lattice_locked || fabs(drift) > 2.5 * e->line_seconds) {
+                // Tape timing drifts the extrapolated lattice a little per
+                // frame. A small drift re-anchors QUIETLY (the next step or
+                // zoom places its window from this fresh anchor); only no
+                // lock yet or a gross miss re-requests at once - each of
+                // those re-requests was a second visible jump per step
+                // (harrypm 2026-11-19 "spectro is still jumping").
+                const bool gross = !e->lattice_locked || fabs(drift) > 10.0 * e->line_seconds;
+                // Locked, a gross miss must be seen in two windows in a row
+                // before it moves the lattice: the first sighting only arms
+                // it (no re-read), so a one-off misread can't start a loop.
+                if (gross && e->lattice_locked) {
+                    bool confirmed = false;
+                    if (e->lattice_pending) {
+                        const double pd = e->mark_t[i] - e->lattice_pending_t0;
+                        confirmed = fabs(pd - floor(pd / frame_s + 0.5) * frame_s) < 3.0 * e->line_seconds;
+                    }
+                    if (!confirmed) {
+                        if (getenv("MISRC_PAUSED_TRACE"))
+                            fprintf(stderr, "[TRACE] spectro ch%d gross drift %.2f lines held (awaiting a second window)\n",
+                                    channel, drift / e->line_seconds);
+                        e->lattice_pending = true;
+                        e->lattice_pending_t0 = e->mark_t[i];
+                        break;
+                    }
+                }
+                e->lattice_pending = false;
+                if (getenv("MISRC_PAUSED_TRACE"))
+                    fprintf(stderr, "[TRACE] spectro ch%d re-anchor lattice %.6f -> %.6f (drift %.2f lines, locked %d)%s\n",
+                            channel, e->lattice_t0, e->mark_t[i], drift / e->line_seconds, (int)e->lattice_locked,
+                            gross ? " re-request" : " quiet");
                 e->lattice_t0 = e->mark_t[i];
                 e->lattice_locked = true;
-                e->analysis_rerequest = true;
+                if (gross) e->analysis_rerequest = true;
+            } else {
+                e->lattice_pending = false;
             }
             break;
         }
@@ -931,6 +1074,27 @@ static void spectro_draw_field_marks(spectro_engine_t *e, double real_rate_hz, R
         }
     }
 
+    // FM head switches: dashed cyan lines tagged HS (harrypm 2026-11-19:
+    // "headswitch peaks are an absolute irrespective of format").
+    for (size_t i = 0; i < e->hs_count; i++) {
+        if (e->hs_t[i] < t0 || e->hs_t[i] > t0 + win) continue;
+        const float frac = (float)((e->hs_t[i] - t0) / win);
+        const Color hc = (Color){ 90, 220, 255, 220 };
+        if (e->time_on_x) {
+            const float x = bounds.x + frac * bounds.width;
+            for (float y = bounds.y; y < bounds.y + bounds.height; y += 8.0f)
+                DrawLineV((Vector2){ x, y }, (Vector2){ x, fminf(y + 4.0f, bounds.y + bounds.height) }, hc);
+            if (tags) gui_text_draw_mono(e->hs_head[i] ? "HS2" : "HS1", x + 3.0f, bounds.y + 40.0f,
+                                         FONT_SIZE_OSC_SCALE, hc);
+        } else {
+            const float y = bounds.y + (1.0f - frac) * bounds.height;
+            for (float x = bounds.x; x < bounds.x + bounds.width; x += 8.0f)
+                DrawLineV((Vector2){ x, y }, (Vector2){ fminf(x + 4.0f, bounds.x + bounds.width), y }, hc);
+            if (tags) gui_text_draw_mono(e->hs_head[i] ? "HS2" : "HS1", bounds.x + bounds.width - 44.0f,
+                                         y - FONT_SIZE_OSC_SCALE - 2.0f, FONT_SIZE_OSC_SCALE, hc);
+        }
+    }
+
     // The boundaries: this window's detected field starts, or the lattice's.
     double bt[96];
     int bf[96];
@@ -1028,7 +1192,8 @@ static void spectro_draw_hover(spectro_engine_t *e, double real_rate_hz, Rectang
     Vector2 m = gui_ui_get_mouse_position();
     if (!CheckCollisionPointRec(m, bounds) || e->last_sample_rate == 0) return;
     if (CheckCollisionPointRec(m, e->palette_btn_rect) || CheckCollisionPointRec(m, e->dir_btn_rect) ||
-        (e->analysis_active && CheckCollisionPointRec(m, e->span_btn_rect))) return;
+        (e->analysis_active && (CheckCollisionPointRec(m, e->span_btn_rect) ||
+                                CheckCollisionPointRec(m, e->marks_btn_rect)))) return;
     const double fx = (m.x - bounds.x) / bounds.width, fy = (m.y - bounds.y) / bounds.height;
     const double nyq = (double)e->last_sample_rate * 0.5;
     // Frequency: Horizontal = Y (Nyquist at the top), Vertical = X.
@@ -1202,12 +1367,24 @@ static void spectro_vtable_render(void *state_ptr, gui_app_t *app, int channel,
         const void *video = NULL;
         if (cfg->left_view == PANEL_VIEW_CVBS) video = cfg->left_state;
         else if (cfg->split && cfg->right_view == PANEL_VIEW_CVBS) video = cfg->right_state;
+        // The field lock is format-agnostic (AUTO: the locator measures mode
+        // and system from the file); the Video panel / Video System setting
+        // only seed the nominal lattice until a lock lands.
         int mode = GUI_FIELD_LOCATE_CVBS, lines = app->settings.video_system == 1 ? 525 : 625;
         if (video) (void)gui_video_panel_sync_source(video, &mode, &lines);
-        if (mode != e->sync_mode || lines != e->sync_lines) {
-            e->sync_mode = mode;
+        e->sync_mode = GUI_FIELD_LOCATE_AUTO;
+        // Measured on this channel (by any panel's paused read): adopt it.
+        const int measured = playback_selected ? gui_playback_measured_lines(app, channel) : 0;
+        if (measured && measured != e->sync_lines) {
+            e->sync_lines = measured;
+            e->found_lines = measured;
+            e->lattice_locked = false;
+            e->lattice_pending = false;
+            e->analysis_rerequest = true;
+        } else if (!measured && !e->found_lines && lines != e->sync_lines) {
             e->sync_lines = lines;
-            e->lattice_locked = false;   // a new source: re-lock
+            e->lattice_locked = false;
+            e->lattice_pending = false;
             e->analysis_rerequest = true;
         }
     }
@@ -1222,6 +1399,24 @@ static void spectro_vtable_render(void *state_ptr, gui_app_t *app, int channel,
     }
 
     if (playback_paused) {
+        // Diagnostics only (no GUI control): MISRC_DEBUG_SPANSTEP=<n> steps the
+        // paused span down one notch every 1.5 s, n times, as the wheel does.
+        {
+            static int span_steps_left = -1;
+            static double span_step_at = 0.0;
+            if (span_steps_left < 0) {
+                const char *ev = getenv("MISRC_DEBUG_SPANSTEP");
+                span_steps_left = ev ? atoi(ev) : 0;
+                span_step_at = GetTime() + 3.0;
+            }
+            if (span_steps_left > 0 && GetTime() >= span_step_at) {
+                spectro_set_span(e, e->span_idx - 1);
+                fprintf(stderr, "[TRACE] spanstep: span idx %d (%d fields)\n", e->span_idx,
+                        e->analysis_span_fields);
+                span_steps_left--;
+                span_step_at = GetTime() + 1.5;
+            }
+        }
         // --- DAW-style paused analysis window (direct file render) ---
         // Playing stays the 1:1 live rolling feed; paused renders a real
         // window of the FILE around the playhead across the full history
@@ -1236,6 +1431,7 @@ static void spectro_vtable_render(void *state_ptr, gui_app_t *app, int channel,
             spectro_set_span(e, s_spec_launch.span);
             e->lattice_t0 = 0.0;
             e->lattice_locked = false;
+            e->lattice_pending = false;
             e->mark_count = 0;
         }
         spectro_update_paused_window(e, app, channel);
@@ -1313,7 +1509,7 @@ static void spectro_vtable_render(void *state_ptr, gui_app_t *app, int channel,
     }
 
     spectro_draw_overlay(e, real_rate_hz, bounds, plot);
-    spectro_draw_field_marks(e, real_rate_hz, bounds);
+    if (!e->marks_hidden) spectro_draw_field_marks(e, real_rate_hz, bounds);
     if (playback_selected) spectro_draw_cut_marks(e, app, channel, real_rate_hz, bounds);
     spectro_draw_hover(e, real_rate_hz, bounds);
 
@@ -1326,7 +1522,9 @@ static void spectro_vtable_render(void *state_ptr, gui_app_t *app, int channel,
         format_span(span_buf, sizeof(span_buf), e);
         const char *lock = e->analysis_span_fields <= 0 ? ""
             : !e->lattice_locked ? "  nominal"
-            : e->sync_mode == GUI_FIELD_LOCATE_FM ? "  locked FM" : "  locked CVBS";
+            : e->found_mode == GUI_FIELD_LOCATE_FM
+                ? (e->sync_lines == 525 ? "  locked FM 525" : "  locked FM 625")
+                : (e->sync_lines == 525 ? "  locked CVBS 525" : "  locked CVBS 625");
         snprintf(win_buf, sizeof(win_buf), "PAUSED  %s%s%s", span_buf, lock,
                  e->analysis_requested ? "" : "  (rendering...)");
         gui_text_draw(win_buf, bounds.x + 38.0f, bounds.y + 3.0f,
@@ -1365,12 +1563,19 @@ static void spectro_vtable_render(void *state_ptr, gui_app_t *app, int channel,
             e->span_btn_rect = (Rectangle){ e->dir_btn_rect.x - gap - span_w, bounds.y + 6, span_w, btn_h };
             spec_draw_dropdown_button(e->span_btn_rect, s_spans[e->span_idx].name,
                                       e->span_dropdown_open, to_logical_w);
+            {
+                const char *ml = e->marks_hidden ? "Marks: Off" : "Marks: On";
+                const float mw = (float)gui_text_measure("Marks: Off", FONT_SIZE_DROPDOWN_OPT) * to_logical_w + 16.0f;
+                e->marks_btn_rect = (Rectangle){ e->span_btn_rect.x - gap - mw, bounds.y + 6, mw, btn_h };
+                spec_draw_toggle_button(e->marks_btn_rect, ml, !e->marks_hidden, to_logical_w);
+            }
             if (e->span_dropdown_open) {
                 spec_draw_dropdown_options(e->span_btn_rect, span_names, SPEC_SPAN_COUNT, e->span_idx,
                                            e->span_opts_rect, to_logical_w);
             }
         } else {
             e->span_dropdown_open = false;
+            e->marks_btn_rect = (Rectangle){0};
         }
         if (e->dir_dropdown_open) {
             spec_draw_dropdown_options(e->dir_btn_rect, s_dir_names, SPEC_DIR_COUNT,
@@ -1435,6 +1640,10 @@ static bool spectro_handle_palette_click(spectro_engine_t *e, gui_app_t *app, in
             }
         }
         e->dir_dropdown_open = false;
+        return true;
+    }
+    if (e->marks_btn_rect.width > 0 && CheckCollisionPointRec(click, e->marks_btn_rect)) {
+        e->marks_hidden = !e->marks_hidden;
         return true;
     }
     if (CheckCollisionPointRec(click, e->palette_btn_rect)) {

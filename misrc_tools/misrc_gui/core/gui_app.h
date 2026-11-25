@@ -37,6 +37,7 @@ typedef enum {
     PANEL_VIEW_DEMOD,              // Demodulator (WFM/NFM/AM/USB/LSB) view on I/Q samples
     PANEL_VIEW_VECTORSCOPE,        // Composite vectorscope (burst-locked chroma U/V)
     PANEL_VIEW_WFM,                // Composite waveform monitor (tbc-analyse raster)
+    PANEL_VIEW_HIFI,               // Decoded Hi-Fi audio (CH3/4): stereo waveform + levels
     PANEL_VIEW_COUNT
     // Future: PANEL_VIEW_XY
 } panel_view_type_t;
@@ -114,6 +115,7 @@ typedef enum {
     TRIGGER_MODE_FALLING,     // Falling edge crossing level
     TRIGGER_MODE_SYNC,        // Sync-locked trigger (CH3 headswitch phase lock)
     TRIGGER_MODE_CVBS_HSYNC,  // CVBS horizontal sync (auto PAL/NTSC)
+    TRIGGER_MODE_HEADSWITCH,  // Tape RF head switch: the envelope step (gui_hs_trigger.c)
     TRIGGER_MODE_COUNT
 } trigger_mode_t;
 // Trigger source selection (absolute channels)
@@ -288,6 +290,12 @@ typedef struct {
     // Audio monitoring
     bool audio_monitor_playback;               // If true, play monitored audio to system output
     bool audio_monitor_ch34;                   // If true, monitor CH3/4; if false, monitor CH1/2
+    // Hi-Fi decode on CH3/4 (processing/gui_hifi34.c) when the device has no
+    // real CH3/4 audio. Source: 0 = Auto (carrier probe), 1 = RF A, 2 = RF B.
+    // Format: 0 = Auto (VHS NTSC / PAL by carrier pair), 1 = VHS PAL,
+    // 2 = VHS NTSC, 3 = Beta NTSC. Flag: --hifi src=,fmt=
+    int hifi34_source;
+    int hifi34_format;
     bool misrc_mode;                           // If true, MISRC mode (default) with A/B channel swap
     bool misrc_v15_v25_ab_swap;               // If true, invert MISRC A/B mapping for V1.5/V2.5 hardware swap variants
     bool stop_on_dropout;                      // If true, automatically stop capture when stream dropout is detected
@@ -393,12 +401,13 @@ typedef struct {
     char playback_file_b[FILE_PATH_MAX];   // FLAC file for channel B playback
     // Per-channel panel setup restored at launch (harrypm 2026-11-19: keep
     // the monitoring config, e.g. FM RF on A and CVBS on B). Same view names
-    // as --panel-view: "<left>[,<right>]"; video decoders per Video slot:
-    // "<cvbs|tape|rf>[,<cvbs|tape|rf>]" (left, right; "-" = not a Video panel).
+    // as --panel-view: "<left>[,<right>]"; per Video slot (left, right; "-" =
+    // not a Video panel) the decoder, system, RF format and field view:
+    // "<cvbs|tape|rf>:<system>:<format|->:<frame|split|field>" (gui_cvbs.h).
     char panel_view_a[48];
     char panel_view_b[48];
-    char video_decoder_a[24];
-    char video_decoder_b[24];
+    char video_decoder_a[96];
+    char video_decoder_b[96];
     char playback_audio_file[FILE_PATH_MAX]; // Audio-rate file for the playback
                                              // monitor (drag-and-drop; the
                                              // position-synced feed in
@@ -550,6 +559,13 @@ typedef struct gui_app {
 
     // Audio monitoring peaks (24-bit audio magnitude, per channel 1..4)
     atomic_uint_fast32_t audio_peak[4];
+    // Last time (get_time_ms) a device audio block arrived: real CH3/4 audio
+    // is only assumed while this is recent (gui_hifi34.c).
+    atomic_uint_fast64_t audio_rx_ms;
+    // Decoded Hi-Fi owns CH3/4 (meters + monitor): written by gui_hifi34.c,
+    // read by the toolbar. Peaks use the audio_peak scale (24-bit magnitude).
+    atomic_bool hifi34_owns_ch34;
+    atomic_uint_fast32_t hifi34_peak[2];
 
     // Buffer manager (centralized ringbuffer management)
     buffer_manager_t buffers;

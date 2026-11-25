@@ -217,6 +217,34 @@ typedef struct playback_ctx {
 
 // A valid seek is always below the file's total sample count.
 #define PLAYBACK_NO_SEEK UINT64_MAX
+// The TV system a field locator MEASURED per channel this session (head
+// switches / V-sync spacing; 0 = none yet): the Spectro and Waveform share
+// it as the hint for runs too short to measure (a 1-field span).
+static atomic_int s_measured_lines[2];
+
+// Hysteresis: the first measurement sets it; a different one replaces it
+// only when two in a row agree (one stray read must not flip both panels).
+static atomic_int s_measured_pending[2];
+static void gui_playback_note_measured(int channel, const gui_field_locate_t *fl) {
+    const int c = channel == 1 ? 1 : 0;
+    if (!fl || !fl->found_measured || (fl->found_lines != 525 && fl->found_lines != 625)) return;
+    const int cur = atomic_load(&s_measured_lines[c]);
+    if (cur == 0 || cur == fl->found_lines) {
+        atomic_store(&s_measured_lines[c], fl->found_lines);
+        atomic_store(&s_measured_pending[c], 0);
+    } else if (atomic_load(&s_measured_pending[c]) == fl->found_lines) {
+        atomic_store(&s_measured_lines[c], fl->found_lines);
+        atomic_store(&s_measured_pending[c], 0);
+    } else {
+        atomic_store(&s_measured_pending[c], fl->found_lines);
+    }
+}
+
+int gui_playback_measured_lines(gui_app_t *app, int channel) {
+    (void)app;
+    return atomic_load(&s_measured_lines[channel == 1 ? 1 : 0]);
+}
+
 static playback_ctx_t s_idle_playback = {.pending_seek = {PLAYBACK_NO_SEEK, PLAYBACK_NO_SEEK},
                                          .cue_sample = {PLAYBACK_NO_SEEK, PLAYBACK_NO_SEEK},
                                          .pending_step = {PLAYBACK_NO_SEEK, PLAYBACK_NO_SEEK}};
@@ -1000,6 +1028,10 @@ typedef struct {
     // Field starts of each buffer's window (published with it)
     gui_field_mark_t marks[3][64];
     size_t mark_count[3];
+    int found_mode[3], found_lines[3];   // What the locator found (AUTO)
+    uint64_t hs_pos[3][GUI_FIELD_LOCATE_MAX_HS];   // FM head switches per buffer
+    int hs_head[3][GUI_FIELD_LOCATE_MAX_HS];
+    size_t hs_n[3];
     gui_field_locate_t fl;      // Worker-owned locator (trace reused across windows)
     // Per-request bookkeeping (worker only)
     uint64_t win_start;
@@ -1014,6 +1046,7 @@ static playback_analysis_t s_analysis[2] = {0};
 
 static void gui_playback_analysis_shutdown(playback_analysis_t *a);
 static void gui_playback_analysis_release(playback_analysis_t *a);
+static void gui_playback_rawwin_shutdown_all(void);
 static void gui_playback_analysis_lock(playback_analysis_t *a) {
     while (atomic_exchange(&a->locked, true)) thrd_sleep_ms(1);
 }
@@ -4919,7 +4952,7 @@ static int playback_thread_func(void *ctx_ptr) {
             if (step != PLAYBACK_NO_SEEK && requested_a == PLAYBACK_NO_SEEK) {
                 const uint64_t at = atomic_load(&ctx->current_sample_a);
                 const uint64_t hop = (uint64_t)(PLAYBACK_STEP_FORWARD_MAX_SECONDS * ctx->channel_rate_hz[0]);
-                if (paused_a && step >= at && step - at <= hop && !ctx->seek_recovery_failed[0]) {
+                if (paused_a && step > at && step - at <= hop && !ctx->seek_recovery_failed[0]) {
                     ctx->backfill_active_a = ctx->backfill_resume_a = true;
                     ctx->backfill_target_a = step;
                     atomic_store(&ctx->cue_sample[0], step);
@@ -5006,7 +5039,7 @@ static int playback_thread_func(void *ctx_ptr) {
             if (step != PLAYBACK_NO_SEEK && requested_b == PLAYBACK_NO_SEEK) {
                 const uint64_t at = atomic_load(&ctx->current_sample_b);
                 const uint64_t hop = (uint64_t)(PLAYBACK_STEP_FORWARD_MAX_SECONDS * ctx->channel_rate_hz[1]);
-                if (paused_b && step >= at && step - at <= hop && !ctx->seek_recovery_failed[1]) {
+                if (paused_b && step > at && step - at <= hop && !ctx->seek_recovery_failed[1]) {
                     ctx->backfill_active_b = ctx->backfill_resume_b = true;
                     ctx->backfill_target_b = step;
                     atomic_store(&ctx->cue_sample[1], step);
@@ -5759,6 +5792,7 @@ static void gui_playback_retire_context(void) {
     // snapshots; join before releasing the active playback context.
     gui_playback_analysis_shutdown(&s_analysis[0]);
     gui_playback_analysis_shutdown(&s_analysis[1]);
+    gui_playback_rawwin_shutdown_all();
 #endif
     gui_playback_release_context(s_playback);
     if (s_playback != &s_idle_playback) {
@@ -6262,6 +6296,8 @@ static int gui_playback_commit_prepared(gui_app_t *app, playback_ctx_t *prepared
     atomic_store(&s_playback->cue_sample[1], PLAYBACK_NO_SEEK);
     atomic_store(&s_playback->pending_step[0], PLAYBACK_NO_SEEK);
     atomic_store(&s_playback->pending_step[1], PLAYBACK_NO_SEEK);
+    atomic_store(&s_measured_lines[0], 0);   // a new session: measure again
+    atomic_store(&s_measured_lines[1], 0);
     atomic_store(&s_playback->current_sample, 0);
     atomic_store(&s_playback->current_sample_a, 0);
     atomic_store(&s_playback->current_sample_b, 0);
@@ -6739,6 +6775,12 @@ bool gui_playback_display_hold_channel(gui_app_t *app, int channel) {
     if (atomic_load(&s_playback->pending_step[c]) != PLAYBACK_NO_SEEK) return true;
     if (atomic_load(&s_playback->step_lead_in[c])) return true;
     return get_time_ms() < atomic_load(&s_playback->step_hold_until_ms[c]);
+}
+
+void gui_playback_refresh_channel(gui_app_t *app, int channel) {
+    // A step to the cue itself is never a forward hop (step > at), so it
+    // seeks with the short step lead-in and lands on the same frame.
+    gui_playback_step_sample_channel(app, channel, gui_playback_get_cue_samples_channel(app, channel));
 }
 
 void gui_playback_step_sample_channel(gui_app_t *app, int channel, uint64_t sample) {
@@ -7389,6 +7431,12 @@ static int gui_playback_analysis_worker(void *arg) {
         }
         if (locate) {
             a->mark_count[dst_idx] = gui_field_locate_finish(&a->fl, a->marks[dst_idx], 64);
+            a->found_mode[dst_idx] = a->fl.found_mode;
+            a->found_lines[dst_idx] = a->fl.found_lines;
+            gui_playback_note_measured(a == &s_analysis[1] ? 1 : 0, &a->fl);
+            a->hs_n[dst_idx] = a->fl.hs_n;
+            memcpy(a->hs_pos[dst_idx], a->fl.hs_pos, a->fl.hs_n * sizeof(uint64_t));
+            memcpy(a->hs_head[dst_idx], a->fl.hs_head, a->fl.hs_n * sizeof(int));
         }
         for (size_t i = 0; i < a->seg_count; i++) a->segs[i].fl = NULL;
         gui_playback_analysis_lock(a);
@@ -7611,7 +7659,7 @@ void gui_playback_request_analysis_window_fields(gui_app_t *app, int channel,
     a->req_span = (uint64_t)(span_seconds * rate);
     if (a->req_span == 0) a->req_span = 1;
     a->req_sync_mode = sync_mode;
-    a->req_lines = lines_per_frame == 525 ? 525 : 625;
+    a->req_lines = (lines_per_frame == 525 || lines_per_frame == 625) ? lines_per_frame : 0;   // 0 = measured
     a->req_rate = rate;
     atomic_fetch_add(&a->req_seq, 1);
     gui_playback_analysis_unlock(a);
@@ -7620,6 +7668,49 @@ void gui_playback_request_analysis_window_fields(gui_app_t *app, int channel,
     (void)span_seconds;
     (void)sync_mode;
     (void)lines_per_frame;
+#endif
+}
+
+bool gui_playback_analysis_field_info(gui_app_t *app, int channel, int *mode, int *lines) {
+    (void)app;
+    if (mode) *mode = 0;
+    if (lines) *lines = 0;
+    if (channel != 0 && channel != 1) return false;
+#if LIBFLAC_ENABLED == 1
+    playback_analysis_t *a = &s_analysis[channel];
+    bool ok = false;
+    gui_playback_analysis_lock(a);
+    if (a->reader_idx >= 0 && a->reader_idx < 3 && a->found_mode[a->reader_idx]) {
+        if (mode) *mode = a->found_mode[a->reader_idx];
+        if (lines) *lines = a->found_lines[a->reader_idx];
+        ok = true;
+    }
+    gui_playback_analysis_unlock(a);
+    return ok;
+#else
+    return false;
+#endif
+}
+
+size_t gui_playback_analysis_head_switches(gui_app_t *app, int channel, uint64_t *pos, int *head,
+                                           size_t max) {
+    (void)app;
+    if ((channel != 0 && channel != 1) || !pos || max == 0) return 0;
+#if LIBFLAC_ENABLED == 1
+    playback_analysis_t *a = &s_analysis[channel];
+    size_t n = 0;
+    gui_playback_analysis_lock(a);
+    if (a->reader_idx >= 0 && a->reader_idx < 3) {
+        n = a->hs_n[a->reader_idx];
+        if (n > max) n = max;
+        memcpy(pos, a->hs_pos[a->reader_idx], n * sizeof(uint64_t));
+        if (head) memcpy(head, a->hs_head[a->reader_idx], n * sizeof(int));
+    }
+    gui_playback_analysis_unlock(a);
+    return n;
+#else
+    (void)head;
+    return 0;
 #endif
 }
 
@@ -7673,5 +7764,295 @@ bool gui_playback_poll_analysis_window(gui_app_t *app, int channel,
 #else
     (void)io_seq; (void)out_magnitudes; (void)out_slice_count; (void)out_bins;
     return false;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Paused raw window (harrypm 2026-11-19: "use field data to also add pos
+// markings for waveform in player mode" - paused only). While paused the
+// Waveform panel shows samples read straight from the file around the
+// playhead, so every point has an exact file position, plus the field
+// starts of the stretch before it (the Spectro's field locator) for the
+// field / line marks. One worker + private FLAC decoder per channel,
+// created on the first request, shut down with the session. Samples land
+// in the same 12-bit display container playback uses (conv16 snapshot).
+// ---------------------------------------------------------------------------
+#if LIBFLAC_ENABLED == 1
+#define PLAYBACK_RAWWIN_MAX ((size_t)1u << 21)
+
+typedef struct {
+    bool worker_valid;
+    thrd_t worker;
+    atomic_bool stop;
+    atomic_bool failed;
+    char path[FILE_PATH_MAX];
+    atomic_flag lock;
+    // Request (render thread)
+    uint64_t req_start, req_pre, req_total;
+    size_t req_count;
+    int req_mode, req_lines, req_conv;
+    double req_rate;
+    atomic_uint_fast64_t req_seq;
+    // Result (worker publishes under lock)
+    int16_t *res, *work;
+    size_t res_count;
+    uint64_t res_start, res_seq;
+    double res_rate;
+    gui_field_mark_t res_marks[GUI_PLAYBACK_RAWWIN_MARKS];
+    size_t res_marks_n;
+    int res_mode, res_lines;
+    uint64_t res_hs_pos[GUI_FIELD_LOCATE_MAX_HS];
+    int res_hs_head[GUI_FIELD_LOCATE_MAX_HS];
+    size_t res_hs_n;
+    // Worker decoder + per-request decode state
+    FILE *file;
+    playback_io_t io;
+    FLAC__StreamDecoder *dec;
+    bool dec_ready;
+    uint64_t dec_start, dec_count, decoded, dst_from;
+    size_t dst_n, dst_got;
+    int conv;
+    bool fl_on;
+    gui_field_locate_t fl;
+} playback_rawwin_t;
+
+static playback_rawwin_t s_rawwin[2];
+
+static void rawwin_lock(playback_rawwin_t *r) {
+    while (atomic_flag_test_and_set_explicit(&r->lock, memory_order_acquire)) {}
+}
+static void rawwin_unlock(playback_rawwin_t *r) {
+    atomic_flag_clear_explicit(&r->lock, memory_order_release);
+}
+
+static FLAC__StreamDecoderWriteStatus rawwin_write_cb(
+    const FLAC__StreamDecoder *decoder, const FLAC__Frame *frame,
+    const FLAC__int32 *const buffer[], void *client_data) {
+    (void)decoder;
+    playback_io_t *io = (playback_io_t *)client_data;
+    playback_rawwin_t *r = io ? (playback_rawwin_t *)io->owner : NULL;
+    if (!r || !frame || !buffer || !buffer[0]) return FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
+    const uint32_t samples = frame->header.blocksize;
+    const unsigned bps = frame->header.bits_per_sample;
+    const FLAC__int32 *in = buffer[0];
+    if (r->decoded >= r->dec_count) return FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE;
+    const uint64_t left = r->dec_count - r->decoded;
+    const size_t use = left < samples ? (size_t)left : (size_t)samples;
+    if (r->fl_on) gui_field_locate_push(&r->fl, in, use);
+    const uint64_t base = r->dec_start + r->decoded;
+    for (size_t i = 0; i < use; i++) {
+        const uint64_t abs = base + i;
+        if (abs < r->dst_from || abs >= r->dst_from + r->dst_n) continue;
+        int32_t v = in[i];
+        int16_t out;
+        if (bps == 16) out = gui_playback_apply_conv16(r->conv, v);
+        else if (bps == 8) out = (int16_t)(v << 4);
+        else out = (int16_t)v;
+        r->work[abs - r->dst_from] = out;
+        r->dst_got = (size_t)(abs - r->dst_from) + 1;
+    }
+    r->decoded += use;
+    return FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE;
+}
+
+static void rawwin_meta_cb(const FLAC__StreamDecoder *decoder,
+                           const FLAC__StreamMetadata *metadata, void *client_data) {
+    (void)decoder; (void)metadata; (void)client_data;
+}
+
+static void rawwin_error_cb(const FLAC__StreamDecoder *decoder,
+                            FLAC__StreamDecoderErrorStatus status, void *client_data) {
+    (void)decoder; (void)status; (void)client_data;
+}
+
+static bool rawwin_init(playback_rawwin_t *r) {
+    r->res = (int16_t *)calloc(PLAYBACK_RAWWIN_MAX, sizeof(int16_t));
+    r->work = (int16_t *)calloc(PLAYBACK_RAWWIN_MAX, sizeof(int16_t));
+    if (!r->res || !r->work) return false;
+    r->file = file_open_read_utf8(r->path);
+    if (!r->file) return false;
+    gui_playback_io_reset(&r->io, r->file, r, PLAYBACK_IO_SI_TOTAL_MOD);
+    r->io.cancel = &r->stop;
+    r->dec = FLAC__stream_decoder_new();
+    if (!r->dec) return false;
+    FLAC__stream_decoder_set_md5_checking(r->dec, false);
+    if (FLAC__stream_decoder_init_stream(r->dec, gui_playback_io_read_cb, gui_playback_io_seek_cb,
+            gui_playback_io_tell_cb, gui_playback_io_length_cb, gui_playback_io_eof_cb,
+            rawwin_write_cb, rawwin_meta_cb, rawwin_error_cb, &r->io) !=
+        FLAC__STREAM_DECODER_INIT_STATUS_OK)
+        return false;
+    if (!FLAC__stream_decoder_process_until_end_of_metadata(r->dec)) return false;
+    r->dec_ready = true;
+    return true;
+}
+
+static int rawwin_worker(void *arg) {
+    playback_rawwin_t *r = (playback_rawwin_t *)arg;
+    uint64_t done = 0;
+    while (!atomic_load(&r->stop)) {
+        const uint64_t seq = atomic_load(&r->req_seq);
+        if (seq == done) {
+            thrd_sleep_ms(4);
+            continue;
+        }
+        rawwin_lock(r);
+        const uint64_t start = r->req_start, pre = r->req_pre, total = r->req_total;
+        const size_t count = r->req_count;
+        const int mode = r->req_mode, lines = r->req_lines;
+        const double rate = r->req_rate;
+        r->conv = r->req_conv;
+        rawwin_unlock(r);
+        done = seq;
+        if (!r->dec_ready && !rawwin_init(r)) {
+            fprintf(stderr, "[PLAYBACK] Raw window: decoder init failed (FLAC files only)\n");
+            atomic_store(&r->failed, true);
+            break;
+        }
+        uint64_t from = start > pre ? start - pre : 0;
+        uint64_t end = start + count;
+        if (end > total) end = total;
+        if (from >= end) continue;
+        r->dec_start = from;
+        r->dec_count = end - from;
+        r->decoded = 0;
+        r->dst_from = start;
+        r->dst_n = count;
+        r->dst_got = 0;
+        r->fl_on = mode != 0;
+        if (r->fl_on) gui_field_locate_begin(&r->fl, mode, rate, lines, from, (size_t)r->dec_count);
+        if (!FLAC__stream_decoder_seek_absolute(r->dec, from)) {
+            FLAC__stream_decoder_flush(r->dec);
+            continue;
+        }
+        bool superseded = false;
+        while (r->decoded < r->dec_count &&
+               FLAC__stream_decoder_get_state(r->dec) != FLAC__STREAM_DECODER_END_OF_STREAM) {
+            if (atomic_load(&r->stop)) break;
+            if (atomic_load(&r->req_seq) != done) { superseded = true; break; }
+            if (!FLAC__stream_decoder_process_single(r->dec)) break;
+        }
+        if (superseded || atomic_load(&r->stop)) continue;
+        gui_field_mark_t marks[GUI_PLAYBACK_RAWWIN_MARKS];
+        size_t nm = r->fl_on ? gui_field_locate_finish(&r->fl, marks, GUI_PLAYBACK_RAWWIN_MARKS) : 0;
+        const int found_mode = r->fl_on ? r->fl.found_mode : 0, found_lines = r->fl_on ? r->fl.found_lines : 0;
+        if (r->fl_on) gui_playback_note_measured(r == &s_rawwin[1] ? 1 : 0, &r->fl);
+        rawwin_lock(r);
+        int16_t *swap = r->res;
+        r->res = r->work;
+        r->work = swap;
+        r->res_count = r->dst_got;
+        r->res_start = start;
+        r->res_rate = rate;
+        memcpy(r->res_marks, marks, nm * sizeof(marks[0]));
+        r->res_marks_n = nm;
+        r->res_mode = found_mode;
+        r->res_lines = found_lines;
+        r->res_hs_n = r->fl_on ? r->fl.hs_n : 0;
+        memcpy(r->res_hs_pos, r->fl.hs_pos, r->res_hs_n * sizeof(uint64_t));
+        memcpy(r->res_hs_head, r->fl.hs_head, r->res_hs_n * sizeof(int));
+        r->res_seq = done;
+        rawwin_unlock(r);
+    }
+    return 0;
+}
+
+static void rawwin_shutdown(playback_rawwin_t *r) {
+    if (r->worker_valid) {
+        atomic_store(&r->stop, true);
+        thrd_join(r->worker, NULL);
+        r->worker_valid = false;
+    }
+    if (r->dec) {
+        FLAC__stream_decoder_finish(r->dec);
+        FLAC__stream_decoder_delete(r->dec);
+    }
+    if (r->file) fclose(r->file);
+    free(r->res);
+    free(r->work);
+    gui_field_locate_free(&r->fl);
+    memset(r, 0, sizeof(*r));
+}
+#endif
+
+void gui_playback_request_raw_window(gui_app_t *app, int channel, uint64_t start, size_t count,
+                                     size_t field_lead, int sync_mode, int lines_per_frame) {
+    (void)app;
+    if (channel != 0 && channel != 1) return;
+#if LIBFLAC_ENABLED == 1
+    playback_rawwin_t *r = &s_rawwin[channel];
+    if (atomic_load(&r->failed) || count == 0) return;
+    if (count > PLAYBACK_RAWWIN_MAX) count = PLAYBACK_RAWWIN_MAX;
+    const double rate = channel == 0 ? (double)s_playback->info_a.real_sample_rate_hz
+                                     : (double)s_playback->info_b.real_sample_rate_hz;
+    const uint64_t total = channel == 0 ? s_playback->info_a.total_samples
+                                        : s_playback->info_b.total_samples;
+    FILE *file = channel == 1 ? s_playback->file_b : s_playback->file_a;
+    if (!atomic_load(&s_playback->running) || !file || !(rate > 0.0) || total == 0) return;
+    if (!r->worker_valid) {
+        const char *session = channel == 1
+            ? (s_playback->decode_path[1][0] ? s_playback->decode_path[1] : s_playback->info_b.filepath)
+            : (s_playback->decode_path[0][0] ? s_playback->decode_path[0] : s_playback->info_a.filepath);
+        snprintf(r->path, sizeof(r->path), "%s", session);
+        atomic_store(&r->stop, false);
+        atomic_flag_clear(&r->lock);
+        if (thrd_create_with_priority(&r->worker, rawwin_worker, r, THRD_PRIORITY_NORMAL) != thrd_success) {
+            atomic_store(&r->failed, true);
+            return;
+        }
+        r->worker_valid = true;
+    }
+    rawwin_lock(r);
+    r->req_start = start;
+    r->req_count = count;
+    r->req_pre = field_lead;
+    r->req_total = total;
+    r->req_mode = sync_mode;
+    r->req_lines = (lines_per_frame == 525 || lines_per_frame == 625) ? lines_per_frame : 0;   // 0 = measured
+    r->req_rate = rate;
+    r->req_conv = s_playback->conv16_state[channel];
+    atomic_fetch_add(&r->req_seq, 1);
+    rawwin_unlock(r);
+#else
+    (void)start; (void)count; (void)field_lead; (void)sync_mode; (void)lines_per_frame;
+#endif
+}
+
+bool gui_playback_poll_raw_window(gui_app_t *app, int channel, uint64_t seen_seq,
+                                  int16_t *dst, size_t cap, gui_playback_raw_window_t *info) {
+    (void)app;
+    if ((channel != 0 && channel != 1) || !dst || !info) return false;
+#if LIBFLAC_ENABLED == 1
+    playback_rawwin_t *r = &s_rawwin[channel];
+    if (!r->worker_valid) return false;
+    bool fresh = false;
+    rawwin_lock(r);
+    if (r->res_seq != 0 && r->res_seq != seen_seq && r->res) {
+        size_t n = r->res_count < cap ? r->res_count : cap;
+        memcpy(dst, r->res, n * sizeof(int16_t));
+        info->start = r->res_start;
+        info->count = n;
+        info->rate = r->res_rate;
+        info->seq = r->res_seq;
+        info->mark_count = r->res_marks_n;
+        info->found_mode = r->res_mode;
+        info->found_lines = r->res_lines;
+        info->hs_n = r->res_hs_n;
+        memcpy(info->hs_pos, r->res_hs_pos, r->res_hs_n * sizeof(uint64_t));
+        memcpy(info->hs_head, r->res_hs_head, r->res_hs_n * sizeof(int));
+        memcpy(info->marks, r->res_marks, r->res_marks_n * sizeof(r->res_marks[0]));
+        fresh = true;
+    }
+    rawwin_unlock(r);
+    return fresh;
+#else
+    (void)seen_seq; (void)cap;
+    return false;
+#endif
+}
+
+static void gui_playback_rawwin_shutdown_all(void) {
+#if LIBFLAC_ENABLED == 1
+    rawwin_shutdown(&s_rawwin[0]);
+    rawwin_shutdown(&s_rawwin[1]);
 #endif
 }

@@ -20,6 +20,14 @@
 #include "../ui/gui_chrome_hide.h"  // double-click overlay toggle (shared helper)
 #include "../input/gui_capture.h"  // gui_app_level_autostop_vpp for mV scale
 #include "../input/gui_playback.h" // DAW-style pause: re-process on config change
+#include "../signal/gui_cvbs.h"     // gui_video_panel_sync_source (paused position marks)
+#include "../signal/gui_field_locate.h"
+
+// --wave launch state (defined with gui_waveform_apply_launch_arg).
+static float s_wave_launch_zoom;
+static int s_wave_launch_lock;
+static bool s_wave_launch_marks_off;
+static int s_wave_launch_trig = -2;   // -2 = stock; -1 = Off; else trigger_mode_t
 #include "../signal/gui_cvbs.h"    // gui_video_follow_generator_system (Gen box)
 #include "../../common/misrc_debug.h"  // gated [WFDISP] display-value diagnostics
 #include <math.h>
@@ -40,12 +48,14 @@ static const char *s_trigger_mode_labels[] = {
     [TRIGGER_MODE_FALLING] = "Falling",
     [TRIGGER_MODE_SYNC] = "Sync",
     [TRIGGER_MODE_CVBS_HSYNC] = "CVBS",
+    [TRIGGER_MODE_HEADSWITCH] = "Head SW",
 };
 static const char *s_trigger_mode_short_labels[] = {
     [TRIGGER_MODE_RISING] = "Rise",
     [TRIGGER_MODE_FALLING] = "Fall",
     [TRIGGER_MODE_SYNC] = "Sync",
     [TRIGGER_MODE_CVBS_HSYNC] = "CVBS",
+    [TRIGGER_MODE_HEADSWITCH] = "HS",
 };
 static const char *s_trigger_source_labels[] = {
     [TRIGGER_SOURCE_CH1] = "Ch1",
@@ -342,6 +352,26 @@ typedef struct {
     bool initialized;
     bool trigger_source_defaulted_by_channel;
     uint32_t remote_last_sequence; /* M-Client only */
+
+    // Paused player mode (harrypm 2026-11-19): the trace is a window read
+    // from the file around the playhead (gui_playback raw window), so every
+    // point has a file position; field / line marks are drawn on it.
+    int16_t *pw_buf;                 // The window's samples (render thread)
+    gui_playback_raw_window_t pw_info;
+    bool pw_have, pw_active;
+    uint64_t pw_key;                 // Last requested (start, count)
+    int pw_lines;                    // 625 / 525 of the request
+    size_t pw_off;                   // Line lock: processed from this window offset
+    int pw_known_lines;              // Last measured system (hint for short runs)
+    int pw_lock;                     // 0 = Line (H sync), 1 = Head switch
+    bool pw_marks_hidden;            // Marks toggle: field / line wireframe off
+    Rectangle marks_btn_rect;
+    uint64_t pw_hs_locked;           // HS lock: the switch held (0 = none)
+    Rectangle lock_btn_rect;         // Paused player-mode Lock button
+    // Sample -> point mapping of the last processed window (process_display)
+    bool map_rec;
+    size_t map_start, map_points;
+    float map_decim;
 } waveform_panel_state_t;
 
 typedef struct {
@@ -1320,6 +1350,7 @@ static size_t waveform_resample_to_buffer(waveform_panel_state_t *state,
 //-----------------------------------------------------------------------------
 
 // Find trigger point using panel's trigger configuration
+static bool s_trigger_self;   // Render thread: processing the paused file window
 static ssize_t waveform_find_trigger_from(const int16_t *buf, size_t count,
                                            const waveform_runtime_cfg_t *cfg,
                                            size_t min_index,
@@ -1339,6 +1370,12 @@ static ssize_t waveform_find_trigger_from(const int16_t *buf, size_t count,
     size_t src_count = count;
     if (s_trigger_src_count > 0 && s_trigger_src_count < src_count) {
         src_count = s_trigger_src_count;
+    }
+    // The paused file window is its own trigger source (the shared source
+    // buffers hold the last DISPLAY frame, a different stretch).
+    if (s_trigger_self) {
+        src_ch1 = src_ch2 = buf;
+        src_count = count;
     }
     if (min_index >= src_count) return -1;
     return trigger_find_from_config_multi(src_ch1, src_ch2, src_count,
@@ -1399,6 +1436,9 @@ static bool waveform_process_display(waveform_panel_state_t *state,
     // If trigger is disabled, just show the start of the buffer
     if (!cfg->trigger_enabled) {
         *out_trigger_display_pos = -1;
+        if (state->map_rec) {
+            state->map_start = 0; state->map_decim = decimation; state->map_points = point_count;
+        }
         *out_available = waveform_resample_to_buffer(
             state, out_samples, buf, num_samples, 0, decimation, point_count,
             norm_scale);
@@ -1409,6 +1449,9 @@ static bool waveform_process_display(waveform_panel_state_t *state,
     // there's no room for trigger positioning - just show from start
     if (display_window >= (float)num_samples * 0.9f) {
         *out_trigger_display_pos = -1;
+        if (state->map_rec) {
+            state->map_start = 0; state->map_decim = decimation; state->map_points = point_count;
+        }
         *out_available = waveform_resample_to_buffer(
             state, out_samples, buf, num_samples, 0, decimation, point_count,
             norm_scale);
@@ -1428,6 +1471,9 @@ static bool waveform_process_display(waveform_panel_state_t *state,
     // Check if there's a valid search range
     if (min_trig_pos >= max_trig_pos) {
         *out_trigger_display_pos = -1;
+        if (state->map_rec) {
+            state->map_start = 0; state->map_decim = decimation; state->map_points = point_count;
+        }
         *out_available = waveform_resample_to_buffer(
             state, out_samples, buf, num_samples, 0, decimation, point_count,
             norm_scale);
@@ -1446,6 +1492,9 @@ static bool waveform_process_display(waveform_panel_state_t *state,
     // Trigger found - place it at desired position
     size_t start_pos = (size_t)((float)trig_pos - pre_trigger_raw_samples);
     *out_trigger_display_pos = (int)trigger_display_pos;
+    if (state->map_rec) {
+        state->map_start = start_pos; state->map_decim = decimation; state->map_points = point_count;
+    }
     *out_available = waveform_resample_to_buffer(
         state, out_samples, buf, num_samples, start_pos, decimation, point_count,
         norm_scale);
@@ -1552,7 +1601,11 @@ static void *waveform_create(void) {
     state->trigger_level = 0;
     state->trigger_mode = TRIGGER_MODE_RISING;
     state->trigger_source = TRIGGER_SOURCE_CH1;
-    state->zoom_scale = ZOOM_SCALE_DEFAULT;
+    state->zoom_scale = s_wave_launch_zoom > 0.0f ? s_wave_launch_zoom : ZOOM_SCALE_DEFAULT;
+    state->pw_lock = s_wave_launch_lock;
+    state->pw_marks_hidden = s_wave_launch_marks_off;
+    if (s_wave_launch_trig == -1) state->trigger_enabled = false;
+    else if (s_wave_launch_trig >= 0) { state->trigger_enabled = true; state->trigger_mode = (trigger_mode_t)s_wave_launch_trig; }
     state->trigger_display_pos = -1;
 
     // Initialize display state
@@ -1604,6 +1657,9 @@ static void waveform_destroy(void *state_ptr) {
     waveform_panel_state_t *state = (waveform_panel_state_t *)state_ptr;
 
     waveform_cleanup_resampler(state);
+
+    free(state->pw_buf);   // paused file window
+    state->pw_buf = NULL;
 
     // Clean up phosphor
     if (state->phosphor) {
@@ -2103,6 +2159,21 @@ static bool waveform_handle_control_click(waveform_panel_state_t *state, struct 
         return true;
     }
 
+    if (!click_on_menu && state->marks_btn_rect.width > 0 &&
+        CheckCollisionPointRec(click, state->marks_btn_rect)) {
+        state->pw_marks_hidden = !state->pw_marks_hidden;
+        return true;
+    }
+
+    if (!click_on_menu && state->lock_btn_rect.width > 0 &&
+        CheckCollisionPointRec(click, state->lock_btn_rect)) {
+        state->pw_lock = state->pw_lock == 1 ? 0 : 1;
+        waveform_state_lock(state);
+        state->config_dirty = true;   // re-place the paused window
+        waveform_state_unlock(state);
+        return true;
+    }
+
     if (!click_on_menu && state->range_btn_rect.width > 0 &&
         CheckCollisionPointRec(click, state->range_btn_rect)) {
         state->range_dropdown_open = !state->range_dropdown_open;
@@ -2454,6 +2525,329 @@ static bool waveform_panel_handle_scroll(void *state_ptr, float delta, Rectangle
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Paused player-mode position marks (harrypm 2026-11-19: "use field data to
+// also add pos markings for waveform in player mode" - paused only).
+// ---------------------------------------------------------------------------
+#define WAVEFORM_PW_CAP ((size_t)1u << 21)
+static bool waveform_pw_hs_target(const waveform_panel_state_t *state, uint64_t at, uint64_t *out);
+
+static float s_wave_launch_zoom = 0.0f;   // 0 = stock
+static const char *v_fmt_zoom(float z) {
+    static char b[16];
+    snprintf(b, sizeof(b), "%.1f", (double)z);
+    return b;
+}
+static int s_wave_launch_lock = 0;
+
+bool gui_waveform_apply_launch_arg(const char *arg) {
+    const char *usage = "--wave: expected key=value[,...] with zoom=<1..128> (samples per pixel), lock=line|hs, trig=off|rise|fall|sync|cvbs|hs, marks=on|off";
+    if (!arg || !arg[0]) { fprintf(stderr, "%s\n", usage); return false; }
+    char buf[128];
+    snprintf(buf, sizeof(buf), "%s", arg);
+    for (char *tok = strtok(buf, ","); tok; tok = strtok(NULL, ",")) {
+        char *eq = strchr(tok, '=');
+        if (!eq) { fprintf(stderr, "%s (got '%s')\n", usage, arg); return false; }
+        *eq = '\0';
+        const char *v = eq + 1;
+        if (strcmp(tok, "zoom") == 0) {
+            char *end = NULL;
+            const float z = strtof(v, &end);
+            if (!end || *end || !(z >= ZOOM_SCALE_MIN) || z > ZOOM_SCALE_MAX) {
+                fprintf(stderr, "%s (got '%s')\n", usage, arg);
+                return false;
+            }
+            s_wave_launch_zoom = z;
+        } else if (strcmp(tok, "trig") == 0) {
+            static const char *const names[] = { "rise", "fall", "sync", "cvbs", "hs" };
+            int t = strcmp(v, "off") == 0 ? -1 : -3;
+            for (int k = 0; k < 5; k++) if (strcmp(v, names[k]) == 0) t = k;
+            if (t == -3) { fprintf(stderr, "%s (got '%s')\n", usage, arg); return false; }
+            s_wave_launch_trig = t;
+        } else if (strcmp(tok, "marks") == 0) {
+            if (strcmp(v, "on") == 0) s_wave_launch_marks_off = false;
+            else if (strcmp(v, "off") == 0) s_wave_launch_marks_off = true;
+            else { fprintf(stderr, "%s (got '%s')\n", usage, arg); return false; }
+        } else if (strcmp(tok, "lock") == 0) {
+            if (strcmp(v, "line") == 0) s_wave_launch_lock = 0;
+            else if (strcmp(v, "hs") == 0) s_wave_launch_lock = 1;
+            else { fprintf(stderr, "%s (got '%s')\n", usage, arg); return false; }
+        } else {
+            fprintf(stderr, "%s (got '%s')\n", usage, arg);
+            return false;
+        }
+    }
+    static const char *const trig_names[] = { "rise", "fall", "sync", "cvbs", "hs" };
+    fprintf(stderr, "[AUTO] --wave: zoom=%s lock=%s trig=%s\n",
+            s_wave_launch_zoom > 0.0f ? v_fmt_zoom(s_wave_launch_zoom) : "stock",
+            s_wave_launch_lock ? "hs" : "line",
+            s_wave_launch_trig == -2 ? "stock" : s_wave_launch_trig == -1 ? "off"
+                                                : trig_names[s_wave_launch_trig]);
+    return true;
+}
+
+// The span the panel shows, in raw samples (as waveform_process_display).
+static float waveform_display_window_samples(waveform_panel_state_t *state) {
+    waveform_runtime_cfg_t cfg = waveform_capture_runtime_cfg(state);
+    size_t display_width = (size_t)atomic_load(&state->display_width);
+    if (display_width == 0 || display_width > DISPLAY_BUFFER_SIZE) display_width = DISPLAY_BUFFER_SIZE;
+    size_t point_count = display_width;
+    if (cfg.res_points != WAVEFORM_RES_AUTO) {
+        int fixed = waveform_res_points_value(cfg.res_points);
+        if (fixed > 0) point_count = (size_t)fixed > DISPLAY_BUFFER_SIZE ? DISPLAY_BUFFER_SIZE : (size_t)fixed;
+    }
+    if (point_count == 0) point_count = 1;
+    float decimation = cfg.zoom_scale;
+    if (decimation < ZOOM_SCALE_MIN) decimation = ZOOM_SCALE_MIN;
+    if (decimation > ZOOM_SCALE_MAX) decimation = ZOOM_SCALE_MAX;
+    decimation *= (float)display_width / (float)point_count;
+    return (float)point_count * decimation;
+}
+
+// Field locator input for this channel: its Video panel's decoder mode
+// (as the Spectro), else this panel's Signal type; lines from the Video
+// panel's system, else the Video System setting.
+static void waveform_sync_source(gui_app_t *app, int channel, const waveform_panel_state_t *state,
+                                 int *mode, int *lines) {
+    *mode = state->signal_type == WAVE_SIGNAL_FM_RF ? GUI_FIELD_LOCATE_FM : GUI_FIELD_LOCATE_CVBS;
+    *lines = app->settings.video_system == 1 ? 525 : 625;
+    const channel_panel_config_t *cfg = channel == 1 ? &app->panel_config_b : &app->panel_config_a;
+    const void *video = cfg->left_view == PANEL_VIEW_CVBS ? cfg->left_state
+                      : (cfg->split && cfg->right_view == PANEL_VIEW_CVBS) ? cfg->right_state : NULL;
+    if (video) (void)gui_video_panel_sync_source(video, mode, lines);
+}
+
+// The current field's head switch for `at`: the last switch at or before
+// it in the last window (else the first after it).
+static bool waveform_pw_hs_target(const waveform_panel_state_t *state, uint64_t at, uint64_t *out) {
+    const gui_playback_raw_window_t *w = &state->pw_info;
+    if (!state->pw_have || w->hs_n == 0) return false;
+    // Only while the last window still covers `at`: after a step past it the
+    // window's switches are an old field's (traced: HS lock stayed on the
+    // first switch through 12 steps) - read around the playhead first.
+    if (at > w->start + (uint64_t)w->count) return false;
+    size_t k = 0;
+    bool found = false;
+    for (size_t i = 0; i < w->hs_n; i++) if (w->hs_pos[i] <= at) { k = i; found = true; }
+    *out = w->hs_pos[found ? k : 0];
+    return true;
+}
+
+// Start of the line holding `at`, from the last window's field marks
+// (field 2 anchored back to field 1's line 1: see waveform_line1_anchor).
+static double waveform_line1_anchor(double field_start, int field, int lines, double line_len);
+static bool waveform_pw_line_start(const waveform_panel_state_t *state, uint64_t at, uint64_t *out) {
+    const gui_playback_raw_window_t *w = &state->pw_info;
+    if (!state->pw_have || w->mark_count == 0 || !(w->rate > 0.0)) return false;
+    const int lines = w->found_lines == 525 ? 525 : 625;
+    const double line_len = w->rate / ((double)lines * (lines == 525 ? 30000.0 / 1001.0 : 25.0));
+    // The last field start at or before `at` (the first one otherwise).
+    size_t k = 0;
+    for (size_t i = 0; i < w->mark_count; i++) if (w->marks[i].pos <= at) k = i;
+    const double anchor = waveform_line1_anchor((double)w->marks[k].pos, w->marks[k].field, lines, line_len);
+    const double n = floor(((double)at - anchor) / line_len);
+    *out = (uint64_t)(anchor + n * line_len + 0.5);
+    return true;
+}
+
+// Paused: request / take the file window and process it (true = the trace
+// is the window; false = fall back to the last display frame).
+static bool waveform_paused_window(waveform_panel_state_t *state, gui_app_t *app, int channel,
+                                   bool config_dirty) {
+    playback_file_info_t info = {0};
+    if (!gui_playback_get_selected_file_info(app, channel, &info) || !(info.real_sample_rate_hz > 0.0))
+        return false;
+    if (!state->pw_buf) {
+        state->pw_buf = (int16_t *)malloc(WAVEFORM_PW_CAP * sizeof(int16_t));
+        if (!state->pw_buf) return false;
+    }
+    int mode = 0, lines = 625;
+    waveform_sync_source(app, channel, state, &mode, &lines);
+    // Format-agnostic (harrypm 2026-11-19): the locator measures mode and
+    // system from the file; the guess above only sizes the lead-in.
+    mode = GUI_FIELD_LOCATE_AUTO;
+    const float span = waveform_display_window_samples(state);
+    size_t count = (size_t)(span * 2.5f) + 64;
+    if (count > WAVEFORM_PW_CAP) count = WAVEFORM_PW_CAP;
+    const uint64_t cue = gui_playback_get_cue_samples_channel(app, channel);
+    // The window opens a line + half a span before the playhead, so the
+    // line-locked view (below) can start on the playhead's line.
+    const double line_guess = info.real_sample_rate_hz * 64e-6;
+    const uint64_t back = (uint64_t)(line_guess + span * 0.6f);
+    uint64_t hs_target = 0;
+    const bool hs_lock = state->pw_lock == 1 && waveform_pw_hs_target(state, cue, &hs_target);
+    // Hysteresis: every read refines the switch peak a few samples apart,
+    // and chasing that moved the window, which moved the next read (trace:
+    // the target cycled 298 / 303 / 308 / 313 for ever = the HS jumping).
+    // Keep the held switch unless the estimate is a different one (> 0.5 ms).
+    if (hs_lock) {
+        const double tol = info.real_sample_rate_hz * 0.5e-3;
+        if (state->pw_hs_locked &&
+            fabs((double)hs_target - (double)state->pw_hs_locked) <= tol)
+            hs_target = state->pw_hs_locked;
+        else
+            state->pw_hs_locked = hs_target;
+    } else {
+        state->pw_hs_locked = 0;
+    }
+    const uint64_t anchor_at = hs_lock ? hs_target : cue;
+    const uint64_t start = anchor_at > back ? anchor_at - back : 0;
+    count += (size_t)line_guess;
+    // HS lock: the window reaches the playhead too, so it keeps covering it
+    // (the switch stays valid until the playhead moves on).
+    if (hs_lock && cue + (uint64_t)span > start) {
+        const uint64_t need = cue + (uint64_t)span - start;
+        if (need > count) count = (size_t)need;
+    }
+    if (count > WAVEFORM_PW_CAP) count = WAVEFORM_PW_CAP;
+    // Lead-in for the locator: ~3 frames, so the FM head switches can be
+    // folded (the system comes from them with nothing preset) and the
+    // field starts before the window are found.
+    const size_t lead = (size_t)(info.real_sample_rate_hz * 0.105);
+    const uint64_t key = start * 1000003ull ^ (uint64_t)count ^ ((uint64_t)mode << 60) ^ ((uint64_t)lines << 48) ^
+                         ((uint64_t)state->pw_lock << 40);
+    if (key != state->pw_key) {
+        if (getenv("MISRC_PAUSED_TRACE"))
+            fprintf(stderr, "[TRACE] wave ch%d request start=%llu count=%zu cue=%llu lock=%d hs_target=%llu\n",
+                    channel, (unsigned long long)start, count, (unsigned long long)cue, state->pw_lock,
+                    (unsigned long long)hs_target);
+        gui_playback_request_raw_window(app, channel, start, count, lead, mode,
+                                        gui_playback_measured_lines(app, channel) ? gui_playback_measured_lines(app, channel)
+                                        : state->pw_known_lines ? state->pw_known_lines : lines);
+        state->pw_key = key;
+        state->pw_lines = lines;
+    }
+    gui_playback_raw_window_t w;
+    bool fresh = gui_playback_poll_raw_window(app, channel, state->pw_info.seq, state->pw_buf,
+                                              WAVEFORM_PW_CAP, &w);
+    if (fresh) {
+        state->pw_info = w;
+        state->pw_have = w.count > 0;
+        if (w.found_lines == 525 || w.found_lines == 625) state->pw_known_lines = w.found_lines;
+    }
+    if (!state->pw_have) return false;
+    if (fresh || config_dirty || !state->pw_active) {
+        // Line lock (harrypm 2026-11-19 "Waveform is not locking"): with a
+        // field lock, the trace starts a tenth of a span before the start
+        // of the playhead's line, so H sync sits at the same place on every
+        // step (Trig, when on, still positions it itself).
+        size_t off = 0;
+        uint64_t ls = 0;
+        uint64_t hs_at = 0;
+        const bool by_hs = state->pw_lock == 1 && state->pw_hs_locked != 0;
+        if (by_hs) hs_at = state->pw_hs_locked;
+        if (by_hs || waveform_pw_line_start(state, cue, &ls)) {
+            // HS lock: the head switch a tenth in; Line lock: the line start.
+            const double want = (double)(by_hs ? hs_at : ls) - 0.1 * (double)span;
+            if (want > (double)state->pw_info.start) off = (size_t)(want - (double)state->pw_info.start);
+            if (off >= state->pw_info.count) off = 0;
+        }
+        state->pw_off = off;
+        state->map_rec = true;
+        s_trigger_self = true;
+        waveform_vtable_process(state, state->pw_buf + off, state->pw_info.count - off,
+                                atomic_load(&app->sample_rate));
+        s_trigger_self = false;
+        state->map_rec = false;
+    }
+    state->pw_active = true;
+    return true;
+}
+
+// Field 1's line-1 start for a field mark: field 2 opens HALF a line into
+// its first line (625: mid line 313, 525: mid line 263), i.e. lines/2
+// lines after field 1's start - so the line grid runs from field 1:
+// line n starts at anchor + (n - 1) * line_len (measured: anchoring line
+// numbering at field 2's own start put every tick half a line before its
+// H sync).
+static double waveform_line1_anchor(double field_start, int field, int lines, double line_len) {
+    return field == 2 ? field_start - ((double)lines * 0.5) * line_len : field_start;
+}
+
+static void waveform_draw_pos_marks(waveform_panel_state_t *state, gui_app_t *app, int channel,
+                                    Rectangle b) {
+    const gui_playback_raw_window_t *w = &state->pw_info;
+    if (!state->pw_active || state->map_points < 2 || !(state->map_decim > 0.0f) || !(w->rate > 0.0)) return;
+    const int lines = w->found_lines == 525 || w->found_lines == 625 ? w->found_lines
+                    : (state->pw_lines == 525 ? 525 : 625);
+    const double frame_hz = lines == 525 ? 30000.0 / 1001.0 : 25.0;
+    const double line_len = w->rate / ((double)lines * frame_hz);
+    const double abs0 = (double)w->start + (double)state->pw_off + (double)state->map_start;
+    const double span = (double)(state->map_points - 1) * (double)state->map_decim;
+    const double abs1 = abs0 + span;
+    const double px_per_sample = (double)b.width / span;
+    #define WF_X(abs_) ((float)(b.x + ((abs_) - abs0) * px_per_sample))
+    const Color tick = Fade(WHITE, 0.5f), field_col = (Color){ 255, 220, 120, 230 };
+    const uint64_t cue = gui_playback_get_cue_samples_channel(app, channel);
+
+    // Line label step: every n lines, n the finest of 1/5/10/25/50/100 with
+    // labels >= 34 px apart.
+    static const int steps[] = { 1, 5, 10, 25, 50, 100 };
+    int step = 100;
+    for (size_t i = 0; i < sizeof(steps) / sizeof(steps[0]); i++)
+        if (line_len * px_per_sample * steps[i] >= 34.0) { step = steps[i]; break; }
+
+    char cue_label[48] = "";
+    for (size_t i = 0; i < w->mark_count; i++) {
+        const double f0 = (double)w->marks[i].pos;
+        const int field = w->marks[i].field;
+        const double anchor = waveform_line1_anchor(f0, field, lines, line_len);
+        // This field's stretch of whole lines: field 2 owns its first
+        // (half-entered) line, so its stretch starts half a line early.
+        const double seg0 = field == 2 ? f0 - 0.5 * line_len : f0;
+        double seg1 = abs1 + line_len;
+        if (i + 1 < w->mark_count) {
+            const double n0 = (double)w->marks[i + 1].pos;
+            seg1 = w->marks[i + 1].field == 2 ? n0 - 0.5 * line_len : n0;
+        }
+        if (seg1 < abs0 || seg0 > abs1) continue;
+        if (f0 >= abs0 && f0 <= abs1) {
+            const float x = WF_X(f0);
+            DrawLineEx((Vector2){ x, b.y }, (Vector2){ x, b.y + b.height }, field == 1 ? 2.0f : 1.5f, field_col);
+            gui_text_draw_mono(field == 1 ? "f1" : field == 2 ? "f2" : "f?", x + 3.0f, b.y + 20.0f,
+                               FONT_SIZE_OSC_SCALE, field_col);
+        }
+        const double lo = fmax(abs0, seg0), hi = fmin(abs1, seg1);
+        for (long n = (long)ceil((lo - anchor) / line_len - 1e-9) + 1; ; n++) {
+            const double at = anchor + (double)(n - 1) * line_len;
+            if (at > hi + 1e-6) break;
+            if (at < lo - 1e-6) continue;
+            const float x = WF_X(at);
+            const bool labelled = (n % step) == 0 || step == 1;
+            const float tl = labelled ? 10.0f : 5.0f;
+            DrawLineV((Vector2){ x, b.y + b.height - tl }, (Vector2){ x, b.y + b.height }, tick);
+            if (labelled) {
+                char t[12];
+                snprintf(t, sizeof(t), "L%ld", n);
+                gui_text_draw_mono(t, x + 2.0f, b.y + b.height - 12.0f - FONT_SIZE_OSC_SCALE, FONT_SIZE_OSC_SCALE, tick);
+            }
+        }
+        if ((double)cue >= seg0 && (double)cue < seg1) {
+            const long n = (long)floor(((double)cue - anchor) / line_len) + 1;
+            snprintf(cue_label, sizeof(cue_label), "f%d L%ld  %s lock  from file (paused)", field, n,
+                     state->pw_lock == 1 ? "HS" : "line");
+        }
+    }
+    // FM head switches: dashed cyan, tagged HS1 / HS2.
+    for (size_t i = 0; i < w->hs_n; i++) {
+        const double at = (double)w->hs_pos[i];
+        if (at < abs0 || at > abs1) continue;
+        const float x = WF_X(at);
+        const Color hc = (Color){ 90, 220, 255, 220 };
+        for (float y = b.y; y < b.y + b.height; y += 8.0f)
+            DrawLineV((Vector2){ x, y }, (Vector2){ x, fminf(y + 4.0f, b.y + b.height) }, hc);
+        gui_text_draw_mono(w->hs_head[i] ? "HS2" : "HS1", x + 3.0f, b.y + 56.0f, FONT_SIZE_OSC_SCALE, hc);
+    }
+    if ((double)cue >= abs0 && (double)cue <= abs1) {
+        const float x = WF_X((double)cue);
+        DrawLineEx((Vector2){ x, b.y }, (Vector2){ x, b.y + b.height }, 1.0f, Fade((Color){ 255, 255, 0, 255 }, 0.8f));
+    }
+    if (!cue_label[0]) snprintf(cue_label, sizeof(cue_label), "%s", w->mark_count ? "from file (paused)"
+                                                                         : "from file (paused, no field lock)");
+    gui_text_draw_mono(cue_label, b.x + 6.0f, b.y + 38.0f, FONT_SIZE_OSC_SCALE, field_col);
+    #undef WF_X
+}
+
 static void waveform_render(void *state_ptr, gui_app_t *app, int channel,
                              Rectangle bounds, Color channel_color) {
     if (!app || !state_ptr) return;
@@ -2551,6 +2945,9 @@ static void waveform_render(void *state_ptr, gui_app_t *app, int channel,
         waveform_state_lock(state);
         dirty = state->config_dirty;
         waveform_state_unlock(state);
+        if (waveform_paused_window(state, app, channel, dirty)) {
+            dirty = false;   // the file window was (re)processed
+        }
         if (dirty) {
             const int16_t *src = (channel == 1) ? s_trigger_src_ch2 : s_trigger_src_ch1;
             if (src && s_trigger_src_count > 0) {
@@ -2560,12 +2957,15 @@ static void waveform_render(void *state_ptr, gui_app_t *app, int channel,
         }
     }
 
+    if (!playback_zoom_hold) state->pw_active = false;
+
     // Dispatch based on render mode
     if (state->render_mode == WAVEFORM_MODE_PHOSPHOR) {
         render_waveform_phosphor_internal(state, app, channel, bounds, channel_color);
     } else {
         render_waveform_line_internal(state, app, channel, bounds, channel_color);
     }
+    if (playback_zoom_hold && !state->pw_marks_hidden) waveform_draw_pos_marks(state, app, channel, bounds);
 
     // Generator option row: rendered AFTER the waveform so the phosphor
     // texture and grid drawing cannot cover it, one row BELOW the
@@ -2770,6 +3170,34 @@ static void waveform_render(void *state_ptr, gui_app_t *app, int channel,
             draw_dropdown_button(state->range_btn_rect, range_label,
                                  state->range_dropdown_open);
 
+            // Lock (paused file window only): Line (H sync) <-> Head switch.
+            state->lock_btn_rect = (Rectangle){0};
+            state->marks_btn_rect = (Rectangle){0};
+            if (state->pw_active) {
+                const char *lock_label = state->pw_lock == 1 ? "Lock: HS" : "Lock: Line";
+                float lock_w = (float)gui_text_measure(lock_label, FONT_SIZE_DROPDOWN_OPT) * to_logical_w + 16.0f;
+                float lock_x = range_x - 8.0f - lock_w;
+                if (lock_x >= bounds.x + 8.0f) {
+                    state->lock_btn_rect = (Rectangle){lock_x, row_y, lock_w, btn_h};
+                    DrawRectangleRounded(state->lock_btn_rect, 0.15f, 4,
+                                         state->pw_lock == 1 ? COLOR_BUTTON_HOVER : COLOR_BUTTON);
+                    gui_text_draw(lock_label, lock_x + 8.0f, row_y + (btn_h - FONT_SIZE_DROPDOWN_OPT) / 2.0f,
+                                  FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+                    // Marks (field / line wireframe) toggle, left of Lock.
+                    const char *marks_label = state->pw_marks_hidden ? "Marks: Off" : "Marks: On";
+                    float marks_w = (float)gui_text_measure("Marks: Off", FONT_SIZE_DROPDOWN_OPT) * to_logical_w + 16.0f;
+                    float marks_x = lock_x - 8.0f - marks_w;
+                    state->marks_btn_rect = (Rectangle){0};
+                    if (marks_x >= bounds.x + 8.0f) {
+                        state->marks_btn_rect = (Rectangle){marks_x, row_y, marks_w, btn_h};
+                        DrawRectangleRounded(state->marks_btn_rect, 0.15f, 4,
+                                             state->pw_marks_hidden ? COLOR_BUTTON : COLOR_BUTTON_HOVER);
+                        gui_text_draw(marks_label, marks_x + 8.0f, row_y + (btn_h - FONT_SIZE_DROPDOWN_OPT) / 2.0f,
+                                      FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+                    }
+                }
+            }
+
             // Range options: Coarse / Fine
             if (state->range_dropdown_open) {
                 const float opt_h = 20.0f;
@@ -2800,6 +3228,8 @@ static void waveform_render(void *state_ptr, gui_app_t *app, int channel,
             // click handler ignores them, and collapse any stale popup.
             state->res_btn_rect = (Rectangle){0};
             state->range_btn_rect = (Rectangle){0};
+            state->lock_btn_rect = (Rectangle){0};
+            state->marks_btn_rect = (Rectangle){0};
             state->res_dropdown_open = false;
             state->range_dropdown_open = false;
         }

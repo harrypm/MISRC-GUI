@@ -42,7 +42,8 @@ enum {
     OVERLAY_PAL_SYSTEM = 1u << 5,
     OVERLAY_NTSC_SYSTEM = 1u << 6,
     OVERLAY_HIFI_PRESET = 1u << 7,
-    OVERLAY_LD_DTS = 1u << 8
+    OVERLAY_LD_DTS = 1u << 8,
+    OVERLAY_FIELD_VIEW = 1u << 9   /* View: Frame / Split / Field button (2026-11-19) */
 };
 static struct {
     Rectangle panel, button;
@@ -106,6 +107,7 @@ void gui_text_draw(const char *text, float x, float y, int size, Color color) {
     if (!strcmp(text,"System: PAL")) overlay_draw.seen|=OVERLAY_PAL_SYSTEM;
     if (!strcmp(text,"System: NTSC")) overlay_draw.seen|=OVERLAY_NTSC_SYSTEM;
     if (!strcmp(text,"Preset: Hi-Fi")) overlay_draw.seen|=OVERLAY_HIFI_PRESET;
+    if (!strcmp(text,"View: Frame")) overlay_draw.seen|=OVERLAY_FIELD_VIEW;
     ++overlay_draw.labels;
     overlay_draw.awaiting_label=false;
 }
@@ -128,9 +130,9 @@ static void test_rf_overlay_scale(void) {
             overlay_draw.scale=scale;
             overlay_draw.labels=overlay_draw.seen=0;
             render_vhs_decoder_overlay(&panel,&route_app,bounds);
-            unsigned expected=OVERLAY_LD_FORMAT|OVERLAY_LD_AUDIO|OVERLAY_RF_DECODER|OVERLAY_NTSC_SYSTEM|
+            unsigned expected=OVERLAY_LD_FORMAT|OVERLAY_LD_AUDIO|OVERLAY_RF_DECODER|OVERLAY_NTSC_SYSTEM|OVERLAY_FIELD_VIEW|
                 (menu==0 ? OVERLAY_LD_OPTION : OVERLAY_OSD_OPTION);
-            assert(!overlay_draw.awaiting_label && overlay_draw.labels==10);
+            assert(!overlay_draw.awaiting_label && overlay_draw.labels==11);   /* +View (Frame / Split / Field) */
             assert(overlay_draw.seen==expected);
             assert(d->overlay.tape_rect.y < d->overlay.format_rect.y &&
                    d->overlay.format_rect.y < d->overlay.ld_audio_rect.y);
@@ -142,7 +144,7 @@ static void test_rf_overlay_scale(void) {
         gui_vhs_fm_set_format(d, system);
         overlay_draw.labels = overlay_draw.seen = 0;
         render_vhs_decoder_overlay(&panel, &route_app, overlay_draw.panel);
-        unsigned expected = OVERLAY_LD_FORMAT | OVERLAY_LD_DTS | OVERLAY_RF_DECODER |
+        unsigned expected = OVERLAY_LD_FORMAT | OVERLAY_LD_DTS | OVERLAY_RF_DECODER | OVERLAY_FIELD_VIEW |
             (system ? OVERLAY_NTSC_SYSTEM : OVERLAY_PAL_SYSTEM);
         assert(!overlay_draw.awaiting_label && overlay_draw.seen == expected);
     }
@@ -196,7 +198,7 @@ static void test_rf_overlay_short_panes(void) {
                 } else {
                     assert(decoder->overlay.format_rect.y < decoder->overlay.ld_audio_rect.y);
                 }
-                assert(!overlay_draw.awaiting_label && overlay_draw.labels == (mode == 1 ? 9 : 10));
+                assert(!overlay_draw.awaiting_label && overlay_draw.labels == (mode == 1 ? 9 : 11));   /* picture modes: +View */
                 assert(overlay_draw.seen & (menu == 0 ? OVERLAY_OSD_OPTION : OVERLAY_LD_OPTION));
             }
         }

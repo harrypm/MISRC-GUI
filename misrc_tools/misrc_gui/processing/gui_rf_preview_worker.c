@@ -133,8 +133,12 @@ struct gui_rf_preview_worker {
     uint64_t expected_source_sample;
     uint32_t source_rate, source_iq_center;
     uint32_t native_audio_rate;
+    uint32_t narrow_rate;        /* Resampled audio/legacy-video rate: 20 MSPS, or 5 MSPS
+                                  * for dedicated (audio-only) Hi-Fi. */
     bool stream_valid;
-    uint64_t output_sample;      /* Audio and legacy video: public 20 MSPS axis. */
+    uint64_t output_sample;      /* Audio and legacy video, on the narrow_rate axis (20 MSPS,
+                                  * or 5 MSPS for dedicated Hi-Fi; audio timestamps are
+                                  * rescaled to 20 MSPS in rf_audio_callback). */
     uint64_t wide_output_sample; /* Wide-passband video: independent 20 MSPS cursor. */
     bool narrow_stream_valid;   /* ED may omit its audio-only converter while muted. */
     uint64_t narrow_audio_generation;
@@ -559,7 +563,7 @@ static void rf_clear_frame(gui_rf_preview_worker_t *w, const char *reason, bool 
     w->stats.source_rate_hz = w->source_rate;
     w->stats.vhs_hifi_rf_rate_hz = 0;
     if (gui_rf_profile_is_audio_only(w->profile))
-        w->stats.vhs_hifi_rf_rate_hz = w->resampler ? GUI_RF_DECODE_RATE_HZ : w->native_audio_rate;
+        w->stats.vhs_hifi_rf_rate_hz = w->resampler ? w->narrow_rate : w->native_audio_rate;
     w->stats.resets++;
     w->stats.decode_ms = 0.0;
     w->stats.latency_ms = 0.0;
@@ -668,6 +672,7 @@ static bool rf_configure_rate(gui_rf_preview_worker_t *w, uint32_t rate, uint32_
     gui_rf_resampler_destroy(w->wide_resampler);
     w->resampler = w->wide_resampler = NULL;
     w->narrow_stream_valid = false;
+    w->narrow_rate = GUI_RF_DECODE_RATE_HZ;
     w->source_rate = rate;
     w->source_iq_center = iq_center;
     w->native_audio_rate = rf_uses_native_audio(w->profile, rate, iq_center) ? rate : 0;
@@ -675,10 +680,18 @@ static bool rf_configure_rate(gui_rf_preview_worker_t *w, uint32_t rate, uint32_
     if (iq_center || !gui_rf_preview_worker_rate_supported(w->profile, rate)) return false;
     bool wideband = rf_wideband_profile(w->profile);
     const bool low_hifi = rate < RF_MIN_RATE;
-    const size_t capacity = low_hifi ? gui_rf_resampler_output_capacity_hifi(rate, RF_BLOCK_SAMPLES)
+    /* Dedicated Hi-Fi (audio-only VHS Hi-Fi) samples at the decoder's 5 MSPS
+     * front-end rate instead of 20 (harrypm 2026-11-25). Integrated audio
+     * (Beta Hi-Fi, LaserDisc) shares the video RF and keeps 20 MSPS. */
+    const bool hifi_narrow = gui_rf_profile_is_audio_only(w->profile) &&
+        gui_rf_resampler_output_capacity_hifi_narrow(rate, 1) != 0;
+    w->narrow_rate = hifi_narrow ? GUI_RF_HIFI_NARROW_RATE_HZ : GUI_RF_DECODE_RATE_HZ;
+    const size_t capacity = hifi_narrow ? gui_rf_resampler_output_capacity_hifi_narrow(rate, RF_BLOCK_SAMPLES)
+                          : low_hifi ? gui_rf_resampler_output_capacity_hifi(rate, RF_BLOCK_SAMPLES)
                                      : gui_rf_resampler_output_capacity(rate, RF_BLOCK_SAMPLES);
     if (!rf_reserve_output(&w->output, &w->output_capacity, capacity)) return false;
-    w->resampler = low_hifi ? gui_rf_resampler_create_hifi(rate) : gui_rf_resampler_create(rate);
+    w->resampler = hifi_narrow ? gui_rf_resampler_create_hifi_narrow(rate)
+                 : low_hifi ? gui_rf_resampler_create_hifi(rate) : gui_rf_resampler_create(rate);
     if (!w->resampler) return false;
     if (wideband) {
         /* ED Beta, S-VHS and LaserDisc keep RF up to the wider 20 MSPS
@@ -1201,7 +1214,7 @@ static void rf_audio_enqueue(gui_rf_preview_worker_t *w, const rf_input_slot_t *
         slot->generation = generation;
         slot->enqueue_us = now;
         slot->profile = w->profile;
-        slot->rate = w->native_audio_rate ? w->native_audio_rate : GUI_RF_DECODE_RATE_HZ;
+        slot->rate = w->native_audio_rate ? w->native_audio_rate : w->narrow_rate;
         slot->iq_center_hz = iq_center;
         if (slot->iq_center_hz) {
             const uint8_t *iq = (const uint8_t *)input->samples + 2 * offset;
@@ -1310,6 +1323,7 @@ static int rf_worker_thread(void *context) {
                 gui_rf_preview_worker_rate_supported(w->profile, rate);
             if (rate && (rf_wideband_profile(previous_profile) != rf_wideband_profile(w->profile) ||
                 (w->native_audio_rate != 0) != rf_uses_native_audio(w->profile, rate, iq_center) ||
+                gui_rf_profile_is_audio_only(previous_profile) != gui_rf_profile_is_audio_only(w->profile) ||
                 low_rf_support_changed))
                 (void)rf_configure_rate(w, rate, iq_center);
             /* Publish completion only after reset and audio invalidation. */
@@ -1394,7 +1408,8 @@ static int rf_worker_thread(void *context) {
                 rf_reset_decoder(w, w->resampler || w->native_audio_rate
                     ? "RF discontinuity; acquiring" : rf_rate_error(w));
                 w->source_epoch = slot->info.epoch;
-                w->output_sample = w->source_rate ? rf_scale_sample(slot->info.start_sample, w->source_rate) : 0;
+                w->output_sample = w->source_rate ? rf_scale_sample_rate(slot->info.start_sample,
+                    w->source_rate, w->narrow_rate) : 0;
                 w->wide_output_sample = w->source_rate ? rf_scale_sample_rate(slot->info.start_sample,
                     w->source_rate, gui_rf_profile_video_rate_hz(w->profile)) : 0;
                 w->stream_valid = true;
@@ -1425,7 +1440,8 @@ static int rf_worker_thread(void *context) {
                          * buffered tail after mute/control changes and restart
                          * its independent clock at the current source block. */
                         gui_rf_resampler_reset(w->resampler);
-                        w->output_sample = rf_scale_sample(slot->info.start_sample,w->source_rate);
+                        w->output_sample = rf_scale_sample_rate(slot->info.start_sample,w->source_rate,
+                                                                w->narrow_rate);
                     }
                     resampled = gui_rf_resampler_process(w->resampler, slot->samples, slot->count,
                         w->output, w->output_capacity, &output_count);
@@ -1435,7 +1451,8 @@ static int rf_worker_thread(void *context) {
                     /* Resume audio from fresh RF,
                      * rather than pretending its skipped history is contiguous. */
                     w->narrow_stream_valid = false;
-                    w->output_sample = rf_scale_sample(w->expected_source_sample,w->source_rate);
+                    w->output_sample = rf_scale_sample_rate(w->expected_source_sample,w->source_rate,
+                                                            w->narrow_rate);
                 }
                 if (resampled && w->wide_resampler)
                     resampled = gui_rf_resampler_process(w->wide_resampler, slot->samples, slot->count,
@@ -1488,6 +1505,7 @@ gui_rf_preview_worker_t *gui_rf_preview_worker_create_profile(gui_rf_profile_t p
     if ((unsigned)profile >= GUI_RF_PROFILE_COUNT) return NULL;
     gui_rf_preview_worker_t *w = calloc(1, sizeof(*w));
     if (!w) return NULL;
+    w->narrow_rate = GUI_RF_DECODE_RATE_HZ;
     if (!rf_mutex_init(&w->frame_mutex)) { free(w); return NULL; }
 #ifdef _WIN32
     LARGE_INTEGER frequency;

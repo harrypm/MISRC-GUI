@@ -49,6 +49,7 @@ Use lowercase with underscores:
 | `prompt_spectro_direction_readme.md` | Waterfall merged into Spectro: Dir (Horizontal / Vertical) dropdown, `--spectro`, legacy `waterfall` alias; open UX sign-off |
 | `prompt_spectro_player_quickwins_readme.md` | Spectro player mode: frames / fields span dropdown, field lock to the active Video decoder mode (`signal/gui_field_locate.c`), boundary markers, line scale, hover readout, Heat default, arrow-key field step |
 | `prompt_cut_markers_readme.md` | Playback cut markers for FLAC-Chop ([ | ] button, menu, I / O keys, `--markers`), repeat-glyph loop icon, paused field-step cue fix |
+| `prompt_video_field_view_readme.md` | Video panel View: Frame / Split / Field (tbc-analyse style; CVBS, Tape Decode, RF Preview), `--video-fields` |
 | `docs_folder_rules.md` | HARD rule: user-facing sub-docs live in `docs/` (root keeps only README/CONTRIBUTING/INSTALLATION/TECHNICAL/UPDATE/LICENSE*); enforced by the docs layout CI guard |
 
 ### When starting a new prompt

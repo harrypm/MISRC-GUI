@@ -27,15 +27,22 @@
 #include <stddef.h>
 #include <stdint.h>
 
-enum { GUI_FIELD_LOCATE_CVBS = 1, GUI_FIELD_LOCATE_FM = 2 };
+// AUTO (harrypm 2026-11-19: "should be easy to detect ... rather than format
+// targeted dependency"): trace the run both ways (FM carrier frequency and
+// CVBS level) and keep the one whose field starts repeat at a field period.
+// With lines_per_frame 0 the system comes from the measured spacing of the
+// vertical-sync trains (20 ms -> 625, 16.68 ms -> 525): the broad-pulse
+// slicer's thresholds hardly differ between the two (64 vs 63.56 us lines).
+enum { GUI_FIELD_LOCATE_CVBS = 1, GUI_FIELD_LOCATE_FM = 2, GUI_FIELD_LOCATE_AUTO = 3 };
+#define GUI_FIELD_LOCATE_MAX_HS 32
 
 typedef struct {
     uint64_t pos;      // Absolute sample of the field start
     int field;         // 1 or 2 (0: parity not resolved)
 } gui_field_mark_t;
 
-typedef struct {
-    int mode;                  // GUI_FIELD_LOCATE_*
+typedef struct gui_field_locate {
+    int mode;                  // GUI_FIELD_LOCATE_* (AUTO runs FM here + CVBS in alt)
     double rate;               // Samples per second
     int lines_per_frame;       // 625 or 525
     uint64_t start;            // Absolute sample of the first pushed sample
@@ -55,10 +62,36 @@ typedef struct {
     double f_acc;
     int f_n;
     float last_f;
+    // AUTO: the CVBS twin (kept across runs like the trace), auto system.
+    struct gui_field_locate *alt;
+    bool auto_mode, auto_lines;
+    // finish(): what the marks were found with.
+    int found_mode;            // GUI_FIELD_LOCATE_CVBS / _FM (0 = none)
+    int found_lines;           // 625 / 525 measured (head switches / train spacing),
+                               // else the caller's hint, else 0 (unknown)
+    bool found_measured;       // found_lines was measured (not the hint)
+    // FM: RF envelope (mean |x - dc| per trace point) and the head switches
+    // found in it (harrypm 2026-11-19: "headswitch peaks are an absolute
+    // irrespective of format"). The envelope steps where the heads hand
+    // over; folding the step measure over a frame period stacks the switch
+    // phase and averages picture content out, and only the right system
+    // puts the two heads exactly half a frame apart - so the head switches
+    // also give the system with nothing preset (measured on the Daimler NTSC
+    // VHS RF: 9-16x / 6-10x the mean, 16.680 ms apart; at the PAL period the
+    // second head fell to ~3x, 19-20 ms off).
+    float *env;
+    size_t env_cap;
+    double env_acc;
+    int env_n;
+    uint64_t hs_pos[GUI_FIELD_LOCATE_MAX_HS];   // Absolute samples, in order
+    int hs_head[GUI_FIELD_LOCATE_MAX_HS];       // 0 / 1: which of the two switch phases
+    size_t hs_n;
+    int hs_lines;              // System the head switches measured (0 = none)
 } gui_field_locate_t;
 
-// Prepare a run: mode, rate, 625 / 525, the absolute position of the first
-// sample, and the expected sample count (sizes the trace; may be exceeded).
+// Prepare a run: mode (AUTO: both), rate, 625 / 525 (0: measured), the
+// absolute position of the first sample, and the expected sample count
+// (sizes the trace; may be exceeded).
 bool gui_field_locate_begin(gui_field_locate_t *fl, int mode, double rate, int lines_per_frame,
                             uint64_t start, uint64_t expected);
 // The run's next samples (int32 as libFLAC delivers them).

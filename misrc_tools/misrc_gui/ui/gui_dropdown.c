@@ -205,8 +205,8 @@ static bool handle_left_view_dropdown(gui_app_t *app, int ch) {
     } else if (gui_dropdown_is_open(DROPDOWN_LEFT_VIEW, ch)) {
         for (int vt = 0; vt < PANEL_VIEW_COUNT; vt++) {
             if (!panel_view_type_available((panel_view_type_t)vt)) continue;
-            // Use ch * 10 + vt to match the ID used in rendering
-            if (Clay_PointerOver(CLAY_IDI("LeftViewOpt", ch * 10 + vt))) {
+            // ch * 32 + vt: the ID used in rendering (view ids exceed 9)
+            if (Clay_PointerOver(CLAY_IDI("LeftViewOpt", ch * 32 + vt))) {
                 bool cvbs_before = false;
                 bool cvbs_after = false;
                 while (atomic_flag_test_and_set(&app->panel_config_lock)) {}
@@ -240,8 +240,8 @@ static bool handle_right_view_dropdown(gui_app_t *app, int ch) {
     } else if (gui_dropdown_is_open(DROPDOWN_RIGHT_VIEW, ch)) {
         for (int vt = 0; vt < PANEL_VIEW_COUNT; vt++) {
             if (!panel_view_type_available((panel_view_type_t)vt)) continue;
-            // Use ch * 10 + vt to match the ID used in rendering
-            if (Clay_PointerOver(CLAY_IDI("RightViewOpt", ch * 10 + vt))) {
+            // ch * 32 + vt: the ID used in rendering (view ids exceed 9)
+            if (Clay_PointerOver(CLAY_IDI("RightViewOpt", ch * 32 + vt))) {
                 bool cvbs_before = false;
                 bool cvbs_after = false;
                 while (atomic_flag_test_and_set(&app->panel_config_lock)) {}
