@@ -5,9 +5,9 @@
  *
  * One audio-only RF preview worker (VHS Hi-Fi NTSC / PAL profile, or the
  * Beta Hi-Fi profile) decodes the Hi-Fi FM carriers of one RF channel to
- * 48 kHz stereo. It runs only while used (CPU rule): CH3/4 is the selected
- * monitor pair and the device has no real CH3/4 audio, or a HiFi panel is
- * shown. Then:
+ * 48 kHz stereo. It runs only when picked by hand (HiFi panel Decoder
+ * button, settings hifi34_enabled, --hifi decode=) while a source runs
+ * (harrypm 2026-11-26). Then, when the device has no real CH3/4 audio:
  * - CH3/4 meters show the decoded L / R (app->hifi34_peak),
  * - the CH3/4 monitor plays it (gui_video_update_rf_routes override),
  * - the HiFi panel draws its waveform (gui_hifi34_copy_recent).

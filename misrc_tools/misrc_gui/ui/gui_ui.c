@@ -184,8 +184,37 @@ Vector2 gui_ui_get_render_scale(void)
     return render_scale;
 }
 
+// Pop-out windows (gui_popout.c): while a popped panel handles input or
+// renders, its window's mouse (logical) stands in for the main window's.
+static bool s_mouse_override;
+static Vector2 s_mouse_override_pos;
+static unsigned s_override_down, s_override_pressed;   // bit = raylib MouseButton
+void gui_ui_set_mouse_override_buttons(unsigned down_mask, unsigned pressed_mask)
+{
+    s_override_down = down_mask;
+    s_override_pressed = pressed_mask;
+}
+
+bool gui_ui_mouse_button_pressed(int button)
+{
+    if (s_mouse_override) return button >= 0 && button < 8 && ((s_override_pressed >> button) & 1u);
+    return IsMouseButtonPressed(button);
+}
+
+bool gui_ui_mouse_button_down(int button)
+{
+    if (s_mouse_override) return button >= 0 && button < 8 && ((s_override_down >> button) & 1u);
+    return IsMouseButtonDown(button);
+}
+void gui_ui_set_mouse_override(bool active, Vector2 logical_pos)
+{
+    s_mouse_override = active;
+    s_mouse_override_pos = logical_pos;
+}
+
 Vector2 gui_ui_get_mouse_position(void)
 {
+    if (s_mouse_override) return s_mouse_override_pos;
 #if defined(__ANDROID__)
     Vector2 position = gui_android_viewport_pointer();
 #else

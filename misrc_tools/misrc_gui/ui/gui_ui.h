@@ -82,6 +82,13 @@ void gui_ui_show_scale_hud(int percent);
 int gui_ui_get_layout_width(void);
 int gui_ui_get_layout_height(void);
 Vector2 gui_ui_get_mouse_position(void);
+// Pop-out windows: substitute that window's mouse (logical) while active.
+void gui_ui_set_mouse_override(bool active, Vector2 logical_pos);
+// Pop-out windows: that window's buttons (bit = raylib MouseButton) while
+// the override is active. Panels read buttons through these, not raylib.
+void gui_ui_set_mouse_override_buttons(unsigned down_mask, unsigned pressed_mask);
+bool gui_ui_mouse_button_pressed(int button);
+bool gui_ui_mouse_button_down(int button);
 
 // Check if UI consumed the current frame's click (prevents click-through to oscilloscope)
 bool gui_ui_click_consumed(void);

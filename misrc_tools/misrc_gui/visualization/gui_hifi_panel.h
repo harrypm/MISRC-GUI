@@ -8,12 +8,11 @@
  * harrypm 2026-11-25: "Add a realtime waveform readout to the decoded
  * hifi-audio so it visually shows something then just levels."
  *
- * Showing the panel is a use of the decoder: it runs while the panel is
- * up (and a source runs), even with CH1/2 monitored.
  *
- * Controls (right stack): Source (Auto / RF A / RF B), Format (Auto /
- * VHS PAL / VHS NTSC / Beta), Span (10 ms - 2 s; also the mouse wheel).
- * Flag: --hifi src=auto|a|b,fmt=auto|pal|ntsc|beta,span=<ms>.
+ * Controls (right stack): Source (Auto / RF A / RF B), Decoder (Off /
+ * Auto / VHS PAL / VHS NTSC / Beta; Off by default - nothing decodes until
+ * picked, harrypm 2026-11-26), Span (10 ms - 2 s; also the mouse wheel).
+ * Flag: --hifi decode=off|auto|pal|ntsc|beta,src=auto|a|b,span=<ms>.
  */
 #ifndef GUI_HIFI_PANEL_H
 #define GUI_HIFI_PANEL_H
@@ -26,6 +25,6 @@ void gui_hifi_panel_register(void);
 /* --hifi <key=value,...>. Span applies to panels created after it; src / fmt
  * are returned (-1 = not given) for the caller to put in the settings after
  * the settings load (flag > --config > default). False + usage on error. */
-bool gui_hifi_panel_apply_launch_arg(const char *arg, int *source, int *format);
+bool gui_hifi_panel_apply_launch_arg(const char *arg, int *source, int *format, int *enabled);
 
 #endif

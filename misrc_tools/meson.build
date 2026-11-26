@@ -547,6 +547,7 @@ if raylib_dep.found()
     'misrc_gui/visualization/gui_vectorscope_panel.c',
     'misrc_gui/visualization/gui_wfm_panel.c',
     'misrc_gui/visualization/gui_hifi_panel.c',
+    'misrc_gui/visualization/gui_popout.c',
     'misrc_gui/visualization/gui_spectrogram.c',
     'misrc_gui/visualization/gui_text.c',
     'misrc_gui/visualization/gui_vu_meter.c',
@@ -633,6 +634,22 @@ if raylib_dep.found()
   zstd_dep = dependency('libzstd', required: true, static: windows_static_deps)
   gui_deps = deps + [ raylib_dep, fftw3f_dep ]
   gui_deps += [ zstd_dep, ld_dts_dep ]
+  # Pop-out panel windows (visualization/gui_popout.c) call GLFW 3 directly:
+  # raylib's bundled GLFW exports it; else a system glfw3; else compile out.
+  popout_probe = 'void *glfwCreateWindow(int, int, const char *, void *, void *);\n' + \
+                 'int main(void) { return glfwCreateWindow(0, 0, 0, 0, 0) ? 0 : 0; }\n'
+  if host_system == 'android'
+    gui_deps += [declare_dependency(compile_args: ['-DMISRC_POPOUT_DISABLED=1'])]
+  elif not meson.get_compiler('c').links(popout_probe, dependencies: raylib_dep,
+                                         name: 'GLFW 3 through raylib (pop-out panels)')
+    glfw_dep = dependency('glfw3', required: false)
+    if glfw_dep.found()
+      gui_deps += [glfw_dep]
+    else
+      message('Pop-out panels disabled: no GLFW 3 through raylib or glfw3')
+      gui_deps += [declare_dependency(compile_args: ['-DMISRC_POPOUT_DISABLED=1'])]
+    endif
+  endif
   # Monitor & Remote Audio Mon streams 48 kHz / 10 ms Opus mono.
   # Do not silently ship a client with a clickable but nonworking Audio Mon.
   if not soxr_dep.found()

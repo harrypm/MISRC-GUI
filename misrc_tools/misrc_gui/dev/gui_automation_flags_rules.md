@@ -104,6 +104,7 @@ GUI autoload trigger flag.**
   (the saved `video_decoder_*` key is its launch state). [2026-11-19]
 - Hi-Fi on CH3/4 + HiFi panel (Source / Format / Span buttons):
   - Flag: `--hifi <key=value,...>`.
+    - `decode=off|auto|pal|ntsc|beta`: the HiFi panel Decoder button (settings `hifi34_enabled` + `hifi34_format`). Off by default: nothing decodes until picked (2026-11-26).
     - `src=auto|a|b`: settings `hifi34_source`, 0 to 2.
     - `fmt=auto|pal|ntsc|beta`: settings `hifi34_format`, 0 to 3.
     - `span=10|20|50|100|250|500|1000|2000`: HiFi panel span in ms, for panels created after it.
@@ -112,6 +113,11 @@ GUI autoload trigger flag.**
   - The CH3/4 monitor toggle (`audio_monitor_ch34`) is the existing settings key.
   - The decoder logs `[HIFI34] decoding RF <A|B> as <format>`.
   - Added 2026-11-25.
+- Pop-out panels (corner pop-out button on each panel; click a popped slot's placeholder to return it):
+  - Flag: `--popout <a|b>:<left|right>[,...]` opens those slots in pop-out windows at launch. Logs `[AUTO] --popout` and `[POPOUT] ... popped out / returned`.
+  - Open slots and their window geometry persist in settings `popout_windows`.
+  - Inside a pop-out: F11 or the corner button toggles fullscreen on its screen.
+  - Added 2026-11-26.
 - Video panel View button (Frame / Split / Field, all three decoders):
   `--video-fields frame|split|field` (launch state of new Video panels;
   logs `[AUTO] --video-fields`; anything else prints the accepted list and

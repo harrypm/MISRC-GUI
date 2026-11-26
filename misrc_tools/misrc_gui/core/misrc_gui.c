@@ -39,6 +39,7 @@
 #include "../visualization/gui_wfm_panel.h"
 #include "../visualization/gui_vectorscope_panel.h"
 #include "../visualization/gui_hifi_panel.h"
+#include "../visualization/gui_popout.h"
 #include "../processing/gui_hifi34.h"
 #include "../input/gui_source_meta.h"
 #include "../visualization/gui_spectrogram.h"
@@ -157,7 +158,10 @@ static void print_usage(const char *program_name) {
             "           channel=y|yc|c, range=active|frame, units=ire|mv,\n"
             "           phosphor=on|off, intensity=0.1..10, system=auto|pal|ntsc|\n"
             "           secam (any subset; defaults y, active, ire, off, 3.0, auto).\n"
+            "--popout <a|b>:<left|right>[,...] open those panels in pop-out windows\n"
+            "           (own window per panel, any screen, F11 = fullscreen).\n"
             "--hifi <key=value,...> Hi-Fi audio decode on CH3/4 + HiFi panels:\n"
+            "           decode=off|auto|pal|ntsc|beta (the Decoder button; off default),\n"
             "           src=auto|a|b (RF channel; auto = carrier probe),\n"
             "           fmt=auto|pal|ntsc|beta (auto = VHS PAL / NTSC carrier pair),\n"
             "           span=10|20|50|100|250|500|1000|2000 (HiFi panel ms).\n"
@@ -1154,7 +1158,7 @@ int main(int argc, char **argv) {
     bool has_capture_arg = false;
     const char *config_path = NULL;  /* --config <path> override */
     const char *select_device_arg = NULL;  /* --select-device <index-or-name> */
-    int hifi_src_arg = -1, hifi_fmt_arg = -1;   /* --hifi src= / fmt= (applied after settings load) */
+    int hifi_src_arg = -1, hifi_fmt_arg = -1, hifi_on_arg = -1;   /* --hifi (applied after settings load) */
     const char *gen_system_arg = NULL;    /* --gen-system <pal|ntsc|secam|mesecam|0-3> */
     const char *gen_format_arg = NULL;    /* --gen-format <vhs|svhs|betamax|video8|hi8|0-4> */
     const char *panel_view_args[2] = {0}; /* --panel-view <a|b>:<left>[,<right>] */
@@ -1267,6 +1271,16 @@ int main(int argc, char **argv) {
             if (!gui_wfm_panel_apply_launch_arg(argv[++i])) return 1;
             continue;
         }
+        if (strcmp(a, "--popout") == 0) {
+            // --popout <a|b>:<left|right>[,...]: open pop-out panel windows
+            // at launch (hard rule dev/gui_automation_flags_rules.md).
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--popout requires <a|b>:<left|right>[,...]\n");
+                return 1;
+            }
+            if (!gui_popout_apply_launch_arg(argv[++i])) return 1;
+            continue;
+        }
         if (strcmp(a, "--hifi") == 0) {
             // --hifi <key=value,...>: Hi-Fi on CH3/4 source / format
             // (settings, applied after the settings load) and the HiFi
@@ -1275,7 +1289,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "--hifi requires <key=value,...>\n");
                 return 1;
             }
-            if (!gui_hifi_panel_apply_launch_arg(argv[++i], &hifi_src_arg, &hifi_fmt_arg)) return 1;
+            if (!gui_hifi_panel_apply_launch_arg(argv[++i], &hifi_src_arg, &hifi_fmt_arg, &hifi_on_arg)) return 1;
             continue;
         }
         if (strcmp(a, "--vector") == 0) {
@@ -1534,10 +1548,12 @@ int main(int argc, char **argv) {
     gui_cvbs_set_default_system(app.settings.video_system);
     if (hifi_src_arg >= 0) app.settings.hifi34_source = hifi_src_arg;
     if (hifi_fmt_arg >= 0) app.settings.hifi34_format = hifi_fmt_arg;
+    if (hifi_on_arg >= 0) app.settings.hifi34_enabled = hifi_on_arg != 0;
     // 50 ohm CVBS mode only on a DdD source (device or DdD file), and the
     // Hi-Fi on CH3/4 decoder's RF tap / monitor hooks.
     gui_cvbs_set_ddd_query(gui_source_is_ddd);
     gui_hifi34_init(&app);
+    gui_popout_restore(&app);   // queues saved pop-outs; opened on the first frame
 
     // Capture limit should not persist across relaunches.
     app.settings.capture_limit_seconds = 0;
@@ -2549,6 +2565,10 @@ int main(int argc, char **argv) {
             panel_handle_all_scrolls(&app, wheel);
         }
 
+        // Pop-out panel windows: input, render to texture, present (before the
+        // main frame; each pop-out swaps without waiting for vsync).
+        gui_popout_frame(&app);
+
         // Render
         BeginDrawing();
 #if defined(__ANDROID__)
@@ -2595,10 +2615,12 @@ int main(int argc, char **argv) {
 
     // Save settings before cleanup (with the live per-channel panel setup)
     gui_panel_settings_capture(&app);
+    gui_popout_capture_settings(&app);   // open pop-outs + window geometry
     gui_settings_save(&app.settings);
     // Raylib output must be destroyed on the GUI thread before net cleanup.
     gui_monitor_audio_client_update(NULL);
     gui_hifi34_shutdown();
+    gui_popout_shutdown();
     
     gui_app_cleanup(&app);
     free(clay_memory);

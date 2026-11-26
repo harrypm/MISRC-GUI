@@ -169,6 +169,19 @@ bool IsMouseButtonPressed(int button)
     return false;
 }
 
+/* Panels read buttons through gui_ui (pop-out windows substitute their own). */
+bool gui_ui_mouse_button_pressed(int button)
+{
+    (void)button;
+    return false;
+}
+
+bool gui_ui_mouse_button_down(int button)
+{
+    (void)button;
+    return false;
+}
+
 Vector2 gui_ui_get_mouse_position(void)
 {
     return test_mouse;

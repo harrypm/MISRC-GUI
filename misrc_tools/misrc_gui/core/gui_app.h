@@ -296,6 +296,11 @@ typedef struct {
     // 2 = VHS NTSC, 3 = Beta NTSC. Flag: --hifi src=,fmt=
     int hifi34_source;
     int hifi34_format;
+    // Hi-Fi decode runs only when picked by hand (HiFi panel Decoder button,
+    // --hifi decode=; harrypm 2026-11-26). Default off.
+    bool hifi34_enabled;
+    // Pop-out panels (gui_popout.c): per slot "slot:open,x,y,w,h,fullscreen" ';'-joined.
+    char popout_windows[192];
     bool misrc_mode;                           // If true, MISRC mode (default) with A/B channel swap
     bool misrc_v15_v25_ab_swap;               // If true, invert MISRC A/B mapping for V1.5/V2.5 hardware swap variants
     bool stop_on_dropout;                      // If true, automatically stop capture when stream dropout is detected

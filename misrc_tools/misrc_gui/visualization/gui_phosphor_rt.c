@@ -7,17 +7,27 @@
 #include "gui_phosphor_rt.h"
 #include "rlgl.h"
 
+/* Nested render textures are not a stack in raylib: EndTextureMode() always
+ * switches to the default framebuffer. After an inner phosphor/FFT pass,
+ * re-enter the outer target: a pop-out panel's render texture
+ * (gui_popout.c, phosphor_rt_set_outer_target) or, on Android, the full-UI
+ * canvas. Callers restore the outer model-view matrix afterwards. */
+static const RenderTexture2D *s_outer_target;
+void phosphor_rt_set_outer_target(const RenderTexture2D *target) {
+    s_outer_target = target;
+}
 #if defined(__ANDROID__)
 #include "../core/gui_android_viewport.h"
-/* Nested render textures are not a stack in raylib: EndTextureMode() always
- * switches to the default framebuffer. Restore the Android full-UI canvas
- * after finishing any inner phosphor/FFT texture pass. */
 #define PHOSPHOR_END_TEXTURE_MODE() do { \
     EndTextureMode(); \
-    gui_android_viewport_restore_canvas_after_texture(); \
+    if (s_outer_target) BeginTextureMode(*s_outer_target); \
+    else gui_android_viewport_restore_canvas_after_texture(); \
 } while (0)
 #else
-#define PHOSPHOR_END_TEXTURE_MODE() EndTextureMode()
+#define PHOSPHOR_END_TEXTURE_MODE() do { \
+    EndTextureMode(); \
+    if (s_outer_target) BeginTextureMode(*s_outer_target); \
+} while (0)
 #endif
 #include <math.h>
 #include <stdlib.h>

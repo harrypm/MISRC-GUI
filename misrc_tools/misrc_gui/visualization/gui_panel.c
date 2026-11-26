@@ -16,6 +16,7 @@
 #include "../signal/gui_demod.h"
 #include "../ui/gui_ui.h"
 #include "../net/gui_net.h"
+#include "gui_popout.h"
 #include "../net/gui_monitor_transport.h"
 #include "../net/gui_remote_display.h"
 #include "gui_text.h"
@@ -115,10 +116,36 @@ void panel_clear_view_state(panel_view_type_t type, void *state) {
 // Channel Panel Rendering (Main Entry Point)
 //-----------------------------------------------------------------------------
 
-// Helper: Render a single panel using vtable dispatch
-static void render_single_panel(gui_app_t *app, int channel,
+static void render_single_panel_impl(gui_app_t *app, int channel,
+                                      panel_view_type_t type, void *state,
+                                      Rectangle bounds, Color color);
+
+// Grid slot: a popped-out slot shows its placeholder; others render and
+// get the pop-out corner button (gui_popout.c).
+static void render_single_panel(gui_app_t *app, int channel, int side,
                                  panel_view_type_t type, void *state,
                                  Rectangle bounds, Color color) {
+    if (gui_popout_is_open(channel, side)) {
+        gui_popout_draw_placeholder(channel, side, bounds, panel_view_type_name(type));
+        return;
+    }
+    render_single_panel_impl(app, channel, type, state, bounds, color);
+    if (gui_popout_available() && app->settings.net_mode != GUI_NET_MODE_MONITOR_CLIENT)
+        gui_popout_draw_button(channel, side, bounds);
+}
+
+void panel_render_popout(gui_app_t *app, int channel, int side, Rectangle bounds) {
+    channel_panel_config_t *config = channel ? &app->panel_config_b : &app->panel_config_a;
+    const panel_view_type_t type = side ? config->right_view : config->left_view;
+    void *state = side ? config->right_state : config->left_state;
+    render_single_panel_impl(app, channel, type, state, bounds,
+                             channel ? COLOR_CHANNEL_B : COLOR_CHANNEL_A);
+}
+
+// Helper: Render a single panel using vtable dispatch
+static void render_single_panel_impl(gui_app_t *app, int channel,
+                                      panel_view_type_t type, void *state,
+                                      Rectangle bounds, Color color) {
     /* M-Client reuses the EXACT Local/Harry Waveform + FFT render vtables,
      * phosphor accumulation, grid, trigger lines, zoom and overlays.
      * Only reduced Zstd/float32 display data comes across the network. */
@@ -188,7 +215,7 @@ void render_channel_panels(gui_app_t *app, int channel,
         config->left_bounds = bounds;
         config->right_bounds = (Rectangle){0, 0, 0, 0};
 
-        render_single_panel(app, channel, config->left_view,
+        render_single_panel(app, channel, 0, config->left_view,
                            config->left_state, bounds, channel_color);
     } else {
         // Split panels - divide width between left and right
@@ -202,7 +229,7 @@ void render_channel_panels(gui_app_t *app, int channel,
         config->right_bounds = right_bounds;
 
         // Left panel
-        render_single_panel(app, channel, config->left_view,
+        render_single_panel(app, channel, 0, config->left_view,
                            config->left_state, left_bounds, channel_color);
 
         // Divider line
@@ -210,7 +237,7 @@ void render_channel_panels(gui_app_t *app, int channel,
                    2.0f, COLOR_GRID_MAJOR);
 
         // Right panel
-        render_single_panel(app, channel, config->right_view,
+        render_single_panel(app, channel, 1, config->right_view,
                            config->right_state, right_bounds, channel_color);
     }
 }
@@ -374,14 +401,21 @@ bool panel_handle_all_clicks(gui_app_t *app, Vector2 mouse_pos) {
             ? &app->panel_config_a
             : &app->panel_config_b;
 
+        // Pop-out button / popped placeholder first; a popped panel gets
+        // its input in its own window (gui_popout.c).
+        if (gui_popout_handle_grid_click(app, ch, 0, mouse_pos, config->left_bounds)) return true;
+        if (config->split &&
+            gui_popout_handle_grid_click(app, ch, 1, mouse_pos, config->right_bounds)) return true;
+
         // Try left panel
-        if (try_panel_click(app, ch, config->left_view, config->left_state,
+        if (!gui_popout_is_open(ch, 0) &&
+            try_panel_click(app, ch, config->left_view, config->left_state,
                             config->left_bounds, mouse_pos)) {
             return true;
         }
 
         // Try right panel if in split mode
-        if (config->split) {
+        if (config->split && !gui_popout_is_open(ch, 1)) {
             if (try_panel_click(app, ch, config->right_view, config->right_state,
                                 config->right_bounds, mouse_pos)) {
                 return true;
@@ -423,14 +457,15 @@ bool panel_handle_all_scrolls(gui_app_t *app, float delta) {
             ? &app->panel_config_a
             : &app->panel_config_b;
 
-        // Try left panel
-        if (try_panel_scroll(config->left_view, config->left_state,
+        // Try left panel (a popped panel scrolls in its own window)
+        if (!gui_popout_is_open(ch, 0) &&
+            try_panel_scroll(config->left_view, config->left_state,
                               config->left_bounds, delta)) {
             return true;
         }
 
         // Try right panel if in split mode
-        if (config->split) {
+        if (config->split && !gui_popout_is_open(ch, 1)) {
             if (try_panel_scroll(config->right_view, config->right_state,
                                   config->right_bounds, delta)) {
                 return true;

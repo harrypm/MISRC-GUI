@@ -34,11 +34,13 @@ static int s_launch_span = HP_SPAN_DEFAULT;
 // Launch flag
 //-----------------------------------------------------------------------------
 
-bool gui_hifi_panel_apply_launch_arg(const char *arg, int *source, int *format) {
-    static const char *usage = "--hifi: expected key=value[,...] with src=auto|a|b, "
+bool gui_hifi_panel_apply_launch_arg(const char *arg, int *source, int *format, int *enabled) {
+    static const char *usage = "--hifi: expected key=value[,...] with "
+                               "decode=off|auto|pal|ntsc|beta (the Decoder button), src=auto|a|b, "
                                "fmt=auto|pal|ntsc|beta, span=10|20|50|100|250|500|1000|2000 (ms)";
     if (source) *source = -1;
     if (format) *format = -1;
+    if (enabled) *enabled = -1;
     if (!arg || !arg[0]) {
         fprintf(stderr, "%s\n", usage);
         return false;
@@ -59,6 +61,13 @@ bool gui_hifi_panel_apply_launch_arg(const char *arg, int *source, int *format) 
             int f = strcmp(v, "auto") == 0 ? 0 : strcmp(v, "pal") == 0 ? 1 :
                     strcmp(v, "ntsc") == 0 ? 2 : strcmp(v, "beta") == 0 ? 3 : -1;
             if (f >= 0) { if (format) *format = f; ok = true; }
+        } else if (strcmp(k, "decode") == 0) {
+            if (strcmp(v, "off") == 0) { if (enabled) *enabled = 0; ok = true; }
+            else {
+                int f = strcmp(v, "auto") == 0 ? 0 : strcmp(v, "pal") == 0 ? 1 :
+                        strcmp(v, "ntsc") == 0 ? 2 : strcmp(v, "beta") == 0 ? 3 : -1;
+                if (f >= 0) { if (format) *format = f; if (enabled) *enabled = 1; ok = true; }
+            }
         } else if (strcmp(k, "span") == 0) {
             int ms = atoi(v);
             for (int i = 0; i < HP_SPAN_COUNT; i++)
@@ -67,7 +76,8 @@ bool gui_hifi_panel_apply_launch_arg(const char *arg, int *source, int *format) 
         if (!ok) { fprintf(stderr, "%s (got '%s')\n", usage, arg); return false; }
     }
     s_launch_span = span;
-    fprintf(stderr, "[AUTO] --hifi: src=%s fmt=%s span=%d ms\n",
+    fprintf(stderr, "[AUTO] --hifi: decode=%s src=%s fmt=%s span=%d ms\n",
+            enabled && *enabled >= 0 ? (*enabled ? "on" : "off") : "(settings)",
             source && *source >= 0 ? gui_hifi34_source_name(*source) : "(settings)",
             format && *format >= 0 ? gui_hifi34_format_name(*format) : "(settings)",
             s_span_ms[span]);
@@ -109,11 +119,13 @@ static void hp_button_label(const hifi_panel_t *s, const gui_app_t *app, const g
             else
                 snprintf(out, n, "Source: %s", gui_hifi34_source_name(app->settings.hifi34_source));
             break;
-        case HP_BTN_FORMAT:
-            if (app->settings.hifi34_format == 0 && st->running)
-                snprintf(out, n, "Format: Auto (%s)", st->fmt == GUI_HIFI_FMT_VHS_PAL ? "PAL" : "NTSC");
+        case HP_BTN_FORMAT:   // the Decoder: Off / Auto / VHS PAL / VHS NTSC / Beta
+            if (!app->settings.hifi34_enabled)
+                snprintf(out, n, "Decoder: Off");
+            else if (app->settings.hifi34_format == 0 && st->running)
+                snprintf(out, n, "Decoder: Auto (%s)", st->fmt == GUI_HIFI_FMT_VHS_PAL ? "PAL" : "NTSC");
             else
-                snprintf(out, n, "Format: %s", gui_hifi34_format_name(app->settings.hifi34_format));
+                snprintf(out, n, "Decoder: %s", gui_hifi34_format_name(app->settings.hifi34_format));
             break;
         default:
             if (s_span_ms[s->span_idx] >= 1000) snprintf(out, n, "Span: %d s", s_span_ms[s->span_idx] / 1000);
@@ -207,6 +219,8 @@ static void hp_render(void *state, gui_app_t *app, int channel, Rectangle bounds
             if ((float)gui_text_measure(line, FONT_SIZE_DROPDOWN_OPT) <= line_room) break;
         }
         line_col = st.locked ? COLOR_SYNC_GREEN : COLOR_METER_YELLOW;
+    } else if (!app->settings.hifi34_enabled) {
+        snprintf(line, sizeof(line), "Decoder off: pick a Decoder to decode Hi-Fi");
     } else if (!st.wanted) {
         snprintf(line, sizeof(line), "Starts with playback / capture");
     } else if (st.rate_unsupported) {
@@ -282,7 +296,15 @@ static bool hp_click(void *state, gui_app_t *app, int channel, Vector2 click, Re
             app->settings.hifi34_source = (app->settings.hifi34_source + 1) % 3;
             gui_settings_save(&app->settings);
         } else if (b == HP_BTN_FORMAT) {
-            app->settings.hifi34_format = (app->settings.hifi34_format + 1) % 4;
+            // Off -> Auto -> VHS PAL -> VHS NTSC -> Beta -> Off
+            if (!app->settings.hifi34_enabled) {
+                app->settings.hifi34_enabled = true;
+                app->settings.hifi34_format = 0;
+            } else if (app->settings.hifi34_format >= 3) {
+                app->settings.hifi34_enabled = false;
+            } else {
+                app->settings.hifi34_format++;
+            }
             gui_settings_save(&app->settings);
         } else {
             s->span_idx = (s->span_idx + 1) % HP_SPAN_COUNT;

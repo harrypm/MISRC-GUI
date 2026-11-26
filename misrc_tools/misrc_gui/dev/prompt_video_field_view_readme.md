@@ -296,3 +296,49 @@ A **View** button (Frame / Split / Field) under Frame: Active/Full, on all three
     - Not reproduced. Asked harrypm to confirm Audio Mon's state when it goes silent; the app is relaunched with `MISRC_AUDIO_TRACE=1`.
     - Also seen: the device plays 43 - 46k of 48k frames/s, so the Hi-Fi monitor runs about 5% short (playback speed vs decode). Not yet investigated.
   - Full rebuild; suite 65/66.
+- **Hi-Fi only when picked; pop-out panels** (harrypm 2026-11-26: "HiFi should not be decoding unless its selected as a decoder mode manually, I want to also add a pop-out feature to fully pop out pannels to put them on dedicated screens if wanted").
+  - harrypm's choices: a Decoder button in the HiFi panel; a corner button, with closing returning the panel; full clicks / wheel / hover in pop-outs.
+  - **Hi-Fi:**
+    - New setting `hifi34_enabled`, default false.
+    - The HiFi panel Format button became Decoder: Off -> Auto -> VHS PAL -> VHS NTSC -> Beta -> Off (saved). Flag `--hifi decode=off|auto|pal|ntsc|beta`.
+    - `gui_hifi34_update` decodes only when enabled and a source runs. Opening the panel or picking CH3/4 no longer starts it.
+    - Off shows "Decoder off: pick a Decoder to decode Hi-Fi".
+  - **Pop-out:**
+    - New `visualization/gui_popout.c`: GLFW windows sharing raylib's GL context. The GLFW 3 calls are declared locally; meson checks that they link through raylib, else a system glfw3, else compiles the feature out (`MISRC_POPOUT_DISABLED`; Android always out).
+    - Per frame, before BeginDrawing:
+      - input from each pop-out (left press -> the panel's `handle_click`; wheel -> `handle_scroll`; hover through `gui_ui_set_mouse_override`);
+      - the panel renders into a RenderTexture at the pop-out framebuffer size and UI scale;
+      - each pop-out draws it with a tiny blit shader in its own context (own VAO; VBO and texture shared) and swaps with `glfwSwapInterval(0)`.
+    - Grid:
+      - `render_single_panel` takes the slot side;
+      - a popped slot draws "<View> popped out / Click here (or close its window) to return it";
+      - other slots get a bottom-right pop-out icon;
+      - clicks and scroll on popped slots go to the pop-out only.
+    - F11, Esc or the corner button toggle fullscreen on the screen the window is on.
+    - Settings `popout_windows` (open slots + geometry) is restored on the first frame; fullscreen is not auto-restored.
+    - Flag `--popout`.
+    - Verified: `--popout b:left` with B = HiFi | Waveform and `--hifi decode=auto` gave a live, locked Hi-Fi panel in its window and the placeholder in the grid.
+    - harrypm popped out A left (Vectorscope), moved it to another screen (x 4290), resized it and changed Intensity inside it (3 -> 6): pop-out clicks work.
+    - v1 limits:
+      - Waveform / FFT drag gestures read raylib's main-window button state, so they do not work in a pop-out;
+      - on Windows, dragging a pop-out by its title bar pauses redraws until released (the modal-loop driver covers the main window only).
+  - Full rebuild; suite 65/66.
+- **Pop-out lands on the main window** (harrypm 2026-11-26: "make pop out land on main window position"):
+  - A pop-out opened with its button, or with `--popout`, now opens exactly over the panel it came from: the main window's client origin plus the panel's grid bounds times the UI scale, at the panel's size (minimum 320x200).
+  - It is created hidden, placed, then shown, so it never flashes at the OS default spot.
+  - `--popout` slots wait until the grid has laid the panel out (up to 120 frames).
+  - Pop-outs restored from the settings still use their saved position, size and screen.
+  - Verified: main client 1007,340; B-left HiFi pop-out client 1085,746, 576x282. The offset (78,406) is the panel's spot in the grid.
+- **Waveform pop-out broken; scope / trigger interaction in pop-outs** (harrypm 2026-11-26: "wavefrom popout is broken", "scope interactions also need fixing", "triggers do not work interaction wise on pop outs"):
+  - **Render:**
+    - The Waveform's phosphor pass ends with `EndTextureMode()`, which in raylib always returns to the main window's framebuffer (texture modes do not nest).
+    - In a pop-out, everything drawn after it (trace composite, overlay buttons) went to the main back buffer and was lost; the pop-out showed only the grid.
+    - Fix: `phosphor_rt_set_outer_target()`. The pop-out registers its render texture, and `PHOSPHOR_END_TEXTURE_MODE` re-enters it after each inner pass (the same idea as the existing Android canvas restore); phosphor already restores the outer model-view matrix.
+    - Verified by dumping the pop-out texture (temporary `MISRC_PO_DUMP`, removed): trace plus 2Vpp / Phosphor / Fall-Ch2 / Range / Res buttons. The window capture matches.
+  - **Interaction:**
+    - Waveform trigger-level click and drag, middle-click reset, and the FFT drag read raylib's main-window button state (`IsMouseButtonPressed` / `IsMouseButtonDown`), so they never fired in a pop-out.
+    - New `gui_ui_mouse_button_pressed` / `_down` return the pop-out window's buttons while its mouse override is active (left / right / middle; pressed = this frame, held through the input step and the render), else raylib's.
+    - `gui_oscilloscope.c` and `gui_fft.c` use them. No raw raylib mouse calls remain in panels.
+    - The waveform overlay harness gained the two stubs.
+  - Not testable here without sending input to harrypm's session: trigger drag in a pop-out needs harrypm's check.
+  - Full rebuild; suite 65/66.

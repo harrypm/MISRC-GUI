@@ -178,15 +178,6 @@ static bool hifi34_real_ch34(gui_app_t *app) {
     return rx && get_time_ms() - rx < HIFI34_REAL_AUDIO_MS;
 }
 
-static bool hifi34_panel_shown(const gui_app_t *app) {
-    const channel_panel_config_t *cfgs[2] = { &app->panel_config_a, &app->panel_config_b };
-    for (int i = 0; i < 2; i++) {
-        if (cfgs[i]->left_view == PANEL_VIEW_HIFI) return true;
-        if (cfgs[i]->split && cfgs[i]->right_view == PANEL_VIEW_HIFI) return true;
-    }
-    return false;
-}
-
 void gui_hifi34_init(gui_app_t *app) {
     s_app = app;
     gui_video_set_rf_tap(hifi34_tap, hifi34_monitor_override);
@@ -205,7 +196,9 @@ void gui_hifi34_update(gui_app_t *app) {
                                 app->settings.net_mode != GUI_NET_MODE_MONITOR_CLIENT;
     st.real_ch34 = hifi34_real_ch34(app);
     const bool ch34_selected = app->settings.audio_monitor_ch34;
-    st.wanted = source_running && (hifi34_panel_shown(app) || (ch34_selected && !st.real_ch34));
+    // Decodes only when picked by hand (Decoder button / --hifi decode=):
+    // neither the HiFi panel nor the CH3/4 pick starts it (harrypm 2026-11-26).
+    st.wanted = source_running && app->settings.hifi34_enabled;
     atomic_store(&s_want, st.wanted);
 
     const int source = app->settings.hifi34_source;

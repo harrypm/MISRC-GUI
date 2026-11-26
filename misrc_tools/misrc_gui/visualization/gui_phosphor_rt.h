@@ -64,6 +64,11 @@ typedef struct phosphor_rt {
 
 // Initialize phosphor shaders (call once at startup or on first use)
 // Returns true on success
+// Outer render target to re-enter after each inner phosphor texture pass
+// (raylib texture modes do not nest). A pop-out panel (gui_popout.c) sets
+// its render texture while that panel renders, NULL otherwise.
+void phosphor_rt_set_outer_target(const RenderTexture2D *target);
+
 bool phosphor_rt_init_shaders(void);
 
 // Cleanup phosphor shaders (call at application exit)

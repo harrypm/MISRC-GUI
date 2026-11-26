@@ -1,1576 +1,1576 @@
-/*
- * MISRC GUI - FFT Line Spectrum Display with GPU Phosphor Persistence
- *
- * Computes FFT of resampled display waveform and displays as a line-based spectrum
- * using GPU-accelerated phosphor persistence (shared module).
- *
- * Copyright (C) 2024-2025 vrunk11, stefan_o
- * Licensed under GNU GPL v3 or later
- */
-
-#include "gui_fft.h"
-#include "../core/gui_app.h"
-#include "gui_phosphor_rt.h"
-#include "../ui/gui_ui.h"
-#include "../ui/gui_chrome_hide.h"  // double-click annotation toggle (panel wrapper below)
-#include "gui_text.h"               // Scale-button text (Lin/Log frequency axis toggle)
-#include "../../common/threading.h"
-
-#include <stdlib.h>
-#include <string.h>
-#include <math.h>
-#include <stdio.h>
-#include <stdatomic.h>
-
-// Define M_PI if not available (Windows compatibility)
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
-
-#if LIBFFTW_ENABLED
-#include <fftw3.h>
-#endif
-
-// FFTW shares planner state across all channels and display workers. Keep
-// every non-execute operation serialized; distinct plans still execute in parallel.
-#if LIBFFTW_ENABLED
-static atomic_flag s_fftw_lock = ATOMIC_FLAG_INIT;
-
-static void gui_fft_library_lock(void) {
-    while (atomic_flag_test_and_set_explicit(&s_fftw_lock, memory_order_acquire)) {
-        thrd_sleep_ms(1);
-    }
-}
-
-static void gui_fft_library_unlock(void) {
-    atomic_flag_clear_explicit(&s_fftw_lock, memory_order_release);
-}
-#endif
-
-void *gui_fft_plan_create_r2c(int size, float *input, void *output, unsigned flags) {
-#if LIBFFTW_ENABLED
-    if (size <= 0 || !input || !output) return NULL;
-    gui_fft_library_lock();
-    fftwf_plan plan = fftwf_plan_dft_r2c_1d(size, input, (fftwf_complex *)output, flags);
-    gui_fft_library_unlock();
-    return plan;
-#else
-    (void)size; (void)input; (void)output; (void)flags;
-    return NULL;
-#endif
-}
-
-void gui_fft_plan_destroy(void *plan) {
-#if LIBFFTW_ENABLED
-    if (!plan) return;
-    gui_fft_library_lock();
-    fftwf_destroy_plan((fftwf_plan)plan);
-    gui_fft_library_unlock();
-#else
-    (void)plan;
-#endif
-}
-
-void *gui_fft_alloc(size_t bytes) {
-#if LIBFFTW_ENABLED
-    gui_fft_library_lock();
-    void *memory = fftwf_malloc(bytes);
-    gui_fft_library_unlock();
-    return memory;
-#else
-    return malloc(bytes);
-#endif
-}
-
-void gui_fft_free(void *memory) {
-#if LIBFFTW_ENABLED
-    if (!memory) return;
-    gui_fft_library_lock();
-    fftwf_free(memory);
-    gui_fft_library_unlock();
-#else
-    free(memory);
-#endif
-}
-
-//-----------------------------------------------------------------------------
-// Availability Check
-//-----------------------------------------------------------------------------
-
-bool gui_fft_available(void) {
-#if LIBFFTW_ENABLED
-    return true;
-#else
-    return false;
-#endif
-}
-
-//-----------------------------------------------------------------------------
-// FFT Lifecycle Management
-//-----------------------------------------------------------------------------
-
-// Helper: Find smallest power of 2 >= n
-static int ceil_power_of_2(int n) {
-    if (n <= 0) return 1;
-    int power = 1;
-    while (power < n) {
-        power *= 2;
-    }
-    return power;
-}
-
-// Helper: Resize FFT buffers and recreate plan for new size
-static bool fft_resize(fft_state_t *state, int new_size) {
-#if LIBFFTW_ENABLED
-    if (!state) return false;
-
-    // Round up to power of 2 first
-    new_size = ceil_power_of_2(new_size);
-
-    // Clamp to valid range
-    if (new_size < FFT_SIZE_MIN) new_size = FFT_SIZE_MIN;
-    if (new_size > FFT_SIZE_MAX) new_size = FFT_SIZE_MAX;
-
-    // Already the right size?
-    if (state->allocated_size == new_size && state->fftw_plan) {
-        return true;
-    }
-
-    int new_bins = new_size / 2 + 1;
-
-    // Free old resources
-    if (state->fftw_plan) {
-        gui_fft_plan_destroy(state->fftw_plan);
-        state->fftw_plan = NULL;
-    }
-    if (state->fftw_input) {
-        gui_fft_free(state->fftw_input);
-        state->fftw_input = NULL;
-    }
-    if (state->fftw_output) {
-        gui_fft_free(state->fftw_output);
-        state->fftw_output = NULL;
-    }
-    if (state->window) {
-        free(state->window);
-        state->window = NULL;
-    }
-    // Free double-buffered magnitude arrays
-    if (state->magnitude_front) {
-        free(state->magnitude_front);
-        state->magnitude_front = NULL;
-    }
-    if (state->magnitude_back) {
-        free(state->magnitude_back);
-        state->magnitude_back = NULL;
-    }
-    state->magnitude = NULL;  // Was alias to front
-    if (state->peak_hold) {
-        free(state->peak_hold);
-        state->peak_hold = NULL;
-    }
-
-    // Allocate new buffers
-    state->fftw_input = (float *)gui_fft_alloc(sizeof(float) * new_size);
-    if (!state->fftw_input) {
-        fprintf(stderr, "[FFT] Failed to allocate FFTW input buffer (%d)\n", new_size);
-        return false;
-    }
-
-    state->fftw_output = gui_fft_alloc(sizeof(fftwf_complex) * new_bins);
-    if (!state->fftw_output) {
-        fprintf(stderr, "[FFT] Failed to allocate FFTW output buffer (%d bins)\n", new_bins);
-        gui_fft_free(state->fftw_input);
-        state->fftw_input = NULL;
-        return false;
-    }
-
-    // Create new FFTW plan
-    state->fftw_plan = gui_fft_plan_create_r2c(new_size, state->fftw_input,
-                                               state->fftw_output, FFTW_ESTIMATE);  // Use ESTIMATE for faster plan creation
-    if (!state->fftw_plan) {
-        fprintf(stderr, "[FFT] Failed to create FFTW plan for size %d\n", new_size);
-        gui_fft_free(state->fftw_input);
-        gui_fft_free(state->fftw_output);
-        state->fftw_input = NULL;
-        state->fftw_output = NULL;
-        return false;
-    }
-
-    // Allocate Hanning window
-    state->window = (float *)malloc(sizeof(float) * new_size);
-    if (!state->window) {
-        fprintf(stderr, "[FFT] Failed to allocate window buffer (%d)\n", new_size);
-        gui_fft_plan_destroy(state->fftw_plan);
-        gui_fft_free(state->fftw_input);
-        gui_fft_free(state->fftw_output);
-        state->fftw_plan = NULL;
-        state->fftw_input = NULL;
-        state->fftw_output = NULL;
-        return false;
-    }
-
-    // Precompute Hanning window coefficients
-    for (int i = 0; i < new_size; i++) {
-        state->window[i] = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * i / (new_size - 1)));
-    }
-
-    // Allocate double-buffered magnitude arrays
-    state->magnitude_front = (float *)malloc(sizeof(float) * new_bins);
-    state->magnitude_back = (float *)malloc(sizeof(float) * new_bins);
-    if (!state->magnitude_front || !state->magnitude_back) {
-        fprintf(stderr, "[FFT] Failed to allocate magnitude buffers (%d bins)\n", new_bins);
-        gui_fft_plan_destroy(state->fftw_plan);
-        gui_fft_free(state->fftw_input);
-        gui_fft_free(state->fftw_output);
-        free(state->window);
-        free(state->magnitude_front);
-        free(state->magnitude_back);
-        state->fftw_plan = NULL;
-        state->fftw_input = NULL;
-        state->fftw_output = NULL;
-        state->window = NULL;
-        state->magnitude_front = NULL;
-        state->magnitude_back = NULL;
-        return false;
-    }
-    memset(state->magnitude_front, 0, sizeof(float) * new_bins);
-    memset(state->magnitude_back, 0, sizeof(float) * new_bins);
-    state->magnitude = state->magnitude_front;  // Alias for compatibility
-
-    // Allocate peak-hold buffer for stable peak detection
-    state->peak_hold = (float *)malloc(sizeof(float) * new_bins);
-    if (!state->peak_hold) {
-        fprintf(stderr, "[FFT] Failed to allocate peak_hold buffer (%d bins)\n", new_bins);
-        gui_fft_plan_destroy(state->fftw_plan);
-        gui_fft_free(state->fftw_input);
-        gui_fft_free(state->fftw_output);
-        free(state->window);
-        free(state->magnitude_front);
-        free(state->magnitude_back);
-        state->fftw_plan = NULL;
-        state->fftw_input = NULL;
-        state->fftw_output = NULL;
-        state->window = NULL;
-        state->magnitude_front = NULL;
-        state->magnitude_back = NULL;
-        state->magnitude = NULL;
-        return false;
-    }
-    memset(state->peak_hold, 0, sizeof(float) * new_bins);
-
-    state->fft_size = new_size;
-    state->fft_bins = new_bins;
-    state->allocated_size = new_size;
-
-    fprintf(stderr, "[FFT] Resized to %d samples (%d bins)\n", new_size, new_bins);
-    return true;
-#else
-    (void)state;
-    (void)new_size;
-    return false;
-#endif
-}
-
-bool gui_fft_init(fft_state_t *state) {
-    if (!state) return false;
-
-    // Clear state first
-    memset(state, 0, sizeof(fft_state_t));
-
-#if LIBFFTW_ENABLED
-    // Initialize atomic variables
-    atomic_init(&state->magnitude_ready, 0);
-    atomic_init(&state->sample_rate, 0);
-
-    // Initialize with minimum size - will be resized on first process call
-    if (!fft_resize(state, FFT_SIZE_MIN)) {
-        return false;
-    }
-
-    // Phosphor render textures will be created on first render (need OpenGL context)
-    memset(&state->phosphor, 0, sizeof(phosphor_rt_t));
-
-    // Set FFT-specific phosphor config
-    state->phosphor.config.decay_rate = FFT_DECAY_RATE;
-    state->phosphor.config.hit_increment = FFT_HIT_INCREMENT;
-    state->phosphor.config.bloom_intensity = FFT_BLOOM;
-
-    state->data_ready = false;
-    state->initialized = true;
-
-    // Initialize zoom/pan state
-    state->zoom_level = 1.0f;
-    state->pan_offset = 0.0f;
-    state->dragging = false;
-    state->drag_start_x = 0.0f;
-    state->drag_start_pan = 0.0f;
-
-    fprintf(stderr, "[FFT] Initialized with dynamic sizing (%d-%d samples)\n",
-            FFT_SIZE_MIN, FFT_SIZE_MAX);
-
-    return true;
-#else
-    fprintf(stderr, "[FFT] FFTW not available, FFT support disabled\n");
-    return false;
-#endif
-}
-
-void gui_fft_clear(fft_state_t *state) {
-    if (!state || !state->initialized) return;
-
-#if LIBFFTW_ENABLED
-    // Clear both magnitude buffers
-    if (state->magnitude_front && state->fft_bins > 0) {
-        memset(state->magnitude_front, 0, sizeof(float) * state->fft_bins);
-    }
-    if (state->magnitude_back && state->fft_bins > 0) {
-        memset(state->magnitude_back, 0, sizeof(float) * state->fft_bins);
-    }
-    atomic_store(&state->magnitude_ready, 0);
-
-    // Clear peak-hold buffer
-    if (state->peak_hold && state->fft_bins > 0) {
-        memset(state->peak_hold, 0, sizeof(float) * state->fft_bins);
-    }
-
-    // Clear phosphor render textures
-    phosphor_rt_clear(&state->phosphor);
-
-    // Reset peak label smoothing state
-    state->peak_label_active = false;
-    state->peak_label_x = 0.0f;
-    state->peak_label_y = 0.0f;
-    state->peak_label_bin = 0;
-
-    // Reset zoom/pan state
-    state->zoom_level = 1.0f;
-    state->pan_offset = 0.0f;
-    state->dragging = false;
-
-    state->data_ready = false;
-#endif
-}
-
-void gui_fft_cleanup(fft_state_t *state) {
-    if (!state) return;
-
-#if LIBFFTW_ENABLED
-    if (state->fftw_plan) {
-        gui_fft_plan_destroy(state->fftw_plan);
-        state->fftw_plan = NULL;
-    }
-
-    if (state->fftw_input) {
-        gui_fft_free(state->fftw_input);
-        state->fftw_input = NULL;
-    }
-
-    if (state->fftw_output) {
-        gui_fft_free(state->fftw_output);
-        state->fftw_output = NULL;
-    }
-
-    if (state->window) {
-        free(state->window);
-        state->window = NULL;
-    }
-
-    // Free double-buffered magnitude arrays
-    if (state->magnitude_front) {
-        free(state->magnitude_front);
-        state->magnitude_front = NULL;
-    }
-    if (state->magnitude_back) {
-        free(state->magnitude_back);
-        state->magnitude_back = NULL;
-    }
-    state->magnitude = NULL;
-
-    if (state->peak_hold) {
-        free(state->peak_hold);
-        state->peak_hold = NULL;
-    }
-
-    phosphor_rt_cleanup(&state->phosphor);
-#endif
-
-    state->initialized = false;
-}
-
-//-----------------------------------------------------------------------------
-// FFT Processing - Compute FFT from raw ADC samples (display thread)
-//-----------------------------------------------------------------------------
-
-void gui_fft_process_raw(fft_state_t *state, const int16_t *samples,
-                         size_t count, uint32_t sample_rate) {
-#if LIBFFTW_ENABLED
-    if (!state || !state->initialized || !samples) return;
-
-    // Store sample rate for render thread (atomic)
-    atomic_store(&state->sample_rate, sample_rate);
-
-    // Need minimum samples
-    if (count < FFT_SIZE_MIN) return;
-
-    // Determine FFT size: round UP sample count to nearest power of 2 for zero-padding
-    int target_size = ceil_power_of_2((int)count);
-    if (target_size > FFT_SIZE_MAX) target_size = FFT_SIZE_MAX;
-    if (target_size < FFT_SIZE_MIN) target_size = FFT_SIZE_MIN;
-
-    // Resize if needed (note: not thread-safe, but resize only happens rarely)
-    if (target_size != state->fft_size) {
-        if (!fft_resize(state, target_size)) {
-            return;  // Resize failed
-        }
-    }
-
-    int fft_size = state->fft_size;
-    int fft_bins = state->fft_bins;
-
-    // Use all available samples (up to fft_size)
-    size_t samples_to_use = (count > (size_t)fft_size) ? (size_t)fft_size : count;
-
-    // Calculate DC offset (mean of actual samples) to remove from signal
-    // Use int32 accumulator to avoid overflow
-    int64_t dc_sum = 0;
-    for (size_t i = 0; i < samples_to_use; i++) {
-        dc_sum += samples[i];
-    }
-    float dc_offset = (float)dc_sum / (float)samples_to_use;
-
-    // Zero-pad symmetrically: place windowed data in center of FFT buffer
-    int pad_total = fft_size - (int)samples_to_use;
-    int pad_left = pad_total / 2;
-    int pad_right = pad_total - pad_left;
-
-    // Zero-pad left side
-    for (int i = 0; i < pad_left; i++) {
-        state->fftw_input[i] = 0.0f;
-    }
-
-    // Apply Hanning window to actual sample data and place in center
-    // Normalize int16 samples to -1.0 to +1.0 range
-    // const float scale = 1.0f / 32768.0f; --- Results in low FFT scale ~30db
-    const float scale = 1.0f / 2048.0f;
-    for (size_t i = 0; i < samples_to_use; i++) {
-        float window_val = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * (float)i / (float)(samples_to_use - 1)));
-        float sample_val = ((float)samples[i] - dc_offset) * scale;
-        state->fftw_input[pad_left + (int)i] = sample_val * window_val;
-    }
-
-    // Zero-pad right side
-    for (int i = 0; i < pad_right; i++) {
-        state->fftw_input[pad_left + (int)samples_to_use + i] = 0.0f;
-    }
-
-    // Execute FFT
-    fftwf_execute((fftwf_plan)state->fftw_plan);
-
-    // Compute magnitude in dB, then normalize to 0-1
-    // Write to back buffer (display thread owns this)
-    fftwf_complex *output = (fftwf_complex *)state->fftw_output;
-    float *back = state->magnitude_back;
-
-    for (int j = 0; j < fft_bins; j++) {
-        float real = output[j][0];
-        float imag = output[j][1];
-        float mag = sqrtf(real * real + imag * imag);
-
-        // Normalize by actual sample count (not padded size) for correct amplitude
-        mag /= (float)samples_to_use;
-
-        // Hanning window coherent gain correction (window gain = 0.5, correction = x2) MA - correct FFT window Scaling
-        mag *= 2.0f;
-        
-        // Convert to dB (with small epsilon to avoid log(0))
-        float db = 20.0f * log10f(mag + 1e-10f);
-
-        // Clamp to dB range
-        if (db < FFT_DB_MIN) db = FFT_DB_MIN;
-        if (db > FFT_DB_MAX) db = FFT_DB_MAX;
-
-        // Convert dB to normalized intensity (0-1)
-        back[j] = (db - FFT_DB_MIN) / (FFT_DB_MAX - FFT_DB_MIN);
-    }
-
-    // Signal that new data is ready for the render thread
-    atomic_store(&state->magnitude_ready, 1);
-#else
-    (void)state;
-    (void)samples;
-    (void)count;
-    (void)sample_rate;
-#endif
-}
-
-//-----------------------------------------------------------------------------
-// FFT Buffer Swap - Copy back buffer to front (render thread)
-//-----------------------------------------------------------------------------
-
-void gui_fft_swap_buffers(fft_state_t *state) {
-#if LIBFFTW_ENABLED
-    if (!state || !state->initialized) return;
-
-    // Check if new data is available
-    if (atomic_exchange(&state->magnitude_ready, 0)) {
-        // Copy back buffer to front buffer
-        // Apply EMA smoothing during copy for temporal smoothing
-        int fft_bins = state->fft_bins;
-        float *front = state->magnitude_front;
-        float *back = state->magnitude_back;
-
-        for (int j = 0; j < fft_bins; j++) {
-            float previous = front[j];
-            float current = back[j];
-            front[j] = FFT_EMA_ALPHA * previous + (1.0f - FFT_EMA_ALPHA) * current;
-        }
-
-        state->data_ready = true;
-    }
-#else
-    (void)state;
-#endif
-}
-
-//-----------------------------------------------------------------------------
-// FFT Rendering - GPU phosphor persistence using shared module
-//-----------------------------------------------------------------------------
-
-// Grid settings for FFT (matching oscilloscope style)
-#define FFT_GRID_MIN_SPACING_PX 80   // Minimum pixels between frequency grid lines
-#define FFT_GRID_MAX_DIVISIONS 24    // Maximum number of frequency divisions
-
-// Peak detection settings
-#define FFT_PEAK_SEARCH_RADIUS_PX 30   // Pixels around mouse to search for peaks
-#define FFT_PEAK_MIN_PROMINENCE 0.02f  // Minimum prominence (0-1) to qualify as a peak
-#define FFT_PEAK_MAX_CANDIDATES 32     // Maximum peaks to consider when finding closest
-#define FFT_PEAK_MAX_DISPLAY 1         // Maximum peaks to display near mouse
-#define FFT_PEAK_HOLD_DECAY 0.99f     // Per-frame decay for peak hold (closer to 1 = slower decay)
-#define FFT_PEAK_LABEL_EMA_ALPHA 0.1f // EMA smoothing for label position (lower = smoother)
-
-// Peak info structure for rendering
-typedef struct {
-    int bin;           // FFT bin index
-    float magnitude;   // Normalized magnitude (0-1)
-    float freq_hz;     // Frequency in Hz
-    float db;          // dB value
-    float screen_x;    // Screen X position
-    float screen_y;    // Screen Y position
-} fft_peak_t;
-
-// Find peaks near a given bin index within a search radius
-// Returns number of peaks found (up to max_peaks)
-static int fft_find_peaks_near(const float *magnitude, int num_bins,
-                               int center_bin, int search_radius,
-                               float min_prominence,
-                               fft_peak_t *peaks, int max_peaks) {
-    if (!magnitude || num_bins < 3 || !peaks || max_peaks <= 0) return 0;
-
-    int start_bin = center_bin - search_radius;
-    int end_bin = center_bin + search_radius;
-    if (start_bin < 1) start_bin = 1;
-    if (end_bin >= num_bins - 1) end_bin = num_bins - 2;
-
-    int peak_count = 0;
-
-    // Find local maxima in the search range
-    for (int i = start_bin; i <= end_bin && peak_count < max_peaks; i++) {
-        float val = magnitude[i];
-        float prev = magnitude[i - 1];
-        float next = magnitude[i + 1];
-
-        // Check if this is a local maximum
-        if (val > prev && val > next) {
-            // Calculate prominence: how much higher than surrounding valleys
-            // Look left for valley
-            float left_valley = val;
-            for (int j = i - 1; j >= 0; j--) {
-                if (magnitude[j] < left_valley) {
-                    left_valley = magnitude[j];
-                }
-                if (magnitude[j] > val) break;  // Hit a higher peak
-            }
-
-            // Look right for valley
-            float right_valley = val;
-            for (int j = i + 1; j < num_bins; j++) {
-                if (magnitude[j] < right_valley) {
-                    right_valley = magnitude[j];
-                }
-                if (magnitude[j] > val) break;  // Hit a higher peak
-            }
-
-            float prominence = val - fmaxf(left_valley, right_valley);
-
-            if (prominence >= min_prominence) {
-                peaks[peak_count].bin = i;
-                peaks[peak_count].magnitude = val;
-                peak_count++;
-            }
-        }
-    }
-
-    // Sort peaks by magnitude (descending) - simple bubble sort for small array
-    for (int i = 0; i < peak_count - 1; i++) {
-        for (int j = i + 1; j < peak_count; j++) {
-            if (peaks[j].magnitude > peaks[i].magnitude) {
-                fft_peak_t tmp = peaks[i];
-                peaks[i] = peaks[j];
-                peaks[j] = tmp;
-            }
-        }
-    }
-
-    return peak_count;
-}
-
-// Snap to 1-2-5 log scale sequence (same as oscilloscope)
-static double fft_snap_to_125(double value) {
-    if (value <= 0) return 1.0;
-
-    double log_val = log10(value);
-    double magnitude = pow(10.0, floor(log_val));
-    double normalized = value / magnitude;
-
-    double snapped;
-    if (normalized < 1.5) {
-        snapped = 1.0;
-    } else if (normalized < 3.5) {
-        snapped = 2.0;
-    } else if (normalized < 7.5) {
-        snapped = 5.0;
-    } else {
-        snapped = 10.0;
-    }
-
-    return snapped * magnitude;
-}
-
-// Toggleable frequency-axis scale: Linear (the STOCK original mode and
-// the default - the panel starts exactly as it did before the toggle
-// existed) and Log via the panel's Scale button. The transform works in
-// normalized axis space, so the existing zoom/pan (which operate on
-// normalized screen coordinates) are unchanged in both modes. Log cannot
-// place DC: the axis starts at the first non-zero bin (one bin width above
-// 0), so bin 1 sits at axis 0 and the DC bin is excluded from the trace on
-// the log axis.
-static float fft_freq_norm_to_axis(float freq_norm, bool log_scale, int fft_bins) {
-    if (!log_scale || fft_bins < 3) return freq_norm;
-    const float log_min = 1.0f / (float)(fft_bins - 1);
-    if (freq_norm <= log_min) return 0.0f;
-    if (freq_norm >= 1.0f) return 1.0f;
-    const float log_span = -log10f(log_min);
-    return (log10f(freq_norm) - log10f(log_min)) / log_span;
-}
-
-static float fft_axis_to_freq_norm(float axis, bool log_scale, int fft_bins) {
-    if (!log_scale || fft_bins < 3) return axis;
-    const float log_min = 1.0f / (float)(fft_bins - 1);
-    if (axis <= 0.0f) return log_min;
-    if (axis >= 1.0f) return 1.0f;
-    const float log_span = -log10f(log_min);
-    return powf(10.0f, log10f(log_min) + axis * log_span);
-}
-
-// Log-mode gridlines: 1-2-5 per decade inside [start, end] Hz, placed in
-// ascending order into out[]. Fewer than 3 candidates means the visible
-// span is under about one decade - the caller falls back to the linear
-// 1-2-5 grid, which is near-evenly placed on a sub-decade log axis.
-static int fft_log_grid_lines(float start_hz, float end_hz,
-                               float *out, int max_out) {
-    if (start_hz <= 0.0f || end_hz <= start_hz || !out || max_out <= 0) return 0;
-    int count = 0;
-    int decade = (int)floorf(log10f(start_hz));
-    for (; decade <= (int)floorf(log10f(end_hz)) && count < max_out; decade++) {
-        static const float mantissa[3] = {1.0f, 2.0f, 5.0f};
-        for (int m = 0; m < 3 && count < max_out; m++) {
-            float freq = mantissa[m] * powf(10.0f, (float)decade);
-            if (freq >= start_hz && freq <= end_hz) out[count++] = freq;
-        }
-    }
-    return count;
-}
-
-// Format frequency value with appropriate unit (Hz, kHz, MHz)
-static void format_freq_label(char *buf, size_t buf_size, double hz) {
-    if (hz >= 1000000.0) {
-        snprintf(buf, buf_size, "%.3gMHz", hz / 1000000.0);
-    } else if (hz >= 1000.0) {
-        snprintf(buf, buf_size, "%.3gkHz", hz / 1000.0);
-    } else {
-        snprintf(buf, buf_size, "%.3gHz", hz);
-    }
-}
-
-// Helper to draw text with font
-static void fft_draw_text(Font *fonts, const char *text, float px, float py, int fontSize, Color color) {
-    if (fonts) {
-        DrawTextEx(fonts[0], text, (Vector2){px, py}, (float)fontSize, 1.0f, color);
-    } else {
-        DrawText(text, (int)px, (int)py, fontSize, color);
-    }
-}
-
-// Helper to draw text with monospace font (for numbers)
-static void fft_draw_text_mono(Font *fonts, const char *text, float px, float py, int fontSize, Color color) {
-    if (fonts) {
-        DrawTextEx(fonts[1], text, (Vector2){px, py}, (float)fontSize, 1.0f, color);
-    } else {
-        DrawText(text, (int)px, (int)py, fontSize, color);
-    }
-}
-
-// Helper to measure text with font
-static int fft_measure_text(Font *fonts, const char *text, int fontSize) {
-    if (fonts) {
-        Vector2 size = MeasureTextEx(fonts[0], text, (float)fontSize, 1.0f);
-        return (int)ceilf(size.x);
-    }
-    return MeasureText(text, fontSize);
-}
-
-static Vector2 fft_measure_text_mono(Font *fonts, const char *text, int fontSize) {
-    if (fonts) {
-        return MeasureTextEx(fonts[1], text, (float)fontSize, 1.0f);
-    }
-    return (Vector2){(float)MeasureText(text, fontSize), (float)fontSize};
-}
-
-// Peak values use ASCII labels. Keep the font size and shorten only when even
-// a separate dB/frequency line cannot fit; never resize the FFT panel.
-static void fft_fit_peak_line(Font *fonts, char *text, size_t text_size, float width) {
-    if (fft_measure_text_mono(fonts, text, FONT_SIZE_NORMAL).x <= width) return;
-    if (text_size < 4) {
-        if (text_size > 0) text[0] = '\0';
-        return;
-    }
-
-    size_t length = strlen(text);
-    if (length > text_size - 4) length = text_size - 4;
-    for (;;) {
-        memcpy(text + length, "...", 4);
-        if (fft_measure_text_mono(fonts, text, FONT_SIZE_NORMAL).x <= width) return;
-        if (length == 0) break;
-        length--;
-    }
-    text[0] = '\0';
-}
-
-static void fft_draw_peak_label(Font *fonts, const char *db_text, const char *freq_text,
-                                Vector2 anchor, float dot_radius, Rectangle bounds) {
-    const float padding = 2;
-    float available_width = bounds.width - 2 * padding;
-    float available_height = bounds.height - 2 * padding;
-    if (available_width <= 0 || available_height <= 0) return;
-
-    char lines[2][64];
-    snprintf(lines[0], sizeof(lines[0]), "%s %s", db_text, freq_text);
-    Vector2 size = fft_measure_text_mono(fonts, lines[0], FONT_SIZE_NORMAL);
-    if (size.y > available_height) return;
-
-    int line_count = 1;
-    float line_step = size.y + 2;
-    if (size.x > available_width && size.y + line_step <= available_height) {
-        snprintf(lines[0], sizeof(lines[0]), "%s", db_text);
-        snprintf(lines[1], sizeof(lines[1]), "%s", freq_text);
-        line_count = 2;
-    }
-
-    float label_height = size.y + (line_count - 1) * line_step;
-    float label_y = anchor.y - dot_radius - 10 - label_height;
-    if (label_y < bounds.y + padding) label_y = anchor.y + dot_radius + 4;
-    label_y = fmaxf(bounds.y + padding,
-                   fminf(label_y, bounds.y + bounds.height - padding - label_height));
-
-    for (int i = 0; i < line_count; i++) {
-        fft_fit_peak_line(fonts, lines[i], sizeof(lines[i]), available_width);
-        if (!lines[i][0]) continue;
-        float label_width = fft_measure_text_mono(fonts, lines[i], FONT_SIZE_NORMAL).x;
-        float label_x = fmaxf(bounds.x + padding,
-            fminf(anchor.x - label_width / 2, bounds.x + bounds.width - padding - label_width));
-        fft_draw_text_mono(fonts, lines[i], label_x, label_y + i * line_step,
-                          FONT_SIZE_NORMAL, COLOR_TEXT);
-    }
-}
-
-// Chrome-hidden flag for the gui_fft_render call in progress. gui_fft_render's
-// signature is public API (gui_fft.h) and fft_state_t cannot carry the flag,
-// so the FFT panel render (fft_panel_state_t wrapper below) publishes its
-// double-click chrome-hide state here immediately before its single call.
-// gui_fft_render has no other callers and always runs on the render thread,
-// so the flag never races or leaks between panels.
-static bool s_fft_chrome_hidden = false;
-
-// Log-frequency-axis toggle + the Scale-button rect, published per render
-// by the panel wrapper (the same single-render-call pattern as the chrome
-// flag above; the click handler reads them from the per-panel wrapper).
-static bool s_fft_log_scale = false;
-static Rectangle s_fft_scale_btn_rect = {0};
-
-void gui_fft_render(fft_state_t *state, float x, float y,
-                    float width, float height, Color color, Font *fonts) {
-#if LIBFFTW_ENABLED
-    if (!state || !state->initialized) return;
-
-    (void)color; // Not used currently
-
-    // Get sample rate from atomic (set by display thread)
-    uint32_t sample_rate = atomic_load(&state->sample_rate);
-
-    int rt_width = (int)width;
-    int rt_height = (int)height;
-
-    // Ensure we have phosphor render textures of the right size
-    Vector2 render_scale = gui_ui_get_render_scale();
-    if (!phosphor_rt_init(&state->phosphor, rt_width, rt_height,
-                          render_scale.x, render_scale.y)) {
-        // Fallback: just draw background
-        DrawRectangle((int)x, (int)y, rt_width, rt_height, COLOR_METER_BG);
-        fft_draw_text(fonts, "FFT: GPU init failed", x + 10, y + 10, FONT_SIZE_OSC_SCALE, (Color){255, 80, 80, 255});
-        return;
-    }
-
-    // Begin phosphor frame (applies decay and prepares for drawing)
-    phosphor_rt_begin_frame(&state->phosphor);
-
-    // Draw FFT bins as connected line segments (with zoom/pan)
-    if (state->magnitude && state->data_ready && state->fft_bins > 1) {
-        Color lineColor = phosphor_rt_get_draw_color(&state->phosphor);
-
-        int fft_bins = state->fft_bins;
-        float zoom = state->zoom_level;
-        float pan = state->pan_offset;
-        // The axis window [pan, pan + 1/zoom] converts back through the
-        // inverse transform to a bin range; DC (bin 0) has no place on a
-        // log axis and is excluded.
-        bool log_scale = s_fft_log_scale;
-        float start_norm = fft_axis_to_freq_norm(pan, log_scale, fft_bins);
-        float end_norm = fft_axis_to_freq_norm(pan + 1.0f / zoom, log_scale, fft_bins);
-
-        // Convert to bin indices
-        int start_bin = (int)(start_norm * (fft_bins - 1));
-        int end_bin = (int)ceilf(end_norm * (fft_bins - 1));
-        if (log_scale && start_bin < 1) start_bin = 1;   // skip DC on the log axis
-        if (start_bin < 0) start_bin = 0;
-        if (end_bin >= fft_bins) end_bin = fft_bins - 1;
-
-        for (int bin = start_bin; bin < end_bin; bin++) {
-            float intensity1 = state->magnitude[bin];
-            float intensity2 = state->magnitude[bin + 1];
-
-            // Convert bin to normalized frequency (0-1), then through the
-            // active axis transform: screen_x = (axis - pan) * zoom * width
-            float freq_norm1 = (float)bin / (float)(fft_bins - 1);
-            float freq_norm2 = (float)(bin + 1) / (float)(fft_bins - 1);
-            float x1 = (fft_freq_norm_to_axis(freq_norm1, log_scale, fft_bins) - pan) * zoom * rt_width;
-            float x2 = (fft_freq_norm_to_axis(freq_norm2, log_scale, fft_bins) - pan) * zoom * rt_width;
-            if (x2 < -2.0f || x1 > rt_width + 2.0f) continue;  // off-screen cull
-
-            // Y positions based on intensity (0 = bottom, 1 = top)
-            float y1 = rt_height - (intensity1 * rt_height);
-            float y2 = rt_height - (intensity2 * rt_height);
-
-            // Draw line segment
-            DrawLineEx((Vector2){x1, y1}, (Vector2){x2, y2}, 1.5f, lineColor);
-        }
-    }
-
-    // End phosphor frame (finalize accumulation buffer)
-    phosphor_rt_end_frame(&state->phosphor);
-
-    // Draw background (same as oscilloscope)
-    DrawRectangle((int)x, (int)y, rt_width, rt_height, COLOR_METER_BG);
-
-    // Grid setup
-    float db_range = FFT_DB_MAX - FFT_DB_MIN;
-    float rough_db_division = db_range * (float)FFT_GRID_MIN_SPACING_PX / height;
-    float db_division = (float)fft_snap_to_125((double)rough_db_division);
-
-    // First gridline
-    float first_db = ceilf(FFT_DB_MIN / db_division) * db_division;
-    int div_count = 0;
-
-    for (float db = first_db;
-        db <= FFT_DB_MAX && div_count < FFT_GRID_MAX_DIVISIONS;
-        db += db_division)
-    {
-        // Skip min/max gridlines (draw only interior lines)
-        if (db <= FFT_DB_MIN || db >= FFT_DB_MAX)
-            continue;
-
-        float normalized = (db - FFT_DB_MIN) / db_range;
-        float line_y = y + height - (normalized * height);
-
-        bool is_zero = (db == 0.0f);
-
-        DrawLineV((Vector2){x, line_y}, (Vector2){x + width, line_y},
-                is_zero ? COLOR_GRID_MAJOR : COLOR_GRID);
-
-        // dB labels are axis STATISTICS: they stay visible even while the
-        // panel's chrome is hidden (the toggle hides only the UI controls -
-        // the Scale button and the FFT title - not the axis/grid readouts).
-        {
-            char label[16];
-            snprintf(label, sizeof(label), "%+.0fdB", db);
-            fft_draw_text_mono(fonts, label, x + 5, line_y, FONT_SIZE_OSC_SCALE, COLOR_TEXT_DIM);
-        }
-
-        div_count++;
-    }
-
-    // Draw vertical frequency grid lines (1-2-5 snapping on the linear axis;
-    // on the log axis 1-2-5 per decade, falling back to the linear walk when
-    // a zoomed view spans under about a decade - over a sub-decade span the
-    // log axis is near-linear and equal-frequency lines are evenly placed).
-    if (sample_rate > 0) {
-        float nyquist = (float)sample_rate / 2.0f;
-        float zoom = state->zoom_level;
-        float pan = state->pan_offset;
-        bool log_scale = s_fft_log_scale && state->fft_bins > 1;
-
-        float grid_freqs[FFT_GRID_MAX_DIVISIONS];
-        int grid_count = 0;
-        bool decade_grid = false;
-        float freq_division = 0.0f;
-        if (log_scale) {
-            float axis_start = pan < 0.0f ? 0.0f : pan;
-            float axis_end = pan + 1.0f / zoom;
-            if (axis_end > 1.0f) axis_end = 1.0f;
-            float vis_start = fft_axis_to_freq_norm(axis_start, true, state->fft_bins) * nyquist;
-            float vis_end = fft_axis_to_freq_norm(axis_end, true, state->fft_bins) * nyquist;
-            grid_count = fft_log_grid_lines(vis_start, vis_end, grid_freqs, FFT_GRID_MAX_DIVISIONS);
-            decade_grid = grid_count >= 3;
-        }
-        if (!decade_grid) {
-            // Visible frequency range based on zoom/pan
-            float visible_freq_start = pan * nyquist;
-            float visible_freq_end = (pan + 1.0f / zoom) * nyquist;
-            float freq_per_pixel = (visible_freq_end - visible_freq_start) / width;
-
-            // Snap the division to the 1-2-5 sequence
-            float rough_division = freq_per_pixel * (float)FFT_GRID_MIN_SPACING_PX;
-            freq_division = (float)fft_snap_to_125((double)rough_division);
-
-            float first_grid_freq = ceilf(visible_freq_start / freq_division) * freq_division;
-            for (float freq = first_grid_freq;
-                 freq < visible_freq_end && grid_count < FFT_GRID_MAX_DIVISIONS;
-                 freq += freq_division) {
-                grid_freqs[grid_count++] = freq;
-            }
-        }
-
-        // Draw the collected gridlines through the active axis transform
-        char freq_buf[32];
-        for (int i = 0; i < grid_count; i++) {
-            float freq = grid_freqs[i];
-            float freq_norm = freq / nyquist;  // Normalized frequency (0-1)
-            float axis = fft_freq_norm_to_axis(freq_norm, log_scale, state->fft_bins);
-            float screen_norm = (axis - pan) * zoom;  // Normalized screen position (0-1)
-            float line_x = x + (screen_norm * width);
-
-            // Only draw if within visible bounds
-            if (line_x >= x && line_x <= x + width) {
-                DrawLineV((Vector2){line_x, y}, (Vector2){line_x, y + height}, COLOR_GRID);
-
-                // Draw frequency label (skip if too close to edges). Axis
-                // labels are STATISTICS: visible even while the chrome is
-                // hidden (only the UI controls hide).
-                if (line_x > x + 30 && line_x < x + width - 30) {
-                    format_freq_label(freq_buf, sizeof(freq_buf), freq);
-                    float label_w = fft_measure_text_mono(fonts, freq_buf, FONT_SIZE_OSC_SCALE).x;
-                    fft_draw_text_mono(fonts, freq_buf, line_x - label_w / 2, y + height - 14, FONT_SIZE_OSC_SCALE, COLOR_TEXT_DIM);
-                }
-            }
-        }
-
-        // /div + zoom/span readouts are STATISTICS: always visible (the
-        // chrome toggle hides only the UI controls, not these readouts).
-        {
-            if (decade_grid) {
-                // A log axis has no fixed per-division step: show the
-                // visible frequency span instead of N/div.
-                float axis_start = pan < 0.0f ? 0.0f : pan;
-                float axis_end = pan + 1.0f / zoom;
-                if (axis_end > 1.0f) axis_end = 1.0f;
-                float vis_start = fft_axis_to_freq_norm(axis_start, true, state->fft_bins) * nyquist;
-                float vis_end = fft_axis_to_freq_norm(axis_end, true, state->fft_bins) * nyquist;
-                char start_buf[32], end_buf[32];
-                format_freq_label(start_buf, sizeof(start_buf), vis_start);
-                format_freq_label(end_buf, sizeof(end_buf), vis_end);
-                char span_label[72];
-                snprintf(span_label, sizeof(span_label), "%s-%s", start_buf, end_buf);
-                float span_label_w = fft_measure_text_mono(fonts, span_label, FONT_SIZE_OSC_DIV).x;
-                fft_draw_text_mono(fonts, span_label, x + width - span_label_w - 8, y + 26, FONT_SIZE_OSC_DIV, COLOR_TEXT);
-            } else {
-                // Show frequency per division in top-right corner (below FFT label)
-                format_freq_label(freq_buf, sizeof(freq_buf), freq_division);
-                char div_label[48];
-                snprintf(div_label, sizeof(div_label), "%s/div", freq_buf);
-                float div_label_w = fft_measure_text_mono(fonts, div_label, FONT_SIZE_OSC_DIV).x;
-                fft_draw_text_mono(fonts, div_label, x + width - div_label_w - 8, y + 26, FONT_SIZE_OSC_DIV, COLOR_TEXT);
-            }
-
-            // Show zoom level if zoomed in
-            if (zoom > 1.01f) {
-                char zoom_label[32];
-                snprintf(zoom_label, sizeof(zoom_label), "%.1fx", zoom);
-                float zoom_label_w = fft_measure_text_mono(fonts, zoom_label, FONT_SIZE_OSC_DIV).x;
-                fft_draw_text_mono(fonts, zoom_label, x + width - zoom_label_w - 8, y + 42, FONT_SIZE_OSC_DIV, COLOR_TEXT_DIM);
-            }
-        }
-    }
-
-    // Draw center line (0V equivalent position not applicable for FFT, skip)
-
-    // Border (same as oscilloscope)
-    DrawRectangleLinesEx((Rectangle){x, y, width, height}, 1, COLOR_GRID_MAJOR);
-
-    // Render phosphor texture with heatmap colormap and bloom
-    phosphor_rt_render(&state->phosphor, x, y, true);
-
-    // Update peak-hold buffer: max-hold with decay for stable peak detection
-    if (state->magnitude && state->peak_hold && state->fft_bins > 1) {
-        int fft_bins = state->fft_bins;
-        for (int i = 0; i < fft_bins; i++) {
-            // Decay existing peak-hold value
-            state->peak_hold[i] *= FFT_PEAK_HOLD_DECAY;
-            // Take max of decayed value and current magnitude
-            if (state->magnitude[i] > state->peak_hold[i]) {
-                state->peak_hold[i] = state->magnitude[i];
-            }
-        }
-    }
-
-    // Peak detection on mouse hover - show closest peak to mouse (with
-    // zoom/pan support). The peak marker + readout are STATISTICS: always
-    // visible (the chrome toggle hides only the UI controls).
-    if (state->peak_hold && state->data_ready && state->fft_bins > 1 && sample_rate > 0) {
-        Vector2 mouse = gui_ui_get_mouse_position();
-        Rectangle fft_rect = {x, y, width, height};
-
-        if (CheckCollisionPointRec(mouse, fft_rect)) {
-            float nyquist = (float)sample_rate / 2.0f;
-            int fft_bins = state->fft_bins;
-            float zoom = state->zoom_level;
-            float pan = state->pan_offset;
-            bool log_scale = s_fft_log_scale && fft_bins > 1;
-
-            // Convert mouse X to normalized frequency using zoom/pan
-            // screen_norm = (freq_norm - pan) * zoom
-            // => freq_norm = screen_norm / zoom + pan  (axis space; converted
-            // through the inverse transform on the log axis)
-            float screen_norm = (mouse.x - x) / width;  // 0.0 to 1.0
-            float freq_norm = fft_axis_to_freq_norm(screen_norm / zoom + pan, log_scale, fft_bins);
-
-            // Convert to bin index
-            int mouse_bin = (int)(freq_norm * (fft_bins - 1) + 0.5f);
-            if (mouse_bin < 0) mouse_bin = 0;
-            if (mouse_bin >= fft_bins) mouse_bin = fft_bins - 1;
-
-            // Calculate search radius in bins (adjusted for zoom)
-            // At higher zoom, bins are wider on screen, so search covers fewer bins
-            float bin_width_screen = width * zoom / (float)(fft_bins - 1);
-            int search_radius_bins = (int)(FFT_PEAK_SEARCH_RADIUS_PX / bin_width_screen + 0.5f);
-            if (search_radius_bins < 2) search_radius_bins = 2;
-
-            // Find peaks near mouse using peak-hold data (stable envelope)
-            // Use larger buffer to find all candidates, then select closest
-            fft_peak_t peaks[FFT_PEAK_MAX_CANDIDATES];
-            int peak_count = fft_find_peaks_near(state->peak_hold, fft_bins,
-                                                  mouse_bin, search_radius_bins,
-                                                  FFT_PEAK_MIN_PROMINENCE,
-                                                  peaks, FFT_PEAK_MAX_CANDIDATES);
-
-            // Find the best peak - balance between closest to mouse and largest magnitude
-            if (peak_count > 0) {
-                // Find the maximum magnitude among candidates for normalization
-                float max_mag = peaks[0].magnitude;
-                for (int i = 1; i < peak_count; i++) {
-                    if (peaks[i].magnitude > max_mag) {
-                        max_mag = peaks[i].magnitude;
-                    }
-                }
-
-                // Score each peak: use circular (Euclidean) distance from mouse
-                // Calculate screen position for each peak and measure actual distance
-                // Weight magnitude more heavily so prominent peaks are preferred
-                const float distance_weight = 0.3f;
-                const float magnitude_weight = 0.7f;
-                float search_radius_px = (float)FFT_PEAK_SEARCH_RADIUS_PX;
-
-                int best_idx = 0;
-                float best_score = -1.0f;
-
-                for (int i = 0; i < peak_count; i++) {
-                    // Calculate screen position for this peak using zoom/pan
-                    int bin = peaks[i].bin;
-                    float peak_mag = state->peak_hold[bin];
-                    float bin_freq_norm = (float)bin / (float)(fft_bins - 1);
-                    float px = x + (fft_freq_norm_to_axis(bin_freq_norm, log_scale, fft_bins) - pan) * zoom * width;
-                    float py = y + height - (peak_mag * height);
-
-                    // Calculate circular (Euclidean) distance from mouse
-                    float dx = px - mouse.x;
-                    float dy = py - mouse.y;
-                    float dist = sqrtf(dx * dx + dy * dy);
-
-                    // Only consider peaks within circular radius
-                    if (dist > search_radius_px) continue;
-
-                    float distance_score = 1.0f - dist / search_radius_px;
-                    float magnitude_score = (max_mag > 0) ? peaks[i].magnitude / max_mag : 0.0f;
-                    float score = distance_weight * distance_score + magnitude_weight * magnitude_score;
-
-                    if (score > best_score) {
-                        best_score = score;
-                        best_idx = i;
-                    }
-                }
-
-                // Skip if no peak within circular radius
-                if (best_score < 0) {
-                    state->peak_label_active = false;
-                } else {
-
-                // Get the peak-hold magnitude for rendering
-                int peak_bin = peaks[best_idx].bin;
-                float peak_mag = state->peak_hold[peak_bin];
-
-                // Calculate screen position for closest peak using zoom/pan
-                float peak_freq_norm = (float)peak_bin / (float)(fft_bins - 1);
-                float peak_x = x + (fft_freq_norm_to_axis(peak_freq_norm, log_scale, fft_bins) - pan) * zoom * width;
-                float peak_y = y + height - (peak_mag * height);
-
-                // Calculate frequency and dB
-                float freq = (float)peak_bin / (float)(fft_bins - 1) * nyquist;
-                float db = FFT_DB_MIN + peak_mag * db_range;
-
-                // Draw peak marker (dot) - at actual peak position (no smoothing)
-                float dot_radius = 4.0f;
-                DrawCircleV((Vector2){peak_x, peak_y}, dot_radius, COLOR_TEXT);
-
-                // Apply EMA smoothing to label position only
-                float label_anchor_x, label_anchor_y;
-                if (!state->peak_label_active) {
-                    // First time - initialize directly to raw position
-                    state->peak_label_x = peak_x;
-                    state->peak_label_y = peak_y;
-                    state->peak_label_bin = peak_bin;
-                    state->peak_label_active = true;
-                    label_anchor_x = peak_x;
-                    label_anchor_y = peak_y;
-                } else {
-                    // Apply EMA: smoothed = alpha * raw + (1 - alpha) * previous
-                    state->peak_label_x = FFT_PEAK_LABEL_EMA_ALPHA * peak_x +
-                                          (1.0f - FFT_PEAK_LABEL_EMA_ALPHA) * state->peak_label_x;
-                    state->peak_label_y = FFT_PEAK_LABEL_EMA_ALPHA * peak_y +
-                                          (1.0f - FFT_PEAK_LABEL_EMA_ALPHA) * state->peak_label_y;
-                    state->peak_label_bin = peak_bin;
-                    label_anchor_x = state->peak_label_x;
-                    label_anchor_y = state->peak_label_y;
-                }
-
-                // Format frequency label
-                char freq_buf[32];
-                format_freq_label(freq_buf, sizeof(freq_buf), freq);
-
-                // Format dB label
-                char db_buf[16];
-                snprintf(db_buf, sizeof(db_buf), "%.1fdB", db);
-
-                // Use the rendered font metrics and retain the smoothed anchor.
-                fft_draw_peak_label(fonts, db_buf, freq_buf,
-                    (Vector2){label_anchor_x, label_anchor_y}, dot_radius, fft_rect);
-                }  // end if (best_score >= 0)
-            } else {
-                // No peak found - deactivate label smoothing
-                state->peak_label_active = false;
-            }
-        } else {
-            // Mouse left FFT area - deactivate label smoothing
-            state->peak_label_active = false;
-        }
-    }
-
-    // Draw "FFT" label in top-right corner (matching oscilloscope channel
-    // label style). Overlay chrome: hidden with the panel's chrome toggle.
-    if (!s_fft_chrome_hidden) {
-        const char *fft_label = "FFT";
-        int label_width = fft_measure_text(fonts, fft_label, FONT_SIZE_OSC_LABEL);
-        fft_draw_text(fonts, fft_label, x + width - label_width - 8, y + 4, FONT_SIZE_OSC_LABEL, COLOR_TEXT);
-    }
-
-    // Scale toggle button (Linear/Log) in the top-left corner, next to the
-    // annotation chrome. The rect is published per render by the panel
-    // wrapper; the click handler reads it from the per-panel state. Like
-    // every other control it is overlay chrome (UI): hidden with the toggle
-    // - the axis/stat readouts above stay visible.
-    if (!s_fft_chrome_hidden && s_fft_scale_btn_rect.width > 0.0f) {
-        const char *scale_label = s_fft_log_scale ? "Scale: Log" : "Scale: Linear";
-        Rectangle btn = s_fft_scale_btn_rect;
-        Vector2 mouse = gui_ui_get_mouse_position();
-        Color btn_bg = CheckCollisionPointRec(mouse, btn) ? COLOR_BUTTON_HOVER : COLOR_BUTTON;
-        DrawRectangleRounded(btn, 0.15f, 4, btn_bg);
-        float scale_text_w = (float)gui_text_measure(scale_label, FONT_SIZE_DROPDOWN_OPT);
-        gui_text_draw(scale_label, btn.x + (btn.width - scale_text_w) * 0.5f,
-                      btn.y + (btn.height - FONT_SIZE_DROPDOWN_OPT) * 0.5f,
-                      FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
-    }
-
-#else
-    (void)state;
-    (void)x;
-    (void)y;
-    (void)width;
-    (void)height;
-    (void)color;
-    (void)fonts;
-#endif
-}
-
-//=============================================================================
-// Zoom and Pan Interaction
-//=============================================================================
-
-// FFT panel state: the base fft engine plus the per-instance double-click
-// chrome-hide tracker. Declared here (before the zoom/pan handlers and the
-// vtable below) because those functions carry the panel state. Processing
-// still happens in the display thread via the embedded fft_state_t.
-typedef struct {
-    fft_state_t fft;
-    gui_chrome_hide_t chrome_hide;   // double-click toggles the UI chrome (the
-                                     // Scale button + the FFT title); the axis
-                                     // dB/frequency labels and the /div, span
-                                     // and peak readouts stay visible
-    bool log_scale;                  // Linear/Log frequency-axis toggle (false
-                                     // = Linear, the stock original default)
-    Rectangle scale_btn_rect;         // cached Scale-button rect for the click handler
-    uint32_t remote_last_sequence;
-    bool remote_has_frame;
-} fft_panel_state_t;
-
-// Zoom limits
-#define FFT_ZOOM_MIN 1.0f      // No zoom (full spectrum)
-#define FFT_ZOOM_MAX 64.0f     // Maximum zoom (64x)
-#define FFT_ZOOM_FACTOR 1.15f  // Zoom step per scroll tick
-
-// Handle mouse scroll for zoom (X-axis only, centered on mouse position)
-static bool fft_handle_scroll(void *state_ptr, float delta, Rectangle bounds) {
-#if LIBFFTW_ENABLED
-    if (!state_ptr || delta == 0.0f) return false;
-
-    fft_panel_state_t *panel = (fft_panel_state_t *)state_ptr;
-    fft_state_t *state = &panel->fft;
-    if (!state->initialized) return false;
-
-    Vector2 mouse = gui_ui_get_mouse_position();
-
-    // Check if mouse is inside bounds
-    if (!CheckCollisionPointRec(mouse, bounds)) return false;
-
-    // Calculate the normalized frequency position under mouse before zoom
-    float rel_x = (mouse.x - bounds.x) / bounds.width;  // 0.0 to 1.0
-    float freq_under_mouse = state->pan_offset + rel_x / state->zoom_level;
-
-    // Apply zoom
-    if (delta > 0.0f) {
-        // Scroll up = zoom in
-        state->zoom_level *= FFT_ZOOM_FACTOR;
-        if (state->zoom_level > FFT_ZOOM_MAX) state->zoom_level = FFT_ZOOM_MAX;
-    } else {
-        // Scroll down = zoom out
-        state->zoom_level /= FFT_ZOOM_FACTOR;
-        if (state->zoom_level < FFT_ZOOM_MIN) state->zoom_level = FFT_ZOOM_MIN;
-    }
-
-    // Adjust pan to keep the frequency under mouse at the same screen position
-    // freq_under_mouse = pan_offset + rel_x / zoom_level
-    // => pan_offset = freq_under_mouse - rel_x / zoom_level
-    state->pan_offset = freq_under_mouse - rel_x / state->zoom_level;
-
-    // Clamp pan to valid range [0, 1 - 1/zoom]
-    float max_pan = 1.0f - 1.0f / state->zoom_level;
-    if (max_pan < 0.0f) max_pan = 0.0f;
-    if (state->pan_offset < 0.0f) state->pan_offset = 0.0f;
-    if (state->pan_offset > max_pan) state->pan_offset = max_pan;
-
-    return true;
-#else
-    (void)state_ptr;
-    (void)delta;
-    (void)bounds;
-    return false;
-#endif
-}
-
-// Handle mouse click for drag-to-pan and the double-click chrome toggle
-static bool fft_handle_click(void *state_ptr, struct gui_app *app, int channel,
-                              Vector2 click, Rectangle bounds) {
-#if LIBFFTW_ENABLED
-    (void)app;
-    (void)channel;
-
-    if (!state_ptr) return false;
-
-    fft_panel_state_t *panel = (fft_panel_state_t *)state_ptr;
-    fft_state_t *state = &panel->fft;
-    if (!state->initialized) return false;
-
-    // Click outside the panel resets double-click tracking (and cancels any
-    // pan drag).
-    if (!CheckCollisionPointRec(click, bounds)) {
-        gui_chrome_hide_reset(&panel->chrome_hide);
-        state->dragging = false;
-        return false;
-    }
-
-    // Scale toggle button (Linear/Log): a control click, so it also resets
-    // the double-click tracker (mirrors the other panels' controls). The
-    // button is not drawn while the chrome is hidden, so its (stale) rect
-    // must not trigger; the click then falls through to the chrome feed
-    // below.
-    if (!gui_chrome_hide_hidden(&panel->chrome_hide) &&
-        panel->scale_btn_rect.width > 0.0f &&
-        CheckCollisionPointRec(click, panel->scale_btn_rect)) {
-        gui_chrome_hide_reset(&panel->chrome_hide);
-        panel->log_scale = !panel->log_scale;
-        return true;
-    }
-
-    // Every other in-bounds click feeds the double-click chrome toggle. A
-    // double-click toggles the annotation labels and consumes the click; a
-    // single click still falls through to the pan drag below (data
-    // interaction, unchanged).
-    if (gui_chrome_hide_feed_click(&panel->chrome_hide, click)) {
-        return true;
-    }
-
-    // Only allow panning when zoomed in
-    if (state->zoom_level <= 1.0f) return false;
-
-    // Start dragging
-    if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
-        state->dragging = true;
-        state->drag_start_x = click.x;
-        state->drag_start_pan = state->pan_offset;
-        return true;
-    }
-
-    return false;
-#else
-    (void)state_ptr;
-    (void)app;
-    (void)channel;
-    (void)click;
-    (void)bounds;
-    return false;
-#endif
-}
-
-// Update drag state (call from render to handle continuous drag)
-static void fft_update_drag(fft_state_t *state, Rectangle bounds) {
-#if LIBFFTW_ENABLED
-    if (!state || !state->initialized || !state->dragging) return;
-
-    Vector2 mouse = gui_ui_get_mouse_position();
-
-    if (IsMouseButtonDown(MOUSE_LEFT_BUTTON)) {
-        // Calculate pan delta based on mouse movement
-        float dx = mouse.x - state->drag_start_x;
-        // Convert pixel delta to normalized frequency delta
-        // At zoom_level, the visible frequency range is 1/zoom_level
-        // So pixel movement maps to frequency: dx / width * (1/zoom_level)
-        float freq_delta = -dx / bounds.width / state->zoom_level;
-        state->pan_offset = state->drag_start_pan + freq_delta;
-
-        // Clamp pan to valid range
-        float max_pan = 1.0f - 1.0f / state->zoom_level;
-        if (max_pan < 0.0f) max_pan = 0.0f;
-        if (state->pan_offset < 0.0f) state->pan_offset = 0.0f;
-        if (state->pan_offset > max_pan) state->pan_offset = max_pan;
-    } else {
-        // Mouse released - stop dragging
-        state->dragging = false;
-    }
-#else
-    (void)state;
-    (void)bounds;
-#endif
-}
-
-//=============================================================================
-// Panel Interface (vtable) Implementation
-//=============================================================================
-
-// FFT panel state is the fft_panel_state_t wrapper (see the Zoom and Pan
-// Interaction section above). Processing happens in display thread via the
-// embedded fft_state_t, rendering in render thread.
-
-//-----------------------------------------------------------------------------
-// Lifecycle Functions
-//-----------------------------------------------------------------------------
-
-static void *fft_vtable_create(void) {
-#if LIBFFTW_ENABLED
-    fft_panel_state_t *panel = calloc(1, sizeof(fft_panel_state_t));
-    if (!panel) return NULL;
-
-    if (!gui_fft_init(&panel->fft)) {
-        free(panel);
-        return NULL;
-    }
-
-    return panel;
-#else
-    return NULL;
-#endif
-}
-
-static void fft_vtable_destroy(void *state_ptr) {
-    if (!state_ptr) return;
-    fft_panel_state_t *panel = (fft_panel_state_t *)state_ptr;
-    gui_fft_cleanup(&panel->fft);
-    free(panel);
-}
-
-static void fft_vtable_clear(void *state_ptr) {
-    if (!state_ptr) return;
-    fft_panel_state_t *panel = (fft_panel_state_t *)state_ptr;
-    gui_fft_clear(&panel->fft);
-}
-
-//-----------------------------------------------------------------------------
-// Processing Function (called from display thread with raw ADC samples)
-//-----------------------------------------------------------------------------
-
-static void fft_vtable_process(void *state_ptr, const int16_t *samples, size_t count, uint32_t sample_rate) {
-    if (!state_ptr || !samples || count == 0) return;
-    fft_panel_state_t *panel = (fft_panel_state_t *)state_ptr;
-
-    // Process raw ADC samples and compute FFT
-    gui_fft_process_raw(&panel->fft, samples, count, sample_rate);
-}
-
-//-----------------------------------------------------------------------------
-// Rendering Functions
-//-----------------------------------------------------------------------------
-
-static void fft_vtable_render(void *state_ptr, gui_app_t *app, int channel,
-                              Rectangle bounds, Color channel_color) {
-    (void)channel;  // FFT uses sample_rate from state, not channel-specific
-
-    if (!state_ptr || !app) return;
-
-    fft_panel_state_t *panel = (fft_panel_state_t *)state_ptr;
-    fft_state_t *fft = &panel->fft;
-
-    if (!fft->initialized) {
-        const char *text = gui_fft_available() ? "FFT Initializing..." : "FFT Not Available";
-        int text_width = MeasureText(text, FONT_SIZE_OSC_MSG);
-        DrawText(text, (int)(bounds.x + bounds.width/2 - text_width/2),
-                 (int)(bounds.y + bounds.height/2 - 12),
-                 FONT_SIZE_OSC_MSG, COLOR_TEXT_DIM);
-        return;
-    }
-
-    // Update drag state for pan (continuous while mouse is held)
-    if (app->settings_panel_open) fft->dragging = false;
-    fft_update_drag(fft, bounds);
-
-    // Swap buffers to get latest FFT data from display thread
-    gui_fft_swap_buffers(fft);
-
-    // Publish the panel's double-click chrome state and the Linear/Log
-    // scale mode for the draws inside gui_fft_render (see the statics
-    // above), and cache the Scale-button rect for the click handler.
-    // gui_text_measure falls back to the default font, so this also works
-    // headless.
-    s_fft_chrome_hidden = gui_chrome_hide_hidden(&panel->chrome_hide);
-    s_fft_log_scale = panel->log_scale;
-    {
-        const char *scale_label = panel->log_scale ? "Scale: Log" : "Scale: Linear";
-        float btn_w = (float)gui_text_measure(scale_label, FONT_SIZE_DROPDOWN_OPT) + 16.0f;
-        if (btn_w < 96.0f) btn_w = 96.0f;
-        panel->scale_btn_rect = (Rectangle){bounds.x + 8.0f, bounds.y + 4.0f, btn_w, 18.0f};
-    }
-    s_fft_scale_btn_rect = panel->scale_btn_rect;
-
-    // Render FFT (sample_rate is read atomically inside gui_fft_render)
-    gui_fft_render(fft, bounds.x, bounds.y, bounds.width, bounds.height,
-                   channel_color, app->fonts);
-}
-
-//-----------------------------------------------------------------------------
-// Vtable Definition
-//-----------------------------------------------------------------------------
-
-static const panel_vtable_t s_fft_vtable = {
-    .name = "FFT",
-
-    // Lifecycle
-    .create = fft_vtable_create,
-    .destroy = fft_vtable_destroy,
-    .clear = fft_vtable_clear,
-
-    // Processing (no-op for FFT - uses display samples in render)
-    .process = fft_vtable_process,
-
-    // Rendering
-    .render = fft_vtable_render,
-    .render_overlay = NULL,  // No overlay for FFT
-
-    // Interaction
-    .handle_click = fft_handle_click,    // Drag to pan
-    .handle_scroll = fft_handle_scroll,  // Scroll to zoom (centered on mouse)
-
-    // Menus
-    .get_menu_count = NULL,
-    .get_menu = NULL,
-};
-
-//-----------------------------------------------------------------------------
-// Registration
-//-----------------------------------------------------------------------------
-
-void gui_fft_panel_register(void) {
-    panel_register(PANEL_VIEW_FFT, &s_fft_vtable);
-}
-
-/* Shared original Local FFTW path; FFTW processing before GUI EMA. */
-static atomic_flag s_rd_fft_lock=ATOMIC_FLAG_INIT;
-void gui_fft_server_bins(const int16_t *samples,size_t count,uint32_t rate,float *out,size_t bins){
-    if(!out||bins!=FFT_SIZE_MAX/2+1)return;
-    memset(out,0,bins*sizeof(float));
-#if LIBFFTW_ENABLED
-    if(!samples||count<FFT_SIZE_MIN)return;
-    while(atomic_flag_test_and_set_explicit(&s_rd_fft_lock,memory_order_acquire))thrd_sleep_ms(1);
-    static fft_state_t fft;
-    static bool started=false;
-    if(!started){started=gui_fft_init(&fft);}
-    if(started){
-        gui_fft_process_raw(&fft,samples,count,rate);
-        if(fft.fft_bins==(int)bins)memcpy(out,fft.magnitude_back,bins*sizeof(float));
-    }
-    atomic_flag_clear_explicit(&s_rd_fft_lock,memory_order_release);
-#else
-    (void)samples;(void)count;(void)rate;
-#endif
-}
-void gui_fft_remote_apply_float(void *state_ptr,const float *bins,size_t n,
-                                uint32_t sample_rate,uint32_t sequence){
-#if LIBFFTW_ENABLED
-    if(!state_ptr||!bins||n!=FFT_SIZE_MAX/2+1||!sample_rate)return;
-    fft_panel_state_t *p=(fft_panel_state_t*)state_ptr;
-    fft_state_t *s=&p->fft;
-    if(!s->initialized||(p->remote_has_frame&&p->remote_last_sequence==sequence))return;
-    if(s->fft_size!=FFT_SIZE_MAX&&!fft_resize(s,FFT_SIZE_MAX))return;
-    memcpy(s->magnitude_back,bins,n*sizeof(float));
-    atomic_store(&s->sample_rate,sample_rate);
-    atomic_store(&s->magnitude_ready,1);
-    p->remote_last_sequence=sequence;
-    p->remote_has_frame=true;
-#else
-    (void)state_ptr;(void)bins;(void)n;(void)sample_rate;(void)sequence;
-#endif
-}
+/*
+ * MISRC GUI - FFT Line Spectrum Display with GPU Phosphor Persistence
+ *
+ * Computes FFT of resampled display waveform and displays as a line-based spectrum
+ * using GPU-accelerated phosphor persistence (shared module).
+ *
+ * Copyright (C) 2024-2025 vrunk11, stefan_o
+ * Licensed under GNU GPL v3 or later
+ */
+
+#include "gui_fft.h"
+#include "../core/gui_app.h"
+#include "gui_phosphor_rt.h"
+#include "../ui/gui_ui.h"
+#include "../ui/gui_chrome_hide.h"  // double-click annotation toggle (panel wrapper below)
+#include "gui_text.h"               // Scale-button text (Lin/Log frequency axis toggle)
+#include "../../common/threading.h"
+
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdatomic.h>
+
+// Define M_PI if not available (Windows compatibility)
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+#if LIBFFTW_ENABLED
+#include <fftw3.h>
+#endif
+
+// FFTW shares planner state across all channels and display workers. Keep
+// every non-execute operation serialized; distinct plans still execute in parallel.
+#if LIBFFTW_ENABLED
+static atomic_flag s_fftw_lock = ATOMIC_FLAG_INIT;
+
+static void gui_fft_library_lock(void) {
+    while (atomic_flag_test_and_set_explicit(&s_fftw_lock, memory_order_acquire)) {
+        thrd_sleep_ms(1);
+    }
+}
+
+static void gui_fft_library_unlock(void) {
+    atomic_flag_clear_explicit(&s_fftw_lock, memory_order_release);
+}
+#endif
+
+void *gui_fft_plan_create_r2c(int size, float *input, void *output, unsigned flags) {
+#if LIBFFTW_ENABLED
+    if (size <= 0 || !input || !output) return NULL;
+    gui_fft_library_lock();
+    fftwf_plan plan = fftwf_plan_dft_r2c_1d(size, input, (fftwf_complex *)output, flags);
+    gui_fft_library_unlock();
+    return plan;
+#else
+    (void)size; (void)input; (void)output; (void)flags;
+    return NULL;
+#endif
+}
+
+void gui_fft_plan_destroy(void *plan) {
+#if LIBFFTW_ENABLED
+    if (!plan) return;
+    gui_fft_library_lock();
+    fftwf_destroy_plan((fftwf_plan)plan);
+    gui_fft_library_unlock();
+#else
+    (void)plan;
+#endif
+}
+
+void *gui_fft_alloc(size_t bytes) {
+#if LIBFFTW_ENABLED
+    gui_fft_library_lock();
+    void *memory = fftwf_malloc(bytes);
+    gui_fft_library_unlock();
+    return memory;
+#else
+    return malloc(bytes);
+#endif
+}
+
+void gui_fft_free(void *memory) {
+#if LIBFFTW_ENABLED
+    if (!memory) return;
+    gui_fft_library_lock();
+    fftwf_free(memory);
+    gui_fft_library_unlock();
+#else
+    free(memory);
+#endif
+}
+
+//-----------------------------------------------------------------------------
+// Availability Check
+//-----------------------------------------------------------------------------
+
+bool gui_fft_available(void) {
+#if LIBFFTW_ENABLED
+    return true;
+#else
+    return false;
+#endif
+}
+
+//-----------------------------------------------------------------------------
+// FFT Lifecycle Management
+//-----------------------------------------------------------------------------
+
+// Helper: Find smallest power of 2 >= n
+static int ceil_power_of_2(int n) {
+    if (n <= 0) return 1;
+    int power = 1;
+    while (power < n) {
+        power *= 2;
+    }
+    return power;
+}
+
+// Helper: Resize FFT buffers and recreate plan for new size
+static bool fft_resize(fft_state_t *state, int new_size) {
+#if LIBFFTW_ENABLED
+    if (!state) return false;
+
+    // Round up to power of 2 first
+    new_size = ceil_power_of_2(new_size);
+
+    // Clamp to valid range
+    if (new_size < FFT_SIZE_MIN) new_size = FFT_SIZE_MIN;
+    if (new_size > FFT_SIZE_MAX) new_size = FFT_SIZE_MAX;
+
+    // Already the right size?
+    if (state->allocated_size == new_size && state->fftw_plan) {
+        return true;
+    }
+
+    int new_bins = new_size / 2 + 1;
+
+    // Free old resources
+    if (state->fftw_plan) {
+        gui_fft_plan_destroy(state->fftw_plan);
+        state->fftw_plan = NULL;
+    }
+    if (state->fftw_input) {
+        gui_fft_free(state->fftw_input);
+        state->fftw_input = NULL;
+    }
+    if (state->fftw_output) {
+        gui_fft_free(state->fftw_output);
+        state->fftw_output = NULL;
+    }
+    if (state->window) {
+        free(state->window);
+        state->window = NULL;
+    }
+    // Free double-buffered magnitude arrays
+    if (state->magnitude_front) {
+        free(state->magnitude_front);
+        state->magnitude_front = NULL;
+    }
+    if (state->magnitude_back) {
+        free(state->magnitude_back);
+        state->magnitude_back = NULL;
+    }
+    state->magnitude = NULL;  // Was alias to front
+    if (state->peak_hold) {
+        free(state->peak_hold);
+        state->peak_hold = NULL;
+    }
+
+    // Allocate new buffers
+    state->fftw_input = (float *)gui_fft_alloc(sizeof(float) * new_size);
+    if (!state->fftw_input) {
+        fprintf(stderr, "[FFT] Failed to allocate FFTW input buffer (%d)\n", new_size);
+        return false;
+    }
+
+    state->fftw_output = gui_fft_alloc(sizeof(fftwf_complex) * new_bins);
+    if (!state->fftw_output) {
+        fprintf(stderr, "[FFT] Failed to allocate FFTW output buffer (%d bins)\n", new_bins);
+        gui_fft_free(state->fftw_input);
+        state->fftw_input = NULL;
+        return false;
+    }
+
+    // Create new FFTW plan
+    state->fftw_plan = gui_fft_plan_create_r2c(new_size, state->fftw_input,
+                                               state->fftw_output, FFTW_ESTIMATE);  // Use ESTIMATE for faster plan creation
+    if (!state->fftw_plan) {
+        fprintf(stderr, "[FFT] Failed to create FFTW plan for size %d\n", new_size);
+        gui_fft_free(state->fftw_input);
+        gui_fft_free(state->fftw_output);
+        state->fftw_input = NULL;
+        state->fftw_output = NULL;
+        return false;
+    }
+
+    // Allocate Hanning window
+    state->window = (float *)malloc(sizeof(float) * new_size);
+    if (!state->window) {
+        fprintf(stderr, "[FFT] Failed to allocate window buffer (%d)\n", new_size);
+        gui_fft_plan_destroy(state->fftw_plan);
+        gui_fft_free(state->fftw_input);
+        gui_fft_free(state->fftw_output);
+        state->fftw_plan = NULL;
+        state->fftw_input = NULL;
+        state->fftw_output = NULL;
+        return false;
+    }
+
+    // Precompute Hanning window coefficients
+    for (int i = 0; i < new_size; i++) {
+        state->window[i] = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * i / (new_size - 1)));
+    }
+
+    // Allocate double-buffered magnitude arrays
+    state->magnitude_front = (float *)malloc(sizeof(float) * new_bins);
+    state->magnitude_back = (float *)malloc(sizeof(float) * new_bins);
+    if (!state->magnitude_front || !state->magnitude_back) {
+        fprintf(stderr, "[FFT] Failed to allocate magnitude buffers (%d bins)\n", new_bins);
+        gui_fft_plan_destroy(state->fftw_plan);
+        gui_fft_free(state->fftw_input);
+        gui_fft_free(state->fftw_output);
+        free(state->window);
+        free(state->magnitude_front);
+        free(state->magnitude_back);
+        state->fftw_plan = NULL;
+        state->fftw_input = NULL;
+        state->fftw_output = NULL;
+        state->window = NULL;
+        state->magnitude_front = NULL;
+        state->magnitude_back = NULL;
+        return false;
+    }
+    memset(state->magnitude_front, 0, sizeof(float) * new_bins);
+    memset(state->magnitude_back, 0, sizeof(float) * new_bins);
+    state->magnitude = state->magnitude_front;  // Alias for compatibility
+
+    // Allocate peak-hold buffer for stable peak detection
+    state->peak_hold = (float *)malloc(sizeof(float) * new_bins);
+    if (!state->peak_hold) {
+        fprintf(stderr, "[FFT] Failed to allocate peak_hold buffer (%d bins)\n", new_bins);
+        gui_fft_plan_destroy(state->fftw_plan);
+        gui_fft_free(state->fftw_input);
+        gui_fft_free(state->fftw_output);
+        free(state->window);
+        free(state->magnitude_front);
+        free(state->magnitude_back);
+        state->fftw_plan = NULL;
+        state->fftw_input = NULL;
+        state->fftw_output = NULL;
+        state->window = NULL;
+        state->magnitude_front = NULL;
+        state->magnitude_back = NULL;
+        state->magnitude = NULL;
+        return false;
+    }
+    memset(state->peak_hold, 0, sizeof(float) * new_bins);
+
+    state->fft_size = new_size;
+    state->fft_bins = new_bins;
+    state->allocated_size = new_size;
+
+    fprintf(stderr, "[FFT] Resized to %d samples (%d bins)\n", new_size, new_bins);
+    return true;
+#else
+    (void)state;
+    (void)new_size;
+    return false;
+#endif
+}
+
+bool gui_fft_init(fft_state_t *state) {
+    if (!state) return false;
+
+    // Clear state first
+    memset(state, 0, sizeof(fft_state_t));
+
+#if LIBFFTW_ENABLED
+    // Initialize atomic variables
+    atomic_init(&state->magnitude_ready, 0);
+    atomic_init(&state->sample_rate, 0);
+
+    // Initialize with minimum size - will be resized on first process call
+    if (!fft_resize(state, FFT_SIZE_MIN)) {
+        return false;
+    }
+
+    // Phosphor render textures will be created on first render (need OpenGL context)
+    memset(&state->phosphor, 0, sizeof(phosphor_rt_t));
+
+    // Set FFT-specific phosphor config
+    state->phosphor.config.decay_rate = FFT_DECAY_RATE;
+    state->phosphor.config.hit_increment = FFT_HIT_INCREMENT;
+    state->phosphor.config.bloom_intensity = FFT_BLOOM;
+
+    state->data_ready = false;
+    state->initialized = true;
+
+    // Initialize zoom/pan state
+    state->zoom_level = 1.0f;
+    state->pan_offset = 0.0f;
+    state->dragging = false;
+    state->drag_start_x = 0.0f;
+    state->drag_start_pan = 0.0f;
+
+    fprintf(stderr, "[FFT] Initialized with dynamic sizing (%d-%d samples)\n",
+            FFT_SIZE_MIN, FFT_SIZE_MAX);
+
+    return true;
+#else
+    fprintf(stderr, "[FFT] FFTW not available, FFT support disabled\n");
+    return false;
+#endif
+}
+
+void gui_fft_clear(fft_state_t *state) {
+    if (!state || !state->initialized) return;
+
+#if LIBFFTW_ENABLED
+    // Clear both magnitude buffers
+    if (state->magnitude_front && state->fft_bins > 0) {
+        memset(state->magnitude_front, 0, sizeof(float) * state->fft_bins);
+    }
+    if (state->magnitude_back && state->fft_bins > 0) {
+        memset(state->magnitude_back, 0, sizeof(float) * state->fft_bins);
+    }
+    atomic_store(&state->magnitude_ready, 0);
+
+    // Clear peak-hold buffer
+    if (state->peak_hold && state->fft_bins > 0) {
+        memset(state->peak_hold, 0, sizeof(float) * state->fft_bins);
+    }
+
+    // Clear phosphor render textures
+    phosphor_rt_clear(&state->phosphor);
+
+    // Reset peak label smoothing state
+    state->peak_label_active = false;
+    state->peak_label_x = 0.0f;
+    state->peak_label_y = 0.0f;
+    state->peak_label_bin = 0;
+
+    // Reset zoom/pan state
+    state->zoom_level = 1.0f;
+    state->pan_offset = 0.0f;
+    state->dragging = false;
+
+    state->data_ready = false;
+#endif
+}
+
+void gui_fft_cleanup(fft_state_t *state) {
+    if (!state) return;
+
+#if LIBFFTW_ENABLED
+    if (state->fftw_plan) {
+        gui_fft_plan_destroy(state->fftw_plan);
+        state->fftw_plan = NULL;
+    }
+
+    if (state->fftw_input) {
+        gui_fft_free(state->fftw_input);
+        state->fftw_input = NULL;
+    }
+
+    if (state->fftw_output) {
+        gui_fft_free(state->fftw_output);
+        state->fftw_output = NULL;
+    }
+
+    if (state->window) {
+        free(state->window);
+        state->window = NULL;
+    }
+
+    // Free double-buffered magnitude arrays
+    if (state->magnitude_front) {
+        free(state->magnitude_front);
+        state->magnitude_front = NULL;
+    }
+    if (state->magnitude_back) {
+        free(state->magnitude_back);
+        state->magnitude_back = NULL;
+    }
+    state->magnitude = NULL;
+
+    if (state->peak_hold) {
+        free(state->peak_hold);
+        state->peak_hold = NULL;
+    }
+
+    phosphor_rt_cleanup(&state->phosphor);
+#endif
+
+    state->initialized = false;
+}
+
+//-----------------------------------------------------------------------------
+// FFT Processing - Compute FFT from raw ADC samples (display thread)
+//-----------------------------------------------------------------------------
+
+void gui_fft_process_raw(fft_state_t *state, const int16_t *samples,
+                         size_t count, uint32_t sample_rate) {
+#if LIBFFTW_ENABLED
+    if (!state || !state->initialized || !samples) return;
+
+    // Store sample rate for render thread (atomic)
+    atomic_store(&state->sample_rate, sample_rate);
+
+    // Need minimum samples
+    if (count < FFT_SIZE_MIN) return;
+
+    // Determine FFT size: round UP sample count to nearest power of 2 for zero-padding
+    int target_size = ceil_power_of_2((int)count);
+    if (target_size > FFT_SIZE_MAX) target_size = FFT_SIZE_MAX;
+    if (target_size < FFT_SIZE_MIN) target_size = FFT_SIZE_MIN;
+
+    // Resize if needed (note: not thread-safe, but resize only happens rarely)
+    if (target_size != state->fft_size) {
+        if (!fft_resize(state, target_size)) {
+            return;  // Resize failed
+        }
+    }
+
+    int fft_size = state->fft_size;
+    int fft_bins = state->fft_bins;
+
+    // Use all available samples (up to fft_size)
+    size_t samples_to_use = (count > (size_t)fft_size) ? (size_t)fft_size : count;
+
+    // Calculate DC offset (mean of actual samples) to remove from signal
+    // Use int32 accumulator to avoid overflow
+    int64_t dc_sum = 0;
+    for (size_t i = 0; i < samples_to_use; i++) {
+        dc_sum += samples[i];
+    }
+    float dc_offset = (float)dc_sum / (float)samples_to_use;
+
+    // Zero-pad symmetrically: place windowed data in center of FFT buffer
+    int pad_total = fft_size - (int)samples_to_use;
+    int pad_left = pad_total / 2;
+    int pad_right = pad_total - pad_left;
+
+    // Zero-pad left side
+    for (int i = 0; i < pad_left; i++) {
+        state->fftw_input[i] = 0.0f;
+    }
+
+    // Apply Hanning window to actual sample data and place in center
+    // Normalize int16 samples to -1.0 to +1.0 range
+    // const float scale = 1.0f / 32768.0f; --- Results in low FFT scale ~30db
+    const float scale = 1.0f / 2048.0f;
+    for (size_t i = 0; i < samples_to_use; i++) {
+        float window_val = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * (float)i / (float)(samples_to_use - 1)));
+        float sample_val = ((float)samples[i] - dc_offset) * scale;
+        state->fftw_input[pad_left + (int)i] = sample_val * window_val;
+    }
+
+    // Zero-pad right side
+    for (int i = 0; i < pad_right; i++) {
+        state->fftw_input[pad_left + (int)samples_to_use + i] = 0.0f;
+    }
+
+    // Execute FFT
+    fftwf_execute((fftwf_plan)state->fftw_plan);
+
+    // Compute magnitude in dB, then normalize to 0-1
+    // Write to back buffer (display thread owns this)
+    fftwf_complex *output = (fftwf_complex *)state->fftw_output;
+    float *back = state->magnitude_back;
+
+    for (int j = 0; j < fft_bins; j++) {
+        float real = output[j][0];
+        float imag = output[j][1];
+        float mag = sqrtf(real * real + imag * imag);
+
+        // Normalize by actual sample count (not padded size) for correct amplitude
+        mag /= (float)samples_to_use;
+
+        // Hanning window coherent gain correction (window gain = 0.5, correction = x2) MA - correct FFT window Scaling
+        mag *= 2.0f;
+        
+        // Convert to dB (with small epsilon to avoid log(0))
+        float db = 20.0f * log10f(mag + 1e-10f);
+
+        // Clamp to dB range
+        if (db < FFT_DB_MIN) db = FFT_DB_MIN;
+        if (db > FFT_DB_MAX) db = FFT_DB_MAX;
+
+        // Convert dB to normalized intensity (0-1)
+        back[j] = (db - FFT_DB_MIN) / (FFT_DB_MAX - FFT_DB_MIN);
+    }
+
+    // Signal that new data is ready for the render thread
+    atomic_store(&state->magnitude_ready, 1);
+#else
+    (void)state;
+    (void)samples;
+    (void)count;
+    (void)sample_rate;
+#endif
+}
+
+//-----------------------------------------------------------------------------
+// FFT Buffer Swap - Copy back buffer to front (render thread)
+//-----------------------------------------------------------------------------
+
+void gui_fft_swap_buffers(fft_state_t *state) {
+#if LIBFFTW_ENABLED
+    if (!state || !state->initialized) return;
+
+    // Check if new data is available
+    if (atomic_exchange(&state->magnitude_ready, 0)) {
+        // Copy back buffer to front buffer
+        // Apply EMA smoothing during copy for temporal smoothing
+        int fft_bins = state->fft_bins;
+        float *front = state->magnitude_front;
+        float *back = state->magnitude_back;
+
+        for (int j = 0; j < fft_bins; j++) {
+            float previous = front[j];
+            float current = back[j];
+            front[j] = FFT_EMA_ALPHA * previous + (1.0f - FFT_EMA_ALPHA) * current;
+        }
+
+        state->data_ready = true;
+    }
+#else
+    (void)state;
+#endif
+}
+
+//-----------------------------------------------------------------------------
+// FFT Rendering - GPU phosphor persistence using shared module
+//-----------------------------------------------------------------------------
+
+// Grid settings for FFT (matching oscilloscope style)
+#define FFT_GRID_MIN_SPACING_PX 80   // Minimum pixels between frequency grid lines
+#define FFT_GRID_MAX_DIVISIONS 24    // Maximum number of frequency divisions
+
+// Peak detection settings
+#define FFT_PEAK_SEARCH_RADIUS_PX 30   // Pixels around mouse to search for peaks
+#define FFT_PEAK_MIN_PROMINENCE 0.02f  // Minimum prominence (0-1) to qualify as a peak
+#define FFT_PEAK_MAX_CANDIDATES 32     // Maximum peaks to consider when finding closest
+#define FFT_PEAK_MAX_DISPLAY 1         // Maximum peaks to display near mouse
+#define FFT_PEAK_HOLD_DECAY 0.99f     // Per-frame decay for peak hold (closer to 1 = slower decay)
+#define FFT_PEAK_LABEL_EMA_ALPHA 0.1f // EMA smoothing for label position (lower = smoother)
+
+// Peak info structure for rendering
+typedef struct {
+    int bin;           // FFT bin index
+    float magnitude;   // Normalized magnitude (0-1)
+    float freq_hz;     // Frequency in Hz
+    float db;          // dB value
+    float screen_x;    // Screen X position
+    float screen_y;    // Screen Y position
+} fft_peak_t;
+
+// Find peaks near a given bin index within a search radius
+// Returns number of peaks found (up to max_peaks)
+static int fft_find_peaks_near(const float *magnitude, int num_bins,
+                               int center_bin, int search_radius,
+                               float min_prominence,
+                               fft_peak_t *peaks, int max_peaks) {
+    if (!magnitude || num_bins < 3 || !peaks || max_peaks <= 0) return 0;
+
+    int start_bin = center_bin - search_radius;
+    int end_bin = center_bin + search_radius;
+    if (start_bin < 1) start_bin = 1;
+    if (end_bin >= num_bins - 1) end_bin = num_bins - 2;
+
+    int peak_count = 0;
+
+    // Find local maxima in the search range
+    for (int i = start_bin; i <= end_bin && peak_count < max_peaks; i++) {
+        float val = magnitude[i];
+        float prev = magnitude[i - 1];
+        float next = magnitude[i + 1];
+
+        // Check if this is a local maximum
+        if (val > prev && val > next) {
+            // Calculate prominence: how much higher than surrounding valleys
+            // Look left for valley
+            float left_valley = val;
+            for (int j = i - 1; j >= 0; j--) {
+                if (magnitude[j] < left_valley) {
+                    left_valley = magnitude[j];
+                }
+                if (magnitude[j] > val) break;  // Hit a higher peak
+            }
+
+            // Look right for valley
+            float right_valley = val;
+            for (int j = i + 1; j < num_bins; j++) {
+                if (magnitude[j] < right_valley) {
+                    right_valley = magnitude[j];
+                }
+                if (magnitude[j] > val) break;  // Hit a higher peak
+            }
+
+            float prominence = val - fmaxf(left_valley, right_valley);
+
+            if (prominence >= min_prominence) {
+                peaks[peak_count].bin = i;
+                peaks[peak_count].magnitude = val;
+                peak_count++;
+            }
+        }
+    }
+
+    // Sort peaks by magnitude (descending) - simple bubble sort for small array
+    for (int i = 0; i < peak_count - 1; i++) {
+        for (int j = i + 1; j < peak_count; j++) {
+            if (peaks[j].magnitude > peaks[i].magnitude) {
+                fft_peak_t tmp = peaks[i];
+                peaks[i] = peaks[j];
+                peaks[j] = tmp;
+            }
+        }
+    }
+
+    return peak_count;
+}
+
+// Snap to 1-2-5 log scale sequence (same as oscilloscope)
+static double fft_snap_to_125(double value) {
+    if (value <= 0) return 1.0;
+
+    double log_val = log10(value);
+    double magnitude = pow(10.0, floor(log_val));
+    double normalized = value / magnitude;
+
+    double snapped;
+    if (normalized < 1.5) {
+        snapped = 1.0;
+    } else if (normalized < 3.5) {
+        snapped = 2.0;
+    } else if (normalized < 7.5) {
+        snapped = 5.0;
+    } else {
+        snapped = 10.0;
+    }
+
+    return snapped * magnitude;
+}
+
+// Toggleable frequency-axis scale: Linear (the STOCK original mode and
+// the default - the panel starts exactly as it did before the toggle
+// existed) and Log via the panel's Scale button. The transform works in
+// normalized axis space, so the existing zoom/pan (which operate on
+// normalized screen coordinates) are unchanged in both modes. Log cannot
+// place DC: the axis starts at the first non-zero bin (one bin width above
+// 0), so bin 1 sits at axis 0 and the DC bin is excluded from the trace on
+// the log axis.
+static float fft_freq_norm_to_axis(float freq_norm, bool log_scale, int fft_bins) {
+    if (!log_scale || fft_bins < 3) return freq_norm;
+    const float log_min = 1.0f / (float)(fft_bins - 1);
+    if (freq_norm <= log_min) return 0.0f;
+    if (freq_norm >= 1.0f) return 1.0f;
+    const float log_span = -log10f(log_min);
+    return (log10f(freq_norm) - log10f(log_min)) / log_span;
+}
+
+static float fft_axis_to_freq_norm(float axis, bool log_scale, int fft_bins) {
+    if (!log_scale || fft_bins < 3) return axis;
+    const float log_min = 1.0f / (float)(fft_bins - 1);
+    if (axis <= 0.0f) return log_min;
+    if (axis >= 1.0f) return 1.0f;
+    const float log_span = -log10f(log_min);
+    return powf(10.0f, log10f(log_min) + axis * log_span);
+}
+
+// Log-mode gridlines: 1-2-5 per decade inside [start, end] Hz, placed in
+// ascending order into out[]. Fewer than 3 candidates means the visible
+// span is under about one decade - the caller falls back to the linear
+// 1-2-5 grid, which is near-evenly placed on a sub-decade log axis.
+static int fft_log_grid_lines(float start_hz, float end_hz,
+                               float *out, int max_out) {
+    if (start_hz <= 0.0f || end_hz <= start_hz || !out || max_out <= 0) return 0;
+    int count = 0;
+    int decade = (int)floorf(log10f(start_hz));
+    for (; decade <= (int)floorf(log10f(end_hz)) && count < max_out; decade++) {
+        static const float mantissa[3] = {1.0f, 2.0f, 5.0f};
+        for (int m = 0; m < 3 && count < max_out; m++) {
+            float freq = mantissa[m] * powf(10.0f, (float)decade);
+            if (freq >= start_hz && freq <= end_hz) out[count++] = freq;
+        }
+    }
+    return count;
+}
+
+// Format frequency value with appropriate unit (Hz, kHz, MHz)
+static void format_freq_label(char *buf, size_t buf_size, double hz) {
+    if (hz >= 1000000.0) {
+        snprintf(buf, buf_size, "%.3gMHz", hz / 1000000.0);
+    } else if (hz >= 1000.0) {
+        snprintf(buf, buf_size, "%.3gkHz", hz / 1000.0);
+    } else {
+        snprintf(buf, buf_size, "%.3gHz", hz);
+    }
+}
+
+// Helper to draw text with font
+static void fft_draw_text(Font *fonts, const char *text, float px, float py, int fontSize, Color color) {
+    if (fonts) {
+        DrawTextEx(fonts[0], text, (Vector2){px, py}, (float)fontSize, 1.0f, color);
+    } else {
+        DrawText(text, (int)px, (int)py, fontSize, color);
+    }
+}
+
+// Helper to draw text with monospace font (for numbers)
+static void fft_draw_text_mono(Font *fonts, const char *text, float px, float py, int fontSize, Color color) {
+    if (fonts) {
+        DrawTextEx(fonts[1], text, (Vector2){px, py}, (float)fontSize, 1.0f, color);
+    } else {
+        DrawText(text, (int)px, (int)py, fontSize, color);
+    }
+}
+
+// Helper to measure text with font
+static int fft_measure_text(Font *fonts, const char *text, int fontSize) {
+    if (fonts) {
+        Vector2 size = MeasureTextEx(fonts[0], text, (float)fontSize, 1.0f);
+        return (int)ceilf(size.x);
+    }
+    return MeasureText(text, fontSize);
+}
+
+static Vector2 fft_measure_text_mono(Font *fonts, const char *text, int fontSize) {
+    if (fonts) {
+        return MeasureTextEx(fonts[1], text, (float)fontSize, 1.0f);
+    }
+    return (Vector2){(float)MeasureText(text, fontSize), (float)fontSize};
+}
+
+// Peak values use ASCII labels. Keep the font size and shorten only when even
+// a separate dB/frequency line cannot fit; never resize the FFT panel.
+static void fft_fit_peak_line(Font *fonts, char *text, size_t text_size, float width) {
+    if (fft_measure_text_mono(fonts, text, FONT_SIZE_NORMAL).x <= width) return;
+    if (text_size < 4) {
+        if (text_size > 0) text[0] = '\0';
+        return;
+    }
+
+    size_t length = strlen(text);
+    if (length > text_size - 4) length = text_size - 4;
+    for (;;) {
+        memcpy(text + length, "...", 4);
+        if (fft_measure_text_mono(fonts, text, FONT_SIZE_NORMAL).x <= width) return;
+        if (length == 0) break;
+        length--;
+    }
+    text[0] = '\0';
+}
+
+static void fft_draw_peak_label(Font *fonts, const char *db_text, const char *freq_text,
+                                Vector2 anchor, float dot_radius, Rectangle bounds) {
+    const float padding = 2;
+    float available_width = bounds.width - 2 * padding;
+    float available_height = bounds.height - 2 * padding;
+    if (available_width <= 0 || available_height <= 0) return;
+
+    char lines[2][64];
+    snprintf(lines[0], sizeof(lines[0]), "%s %s", db_text, freq_text);
+    Vector2 size = fft_measure_text_mono(fonts, lines[0], FONT_SIZE_NORMAL);
+    if (size.y > available_height) return;
+
+    int line_count = 1;
+    float line_step = size.y + 2;
+    if (size.x > available_width && size.y + line_step <= available_height) {
+        snprintf(lines[0], sizeof(lines[0]), "%s", db_text);
+        snprintf(lines[1], sizeof(lines[1]), "%s", freq_text);
+        line_count = 2;
+    }
+
+    float label_height = size.y + (line_count - 1) * line_step;
+    float label_y = anchor.y - dot_radius - 10 - label_height;
+    if (label_y < bounds.y + padding) label_y = anchor.y + dot_radius + 4;
+    label_y = fmaxf(bounds.y + padding,
+                   fminf(label_y, bounds.y + bounds.height - padding - label_height));
+
+    for (int i = 0; i < line_count; i++) {
+        fft_fit_peak_line(fonts, lines[i], sizeof(lines[i]), available_width);
+        if (!lines[i][0]) continue;
+        float label_width = fft_measure_text_mono(fonts, lines[i], FONT_SIZE_NORMAL).x;
+        float label_x = fmaxf(bounds.x + padding,
+            fminf(anchor.x - label_width / 2, bounds.x + bounds.width - padding - label_width));
+        fft_draw_text_mono(fonts, lines[i], label_x, label_y + i * line_step,
+                          FONT_SIZE_NORMAL, COLOR_TEXT);
+    }
+}
+
+// Chrome-hidden flag for the gui_fft_render call in progress. gui_fft_render's
+// signature is public API (gui_fft.h) and fft_state_t cannot carry the flag,
+// so the FFT panel render (fft_panel_state_t wrapper below) publishes its
+// double-click chrome-hide state here immediately before its single call.
+// gui_fft_render has no other callers and always runs on the render thread,
+// so the flag never races or leaks between panels.
+static bool s_fft_chrome_hidden = false;
+
+// Log-frequency-axis toggle + the Scale-button rect, published per render
+// by the panel wrapper (the same single-render-call pattern as the chrome
+// flag above; the click handler reads them from the per-panel wrapper).
+static bool s_fft_log_scale = false;
+static Rectangle s_fft_scale_btn_rect = {0};
+
+void gui_fft_render(fft_state_t *state, float x, float y,
+                    float width, float height, Color color, Font *fonts) {
+#if LIBFFTW_ENABLED
+    if (!state || !state->initialized) return;
+
+    (void)color; // Not used currently
+
+    // Get sample rate from atomic (set by display thread)
+    uint32_t sample_rate = atomic_load(&state->sample_rate);
+
+    int rt_width = (int)width;
+    int rt_height = (int)height;
+
+    // Ensure we have phosphor render textures of the right size
+    Vector2 render_scale = gui_ui_get_render_scale();
+    if (!phosphor_rt_init(&state->phosphor, rt_width, rt_height,
+                          render_scale.x, render_scale.y)) {
+        // Fallback: just draw background
+        DrawRectangle((int)x, (int)y, rt_width, rt_height, COLOR_METER_BG);
+        fft_draw_text(fonts, "FFT: GPU init failed", x + 10, y + 10, FONT_SIZE_OSC_SCALE, (Color){255, 80, 80, 255});
+        return;
+    }
+
+    // Begin phosphor frame (applies decay and prepares for drawing)
+    phosphor_rt_begin_frame(&state->phosphor);
+
+    // Draw FFT bins as connected line segments (with zoom/pan)
+    if (state->magnitude && state->data_ready && state->fft_bins > 1) {
+        Color lineColor = phosphor_rt_get_draw_color(&state->phosphor);
+
+        int fft_bins = state->fft_bins;
+        float zoom = state->zoom_level;
+        float pan = state->pan_offset;
+        // The axis window [pan, pan + 1/zoom] converts back through the
+        // inverse transform to a bin range; DC (bin 0) has no place on a
+        // log axis and is excluded.
+        bool log_scale = s_fft_log_scale;
+        float start_norm = fft_axis_to_freq_norm(pan, log_scale, fft_bins);
+        float end_norm = fft_axis_to_freq_norm(pan + 1.0f / zoom, log_scale, fft_bins);
+
+        // Convert to bin indices
+        int start_bin = (int)(start_norm * (fft_bins - 1));
+        int end_bin = (int)ceilf(end_norm * (fft_bins - 1));
+        if (log_scale && start_bin < 1) start_bin = 1;   // skip DC on the log axis
+        if (start_bin < 0) start_bin = 0;
+        if (end_bin >= fft_bins) end_bin = fft_bins - 1;
+
+        for (int bin = start_bin; bin < end_bin; bin++) {
+            float intensity1 = state->magnitude[bin];
+            float intensity2 = state->magnitude[bin + 1];
+
+            // Convert bin to normalized frequency (0-1), then through the
+            // active axis transform: screen_x = (axis - pan) * zoom * width
+            float freq_norm1 = (float)bin / (float)(fft_bins - 1);
+            float freq_norm2 = (float)(bin + 1) / (float)(fft_bins - 1);
+            float x1 = (fft_freq_norm_to_axis(freq_norm1, log_scale, fft_bins) - pan) * zoom * rt_width;
+            float x2 = (fft_freq_norm_to_axis(freq_norm2, log_scale, fft_bins) - pan) * zoom * rt_width;
+            if (x2 < -2.0f || x1 > rt_width + 2.0f) continue;  // off-screen cull
+
+            // Y positions based on intensity (0 = bottom, 1 = top)
+            float y1 = rt_height - (intensity1 * rt_height);
+            float y2 = rt_height - (intensity2 * rt_height);
+
+            // Draw line segment
+            DrawLineEx((Vector2){x1, y1}, (Vector2){x2, y2}, 1.5f, lineColor);
+        }
+    }
+
+    // End phosphor frame (finalize accumulation buffer)
+    phosphor_rt_end_frame(&state->phosphor);
+
+    // Draw background (same as oscilloscope)
+    DrawRectangle((int)x, (int)y, rt_width, rt_height, COLOR_METER_BG);
+
+    // Grid setup
+    float db_range = FFT_DB_MAX - FFT_DB_MIN;
+    float rough_db_division = db_range * (float)FFT_GRID_MIN_SPACING_PX / height;
+    float db_division = (float)fft_snap_to_125((double)rough_db_division);
+
+    // First gridline
+    float first_db = ceilf(FFT_DB_MIN / db_division) * db_division;
+    int div_count = 0;
+
+    for (float db = first_db;
+        db <= FFT_DB_MAX && div_count < FFT_GRID_MAX_DIVISIONS;
+        db += db_division)
+    {
+        // Skip min/max gridlines (draw only interior lines)
+        if (db <= FFT_DB_MIN || db >= FFT_DB_MAX)
+            continue;
+
+        float normalized = (db - FFT_DB_MIN) / db_range;
+        float line_y = y + height - (normalized * height);
+
+        bool is_zero = (db == 0.0f);
+
+        DrawLineV((Vector2){x, line_y}, (Vector2){x + width, line_y},
+                is_zero ? COLOR_GRID_MAJOR : COLOR_GRID);
+
+        // dB labels are axis STATISTICS: they stay visible even while the
+        // panel's chrome is hidden (the toggle hides only the UI controls -
+        // the Scale button and the FFT title - not the axis/grid readouts).
+        {
+            char label[16];
+            snprintf(label, sizeof(label), "%+.0fdB", db);
+            fft_draw_text_mono(fonts, label, x + 5, line_y, FONT_SIZE_OSC_SCALE, COLOR_TEXT_DIM);
+        }
+
+        div_count++;
+    }
+
+    // Draw vertical frequency grid lines (1-2-5 snapping on the linear axis;
+    // on the log axis 1-2-5 per decade, falling back to the linear walk when
+    // a zoomed view spans under about a decade - over a sub-decade span the
+    // log axis is near-linear and equal-frequency lines are evenly placed).
+    if (sample_rate > 0) {
+        float nyquist = (float)sample_rate / 2.0f;
+        float zoom = state->zoom_level;
+        float pan = state->pan_offset;
+        bool log_scale = s_fft_log_scale && state->fft_bins > 1;
+
+        float grid_freqs[FFT_GRID_MAX_DIVISIONS];
+        int grid_count = 0;
+        bool decade_grid = false;
+        float freq_division = 0.0f;
+        if (log_scale) {
+            float axis_start = pan < 0.0f ? 0.0f : pan;
+            float axis_end = pan + 1.0f / zoom;
+            if (axis_end > 1.0f) axis_end = 1.0f;
+            float vis_start = fft_axis_to_freq_norm(axis_start, true, state->fft_bins) * nyquist;
+            float vis_end = fft_axis_to_freq_norm(axis_end, true, state->fft_bins) * nyquist;
+            grid_count = fft_log_grid_lines(vis_start, vis_end, grid_freqs, FFT_GRID_MAX_DIVISIONS);
+            decade_grid = grid_count >= 3;
+        }
+        if (!decade_grid) {
+            // Visible frequency range based on zoom/pan
+            float visible_freq_start = pan * nyquist;
+            float visible_freq_end = (pan + 1.0f / zoom) * nyquist;
+            float freq_per_pixel = (visible_freq_end - visible_freq_start) / width;
+
+            // Snap the division to the 1-2-5 sequence
+            float rough_division = freq_per_pixel * (float)FFT_GRID_MIN_SPACING_PX;
+            freq_division = (float)fft_snap_to_125((double)rough_division);
+
+            float first_grid_freq = ceilf(visible_freq_start / freq_division) * freq_division;
+            for (float freq = first_grid_freq;
+                 freq < visible_freq_end && grid_count < FFT_GRID_MAX_DIVISIONS;
+                 freq += freq_division) {
+                grid_freqs[grid_count++] = freq;
+            }
+        }
+
+        // Draw the collected gridlines through the active axis transform
+        char freq_buf[32];
+        for (int i = 0; i < grid_count; i++) {
+            float freq = grid_freqs[i];
+            float freq_norm = freq / nyquist;  // Normalized frequency (0-1)
+            float axis = fft_freq_norm_to_axis(freq_norm, log_scale, state->fft_bins);
+            float screen_norm = (axis - pan) * zoom;  // Normalized screen position (0-1)
+            float line_x = x + (screen_norm * width);
+
+            // Only draw if within visible bounds
+            if (line_x >= x && line_x <= x + width) {
+                DrawLineV((Vector2){line_x, y}, (Vector2){line_x, y + height}, COLOR_GRID);
+
+                // Draw frequency label (skip if too close to edges). Axis
+                // labels are STATISTICS: visible even while the chrome is
+                // hidden (only the UI controls hide).
+                if (line_x > x + 30 && line_x < x + width - 30) {
+                    format_freq_label(freq_buf, sizeof(freq_buf), freq);
+                    float label_w = fft_measure_text_mono(fonts, freq_buf, FONT_SIZE_OSC_SCALE).x;
+                    fft_draw_text_mono(fonts, freq_buf, line_x - label_w / 2, y + height - 14, FONT_SIZE_OSC_SCALE, COLOR_TEXT_DIM);
+                }
+            }
+        }
+
+        // /div + zoom/span readouts are STATISTICS: always visible (the
+        // chrome toggle hides only the UI controls, not these readouts).
+        {
+            if (decade_grid) {
+                // A log axis has no fixed per-division step: show the
+                // visible frequency span instead of N/div.
+                float axis_start = pan < 0.0f ? 0.0f : pan;
+                float axis_end = pan + 1.0f / zoom;
+                if (axis_end > 1.0f) axis_end = 1.0f;
+                float vis_start = fft_axis_to_freq_norm(axis_start, true, state->fft_bins) * nyquist;
+                float vis_end = fft_axis_to_freq_norm(axis_end, true, state->fft_bins) * nyquist;
+                char start_buf[32], end_buf[32];
+                format_freq_label(start_buf, sizeof(start_buf), vis_start);
+                format_freq_label(end_buf, sizeof(end_buf), vis_end);
+                char span_label[72];
+                snprintf(span_label, sizeof(span_label), "%s-%s", start_buf, end_buf);
+                float span_label_w = fft_measure_text_mono(fonts, span_label, FONT_SIZE_OSC_DIV).x;
+                fft_draw_text_mono(fonts, span_label, x + width - span_label_w - 8, y + 26, FONT_SIZE_OSC_DIV, COLOR_TEXT);
+            } else {
+                // Show frequency per division in top-right corner (below FFT label)
+                format_freq_label(freq_buf, sizeof(freq_buf), freq_division);
+                char div_label[48];
+                snprintf(div_label, sizeof(div_label), "%s/div", freq_buf);
+                float div_label_w = fft_measure_text_mono(fonts, div_label, FONT_SIZE_OSC_DIV).x;
+                fft_draw_text_mono(fonts, div_label, x + width - div_label_w - 8, y + 26, FONT_SIZE_OSC_DIV, COLOR_TEXT);
+            }
+
+            // Show zoom level if zoomed in
+            if (zoom > 1.01f) {
+                char zoom_label[32];
+                snprintf(zoom_label, sizeof(zoom_label), "%.1fx", zoom);
+                float zoom_label_w = fft_measure_text_mono(fonts, zoom_label, FONT_SIZE_OSC_DIV).x;
+                fft_draw_text_mono(fonts, zoom_label, x + width - zoom_label_w - 8, y + 42, FONT_SIZE_OSC_DIV, COLOR_TEXT_DIM);
+            }
+        }
+    }
+
+    // Draw center line (0V equivalent position not applicable for FFT, skip)
+
+    // Border (same as oscilloscope)
+    DrawRectangleLinesEx((Rectangle){x, y, width, height}, 1, COLOR_GRID_MAJOR);
+
+    // Render phosphor texture with heatmap colormap and bloom
+    phosphor_rt_render(&state->phosphor, x, y, true);
+
+    // Update peak-hold buffer: max-hold with decay for stable peak detection
+    if (state->magnitude && state->peak_hold && state->fft_bins > 1) {
+        int fft_bins = state->fft_bins;
+        for (int i = 0; i < fft_bins; i++) {
+            // Decay existing peak-hold value
+            state->peak_hold[i] *= FFT_PEAK_HOLD_DECAY;
+            // Take max of decayed value and current magnitude
+            if (state->magnitude[i] > state->peak_hold[i]) {
+                state->peak_hold[i] = state->magnitude[i];
+            }
+        }
+    }
+
+    // Peak detection on mouse hover - show closest peak to mouse (with
+    // zoom/pan support). The peak marker + readout are STATISTICS: always
+    // visible (the chrome toggle hides only the UI controls).
+    if (state->peak_hold && state->data_ready && state->fft_bins > 1 && sample_rate > 0) {
+        Vector2 mouse = gui_ui_get_mouse_position();
+        Rectangle fft_rect = {x, y, width, height};
+
+        if (CheckCollisionPointRec(mouse, fft_rect)) {
+            float nyquist = (float)sample_rate / 2.0f;
+            int fft_bins = state->fft_bins;
+            float zoom = state->zoom_level;
+            float pan = state->pan_offset;
+            bool log_scale = s_fft_log_scale && fft_bins > 1;
+
+            // Convert mouse X to normalized frequency using zoom/pan
+            // screen_norm = (freq_norm - pan) * zoom
+            // => freq_norm = screen_norm / zoom + pan  (axis space; converted
+            // through the inverse transform on the log axis)
+            float screen_norm = (mouse.x - x) / width;  // 0.0 to 1.0
+            float freq_norm = fft_axis_to_freq_norm(screen_norm / zoom + pan, log_scale, fft_bins);
+
+            // Convert to bin index
+            int mouse_bin = (int)(freq_norm * (fft_bins - 1) + 0.5f);
+            if (mouse_bin < 0) mouse_bin = 0;
+            if (mouse_bin >= fft_bins) mouse_bin = fft_bins - 1;
+
+            // Calculate search radius in bins (adjusted for zoom)
+            // At higher zoom, bins are wider on screen, so search covers fewer bins
+            float bin_width_screen = width * zoom / (float)(fft_bins - 1);
+            int search_radius_bins = (int)(FFT_PEAK_SEARCH_RADIUS_PX / bin_width_screen + 0.5f);
+            if (search_radius_bins < 2) search_radius_bins = 2;
+
+            // Find peaks near mouse using peak-hold data (stable envelope)
+            // Use larger buffer to find all candidates, then select closest
+            fft_peak_t peaks[FFT_PEAK_MAX_CANDIDATES];
+            int peak_count = fft_find_peaks_near(state->peak_hold, fft_bins,
+                                                  mouse_bin, search_radius_bins,
+                                                  FFT_PEAK_MIN_PROMINENCE,
+                                                  peaks, FFT_PEAK_MAX_CANDIDATES);
+
+            // Find the best peak - balance between closest to mouse and largest magnitude
+            if (peak_count > 0) {
+                // Find the maximum magnitude among candidates for normalization
+                float max_mag = peaks[0].magnitude;
+                for (int i = 1; i < peak_count; i++) {
+                    if (peaks[i].magnitude > max_mag) {
+                        max_mag = peaks[i].magnitude;
+                    }
+                }
+
+                // Score each peak: use circular (Euclidean) distance from mouse
+                // Calculate screen position for each peak and measure actual distance
+                // Weight magnitude more heavily so prominent peaks are preferred
+                const float distance_weight = 0.3f;
+                const float magnitude_weight = 0.7f;
+                float search_radius_px = (float)FFT_PEAK_SEARCH_RADIUS_PX;
+
+                int best_idx = 0;
+                float best_score = -1.0f;
+
+                for (int i = 0; i < peak_count; i++) {
+                    // Calculate screen position for this peak using zoom/pan
+                    int bin = peaks[i].bin;
+                    float peak_mag = state->peak_hold[bin];
+                    float bin_freq_norm = (float)bin / (float)(fft_bins - 1);
+                    float px = x + (fft_freq_norm_to_axis(bin_freq_norm, log_scale, fft_bins) - pan) * zoom * width;
+                    float py = y + height - (peak_mag * height);
+
+                    // Calculate circular (Euclidean) distance from mouse
+                    float dx = px - mouse.x;
+                    float dy = py - mouse.y;
+                    float dist = sqrtf(dx * dx + dy * dy);
+
+                    // Only consider peaks within circular radius
+                    if (dist > search_radius_px) continue;
+
+                    float distance_score = 1.0f - dist / search_radius_px;
+                    float magnitude_score = (max_mag > 0) ? peaks[i].magnitude / max_mag : 0.0f;
+                    float score = distance_weight * distance_score + magnitude_weight * magnitude_score;
+
+                    if (score > best_score) {
+                        best_score = score;
+                        best_idx = i;
+                    }
+                }
+
+                // Skip if no peak within circular radius
+                if (best_score < 0) {
+                    state->peak_label_active = false;
+                } else {
+
+                // Get the peak-hold magnitude for rendering
+                int peak_bin = peaks[best_idx].bin;
+                float peak_mag = state->peak_hold[peak_bin];
+
+                // Calculate screen position for closest peak using zoom/pan
+                float peak_freq_norm = (float)peak_bin / (float)(fft_bins - 1);
+                float peak_x = x + (fft_freq_norm_to_axis(peak_freq_norm, log_scale, fft_bins) - pan) * zoom * width;
+                float peak_y = y + height - (peak_mag * height);
+
+                // Calculate frequency and dB
+                float freq = (float)peak_bin / (float)(fft_bins - 1) * nyquist;
+                float db = FFT_DB_MIN + peak_mag * db_range;
+
+                // Draw peak marker (dot) - at actual peak position (no smoothing)
+                float dot_radius = 4.0f;
+                DrawCircleV((Vector2){peak_x, peak_y}, dot_radius, COLOR_TEXT);
+
+                // Apply EMA smoothing to label position only
+                float label_anchor_x, label_anchor_y;
+                if (!state->peak_label_active) {
+                    // First time - initialize directly to raw position
+                    state->peak_label_x = peak_x;
+                    state->peak_label_y = peak_y;
+                    state->peak_label_bin = peak_bin;
+                    state->peak_label_active = true;
+                    label_anchor_x = peak_x;
+                    label_anchor_y = peak_y;
+                } else {
+                    // Apply EMA: smoothed = alpha * raw + (1 - alpha) * previous
+                    state->peak_label_x = FFT_PEAK_LABEL_EMA_ALPHA * peak_x +
+                                          (1.0f - FFT_PEAK_LABEL_EMA_ALPHA) * state->peak_label_x;
+                    state->peak_label_y = FFT_PEAK_LABEL_EMA_ALPHA * peak_y +
+                                          (1.0f - FFT_PEAK_LABEL_EMA_ALPHA) * state->peak_label_y;
+                    state->peak_label_bin = peak_bin;
+                    label_anchor_x = state->peak_label_x;
+                    label_anchor_y = state->peak_label_y;
+                }
+
+                // Format frequency label
+                char freq_buf[32];
+                format_freq_label(freq_buf, sizeof(freq_buf), freq);
+
+                // Format dB label
+                char db_buf[16];
+                snprintf(db_buf, sizeof(db_buf), "%.1fdB", db);
+
+                // Use the rendered font metrics and retain the smoothed anchor.
+                fft_draw_peak_label(fonts, db_buf, freq_buf,
+                    (Vector2){label_anchor_x, label_anchor_y}, dot_radius, fft_rect);
+                }  // end if (best_score >= 0)
+            } else {
+                // No peak found - deactivate label smoothing
+                state->peak_label_active = false;
+            }
+        } else {
+            // Mouse left FFT area - deactivate label smoothing
+            state->peak_label_active = false;
+        }
+    }
+
+    // Draw "FFT" label in top-right corner (matching oscilloscope channel
+    // label style). Overlay chrome: hidden with the panel's chrome toggle.
+    if (!s_fft_chrome_hidden) {
+        const char *fft_label = "FFT";
+        int label_width = fft_measure_text(fonts, fft_label, FONT_SIZE_OSC_LABEL);
+        fft_draw_text(fonts, fft_label, x + width - label_width - 8, y + 4, FONT_SIZE_OSC_LABEL, COLOR_TEXT);
+    }
+
+    // Scale toggle button (Linear/Log) in the top-left corner, next to the
+    // annotation chrome. The rect is published per render by the panel
+    // wrapper; the click handler reads it from the per-panel state. Like
+    // every other control it is overlay chrome (UI): hidden with the toggle
+    // - the axis/stat readouts above stay visible.
+    if (!s_fft_chrome_hidden && s_fft_scale_btn_rect.width > 0.0f) {
+        const char *scale_label = s_fft_log_scale ? "Scale: Log" : "Scale: Linear";
+        Rectangle btn = s_fft_scale_btn_rect;
+        Vector2 mouse = gui_ui_get_mouse_position();
+        Color btn_bg = CheckCollisionPointRec(mouse, btn) ? COLOR_BUTTON_HOVER : COLOR_BUTTON;
+        DrawRectangleRounded(btn, 0.15f, 4, btn_bg);
+        float scale_text_w = (float)gui_text_measure(scale_label, FONT_SIZE_DROPDOWN_OPT);
+        gui_text_draw(scale_label, btn.x + (btn.width - scale_text_w) * 0.5f,
+                      btn.y + (btn.height - FONT_SIZE_DROPDOWN_OPT) * 0.5f,
+                      FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+    }
+
+#else
+    (void)state;
+    (void)x;
+    (void)y;
+    (void)width;
+    (void)height;
+    (void)color;
+    (void)fonts;
+#endif
+}
+
+//=============================================================================
+// Zoom and Pan Interaction
+//=============================================================================
+
+// FFT panel state: the base fft engine plus the per-instance double-click
+// chrome-hide tracker. Declared here (before the zoom/pan handlers and the
+// vtable below) because those functions carry the panel state. Processing
+// still happens in the display thread via the embedded fft_state_t.
+typedef struct {
+    fft_state_t fft;
+    gui_chrome_hide_t chrome_hide;   // double-click toggles the UI chrome (the
+                                     // Scale button + the FFT title); the axis
+                                     // dB/frequency labels and the /div, span
+                                     // and peak readouts stay visible
+    bool log_scale;                  // Linear/Log frequency-axis toggle (false
+                                     // = Linear, the stock original default)
+    Rectangle scale_btn_rect;         // cached Scale-button rect for the click handler
+    uint32_t remote_last_sequence;
+    bool remote_has_frame;
+} fft_panel_state_t;
+
+// Zoom limits
+#define FFT_ZOOM_MIN 1.0f      // No zoom (full spectrum)
+#define FFT_ZOOM_MAX 64.0f     // Maximum zoom (64x)
+#define FFT_ZOOM_FACTOR 1.15f  // Zoom step per scroll tick
+
+// Handle mouse scroll for zoom (X-axis only, centered on mouse position)
+static bool fft_handle_scroll(void *state_ptr, float delta, Rectangle bounds) {
+#if LIBFFTW_ENABLED
+    if (!state_ptr || delta == 0.0f) return false;
+
+    fft_panel_state_t *panel = (fft_panel_state_t *)state_ptr;
+    fft_state_t *state = &panel->fft;
+    if (!state->initialized) return false;
+
+    Vector2 mouse = gui_ui_get_mouse_position();
+
+    // Check if mouse is inside bounds
+    if (!CheckCollisionPointRec(mouse, bounds)) return false;
+
+    // Calculate the normalized frequency position under mouse before zoom
+    float rel_x = (mouse.x - bounds.x) / bounds.width;  // 0.0 to 1.0
+    float freq_under_mouse = state->pan_offset + rel_x / state->zoom_level;
+
+    // Apply zoom
+    if (delta > 0.0f) {
+        // Scroll up = zoom in
+        state->zoom_level *= FFT_ZOOM_FACTOR;
+        if (state->zoom_level > FFT_ZOOM_MAX) state->zoom_level = FFT_ZOOM_MAX;
+    } else {
+        // Scroll down = zoom out
+        state->zoom_level /= FFT_ZOOM_FACTOR;
+        if (state->zoom_level < FFT_ZOOM_MIN) state->zoom_level = FFT_ZOOM_MIN;
+    }
+
+    // Adjust pan to keep the frequency under mouse at the same screen position
+    // freq_under_mouse = pan_offset + rel_x / zoom_level
+    // => pan_offset = freq_under_mouse - rel_x / zoom_level
+    state->pan_offset = freq_under_mouse - rel_x / state->zoom_level;
+
+    // Clamp pan to valid range [0, 1 - 1/zoom]
+    float max_pan = 1.0f - 1.0f / state->zoom_level;
+    if (max_pan < 0.0f) max_pan = 0.0f;
+    if (state->pan_offset < 0.0f) state->pan_offset = 0.0f;
+    if (state->pan_offset > max_pan) state->pan_offset = max_pan;
+
+    return true;
+#else
+    (void)state_ptr;
+    (void)delta;
+    (void)bounds;
+    return false;
+#endif
+}
+
+// Handle mouse click for drag-to-pan and the double-click chrome toggle
+static bool fft_handle_click(void *state_ptr, struct gui_app *app, int channel,
+                              Vector2 click, Rectangle bounds) {
+#if LIBFFTW_ENABLED
+    (void)app;
+    (void)channel;
+
+    if (!state_ptr) return false;
+
+    fft_panel_state_t *panel = (fft_panel_state_t *)state_ptr;
+    fft_state_t *state = &panel->fft;
+    if (!state->initialized) return false;
+
+    // Click outside the panel resets double-click tracking (and cancels any
+    // pan drag).
+    if (!CheckCollisionPointRec(click, bounds)) {
+        gui_chrome_hide_reset(&panel->chrome_hide);
+        state->dragging = false;
+        return false;
+    }
+
+    // Scale toggle button (Linear/Log): a control click, so it also resets
+    // the double-click tracker (mirrors the other panels' controls). The
+    // button is not drawn while the chrome is hidden, so its (stale) rect
+    // must not trigger; the click then falls through to the chrome feed
+    // below.
+    if (!gui_chrome_hide_hidden(&panel->chrome_hide) &&
+        panel->scale_btn_rect.width > 0.0f &&
+        CheckCollisionPointRec(click, panel->scale_btn_rect)) {
+        gui_chrome_hide_reset(&panel->chrome_hide);
+        panel->log_scale = !panel->log_scale;
+        return true;
+    }
+
+    // Every other in-bounds click feeds the double-click chrome toggle. A
+    // double-click toggles the annotation labels and consumes the click; a
+    // single click still falls through to the pan drag below (data
+    // interaction, unchanged).
+    if (gui_chrome_hide_feed_click(&panel->chrome_hide, click)) {
+        return true;
+    }
+
+    // Only allow panning when zoomed in
+    if (state->zoom_level <= 1.0f) return false;
+
+    // Start dragging
+    if (gui_ui_mouse_button_pressed(MOUSE_LEFT_BUTTON)) {
+        state->dragging = true;
+        state->drag_start_x = click.x;
+        state->drag_start_pan = state->pan_offset;
+        return true;
+    }
+
+    return false;
+#else
+    (void)state_ptr;
+    (void)app;
+    (void)channel;
+    (void)click;
+    (void)bounds;
+    return false;
+#endif
+}
+
+// Update drag state (call from render to handle continuous drag)
+static void fft_update_drag(fft_state_t *state, Rectangle bounds) {
+#if LIBFFTW_ENABLED
+    if (!state || !state->initialized || !state->dragging) return;
+
+    Vector2 mouse = gui_ui_get_mouse_position();
+
+    if (gui_ui_mouse_button_down(MOUSE_LEFT_BUTTON)) {
+        // Calculate pan delta based on mouse movement
+        float dx = mouse.x - state->drag_start_x;
+        // Convert pixel delta to normalized frequency delta
+        // At zoom_level, the visible frequency range is 1/zoom_level
+        // So pixel movement maps to frequency: dx / width * (1/zoom_level)
+        float freq_delta = -dx / bounds.width / state->zoom_level;
+        state->pan_offset = state->drag_start_pan + freq_delta;
+
+        // Clamp pan to valid range
+        float max_pan = 1.0f - 1.0f / state->zoom_level;
+        if (max_pan < 0.0f) max_pan = 0.0f;
+        if (state->pan_offset < 0.0f) state->pan_offset = 0.0f;
+        if (state->pan_offset > max_pan) state->pan_offset = max_pan;
+    } else {
+        // Mouse released - stop dragging
+        state->dragging = false;
+    }
+#else
+    (void)state;
+    (void)bounds;
+#endif
+}
+
+//=============================================================================
+// Panel Interface (vtable) Implementation
+//=============================================================================
+
+// FFT panel state is the fft_panel_state_t wrapper (see the Zoom and Pan
+// Interaction section above). Processing happens in display thread via the
+// embedded fft_state_t, rendering in render thread.
+
+//-----------------------------------------------------------------------------
+// Lifecycle Functions
+//-----------------------------------------------------------------------------
+
+static void *fft_vtable_create(void) {
+#if LIBFFTW_ENABLED
+    fft_panel_state_t *panel = calloc(1, sizeof(fft_panel_state_t));
+    if (!panel) return NULL;
+
+    if (!gui_fft_init(&panel->fft)) {
+        free(panel);
+        return NULL;
+    }
+
+    return panel;
+#else
+    return NULL;
+#endif
+}
+
+static void fft_vtable_destroy(void *state_ptr) {
+    if (!state_ptr) return;
+    fft_panel_state_t *panel = (fft_panel_state_t *)state_ptr;
+    gui_fft_cleanup(&panel->fft);
+    free(panel);
+}
+
+static void fft_vtable_clear(void *state_ptr) {
+    if (!state_ptr) return;
+    fft_panel_state_t *panel = (fft_panel_state_t *)state_ptr;
+    gui_fft_clear(&panel->fft);
+}
+
+//-----------------------------------------------------------------------------
+// Processing Function (called from display thread with raw ADC samples)
+//-----------------------------------------------------------------------------
+
+static void fft_vtable_process(void *state_ptr, const int16_t *samples, size_t count, uint32_t sample_rate) {
+    if (!state_ptr || !samples || count == 0) return;
+    fft_panel_state_t *panel = (fft_panel_state_t *)state_ptr;
+
+    // Process raw ADC samples and compute FFT
+    gui_fft_process_raw(&panel->fft, samples, count, sample_rate);
+}
+
+//-----------------------------------------------------------------------------
+// Rendering Functions
+//-----------------------------------------------------------------------------
+
+static void fft_vtable_render(void *state_ptr, gui_app_t *app, int channel,
+                              Rectangle bounds, Color channel_color) {
+    (void)channel;  // FFT uses sample_rate from state, not channel-specific
+
+    if (!state_ptr || !app) return;
+
+    fft_panel_state_t *panel = (fft_panel_state_t *)state_ptr;
+    fft_state_t *fft = &panel->fft;
+
+    if (!fft->initialized) {
+        const char *text = gui_fft_available() ? "FFT Initializing..." : "FFT Not Available";
+        int text_width = MeasureText(text, FONT_SIZE_OSC_MSG);
+        DrawText(text, (int)(bounds.x + bounds.width/2 - text_width/2),
+                 (int)(bounds.y + bounds.height/2 - 12),
+                 FONT_SIZE_OSC_MSG, COLOR_TEXT_DIM);
+        return;
+    }
+
+    // Update drag state for pan (continuous while mouse is held)
+    if (app->settings_panel_open) fft->dragging = false;
+    fft_update_drag(fft, bounds);
+
+    // Swap buffers to get latest FFT data from display thread
+    gui_fft_swap_buffers(fft);
+
+    // Publish the panel's double-click chrome state and the Linear/Log
+    // scale mode for the draws inside gui_fft_render (see the statics
+    // above), and cache the Scale-button rect for the click handler.
+    // gui_text_measure falls back to the default font, so this also works
+    // headless.
+    s_fft_chrome_hidden = gui_chrome_hide_hidden(&panel->chrome_hide);
+    s_fft_log_scale = panel->log_scale;
+    {
+        const char *scale_label = panel->log_scale ? "Scale: Log" : "Scale: Linear";
+        float btn_w = (float)gui_text_measure(scale_label, FONT_SIZE_DROPDOWN_OPT) + 16.0f;
+        if (btn_w < 96.0f) btn_w = 96.0f;
+        panel->scale_btn_rect = (Rectangle){bounds.x + 8.0f, bounds.y + 4.0f, btn_w, 18.0f};
+    }
+    s_fft_scale_btn_rect = panel->scale_btn_rect;
+
+    // Render FFT (sample_rate is read atomically inside gui_fft_render)
+    gui_fft_render(fft, bounds.x, bounds.y, bounds.width, bounds.height,
+                   channel_color, app->fonts);
+}
+
+//-----------------------------------------------------------------------------
+// Vtable Definition
+//-----------------------------------------------------------------------------
+
+static const panel_vtable_t s_fft_vtable = {
+    .name = "FFT",
+
+    // Lifecycle
+    .create = fft_vtable_create,
+    .destroy = fft_vtable_destroy,
+    .clear = fft_vtable_clear,
+
+    // Processing (no-op for FFT - uses display samples in render)
+    .process = fft_vtable_process,
+
+    // Rendering
+    .render = fft_vtable_render,
+    .render_overlay = NULL,  // No overlay for FFT
+
+    // Interaction
+    .handle_click = fft_handle_click,    // Drag to pan
+    .handle_scroll = fft_handle_scroll,  // Scroll to zoom (centered on mouse)
+
+    // Menus
+    .get_menu_count = NULL,
+    .get_menu = NULL,
+};
+
+//-----------------------------------------------------------------------------
+// Registration
+//-----------------------------------------------------------------------------
+
+void gui_fft_panel_register(void) {
+    panel_register(PANEL_VIEW_FFT, &s_fft_vtable);
+}
+
+/* Shared original Local FFTW path; FFTW processing before GUI EMA. */
+static atomic_flag s_rd_fft_lock=ATOMIC_FLAG_INIT;
+void gui_fft_server_bins(const int16_t *samples,size_t count,uint32_t rate,float *out,size_t bins){
+    if(!out||bins!=FFT_SIZE_MAX/2+1)return;
+    memset(out,0,bins*sizeof(float));
+#if LIBFFTW_ENABLED
+    if(!samples||count<FFT_SIZE_MIN)return;
+    while(atomic_flag_test_and_set_explicit(&s_rd_fft_lock,memory_order_acquire))thrd_sleep_ms(1);
+    static fft_state_t fft;
+    static bool started=false;
+    if(!started){started=gui_fft_init(&fft);}
+    if(started){
+        gui_fft_process_raw(&fft,samples,count,rate);
+        if(fft.fft_bins==(int)bins)memcpy(out,fft.magnitude_back,bins*sizeof(float));
+    }
+    atomic_flag_clear_explicit(&s_rd_fft_lock,memory_order_release);
+#else
+    (void)samples;(void)count;(void)rate;
+#endif
+}
+void gui_fft_remote_apply_float(void *state_ptr,const float *bins,size_t n,
+                                uint32_t sample_rate,uint32_t sequence){
+#if LIBFFTW_ENABLED
+    if(!state_ptr||!bins||n!=FFT_SIZE_MAX/2+1||!sample_rate)return;
+    fft_panel_state_t *p=(fft_panel_state_t*)state_ptr;
+    fft_state_t *s=&p->fft;
+    if(!s->initialized||(p->remote_has_frame&&p->remote_last_sequence==sequence))return;
+    if(s->fft_size!=FFT_SIZE_MAX&&!fft_resize(s,FFT_SIZE_MAX))return;
+    memcpy(s->magnitude_back,bins,n*sizeof(float));
+    atomic_store(&s->sample_rate,sample_rate);
+    atomic_store(&s->magnitude_ready,1);
+    p->remote_last_sequence=sequence;
+    p->remote_has_frame=true;
+#else
+    (void)state_ptr;(void)bins;(void)n;(void)sample_rate;(void)sequence;
+#endif
+}

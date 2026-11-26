@@ -40,6 +40,8 @@ void panel_clear_view_state(panel_view_type_t type, void *state);
 
 // Render all panels for a channel using the panel configuration
 // This is the main entry point for panel rendering
+// A popped-out slot's panel at bounds (gui_popout.c, inside its render texture).
+void panel_render_popout(gui_app_t *app, int channel, int side, Rectangle bounds);
 void render_channel_panels(gui_app_t *app, int channel,
                            float x, float y, float width, float height,
                            Color channel_color);
