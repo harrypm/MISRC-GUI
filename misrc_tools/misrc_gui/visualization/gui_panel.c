@@ -130,7 +130,8 @@ static void render_single_panel(gui_app_t *app, int channel, int side,
         return;
     }
     render_single_panel_impl(app, channel, type, state, bounds, color);
-    if (gui_popout_available() && app->settings.net_mode != GUI_NET_MODE_MONITOR_CLIENT)
+    // Pop-out button (desktop) or full-screen button (mobile / no GLFW).
+    if (app->settings.net_mode != GUI_NET_MODE_MONITOR_CLIENT)
         gui_popout_draw_button(channel, side, bounds);
 }
 
@@ -450,6 +451,7 @@ static bool try_panel_scroll(panel_view_type_t type, void *state,
 
 bool panel_handle_all_scrolls(gui_app_t *app, float delta) {
     if (!app || app->settings_panel_open || delta == 0.0f) return false;
+    if (gui_popout_fullscreen_scroll(app, delta)) return true;   // full-screen panel
 
     // Process both channels
     for (int ch = 0; ch < 2; ch++) {

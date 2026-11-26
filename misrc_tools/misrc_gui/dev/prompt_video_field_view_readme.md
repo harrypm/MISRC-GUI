@@ -342,3 +342,15 @@ A **View** button (Frame / Split / Field) under Frame: Active/Full, on all three
     - The waveform overlay harness gained the two stubs.
   - Not testable here without sending input to harrypm's session: trigger drag in a pop-out needs harrypm's check.
   - Full rebuild; suite 65/66.
+- **Mobile: panel full screen instead of pop-out** (harrypm 2026-11-26: "make pannel full screen instead of pop out for mobile").
+  - Where pop-out windows do not exist (Android, or a desktop build without GLFW), the corner button is a touch-sized (40x32) full-screen button.
+  - The panel fills the whole app layout, drawn over the UI after the Clay render and inside the Android canvas.
+  - While it is full screen it owns every tap: `gui_handle_interactions` returns early via `gui_popout_fullscreen_input`, so toolbar buttons underneath never fire. The wheel goes to it through `panel_handle_all_scrolls`.
+  - Its corner button, Back or Esc returns it to the grid. On Android `gui_ui.c` maps `IsMouseButtonPressed` to the verified single tap, so panel buttons get real taps through the new `gui_ui_mouse_button_*` helpers.
+  - `--popout` there makes the first named slot full screen.
+  - The full-screen code is shared (`fs_*` in `gui_popout.c`). The desktop build can switch to it at runtime with `MISRC_PANEL_FULLSCREEN=1` (diagnostics), so the Android path is tested on desktop.
+  - Verified:
+    - `MISRC_PANEL_FULLSCREEN=1 --popout b:right`: B's Waveform fills the app window with its controls and the return button.
+    - Grid view shows the full-screen buttons in every panel corner.
+    - `gui_popout.c` compiles clean with `-DMISRC_POPOUT_DISABLED` (`-Wall -Wextra`).
+  - Not built for Android here (no NDK toolchain in this session).

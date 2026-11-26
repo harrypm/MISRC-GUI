@@ -28,6 +28,7 @@
 //-----------------------------------------------------------------------------
 
 static bool s_launch_open[GUI_POPOUT_SLOTS];
+static int s_fs_slot = -1;   // full-screen slot (builds without pop-out windows)
 static bool s_launch_saved[GUI_POPOUT_SLOTS];   // restored at launch: use the saved geometry
 
 bool gui_popout_apply_launch_arg(const char *arg) {
@@ -47,6 +48,97 @@ bool gui_popout_apply_launch_arg(const char *arg) {
     }
     fprintf(stderr, "[AUTO] --popout: %s\n", arg);
     return true;
+}
+
+
+//-----------------------------------------------------------------------------
+// In-app full-screen panels: the mode on Android / without GLFW, and on
+// desktop with MISRC_PANEL_FULLSCREEN=1 (tests the same code path).
+//-----------------------------------------------------------------------------
+
+//-----------------------------------------------------------------------------
+// No pop-out windows (Android / no GLFW): the corner button makes the panel
+// full screen inside the app instead (harrypm 2026-11-26: "make panel full
+// screen instead of pop out for mobile").
+//-----------------------------------------------------------------------------
+
+static Rectangle s_fs_grid_btn[GUI_POPOUT_SLOTS];
+static Rectangle s_fs_exit_btn;
+
+// Touch-sized corner button.
+#define FS_BTN_W 40.0f
+#define FS_BTN_H 32.0f
+
+static void fs_draw_corner_glyph(Rectangle r, bool enter, bool hover) {
+    DrawRectangleRounded(r, 0.2f, 4, hover ? COLOR_BUTTON_HOVER : (Color){ 65, 65, 75, 190 });
+    const Rectangle g = { r.x + 10, r.y + 8, r.width - 20, r.height - 16 };
+    const Color c = COLOR_TEXT;
+    const float k = 6.0f, t = 2.0f;
+    if (enter) {   // corner brackets pointing out = full screen
+        DrawLineEx((Vector2){ g.x, g.y }, (Vector2){ g.x + k, g.y }, t, c);
+        DrawLineEx((Vector2){ g.x, g.y }, (Vector2){ g.x, g.y + k }, t, c);
+        DrawLineEx((Vector2){ g.x + g.width, g.y }, (Vector2){ g.x + g.width - k, g.y }, t, c);
+        DrawLineEx((Vector2){ g.x + g.width, g.y }, (Vector2){ g.x + g.width, g.y + k }, t, c);
+        DrawLineEx((Vector2){ g.x, g.y + g.height }, (Vector2){ g.x + k, g.y + g.height }, t, c);
+        DrawLineEx((Vector2){ g.x, g.y + g.height }, (Vector2){ g.x, g.y + g.height - k }, t, c);
+        DrawLineEx((Vector2){ g.x + g.width, g.y + g.height }, (Vector2){ g.x + g.width - k, g.y + g.height }, t, c);
+        DrawLineEx((Vector2){ g.x + g.width, g.y + g.height }, (Vector2){ g.x + g.width, g.y + g.height - k }, t, c);
+    } else {       // a small framed box = back to the grid
+        DrawRectangleLinesEx(g, t, c);
+    }
+}
+
+static bool fs_is_open(int channel, int side) {
+    return s_fs_slot >= 0 && s_fs_slot == channel * 2 + side;
+}
+static bool fs_open(struct gui_app *app, int channel, int side) {
+    (void)app;
+    const int s = channel * 2 + side;
+    if (s < 0 || s >= GUI_POPOUT_SLOTS) return false;
+    s_fs_slot = s;
+    fprintf(stderr, "[POPOUT] slot %d full screen\n", s);
+    return true;
+}
+static void fs_close(int channel, int side) {
+    if (fs_is_open(channel, side)) {
+        s_fs_slot = -1;
+        fprintf(stderr, "[POPOUT] slot %d back to the grid\n", channel * 2 + side);
+    }
+}
+static void fs_frame(struct gui_app *app) {
+    if (!app) return;
+    for (int s = 0; s < GUI_POPOUT_SLOTS; s++) {
+        if (s_launch_open[s]) {   // --popout: first requested slot goes full screen
+            s_launch_open[s] = false;
+            if (s_fs_slot < 0) fs_open(app, s / 2, s % 2);
+        }
+    }
+}
+static void fs_restore(struct gui_app *app) { (void)app; }
+static void fs_capture_settings(struct gui_app *app) { (void)app; }
+static void fs_shutdown(void) { s_fs_slot = -1; }
+
+static void fs_draw_button(int channel, int side, Rectangle b) {
+    const int s = channel * 2 + side;
+    if (s < 0 || s >= GUI_POPOUT_SLOTS) return;
+    if (b.width < 2.0f * FS_BTN_W || b.height < 2.0f * FS_BTN_H) { s_fs_grid_btn[s] = (Rectangle){ 0 }; return; }
+    s_fs_grid_btn[s] = (Rectangle){ b.x + b.width - FS_BTN_W - 6.0f, b.y + b.height - FS_BTN_H - 6.0f, FS_BTN_W, FS_BTN_H };
+    fs_draw_corner_glyph(s_fs_grid_btn[s], true, CheckCollisionPointRec(gui_ui_get_mouse_position(), s_fs_grid_btn[s]));
+}
+static bool fs_handle_grid_click(struct gui_app *app, int channel, int side, Vector2 click, Rectangle b) {
+    (void)b;
+    const int s = channel * 2 + side;
+    if (s < 0 || s >= GUI_POPOUT_SLOTS || s_fs_slot >= 0) return false;
+    if (s_fs_grid_btn[s].width > 0 && CheckCollisionPointRec(click, s_fs_grid_btn[s])) {
+        fs_open(app, channel, side);
+        return true;
+    }
+    return false;
+}
+static void fs_draw_placeholder(int channel, int side, Rectangle b, const char *view_name) {
+    // Hidden under the full-screen panel; kept plain.
+    (void)channel; (void)side; (void)view_name;
+    DrawRectangleRec(b, COLOR_PANEL_BG);
 }
 
 #if POPOUT_ENABLED
@@ -127,9 +219,16 @@ static bool s_blit_ok;
 static int s_blit_tex_loc = -1;
 static Rectangle s_grid_btn[GUI_POPOUT_SLOTS];
 
-bool gui_popout_available(void) { return true; }
+static bool popout_fs_mode(void) {
+    static int mode = -1;
+    if (mode < 0) mode = getenv("MISRC_PANEL_FULLSCREEN") != NULL;
+    return mode != 0;
+}
+
+bool gui_popout_available(void) { return !popout_fs_mode(); }
 
 bool gui_popout_is_open(int channel, int side) {
+    if (popout_fs_mode()) return fs_is_open(channel, side);
     const int s = channel * 2 + side;
     return s >= 0 && s < GUI_POPOUT_SLOTS && s_po[s].open;
 }
@@ -228,6 +327,7 @@ static void popout_set_fullscreen(popout_t *p, bool on) {
 static bool popout_open_impl(gui_app_t *app, int channel, int side, bool use_saved);
 
 bool gui_popout_open(gui_app_t *app, int channel, int side) {
+    if (popout_fs_mode()) return fs_open(app, channel, side);
     return popout_open_impl(app, channel, side, false);
 }
 
@@ -309,6 +409,7 @@ static bool popout_open_impl(gui_app_t *app, int channel, int side, bool use_sav
 }
 
 void gui_popout_close(int channel, int side) {
+    if (popout_fs_mode()) { fs_close(channel, side); return; }
     const int s = channel * 2 + side;
     if (s < 0 || s >= GUI_POPOUT_SLOTS || !s_po[s].open) return;
     popout_destroy(&s_po[s]);
@@ -347,6 +448,7 @@ static void popout_draw_fs_button(popout_t *p, Rectangle panel, Vector2 mouse) {
 }
 
 void gui_popout_frame(gui_app_t *app) {
+    if (popout_fs_mode()) { fs_frame(app); return; }
     if (!app) return;
     // Launch flags / restored slots wait for the first frame (window exists).
     for (int s = 0; s < GUI_POPOUT_SLOTS; s++) {
@@ -519,6 +621,7 @@ void gui_popout_restore(gui_app_t *app) {
 //-----------------------------------------------------------------------------
 
 void gui_popout_draw_button(int channel, int side, Rectangle b) {
+    if (popout_fs_mode()) { fs_draw_button(channel, side, b); return; }
     const int s = channel * 2 + side;
     if (s < 0 || s >= GUI_POPOUT_SLOTS || b.width < 80.0f || b.height < 60.0f) {
         if (s >= 0 && s < GUI_POPOUT_SLOTS) s_grid_btn[s] = (Rectangle){ 0 };
@@ -538,6 +641,7 @@ void gui_popout_draw_button(int channel, int side, Rectangle b) {
 }
 
 void gui_popout_draw_placeholder(int channel, int side, Rectangle b, const char *view_name) {
+    if (popout_fs_mode()) { fs_draw_placeholder(channel, side, b, view_name); return; }
     (void)channel;
     (void)side;
     DrawRectangleRec(b, COLOR_PANEL_BG);
@@ -553,6 +657,7 @@ void gui_popout_draw_placeholder(int channel, int side, Rectangle b, const char 
 }
 
 bool gui_popout_handle_grid_click(gui_app_t *app, int channel, int side, Vector2 click, Rectangle b) {
+    if (popout_fs_mode()) return fs_handle_grid_click(app, channel, side, click, b);
     const int s = channel * 2 + side;
     if (s < 0 || s >= GUI_POPOUT_SLOTS) return false;
     if (s_po[s].open) {
@@ -570,21 +675,82 @@ bool gui_popout_handle_grid_click(gui_app_t *app, int channel, int side, Vector2
 }
 
 #else  // !POPOUT_ENABLED
-
 bool gui_popout_available(void) { return false; }
-bool gui_popout_is_open(int channel, int side) { (void)channel; (void)side; return false; }
-bool gui_popout_open(struct gui_app *app, int channel, int side) { (void)app; (void)channel; (void)side; return false; }
-void gui_popout_close(int channel, int side) { (void)channel; (void)side; }
-void gui_popout_frame(struct gui_app *app) { (void)app; }
-void gui_popout_restore(struct gui_app *app) { (void)app; }
-void gui_popout_capture_settings(struct gui_app *app) { (void)app; }
-void gui_popout_shutdown(void) {}
-void gui_popout_draw_button(int channel, int side, Rectangle b) { (void)channel; (void)side; (void)b; }
+bool gui_popout_is_open(int channel, int side) { return fs_is_open(channel, side); }
+bool gui_popout_open(struct gui_app *app, int channel, int side) { return fs_open(app, channel, side); }
+void gui_popout_close(int channel, int side) { fs_close(channel, side); }
+void gui_popout_frame(struct gui_app *app) { fs_frame(app); }
+void gui_popout_restore(struct gui_app *app) { fs_restore(app); }
+void gui_popout_capture_settings(struct gui_app *app) { fs_capture_settings(app); }
+void gui_popout_shutdown(void) { fs_shutdown(); }
+void gui_popout_draw_button(int channel, int side, Rectangle b) { fs_draw_button(channel, side, b); }
 bool gui_popout_handle_grid_click(struct gui_app *app, int channel, int side, Vector2 click, Rectangle b) {
-    (void)app; (void)channel; (void)side; (void)click; (void)b; return false;
+    return fs_handle_grid_click(app, channel, side, click, b);
 }
 void gui_popout_draw_placeholder(int channel, int side, Rectangle b, const char *view_name) {
-    (void)channel; (void)side; (void)b; (void)view_name;
+    fs_draw_placeholder(channel, side, b, view_name);
+}
+#endif
+
+//-----------------------------------------------------------------------------
+// Full-screen panel (all builds; only entered where pop-outs are unavailable)
+//-----------------------------------------------------------------------------
+
+bool gui_popout_fullscreen_active(void) { return s_fs_slot >= 0; }
+
+static Rectangle fs_bounds(void) {
+    return (Rectangle){ 0.0f, 0.0f, (float)gui_ui_get_layout_width(), (float)gui_ui_get_layout_height() };
 }
 
-#endif
+void gui_popout_draw_fullscreen(struct gui_app *app) {
+    if (!app || s_fs_slot < 0) return;
+    const channel_panel_config_t *cfg = (s_fs_slot / 2) ? &app->panel_config_b : &app->panel_config_a;
+    if (s_fs_slot % 2 == 1 && (!cfg->split || !cfg->right_state)) {   // the slot went away
+        s_fs_slot = -1;
+        return;
+    }
+    const Rectangle b = fs_bounds();
+    const float scale = gui_ui_get_scale_factor();
+    rlDrawRenderBatchActive();
+    rlPushMatrix();
+    rlScalef(scale, scale, 1.0f);
+    DrawRectangleRec(b, COLOR_BG);
+    panel_render_popout(app, s_fs_slot / 2, s_fs_slot % 2, b);
+    {
+    s_fs_exit_btn = (Rectangle){ b.x + b.width - FS_BTN_W - 8.0f, b.y + b.height - FS_BTN_H - 8.0f, FS_BTN_W, FS_BTN_H };
+    fs_draw_corner_glyph(s_fs_exit_btn, false, CheckCollisionPointRec(gui_ui_get_mouse_position(), s_fs_exit_btn));
+    }
+    rlPopMatrix();
+}
+
+bool gui_popout_fullscreen_input(struct gui_app *app, bool pressed) {
+    if (!app || s_fs_slot < 0) return false;
+    const int ch = s_fs_slot / 2, side = s_fs_slot % 2;
+    if (IsKeyPressed(KEY_BACK) || IsKeyPressed(KEY_ESCAPE)) {
+        gui_popout_close(ch, side);
+        return true;
+    }
+    if (!pressed) return true;   // taps are this panel's alone while full screen
+    const Vector2 click = gui_ui_get_mouse_position();
+    if (s_fs_exit_btn.width > 0 && CheckCollisionPointRec(click, s_fs_exit_btn)) {
+        gui_popout_close(ch, side);
+        return true;
+    }
+    const channel_panel_config_t *cfg = ch ? &app->panel_config_b : &app->panel_config_a;
+    const panel_view_type_t view = side ? cfg->right_view : cfg->left_view;
+    void *state = side ? cfg->right_state : cfg->left_state;
+    const panel_vtable_t *vt = panel_get_vtable(view);
+    if (vt && vt->handle_click) vt->handle_click(state, app, ch, click, fs_bounds());
+    return true;
+}
+
+bool gui_popout_fullscreen_scroll(struct gui_app *app, float delta) {
+    if (!app || s_fs_slot < 0) return false;
+    const int ch = s_fs_slot / 2, side = s_fs_slot % 2;
+    const channel_panel_config_t *cfg = ch ? &app->panel_config_b : &app->panel_config_a;
+    const panel_view_type_t view = side ? cfg->right_view : cfg->left_view;
+    void *state = side ? cfg->right_state : cfg->left_state;
+    const panel_vtable_t *vt = panel_get_vtable(view);
+    if (vt && vt->handle_scroll) vt->handle_scroll(state, delta, fs_bounds());
+    return true;
+}

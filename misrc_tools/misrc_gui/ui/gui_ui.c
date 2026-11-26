@@ -22,6 +22,7 @@
 #include "../visualization/gui_oscilloscope.h"
 #include "../signal/gui_cvbs.h"
 #include "../visualization/gui_panel.h"
+#include "../visualization/gui_popout.h"
 #include "../input/gui_playback.h"
 #include "../input/gui_cut_markers.h"
 #include "../input/gui_cxadc.h"
@@ -10192,6 +10193,12 @@ void gui_handle_interactions(gui_app_t *app) {
     if (gui_popup_handle_interactions()) {
         s_ui_consumed_click = true;
         return;  // Popup consumed the interaction
+    }
+
+    // A full-screen panel (mobile, gui_popout.c) owns every tap until left.
+    if (gui_popout_fullscreen_input(app, IsMouseButtonPressed(MOUSE_LEFT_BUTTON))) {
+        s_ui_consumed_click = true;
+        return;
     }
 
     // Handle clicks

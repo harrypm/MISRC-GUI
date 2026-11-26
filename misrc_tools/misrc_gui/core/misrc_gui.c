@@ -2578,6 +2578,8 @@ int main(int argc, char **argv) {
 
         // Render Clay UI (custom elements are handled via CLAY_RENDER_COMMAND_TYPE_CUSTOM)
         Clay_Raylib_Render(render_commands, fonts);
+        // Full-screen panel (mobile / no pop-out windows) over the whole UI.
+        gui_popout_draw_fullscreen(&app);
 
         // Draw FPS in debug mode
         #ifdef DEBUG

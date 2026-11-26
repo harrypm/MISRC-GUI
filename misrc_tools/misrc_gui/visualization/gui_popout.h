@@ -66,4 +66,16 @@ bool gui_popout_handle_grid_click(struct gui_app *app, int channel, int side, Ve
 /* Placeholder drawn in the grid for a popped slot. */
 void gui_popout_draw_placeholder(int channel, int side, Rectangle bounds, const char *view_name);
 
+/* Builds without pop-out windows (Android / no GLFW): the corner button
+ * makes the panel full screen inside the app (harrypm 2026-11-26). While
+ * active it is drawn over the whole layout and owns taps / wheel; its
+ * corner button or Back / Esc returns it to the grid. */
+bool gui_popout_fullscreen_active(void);
+/* After the Clay UI render, inside the frame (and the Android canvas). */
+void gui_popout_draw_fullscreen(struct gui_app *app);
+/* Call in place of the UI's click handling: true = full screen owns input
+ * this frame (pressed = this frame's tap). */
+bool gui_popout_fullscreen_input(struct gui_app *app, bool pressed);
+bool gui_popout_fullscreen_scroll(struct gui_app *app, float delta);
+
 #endif

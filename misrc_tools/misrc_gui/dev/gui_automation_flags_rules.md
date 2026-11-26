@@ -117,6 +117,8 @@ GUI autoload trigger flag.**
   - Flag: `--popout <a|b>:<left|right>[,...]` opens those slots in pop-out windows at launch. Logs `[AUTO] --popout` and `[POPOUT] ... popped out / returned`.
   - Open slots and their window geometry persist in settings `popout_windows`.
   - Inside a pop-out: F11 or the corner button toggles fullscreen on its screen.
+  - Without pop-out windows (Android / no GLFW) the same button and `--popout` make the panel full screen inside the app. Back, Esc or its corner button returns it.
+  - `MISRC_PANEL_FULLSCREEN=1` (diagnostics) selects that mode on desktop.
   - Added 2026-11-26.
 - Video panel View button (Frame / Split / Field, all three decoders):
   `--video-fields frame|split|field` (launch state of new Video panels;
