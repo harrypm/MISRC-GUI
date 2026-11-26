@@ -1505,7 +1505,14 @@ static void fft_vtable_render(void *state_ptr, gui_app_t *app, int channel,
 // Vtable Definition
 //-----------------------------------------------------------------------------
 
-static const panel_vtable_t s_fft_vtable = {
+// Double-click chrome-hide state, for the grid's pop-out button.
+static bool fft_vtable_chrome_hidden(void *state) {
+    const fft_panel_state_t *p = (const fft_panel_state_t *)state;
+    return p && gui_chrome_hide_hidden(&p->chrome_hide);
+}
+
+static const panel_vtable_t s_fft_vtable = {
+    .chrome_hidden = fft_vtable_chrome_hidden,
     .name = "FFT",
 
     // Lifecycle

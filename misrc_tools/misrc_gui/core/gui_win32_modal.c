@@ -130,6 +130,75 @@ static void gui_win32_snap_track_cursor(void)
     }
 }
 
+// Extra windows (pop-out panels): only the render timer, no snap logic.
+#define GUI_WIN32_MODAL_EXTRA 8
+static struct { HWND hwnd; WNDPROC orig; bool in_loop; } s_extra[GUI_WIN32_MODAL_EXTRA];
+
+static LRESULT CALLBACK gui_win32_extra_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    int i = 0;
+    while (i < GUI_WIN32_MODAL_EXTRA && s_extra[i].hwnd != hwnd) i++;
+    if (i == GUI_WIN32_MODAL_EXTRA) return DefWindowProcW(hwnd, msg, wp, lp);
+    switch (msg) {
+        case WM_ENTERSIZEMOVE:
+            s_extra[i].in_loop = true;
+            SetTimer(hwnd, GUI_WIN32_MODAL_TIMER_ID, GUI_WIN32_MODAL_TIMER_MS, NULL);
+            break;
+        case WM_TIMER:
+            if (wp == GUI_WIN32_MODAL_TIMER_ID && s_extra[i].in_loop && s_frame_cb) {
+                s_frame_cb(s_frame_ctx);   // render-only frame, the main window's too
+                return 0;
+            }
+            break;
+        case WM_EXITSIZEMOVE:
+            s_extra[i].in_loop = false;
+            KillTimer(hwnd, GUI_WIN32_MODAL_TIMER_ID);
+            break;
+        default:
+            break;
+    }
+    return CallWindowProcW(s_extra[i].orig, hwnd, msg, wp, lp);
+}
+
+bool gui_win32_modal_attach_window(void *window)
+{
+    HWND hwnd = (HWND)window;
+    if (!hwnd) return false;
+    int free_slot = -1;
+    for (int i = 0; i < GUI_WIN32_MODAL_EXTRA; i++) {
+        if (s_extra[i].hwnd == hwnd) return true;
+        if (!s_extra[i].hwnd && free_slot < 0) free_slot = i;
+    }
+    if (free_slot < 0) return false;
+    WNDPROC orig = (WNDPROC)(VOID *)SetWindowLongPtrW(hwnd, GWLP_WNDPROC,
+                                                      (LONG_PTR)(VOID *)gui_win32_extra_proc);
+    if (!orig) return false;
+    s_extra[free_slot].hwnd = hwnd;
+    s_extra[free_slot].orig = orig;
+    s_extra[free_slot].in_loop = false;
+    return true;
+}
+
+void gui_win32_modal_detach_window(void *window)
+{
+    HWND hwnd = (HWND)window;
+    for (int i = 0; i < GUI_WIN32_MODAL_EXTRA; i++) {
+        if (!hwnd || s_extra[i].hwnd != hwnd) continue;
+        KillTimer(hwnd, GUI_WIN32_MODAL_TIMER_ID);
+        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)(VOID *)s_extra[i].orig);
+        s_extra[i].hwnd = NULL;
+        s_extra[i].orig = NULL;
+        s_extra[i].in_loop = false;
+    }
+}
+
+bool gui_win32_modal_in_loop(void)
+{
+    if (s_in_modal_loop) return true;
+    for (int i = 0; i < GUI_WIN32_MODAL_EXTRA; i++) if (s_extra[i].in_loop) return true;
+    return false;
+}
+
 static LRESULT CALLBACK gui_win32_modal_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     if (hwnd == s_hwnd) {

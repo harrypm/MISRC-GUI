@@ -115,7 +115,7 @@ static struct {
     float gain;
     int system;      // -1 Auto, else 0=PAL 1=NTSC 2=SECAM
     bool from_flag;  // --wfm given: log each panel's applied state
-} s_wf_launch = { GUI_WFM_CH_Y, GUI_WFM_RANGE_ACTIVE, false, false, 3.0f, -1, false };
+} s_wf_launch = { GUI_WFM_CH_Y, GUI_WFM_RANGE_FRAME, false, false, 3.0f, -1, false };   // Range: Full (harrypm 2026-11-26)
 
 static const char *wf_channel_name(int channel) {
     return channel == GUI_WFM_CH_C ? "C" : channel == GUI_WFM_CH_Y ? "Y" : "Y+C";
@@ -129,7 +129,7 @@ static bool wf_flag_value(const char *key, const char *val, size_t len) {
         if (WF_IS("c")) { s_wf_launch.channel = GUI_WFM_CH_C; return true; }
     } else if (strcmp(key, "range") == 0) {
         if (WF_IS("active")) { s_wf_launch.range = GUI_WFM_RANGE_ACTIVE; return true; }
-        if (WF_IS("frame")) { s_wf_launch.range = GUI_WFM_RANGE_FRAME; return true; }
+        if (WF_IS("frame") || WF_IS("full")) { s_wf_launch.range = GUI_WFM_RANGE_FRAME; return true; }
     } else if (strcmp(key, "units") == 0) {
         if (WF_IS("ire")) { s_wf_launch.mv = false; return true; }
         if (WF_IS("mv")) { s_wf_launch.mv = true; return true; }
@@ -159,7 +159,7 @@ static bool wf_flag_value(const char *key, const char *val, size_t len) {
 
 bool gui_wfm_panel_apply_launch_arg(const char *arg) {
     static const char *usage =
-        "--wfm: expected comma-separated key=value pairs: channel=y|yc|c, range=active|frame, "
+        "--wfm: expected comma-separated key=value pairs: channel=y|yc|c, range=active|full (frame = full), "
         "units=ire|mv, phosphor=on|off, intensity=0.1..10, system=auto|pal|ntsc|secam";
     if (!arg || !*arg) {
         fprintf(stderr, "%s (got '')\n", usage);
@@ -188,7 +188,7 @@ bool gui_wfm_panel_apply_launch_arg(const char *arg) {
     static const char *systems[] = { "PAL", "NTSC", "SECAM" };
     fprintf(stderr, "[AUTO] --wfm: channel=%s range=%s units=%s phosphor=%s intensity=%.1fx system=%s\n",
             wf_channel_name(s_wf_launch.channel),
-            s_wf_launch.range == GUI_WFM_RANGE_FRAME ? "Whole frame" : "Active",
+            s_wf_launch.range == GUI_WFM_RANGE_FRAME ? "Full" : "Active",
             s_wf_launch.mv ? "mV" : "IRE", s_wf_launch.phosphor ? "On" : "Off", s_wf_launch.gain,
             s_wf_launch.system < 0 ? "Auto" : systems[s_wf_launch.system]);
     return true;
@@ -226,7 +226,7 @@ static void *wf_create(void) {
     s->image_dirty = true;
     if (s_wf_launch.from_flag) {
         fprintf(stderr, "[AUTO] WFM panel: channel=%s range=%s units=%s phosphor=%s intensity=%.1fx system=%s\n",
-                wf_channel_name(s->channel), s->range == GUI_WFM_RANGE_FRAME ? "Whole frame" : "Active",
+                wf_channel_name(s->channel), s->range == GUI_WFM_RANGE_FRAME ? "Full" : "Active",
                 s->mv ? "mV" : "IRE", s->phosphor ? "On" : "Off", s->gain,
                 s_wf_launch.system < 0 ? "Auto" : s_wf_launch.system == 1 ? "NTSC"
                 : s_wf_launch.system == 2 ? "SECAM" : "PAL");
@@ -492,7 +492,7 @@ static const char *wf_button_label(const wfm_panel_t *s, int b, char *buf, size_
             break;
         }
         case WF_BTN_CHANNEL: snprintf(buf, n, "Channel: %s", wf_channel_name(s->channel)); break;
-        case WF_BTN_RANGE: snprintf(buf, n, "Range: %s", s->range == GUI_WFM_RANGE_FRAME ? "Whole frame" : "Active"); break;
+        case WF_BTN_RANGE: snprintf(buf, n, "Range: %s", s->range == GUI_WFM_RANGE_FRAME ? "Full" : "Active"); break;
         case WF_BTN_UNITS: snprintf(buf, n, "Units: %s", s->mv ? "mV" : "IRE"); break;
         case WF_BTN_PHOSPHOR: snprintf(buf, n, "Phosphor: %s", s->phosphor ? "On" : "Off"); break;
         default: snprintf(buf, n, "Intensity: %.1fx", s->gain); break;
@@ -870,7 +870,14 @@ static bool wf_handle_scroll(void *state_ptr, float delta, Rectangle bounds) {
     return true;
 }
 
+// Double-click chrome-hide state, for the grid's pop-out button.
+static bool wf_vtable_chrome_hidden(void *state) {
+    const wfm_panel_t *p = (const wfm_panel_t *)state;
+    return p && gui_chrome_hide_hidden(&p->chrome_hide);
+}
+
 static const panel_vtable_t s_wfm_vtable = {
+    .chrome_hidden = wf_vtable_chrome_hidden,
     .name = "Waveform Monitor",
     .create = wf_create,
     .destroy = wf_destroy,

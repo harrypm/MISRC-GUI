@@ -181,6 +181,7 @@ static void print_usage(const char *program_name) {
             "           2frames|3frames|5frames|10frames|25frames|1s|3s|10s|30s|60s\n"
             "           (the paused window; any subset; defaults horizontal,\n"
             "           heat, 1frame).\n"
+            "--video-frame active|full  launch Frame of Video panels (default full)\n"
             "--video-fields frame|split|field  launch field view of Video panels\n"
             "           (Frame = woven frame, Split = the two fields stacked,\n"
             "           Field = the newest field stretched; the View button).\n"
@@ -789,9 +790,14 @@ static void app_modal_frame(void *ctx)
 
     Clay_RenderCommandArray render_commands = app_build_render_commands(app);
 
+    // Pop-out windows keep drawing while the main window or a pop-out is
+    // dragged (render-only inside the modal loop; harrypm 2026-11-26).
+    gui_popout_frame(app);
+
     BeginDrawing();
     ClearBackground(COLOR_BG);
     Clay_Raylib_Render(render_commands, fonts);
+    gui_popout_draw_fullscreen(app);
     rlDrawRenderBatchActive();
     SwapScreenBuffer();
 }
@@ -1303,6 +1309,15 @@ int main(int argc, char **argv) {
                 return 1;
             }
             if (!gui_vectorscope_panel_apply_launch_arg(argv[++i])) return 1;
+            continue;
+        }
+        if (strcmp(a, "--video-frame") == 0) {
+            // --video-frame active|full: Frame of new Video panels (default Full).
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--video-frame requires active|full\n");
+                return 1;
+            }
+            if (!gui_video_apply_frame_arg(argv[++i])) return 1;
             continue;
         }
         if (strcmp(a, "--video-fields") == 0) {

@@ -123,6 +123,11 @@ typedef struct panel_vtable {
     // May be NULL if get_menu_count is NULL or returns 0.
     panel_menu_t (*get_menu)(void *state, size_t index);
 
+    // True while the panel's double-click chrome-hide is on (its OSD /
+    // controls hidden): the grid then hides the pop-out / full-screen
+    // button too (harrypm 2026-11-26). May be NULL (never hidden).
+    bool (*chrome_hidden)(void *state);
+
 } panel_vtable_t;
 
 //-----------------------------------------------------------------------------

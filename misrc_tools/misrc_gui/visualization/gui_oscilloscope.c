@@ -3240,7 +3240,14 @@ static void waveform_render(void *state_ptr, gui_app_t *app, int channel,
 // Unified Waveform Panel Vtable
 //-----------------------------------------------------------------------------
 
-static const panel_vtable_t s_waveform_vtable = {
+// Double-click chrome-hide state, for the grid's pop-out button.
+static bool waveform_vtable_chrome_hidden(void *state) {
+    const waveform_panel_state_t *p = (const waveform_panel_state_t *)state;
+    return p && gui_chrome_hide_hidden(&p->chrome_hide);
+}
+
+static const panel_vtable_t s_waveform_vtable = {
+    .chrome_hidden = waveform_vtable_chrome_hidden,
     .name = "Waveform",
     .create = waveform_create,
     .destroy = waveform_destroy,

@@ -66,7 +66,7 @@ GUI autoload trigger flag.**
   print the accepted list and exit 1; logs `[AUTO] --panel-view`). [2026-11-14]
 - WFM (waveform monitor) panel System / Channel / Range / Units / Phosphor /
   Intensity buttons: `--wfm <key=value,...>` (channel=y|yc|c, range=
-  active|frame, units=ire|mv, phosphor=on|off, intensity=0.1..10, system=
+  active|full (frame = full; default full since 2026-11-26), units=ire|mv, phosphor=on|off, intensity=0.1..10, system=
   auto|pal|ntsc|secam; launch state of every WFM panel created after it;
   unknown keys/values print the accepted list and exit 1; logs
   `[AUTO] --wfm` and `[AUTO] WFM panel: ...` per panel). [2026-11-16]
@@ -120,6 +120,9 @@ GUI autoload trigger flag.**
   - Without pop-out windows (Android / no GLFW) the same button and `--popout` make the panel full screen inside the app. Back, Esc or its corner button returns it.
   - `MISRC_PANEL_FULLSCREEN=1` (diagnostics) selects that mode on desktop.
   - Added 2026-11-26.
+- Video panel Frame button (Active / Full, all three decoders):
+  - Flag: `--video-frame active|full` (launch state of new Video panels; logs `[AUTO] --video-frame`).
+  - Default Full since 2026-11-26; a saved panel keeps its own.
 - Video panel View button (Frame / Split / Field, all three decoders):
   `--video-fields frame|split|field` (launch state of new Video panels;
   logs `[AUTO] --video-fields`; anything else prints the accepted list and

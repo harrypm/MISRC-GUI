@@ -721,6 +721,8 @@ int gui_cvbs_split_row(int row, int frame_rows, int top_parity, int *top_rows);
 #define CVBS_FIELD_VIEW_FIELD 2
 // --video-fields frame|split|field: launch state of new Video panels.
 bool gui_video_apply_field_view_arg(const char *value);
+// --video-frame active|full: Frame of new Video panels (default Full).
+bool gui_video_apply_frame_arg(const char *value);
 void gui_video_panel_set_decoder(void *state, int decoder);
 // A Video slot's saved setup as "<cvbs|tape|rf>:<pal|ntsc|secam|mesecam>:
 // <vhs|betamax|laserdisc|->:<frame|split|field>:<active|full>" (the active

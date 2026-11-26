@@ -491,7 +491,14 @@ static panel_menu_t histogram_vtable_get_menu(void *state_ptr, size_t index) {
 // Vtable Definition
 //-----------------------------------------------------------------------------
 
+// Double-click chrome-hide state, for the grid's pop-out button.
+static bool histogram_vtable_chrome_hidden(void *state) {
+    const histogram_panel_state_t *p = (const histogram_panel_state_t *)state;
+    return p && gui_chrome_hide_hidden(&p->chrome_hide);
+}
+
 static const panel_vtable_t s_histogram_vtable = {
+    .chrome_hidden = histogram_vtable_chrome_hidden,
     .name = "Histogram",
 
     // Lifecycle

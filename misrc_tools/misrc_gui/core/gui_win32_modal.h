@@ -58,6 +58,15 @@ void gui_win32_modal_apply_top_half(void);
 // every terminal).
 bool gui_win32_modal_take_drag_summary(char *dst, size_t cap);
 
+// Pop-out panel windows (harrypm 2026-11-26: moving the main window or a
+// pop-out froze both): subclass another top-level window so its own
+// move/size modal loop also drives the registered frame callback. Detach
+// before destroying the window. True while any attached or main window is
+// inside its modal loop (the frame callback must then stay render-only).
+bool gui_win32_modal_attach_window(void *hwnd);
+void gui_win32_modal_detach_window(void *hwnd);
+bool gui_win32_modal_in_loop(void);
+
 #else
 // Other platforms have no modal move/size loop (X11/Cocoa keep the app loop
 // running during live resize): the call sites compile to no-ops, and
@@ -78,6 +87,9 @@ static inline bool gui_win32_modal_take_drag_summary(char *dst, size_t cap)
     (void)cap;
     return false;
 }
+static inline bool gui_win32_modal_attach_window(void *hwnd) { (void)hwnd; return true; }
+static inline void gui_win32_modal_detach_window(void *hwnd) { (void)hwnd; }
+static inline bool gui_win32_modal_in_loop(void) { return false; }
 
 #endif
 

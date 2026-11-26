@@ -1707,7 +1707,14 @@ static bool spectro_vtable_handle_scroll(void *state_ptr, float delta, Rectangle
     return true;
 }
 
+// Double-click chrome-hide state, for the grid's pop-out button.
+static bool spectro_vtable_chrome_hidden(void *state) {
+    const spectro_engine_t *p = (const spectro_engine_t *)state;
+    return p && gui_chrome_hide_hidden(&p->chrome_hide);
+}
+
 static const panel_vtable_t s_spectrograph_vtable = {
+    .chrome_hidden = spectro_vtable_chrome_hidden,
     .name = "Spectro",
     .create = spectrograph_vtable_create,
     .destroy = spectro_vtable_destroy,

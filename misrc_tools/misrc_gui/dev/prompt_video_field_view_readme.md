@@ -374,3 +374,23 @@ A **View** button (Frame / Split / Field) under Frame: Active/Full, on all three
     - WFM Y: 75% bar luma steps about 69 / 56 / 48 / 36 / 28 / 15 IRE.
     - WFM C: envelopes about +-31 / 44 / 41 / 41 / 44 / 31 IRE, the standard 75% NTSC chroma amplitudes.
     - `gui_rf_routes_test` gained a scope-sink stub. Suite 65/66.
+- **Defaults: WFM Range Full, Video Frame Full** (harrypm 2026-11-26: "WFM to Whole Frame Rename that to \"full\" and decoders should also stock to full frame or \"Full\"").
+  - WFM:
+    - Range defaults to the whole frame (`GUI_WFM_RANGE_FRAME`), labelled "Full" (was "Whole frame") on the button and in the logs.
+    - `--wfm range=full` is accepted; `frame` stays as an alias.
+  - Video panels:
+    - New Video panels open with Frame: Full on all three decoders (CVBS, Tape, RF Preview; the RF one applies when its worker binds).
+    - Set in the Video panel's create, not the shared decoder init, so the scopes' hidden composite decoders are untouched.
+    - New flag `--video-frame active|full`. A saved panel (`video_decoder_*`) keeps its own Frame.
+  - Verified: fresh `--panel-view a:wfm,video` shows "Range: Full" (whole line: sync, burst, picture) and "Frame: Full". Suite 65/66.
+- **Pop-out button hides with the OSD** (harrypm 2026-11-26: "dubble click to hide OSD should also hide the pop out button"):
+  - New optional `panel_vtable_t.chrome_hidden(state)`. Every panel with a double-click hide answers it: Video, Demod, FFT, Histogram, Waveform, Spectro, Vectorscope, WFM.
+  - The grid draws no pop-out / full-screen button while it is true, and the hit box is cleared, so the hidden corner cannot pop out.
+  - The pop-out window's fullscreen button and the in-app full-screen return button hide too (F11 / Esc / Back still work).
+- **Window moves no longer freeze the app** (harrypm 2026-11-26: "fix window move pausing/freezing for main and pop out when either is moved"):
+  - Windows runs a modal loop inside the dragged window's procedure.
+  - Main window: its modal frame (`app_modal_frame`) now also runs `gui_popout_frame` (pop-outs keep drawing) and the in-app full-screen panel.
+  - Pop-outs: `gui_win32_modal_attach_window()` subclasses each pop-out (HWND via `glfwGetWin32Window`) with the same 15 ms timer, driving the same render-only frame. It is detached before the window is destroyed.
+  - Inside any modal loop (`gui_win32_modal_in_loop`), `gui_popout_frame` only renders and presents. No open / close / fullscreen / click / wheel, so the window being dragged is never reconfigured mid-drag.
+  - Non-Windows: no-op stubs (X11 / Cocoa keep the loop running).
+  - Not verifiable here without injecting mouse drags into harrypm's session; needs harrypm's check. Regression check: pop-out and main render normally. Suite 65/66.

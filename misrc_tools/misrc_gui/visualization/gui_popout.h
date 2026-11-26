@@ -25,8 +25,8 @@
  * (settings popout_windows).
  *
  * v1 limits: drag gestures that read raylib's main-window button state
- * (Waveform / FFT drag) do not work in a pop-out; on Windows, dragging a
- * pop-out window by its title bar pauses redraws until released.
+ * (Waveform / FFT drag) do not work in a pop-out. Windows title-bar drags
+ * keep every window drawing (gui_win32_modal_attach_window, render-only).
  */
 #ifndef GUI_POPOUT_H
 #define GUI_POPOUT_H

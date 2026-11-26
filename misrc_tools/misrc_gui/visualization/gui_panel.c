@@ -131,8 +131,13 @@ static void render_single_panel(gui_app_t *app, int channel, int side,
     }
     render_single_panel_impl(app, channel, type, state, bounds, color);
     // Pop-out button (desktop) or full-screen button (mobile / no GLFW).
-    if (app->settings.net_mode != GUI_NET_MODE_MONITOR_CLIENT)
+    // Hidden with the panel's OSD by its double-click (harrypm 2026-11-26).
+    const panel_vtable_t *vt = panel_get_vtable(type);
+    const bool chrome_hidden = vt && vt->chrome_hidden && state && vt->chrome_hidden(state);
+    if (app->settings.net_mode != GUI_NET_MODE_MONITOR_CLIENT && !chrome_hidden)
         gui_popout_draw_button(channel, side, bounds);
+    else
+        gui_popout_draw_button(channel, side, (Rectangle){ 0 });   // no button, no stale hit box
 }
 
 void panel_render_popout(gui_app_t *app, int channel, int side, Rectangle bounds) {

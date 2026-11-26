@@ -1014,7 +1014,14 @@ static void demod_vtable_clear(void *state_ptr) {
 // Vtable + Registration
 //-----------------------------------------------------------------------------
 
+// Double-click chrome-hide state, for the grid's pop-out button.
+static bool demod_vtable_chrome_hidden(void *state) {
+    const demod_state_t *p = (const demod_state_t *)state;
+    return p && gui_chrome_hide_hidden(&p->overlay.chrome_hide);
+}
+
 static const panel_vtable_t s_demod_vtable = {
+    .chrome_hidden = demod_vtable_chrome_hidden,
     .name = "Demod",
     .create = demod_vtable_create,
     .destroy = demod_vtable_destroy,

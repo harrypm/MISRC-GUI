@@ -8,6 +8,7 @@
 #include "gui_panel.h"
 #include "panel_interface.h"
 #include "gui_phosphor_rt.h"
+#include "../core/gui_win32_modal.h"   // keep drawing while any window is dragged
 #include "gui_text.h"
 
 #include "rlgl.h"
@@ -29,6 +30,17 @@
 
 static bool s_launch_open[GUI_POPOUT_SLOTS];
 static int s_fs_slot = -1;   // full-screen slot (builds without pop-out windows)
+
+// The slot panel's double-click chrome-hide is on: its corner buttons hide
+// with its OSD (harrypm 2026-11-26). F11 / Esc / Back still work.
+static bool popout_slot_chrome_hidden(struct gui_app *app, int slot) {
+    if (!app || slot < 0 || slot >= GUI_POPOUT_SLOTS) return false;
+    const channel_panel_config_t *cfg = (slot / 2) ? &app->panel_config_b : &app->panel_config_a;
+    const panel_view_type_t view = (slot % 2) ? cfg->right_view : cfg->left_view;
+    void *state = (slot % 2) ? cfg->right_state : cfg->left_state;
+    const panel_vtable_t *vt = panel_get_vtable(view);
+    return vt && vt->chrome_hidden && state && vt->chrome_hidden(state);
+}
 static bool s_launch_saved[GUI_POPOUT_SLOTS];   // restored at launch: use the saved geometry
 
 bool gui_popout_apply_launch_arg(const char *arg) {
@@ -178,6 +190,9 @@ const GLFWvidmode *glfwGetVideoMode(GLFWmonitor *monitor);
 void glfwSetWindowMonitor(GLFWwindow *window, GLFWmonitor *monitor, int x, int y, int w, int h, int refresh);
 GLFWmonitor *glfwGetWindowMonitor(GLFWwindow *window);
 int glfwGetWindowAttrib(GLFWwindow *window, int attrib);
+#if defined(_WIN32)
+void *glfwGetWin32Window(GLFWwindow *window);   // HWND
+#endif
 
 #define P_GLFW_PRESS 1
 #define P_GLFW_MOUSE_BUTTON_LEFT 0
@@ -284,6 +299,9 @@ static void popout_destroy(popout_t *p) {
     if (p->rt.id) UnloadRenderTexture(p->rt);
     p->rt = (RenderTexture2D){ 0 };
     p->rt_w = p->rt_h = 0;
+#if defined(_WIN32)
+    gui_win32_modal_detach_window(glfwGetWin32Window(p->win));
+#endif
     glfwDestroyWindow(p->win);
     p->win = NULL;
     p->open = false;
@@ -384,6 +402,10 @@ static bool popout_open_impl(gui_app_t *app, int channel, int side, bool use_sav
     }
     glfwSetWindowPos(p->win, x, y);
     glfwShowWindow(p->win);
+#if defined(_WIN32)
+    // Its own title-bar drag runs a modal loop: keep every window drawing.
+    gui_win32_modal_attach_window(glfwGetWin32Window(p->win));
+#endif
     glfwSetWindowUserPointer(p->win, p);
     glfwSetScrollCallback(p->win, popout_scroll_cb);
     glfwMakeContextCurrent(p->win);
@@ -450,9 +472,10 @@ static void popout_draw_fs_button(popout_t *p, Rectangle panel, Vector2 mouse) {
 void gui_popout_frame(gui_app_t *app) {
     if (popout_fs_mode()) { fs_frame(app); return; }
     if (!app) return;
+    const bool modal = gui_win32_modal_in_loop();   // render-only inside a window drag
     // Launch flags / restored slots wait for the first frame (window exists).
     for (int s = 0; s < GUI_POPOUT_SLOTS; s++) {
-        if (s_launch_open[s]) {
+        if (s_launch_open[s] && !modal) {
             // A --popout slot lands over its panel: wait (up to ~2 s) until
             // the grid has laid that panel out once.
             static int s_wait_frames[GUI_POPOUT_SLOTS];
@@ -476,7 +499,7 @@ void gui_popout_frame(gui_app_t *app) {
         void *state;
         popout_slot_panel(app, s, &view, &state);
         // The window was closed, or the slot no longer has a panel (split off).
-        if (glfwWindowShouldClose(p->win) || (s % 2 == 1 && !state)) {
+        if (!modal && (glfwWindowShouldClose(p->win) || (s % 2 == 1 && !state))) {
             gui_popout_close(s / 2, s % 2);
             continue;
         }
@@ -500,8 +523,8 @@ void gui_popout_frame(gui_app_t *app) {
         // Keys: F11 toggles fullscreen, Esc leaves it.
         const bool f11 = glfwGetKey(p->win, P_GLFW_KEY_F11) == P_GLFW_PRESS;
         const bool esc = glfwGetKey(p->win, P_GLFW_KEY_ESCAPE) == P_GLFW_PRESS;
-        if (f11 && !p->f11_down) popout_set_fullscreen(p, !p->fullscreen);
-        if (esc && !p->esc_down && p->fullscreen) popout_set_fullscreen(p, false);
+        if (!modal && f11 && !p->f11_down) popout_set_fullscreen(p, !p->fullscreen);
+        if (!modal && esc && !p->esc_down && p->fullscreen) popout_set_fullscreen(p, false);
         p->f11_down = f11;
         p->esc_down = esc;
 
@@ -516,14 +539,14 @@ void gui_popout_frame(gui_app_t *app) {
         gui_ui_set_mouse_override_buttons(down_mask, pressed_mask);
         const bool pressed = (pressed_mask & 1u) != 0;
         const panel_vtable_t *vt = panel_get_vtable(view);
-        if (pressed) {
+        if (pressed && !modal) {
             if (p->fs_btn.width > 0 && CheckCollisionPointRec(mouse, p->fs_btn)) {
                 popout_set_fullscreen(p, !p->fullscreen);
             } else if (vt && vt->handle_click && CheckCollisionPointRec(mouse, panel)) {
                 vt->handle_click(state, app, s / 2, mouse, panel);
             }
         }
-        if (p->wheel != 0.0 && vt && vt->handle_scroll)
+        if (!modal && p->wheel != 0.0 && vt && vt->handle_scroll)
             vt->handle_scroll(state, (float)p->wheel, panel);
         p->wheel = 0.0;
 
@@ -533,7 +556,8 @@ void gui_popout_frame(gui_app_t *app) {
         rlPushMatrix();
         rlScalef(scale, scale, 1.0f);
         panel_render_popout(app, s / 2, s % 2, panel);
-        popout_draw_fs_button(p, panel, mouse);
+        if (popout_slot_chrome_hidden(app, s)) p->fs_btn = (Rectangle){ 0 };
+        else popout_draw_fs_button(p, panel, mouse);
         rlPopMatrix();
         phosphor_rt_set_outer_target(NULL);
         EndTextureMode();
@@ -717,8 +741,12 @@ void gui_popout_draw_fullscreen(struct gui_app *app) {
     DrawRectangleRec(b, COLOR_BG);
     panel_render_popout(app, s_fs_slot / 2, s_fs_slot % 2, b);
     {
+    if (popout_slot_chrome_hidden(app, s_fs_slot)) {
+        s_fs_exit_btn = (Rectangle){ 0 };   // hidden with the OSD; Back / Esc still leave
+    } else {
     s_fs_exit_btn = (Rectangle){ b.x + b.width - FS_BTN_W - 8.0f, b.y + b.height - FS_BTN_H - 8.0f, FS_BTN_W, FS_BTN_H };
     fs_draw_corner_glyph(s_fs_exit_btn, false, CheckCollisionPointRec(gui_ui_get_mouse_position(), s_fs_exit_btn));
+    }
     }
     rlPopMatrix();
 }

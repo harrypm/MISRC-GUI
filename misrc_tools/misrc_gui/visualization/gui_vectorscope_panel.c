@@ -1332,7 +1332,14 @@ static bool vs_handle_scroll(void *state_ptr, float delta, Rectangle bounds) {
     return true;
 }
 
+// Double-click chrome-hide state, for the grid's pop-out button.
+static bool vs_vtable_chrome_hidden(void *state) {
+    const vectorscope_panel_t *p = (const vectorscope_panel_t *)state;
+    return p && gui_chrome_hide_hidden(&p->chrome_hide);
+}
+
 static const panel_vtable_t s_vectorscope_vtable = {
+    .chrome_hidden = vs_vtable_chrome_hidden,
     .name = "Vectorscope",
     .create = vs_create,
     .destroy = vs_destroy,

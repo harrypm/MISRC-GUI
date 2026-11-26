@@ -8935,6 +8935,19 @@ static void video_detach_rf(vhs_fm_decoder_t *decoder);
 static void video_panel_activate_plugin(video_panel_state_t *panel, video_plugin_kind_t plugin);
 
 static int s_default_field_view = CVBS_FIELD_VIEW_FRAME;
+// Frame (Active / Full) of new Video panels: Full by default (harrypm
+// 2026-11-26); --video-frame active|full. A saved panel keeps its own.
+static bool s_default_frame_full = true;
+
+bool gui_video_apply_frame_arg(const char *value) {
+    if (value && (strcmp(value, "active") == 0 || strcmp(value, "full") == 0)) {
+        s_default_frame_full = strcmp(value, "full") == 0;
+        fprintf(stderr, "[AUTO] --video-frame: %s\n", value);
+        return true;
+    }
+    fprintf(stderr, "--video-frame: expected active|full (got '%s')\n", value ? value : "");
+    return false;
+}
 
 bool gui_video_apply_field_view_arg(const char *value) {
     static const char *const names[3] = {"frame", "split", "field"};
@@ -9469,6 +9482,11 @@ static void *cvbs_vtable_create(void) {
     panel->cvbs.decoder.field_view = s_default_field_view;
     panel->tape_decode.decoder.field_view = s_default_field_view;
     panel->vhs_fm.decoder.overlay.field_view = s_default_field_view;
+    if (s_default_frame_full) {
+        gui_cvbs_set_frame_view_mode(&panel->cvbs.decoder, CVBS_FRAME_VIEW_FULL);
+        gui_cvbs_set_frame_view_mode(&panel->tape_decode.decoder, CVBS_FRAME_VIEW_FULL);
+        gui_vhs_fm_set_frame_mode(&panel->vhs_fm.decoder, 1);
+    }
     return panel;
 }
 
@@ -10481,7 +10499,14 @@ static bool cvbs_vtable_handle_click(void *state, gui_app_t *app, int channel,
 // Vtable Definition
 //-----------------------------------------------------------------------------
 
+// Double-click chrome-hide state, for the grid's pop-out button.
+static bool cvbs_vtable_chrome_hidden(void *state) {
+    const video_panel_state_t *p = (const video_panel_state_t *)state;
+    return p && p->chrome.controls_hidden;
+}
+
 static const panel_vtable_t s_cvbs_vtable = {
+    .chrome_hidden = cvbs_vtable_chrome_hidden,
     .name = "Video",
 
     // Lifecycle
