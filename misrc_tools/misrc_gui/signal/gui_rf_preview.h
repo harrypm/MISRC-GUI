@@ -77,6 +77,33 @@ static inline bool gui_rf_profile_is_audio_only(gui_rf_profile_t profile) {
 }
 typedef struct gui_rf_decoder gui_rf_decoder_t;
 
+/* Scope feed (harrypm 2026-11-26: the Vectorscope and WFM work on the RF
+ * Preview's decoded output on the same channel). While a sink is set, the
+ * field renderer hands it every rendered row of PAL / NTSC (VHS, S-VHS,
+ * Beta, ED Beta, LaserDisc) fields: the time-base-corrected luma in IRE and
+ * the burst-locked chroma U / V (BT.601, units of the 100 IRE span - the
+ * decoder's burst-normalised colour, PAL V-switch removed). Callbacks run
+ * on the decoder (RF worker) thread and must not block. SECAM has no feed. */
+typedef struct {
+    const float *ire, *u, *v;     /* count samples each */
+    int count;
+    double t0_us, dt_us;          /* sample i at t0 + i*dt us after 0H */
+    double line_us, active_start_us, active_end_us;
+    int line;                     /* field line number */
+    int format;                   /* gui_rf_format_t */
+    bool picture;                 /* an active-picture line */
+    bool color;                   /* u / v valid (burst locked) */
+} gui_rf_scope_line_t;
+typedef struct {
+    void *ctx;
+    void (*begin_field)(void *ctx);
+    void (*line)(void *ctx, const gui_rf_scope_line_t *line);
+    /* parity: the ending field's frame-row parity; field1_parity: ITU field 1's. */
+    void (*end_field)(void *ctx, int parity, int field1_parity);
+} gui_rf_scope_sink_t;
+/* Any thread; the sink must outlive its use (gui_rf_scopes.c: static). */
+void gui_rf_decoder_set_scope_sink(gui_rf_decoder_t *decoder, const gui_rf_scope_sink_t *sink);
+
 typedef struct {
     bool h_locked;
     bool v_locked;

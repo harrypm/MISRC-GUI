@@ -42,6 +42,7 @@
 #include "../visualization/gui_popout.h"
 #include "../processing/gui_hifi34.h"
 #include "../input/gui_source_meta.h"
+#include "../signal/gui_rf_scopes.h"
 #include "../visualization/gui_spectrogram.h"
 #include "../signal/gui_cvbs.h"   // gui_video_panel_sync_source (field step)
 #include "../input/gui_cut_markers.h"   // --markers preset
@@ -1553,6 +1554,7 @@ int main(int argc, char **argv) {
     // Hi-Fi on CH3/4 decoder's RF tap / monitor hooks.
     gui_cvbs_set_ddd_query(gui_source_is_ddd);
     gui_hifi34_init(&app);
+    gui_video_set_rf_scope_provider(gui_rf_scopes_sink);   // Vector / WFM on RF Preview output
     gui_popout_restore(&app);   // queues saved pop-outs; opened on the first frame
 
     // Capture limit should not persist across relaunches.

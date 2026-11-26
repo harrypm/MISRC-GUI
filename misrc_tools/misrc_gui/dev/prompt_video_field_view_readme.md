@@ -354,3 +354,23 @@ A **View** button (Frame / Split / Field) under Frame: Active/Full, on all three
     - Grid view shows the full-screen buttons in every panel corner.
     - `gui_popout.c` compiles clean with `-DMISRC_POPOUT_DISABLED` (`-Wall -Wextra`).
   - Not built for Android here (no NDK toolchain in this session).
+- **Vectorscope + WFM on the RF Preview's decoded output** (harrypm 2026-11-26: "vectorscope should work on decoded RF Preview feeds when used on the same channel", "same for wavefrom monitor").
+  - **Approach** (harrypm picked the direct decoded feed):
+    - Re-encoding the decoded picture through Test Gen was measured at 30 ms per PAL frame at 20 MSPS (75% of a core), so it was rejected.
+    - The RF field renderer (`rf_render_field`) already computes, per pixel, the time-base-corrected luma and the burst-locked U / V (burst gain 150/700 PAL, 0.20 NTSC; V-switch and colour-under rotation removed) to draw its picture.
+    - A `gui_rf_scope_sink_t` (begin_field / line / end_field) receives every rendered row: IRE luma, U / V in units of the 100 IRE span, the nominal time grid after 0H, the active window, and the picture / colour-valid flags. Near-zero extra CPU.
+  - **New `signal/gui_rf_scopes.c` (GUI only):**
+    - Static per-channel sinks (no lifetime race) owning a vectorscope and a WFM accumulator.
+    - Vectorscope: U / V per the scope's Lines (Active window / whole row), Field (active / whole) and trace stride; `end_field_parity` with the ITU field order.
+    - WFM: new `gui_wfm_add_decoded_line` resamples onto the 4fsc column grid with the usual dither, rebuilds C as 100 * (U sin + V cos) by rotation (one sin / cos per line), and serves Y / C / Y+C with the same ranges and frame publishing.
+  - **Routing** (`gui_video_update_rf_routes`): a provider attaches the channel's sink to the first RF Video panel's worker on that channel while a scope used it within 0.5 s. It is re-set every frame, and the decoder keeps it across profile resets.
+  - **Panels:**
+    - With an RF Preview Video panel on the same channel, the Vectorscope / WFM read the RF sink and skip their own composite decode.
+    - The System button reads "System: RF (PAL / NTSC)" and does not cycle.
+    - SECAM / MESECAM have their own renderer and no feed; Advanced burst readouts are not available on an RF feed.
+  - **Verified:**
+    - Daimler NTSC VHS RF: "System: RF (NTSC)", centre cluster for near-colourless footage.
+    - Test Gen NTSC VHS RF bars: six bar clusters on the 75% targets with VHS colour-under smear.
+    - WFM Y: 75% bar luma steps about 69 / 56 / 48 / 36 / 28 / 15 IRE.
+    - WFM C: envelopes about +-31 / 44 / 41 / 41 / 44 / 31 IRE, the standard 75% NTSC chroma amplitudes.
+    - `gui_rf_routes_test` gained a scope-sink stub. Suite 65/66.

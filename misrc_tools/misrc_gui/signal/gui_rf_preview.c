@@ -15,6 +15,7 @@
 #include "gui_rf_preview_filters.h"
 #include "gui_rf_preview_geometry.h"
 #include <math.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -193,6 +194,10 @@ typedef struct {
 } rf_svhs_scratch_t;
 
 struct gui_rf_decoder {
+    /* Scope feed (gui_rf_scope_sink_t); NULL = none. */
+    _Atomic(const gui_rf_scope_sink_t *) scope_sink;
+    float scope_ire[GUI_RF_FRAME_MAX_WIDTH], scope_u[GUI_RF_FRAME_MAX_WIDTH],
+          scope_v[GUI_RF_FRAME_MAX_WIDTH];
     gui_rf_format_t format;
     gui_rf_profile_t profile;
     rf_profile_t p;
@@ -1444,6 +1449,8 @@ static bool rf_render_field(gui_rf_decoder_t *d, double field_start, int parity,
                             uint64_t end_sample, gui_rf_frame_callback_t callback,
                             void *context) {
     d->svhs_reverse_prepared=false;
+    /* Scope feed (gui_rf_scope_sink_t): latched for the whole field. */
+    const gui_rf_scope_sink_t *scope=atomic_load(&d->scope_sink);
     double lines[RF_MAX_LINES+1], periods[RF_MAX_LINES];
     rf_complex_t burst[RF_MAX_LINES], corrected[RF_MAX_LINES];
     double magnitudes[RF_MAX_LINES], gain[RF_MAX_LINES], luma_wow[RF_MAX_LINES];
@@ -1598,6 +1605,7 @@ static bool rf_render_field(gui_rf_decoder_t *d, double field_start, int parity,
     }
     if(svhs) rf_svhs_phase_cuts(canonical,magnitudes,phase_reference_valid,rows,line_first,
         d->p.active_first,phase_cuts);
+    if (scope && scope->begin_field) scope->begin_field(scope->ctx);
     /* PAL swings its burst about the -U axis. Use neighboring measured burst
      * vectors after the tape rotation is removed, rather than field number. */
     for (int y=0; y<rows; ++y) {
@@ -1728,6 +1736,11 @@ static bool rf_render_field(gui_rf_decoder_t *d, double field_start, int parity,
                 double imaginary=re*rotate_im+im*rotate_re;
                 v=imaginary*gain[y]*vswitch*(!laserdisc && d->format==GUI_RF_NTSC ? -1.0 : 1.0);
             }
+            if (scope) {
+                d->scope_ire[x]=(float)((hz*luma_wow[y]-d->display_blank_hz)/d->display_hz_ire);
+                d->scope_u[x]=(float)u;
+                d->scope_v[x]=(float)v;
+            }
             double next_re=rotate_re*step_re-rotate_im*step_im;
             rotate_im=rotate_im*step_re+rotate_re*step_im; rotate_re=next_re;
             d->field_rows[y&1][0][x]=(float)luminance;
@@ -1738,6 +1751,16 @@ static bool rf_render_field(gui_rf_decoder_t *d, double field_start, int parity,
                 scratch->color_rows[1][y][x]=(float)u;
                 scratch->color_rows[2][y][x]=(float)v;
             }
+        }
+        if (scope && scope->line) {
+            const double dt_us=(win_end_us-win_start_us)/d->p.width;
+            const gui_rf_scope_line_t sl={
+                d->scope_ire,d->scope_u,d->scope_v,d->p.width,
+                win_start_us+.5*dt_us,dt_us,
+                d->p.line_us,d->p.active_start_us,d->p.active_end_us,
+                line,(int)d->format,active_line,
+                color && (svhs ? render_valid[y] : valid[y])};
+            scope->line(scope->ctx,&sl);
         }
         if(!scratch) {
             const bool *color_valid = svhs ? render_valid : valid;
@@ -1756,6 +1779,7 @@ static bool rf_render_field(gui_rf_decoder_t *d, double field_start, int parity,
     if (rows*2+parity<frame_height)
         memset(&d->rgba[(size_t)(rows*2+parity)*d->p.width*4u],0,
                (size_t)d->p.width*4u);
+    if (scope && scope->end_field) scope->end_field(scope->ctx,parity,gui_rf_field1_parity(d->profile));
     d->svhs_reverse_prepared=false;
     d->status.fields_decoded++;
     d->status.fields_accepted++;
@@ -2190,7 +2214,9 @@ void gui_rf_decoder_reset_profile(gui_rf_decoder_t *d, gui_rf_profile_t profile)
     bool have_lane_runner=d->have_lane_runner;
     float *lane_buf=d->lane_buf;
     size_t lane_cap=d->lane_cap;
+    const gui_rf_scope_sink_t *scope_sink=atomic_load(&d->scope_sink);   /* owner wiring */
     memset(d,0,sizeof(*d));
+    atomic_store(&d->scope_sink,scope_sink);
     d->storage=storage; d->rgba=rgba;
     d->svhs_scratch = scratch;
     d->lane_runner=lane_runner; d->have_lane_runner=have_lane_runner;
@@ -2382,6 +2408,10 @@ gui_rf_decoder_t *gui_rf_decoder_create_profile(gui_rf_profile_t profile) {
 
 gui_rf_decoder_t *gui_rf_decoder_create(gui_rf_format_t format) {
     return gui_rf_decoder_create_profile(format==GUI_RF_NTSC ? GUI_RF_PROFILE_NTSC_VHS : GUI_RF_PROFILE_PAL_VHS);
+}
+
+void gui_rf_decoder_set_scope_sink(gui_rf_decoder_t *d, const gui_rf_scope_sink_t *sink) {
+    if (d) atomic_store(&d->scope_sink, sink);
 }
 
 void gui_rf_decoder_destroy(gui_rf_decoder_t *d) {

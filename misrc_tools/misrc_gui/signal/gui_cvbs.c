@@ -9064,6 +9064,8 @@ static gui_rf_preview_worker_t *s_rf_audio_source;
 static bool s_rf_audio_audible;
 // Hi-Fi on CH3/4 hooks (set once at startup, before capture threads run).
 static gui_video_rf_tap_fn s_rf_tap;
+// Scopes on the RF Preview output (gui_rf_scopes.c): the channel's sink while used.
+static const gui_rf_scope_sink_t *(*s_rf_scope_provider)(int channel);
 static gui_rf_preview_worker_t *(*s_rf_monitor_override)(gui_app_t *app);
 static void video_rf_audio(void *context, const float *stereo, size_t frames, uint64_t end_sample) {
     if (!stereo || !frames) {
@@ -9174,6 +9176,19 @@ void gui_video_update_rf_routes(gui_app_t *app) {
             if (created) atomic_store(&s_rf_routes[ch][sys],worker);
         }
         s_rf_bindings[i]=decoder;
+    }
+    // Scope feed: the channel's first RF Video panel's worker gets the
+    // channel's sink while a Vectorscope / WFM there uses it; every other
+    // worker none (re-set each frame: cheap, and survives worker swaps).
+    for (int ch=0; ch<2; ++ch) {
+        const gui_rf_scope_sink_t *sink = s_rf_scope_provider ? s_rf_scope_provider(ch) : NULL;
+        gui_rf_preview_worker_t *chosen = NULL;
+        for (int i=ch*2; i<ch*2+2 && !chosen; ++i)
+            if (desired[i] && desired[i]->worker) chosen = desired[i]->worker;
+        for (int sys=0; sys<GUI_RF_PROFILE_COUNT; ++sys) {
+            gui_rf_preview_worker_t *worker = atomic_load(&s_rf_routes[ch][sys]);
+            if (worker) gui_rf_preview_worker_set_scope_sink(worker, worker == chosen ? sink : NULL);
+        }
     }
     // Prefer the first playing RF audio panel (A before B). If all candidates
     // are paused, keep the first selected so monitoring stays on the RF route.
@@ -9381,6 +9396,24 @@ void gui_video_set_rf_tap(gui_video_rf_tap_fn tap,
                           gui_rf_preview_worker_t *(*monitor_override)(gui_app_t *app)) {
     s_rf_tap = tap;
     s_rf_monitor_override = monitor_override;
+}
+
+void gui_video_set_rf_scope_provider(const gui_rf_scope_sink_t *(*provider)(int channel)) {
+    s_rf_scope_provider = provider;
+}
+
+int gui_video_channel_rf_format(gui_app_t *app, int channel) {
+    if (!app || channel < 0 || channel > 1) return -1;
+    const channel_panel_config_t *cfg = channel ? &app->panel_config_b : &app->panel_config_a;
+    vhs_fm_decoder_t *dec = video_config_rf(cfg->left_view, cfg->left_state);
+    if (!dec && cfg->split) dec = video_config_rf(cfg->right_view, cfg->right_state);
+    if (!dec || !dec->worker) return -1;
+    const gui_rf_profile_t profile = gui_vhs_fm_get_profile(dec);
+    // The field renderer feeds PAL / NTSC colour-under and LaserDisc; SECAM
+    // has its own renderer and no feed.
+    if (profile == GUI_RF_PROFILE_SECAM_VHS || profile == GUI_RF_PROFILE_MESECAM_VHS ||
+        gui_rf_profile_is_audio_only(profile)) return -1;
+    return (int)gui_rf_profile_format(profile);
 }
 
 void gui_video_forget_rf_audio_source(const void *worker) {

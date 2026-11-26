@@ -145,6 +145,26 @@ void gui_wfm_reset(gui_wfm_t *w);
 
 // Decoder thread.
 void gui_wfm_add_line(gui_wfm_t *w, const gui_wfm_line_t *line);
+
+// One line from a decoder that already resolved levels and colour (the RF
+// Preview, gui_rf_scopes.c; harrypm 2026-11-26): luma in IRE (blanking 0)
+// and burst-locked U / V (units of the 100 IRE span) on a time grid after
+// 0H. The monitor resamples them onto its columns and rebuilds C as
+// U sin + V cos at the subcarrier (with the same per-line column dither),
+// so Y / C / Y+C, the ranges and the frame publishing work as for CVBS.
+typedef struct {
+    const float *ire;      // count samples
+    const float *u, *v;    // count samples, or NULL (no colour)
+    int count;
+    double t0_us, dt_us;   // sample i at t0 + i*dt us after 0H
+    double rate;           // raster column rate (Hz), e.g. 4 x fsc
+    double fsc_hz;         // subcarrier for the rebuilt C
+    double phase0;         // subcarrier phase at 0H (rad)
+    double line_us, active_start_us, active_end_us;
+    int system;            // GUI_WFM_SYS_*
+    bool picture;
+} gui_wfm_decoded_line_t;
+void gui_wfm_add_decoded_line(gui_wfm_t *w, const gui_wfm_decoded_line_t *line);
 // Unlocked: publish every second field, whatever they are.
 void gui_wfm_end_field(gui_wfm_t *w);
 // Field / frame lock (harrypm 2026-11-19): `parity` is the ending field's,

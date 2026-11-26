@@ -117,6 +117,10 @@ void gui_rf_preview_worker_set_audio_callback(gui_rf_preview_worker_t *worker,
                                               gui_rf_preview_audio_callback_t callback,
                                               void *context);
 void gui_rf_preview_worker_destroy(gui_rf_preview_worker_t *worker);
+/* Scope feed of this worker's video decoder (gui_rf_scope_sink_t; NULL =
+ * none). Any thread; the sink must outlive the worker's use of it. */
+void gui_rf_preview_worker_set_scope_sink(gui_rf_preview_worker_t *worker,
+                                          const gui_rf_scope_sink_t *sink);
 void gui_rf_preview_worker_set_format(gui_rf_preview_worker_t *worker,
                                      gui_rf_format_t format);
 /* Frame display mode: Active (default) or Full (VBI + burst with decoded

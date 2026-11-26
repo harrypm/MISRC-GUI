@@ -1501,6 +1501,11 @@ gui_rf_preview_worker_t *gui_rf_preview_worker_create(gui_rf_format_t format) {
              GUI_RF_PROFILE_NTSC_VHS : GUI_RF_PROFILE_PAL_VHS);
 }
 
+void gui_rf_preview_worker_set_scope_sink(gui_rf_preview_worker_t *w,
+                                          const gui_rf_scope_sink_t *sink) {
+    if (w && w->decoder) gui_rf_decoder_set_scope_sink(w->decoder, sink);
+}
+
 gui_rf_preview_worker_t *gui_rf_preview_worker_create_profile(gui_rf_profile_t profile) {
     if ((unsigned)profile >= GUI_RF_PROFILE_COUNT) return NULL;
     gui_rf_preview_worker_t *w = calloc(1, sizeof(*w));

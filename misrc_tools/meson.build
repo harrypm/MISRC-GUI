@@ -527,6 +527,7 @@ if raylib_dep.found()
     'misrc_gui/signal/gui_trigger.c', 'misrc_gui/signal/gui_hs_trigger.c',
     'misrc_gui/signal/gui_cvbs.c',
     'misrc_gui/signal/gui_vectorscope.c', 'misrc_gui/signal/gui_wfm.c',
+    'misrc_gui/signal/gui_rf_scopes.c',
     'misrc_gui/signal/gui_vhs_fm.c',
     'misrc_gui/signal/gui_rf_resampler.c',
     'misrc_gui/processing/gui_rf_preview_worker.c', 'misrc_gui/signal/gui_beta_hifi.c',

@@ -225,6 +225,12 @@ gui_rf_preview_worker_t *gui_rf_preview_worker_create_profile(gui_rf_profile_t p
     ((route_worker_t*)worker)->profile=profile;
     return worker;
 }
+/* Scope feed (gui_rf_scopes.c): not exercised by the route tests. */
+void gui_rf_preview_worker_set_scope_sink(gui_rf_preview_worker_t *w, const gui_rf_scope_sink_t *sink) {
+    (void)w;
+    (void)sink;
+}
+
 void gui_rf_preview_worker_set_audio_callback(gui_rf_preview_worker_t *w, gui_rf_preview_audio_callback_t cb, void *ctx) {
     assert(w && cb && ctx==w);
 }

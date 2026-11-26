@@ -27,6 +27,7 @@
 #include "gui_vectorscope_panel.h"
 #include "../signal/gui_cvbs.h"
 #include "../signal/gui_vectorscope.h"
+#include "../signal/gui_rf_scopes.h"   // RF Preview feed
 #include "../core/gui_app.h"
 #include "../ui/gui_ui.h"
 #include "../ui/gui_chrome_hide.h"
@@ -76,6 +77,12 @@ typedef struct {
     // Display thread: the CVBS plugin decode chain + the accumulator it feeds.
     gui_cvbs_feed_t *feed;
     gui_vectorscope_t scope;
+    // Where fields come from: &scope (this panel's composite decode) or the
+    // channel's RF Preview feed (gui_rf_scopes.c) while a Video panel on the
+    // same channel runs the RF Preview. rf_fed: the display thread then
+    // skips this panel's own decode.
+    gui_vectorscope_t *src;
+    atomic_bool rf_fed;
     atomic_int pending_system;     // -1 none, else 0=PAL 1=NTSC 2=SECAM
     atomic_bool release_hold;      // Test Gen mode ended: drop the follow hold
     atomic_int decoder_system;     // The decoder's current pick (for the UI)
@@ -298,10 +305,14 @@ bool gui_vectorscope_panel_apply_launch_arg(const char *arg) {
 static void vs_destroy(void *state_ptr);
 
 static void vs_push_settings(vectorscope_panel_t *s) {
-    atomic_store(&s->scope.want_mode, s->mode);
-    atomic_store(&s->scope.want_lines, s->lines_view);
-    atomic_store(&s->scope.want_field, s->field_view);
-    atomic_store(&s->scope.want_trace, s->trace);
+    gui_vectorscope_t *targets[2] = { &s->scope, s->src };
+    for (int i = 0; i < 2; i++) {
+        if (!targets[i] || (i == 1 && targets[1] == &s->scope)) continue;
+        atomic_store(&targets[i]->want_mode, s->mode);
+        atomic_store(&targets[i]->want_lines, s->lines_view);
+        atomic_store(&targets[i]->want_field, s->field_view);
+        atomic_store(&targets[i]->want_trace, s->trace);
+    }
 }
 
 static void *vs_create(void) {
@@ -332,6 +343,7 @@ static void *vs_create(void) {
     }
     cvbs_decoder_t *dec = gui_cvbs_feed_decoder(s->feed);
     dec->vscope = &s->scope;
+    s->src = &s->scope;
     gui_cvbs_feed_set_pixels(s->feed, false);   // scope only: no picture pass
     atomic_init(&s->pending_system, -1);
     s->gen_seen = -1;
@@ -419,6 +431,7 @@ static void vs_process(void *state_ptr, const int16_t *samples, size_t count,
                        uint32_t sample_rate) {
     vectorscope_panel_t *s = state_ptr;
     if (!s || !s->feed || !samples || count == 0) return;
+    if (atomic_load(&s->rf_fed)) return;   // fed by the RF Preview's decoder
     int pending = atomic_exchange(&s->pending_system, -1);
     if (pending >= 0 && pending <= 2) {
         s->follow_target = pending;
@@ -529,7 +542,7 @@ static void vs_zero_box(uint32_t *grid, const gui_vscope_meta_t *m) {
 static bool vs_take_fields(vectorscope_panel_t *s) {
     gui_vscope_meta_t meta;
     bool fresh = false;
-    while (gui_vectorscope_take_swap(&s->scope, &s->take_hits, &s->take_trans, &meta)) {
+    while (gui_vectorscope_take_swap(s->src ? s->src : &s->scope, &s->take_hits, &s->take_trans, &meta)) {
         // A field latched before the last Mode / Lines / Field click (up to
         // two are in flight: published, and being accumulated) is not this
         // view: drop it, its buffers zeroed back for the scope. Shown, an
@@ -1041,7 +1054,19 @@ static void vs_render(void *state_ptr, gui_app_t *app, int channel,
     vectorscope_panel_t *s = state_ptr;
     DrawRectangleRec(bounds, COLOR_METER_BG);
     if (!s) return;
-    vs_follow_generator(s, app);
+    // RF Preview on this channel (harrypm 2026-11-26): plot its decoded,
+    // burst-locked chroma instead of decoding the raw RF as composite.
+    const int rf_format = app ? gui_video_channel_rf_format(app, channel) : -1;
+    gui_vectorscope_t *rf_src = rf_format >= 0 ? gui_rf_scopes_vectorscope(channel) : NULL;
+    gui_vectorscope_t *want_src = rf_src ? rf_src : &s->scope;
+    if (want_src != s->src) {
+        s->src = want_src;
+        vs_push_settings(s);
+        vs_clear(s);
+    }
+    atomic_store(&s->rf_fed, rf_src != NULL);
+    if (rf_src) atomic_store(&s->decoder_system, rf_format == 1 ? 1 : 0);   // GUI_RF_NTSC = 1
+    else vs_follow_generator(s, app);
     // Paused playback (harrypm 2026-11-19, as the WFM): the feed stops on
     // purpose, so the last trace stays instead of blanking as a lost feed;
     // a step-back lead-in is decoded but not shown until the step lands.
@@ -1181,7 +1206,9 @@ static const char *vs_button_label(const vectorscope_panel_t *s, int b, char *bu
         case VS_BTN_SYSTEM: {
             int sys = atomic_load(&((vectorscope_panel_t *)s)->decoder_system);
             const char *name = vs_system_name(sys);
-            if (atomic_load(&((vectorscope_panel_t *)s)->auto_system))
+            if (atomic_load(&((vectorscope_panel_t *)s)->rf_fed))
+                snprintf(buf, n, "System: RF (%s)", name);
+            else if (atomic_load(&((vectorscope_panel_t *)s)->auto_system))
                 snprintf(buf, n, "System: Auto (%s)", name);
             else
                 snprintf(buf, n, "System: %s", name);
@@ -1253,6 +1280,7 @@ static bool vs_handle_click(void *state_ptr, gui_app_t *app, int channel,
             if (s->btn[b].width <= 0.0f || !CheckCollisionPointRec(click, s->btn[b])) continue;
             switch (b) {
                 case VS_BTN_SYSTEM: {
+                    if (atomic_load(&s->rf_fed)) break;   // the RF Preview sets the system
                     s->refeed = true;
                     // Auto -> PAL -> NTSC -> SECAM -> Auto.
                     if (atomic_load(&s->auto_system)) {

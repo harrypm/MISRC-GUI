@@ -282,6 +282,66 @@ void gui_wfm_add_line(gui_wfm_t *w, const gui_wfm_line_t *in) {
     w->acc_meta.lines++;
 }
 
+void gui_wfm_add_decoded_line(gui_wfm_t *w, const gui_wfm_decoded_line_t *in) {
+    if (!w || !w->acc || !in || !in->ire || in->count < 2 || !(in->rate > 1e6) || !(in->dt_us > 0.0)) return;
+    if (w->acc_started && in->system != w->acc_meta.system) gui_wfm_reset(w);
+    if (w->acc_started && fabs(in->rate - w->acc_meta.rate) > 0.5) {
+        memset(w->acc, 0, WFM_CELLS * sizeof(uint16_t));
+        w->fields_in_acc = 0;
+        w->acc_started = false;
+    }
+    if (!w->acc_started) {
+        gui_wfm_line_t l;
+        memset(&l, 0, sizeof(l));
+        l.rate = in->rate;
+        l.line_us = in->line_us;
+        l.active_start_us = in->active_start_us;
+        l.active_end_us = in->active_end_us;
+        l.system = in->system;
+        wfm_start(w, &l);
+    }
+    const gui_wfm_meta_t *m = &w->acc_meta;
+    if (m->range == GUI_WFM_RANGE_ACTIVE && !in->picture) return;
+    const bool chroma = m->channel == GUI_WFM_CH_C;
+    const bool y_only = m->channel == GUI_WFM_CH_Y;
+    const bool colour = in->u && in->v && !y_only;
+    const double bpi = (double)GUI_WFM_BINS / (m->hi_ire - m->lo_ire);
+    // The same per-line column dither as the CVBS path (equivalent-time
+    // sampling of the rebuilt subcarrier: the envelope, not two phases).
+    w->dither = w->dither + 0.6180339887498949;
+    if (w->dither >= 1.0) w->dither -= 1.0;
+    const double jitter = 2.0 * (w->dither - 0.5) * m->us_per_col;
+    const double wsc = 2.0 * 3.14159265358979323846 * in->fsc_hz * 1e-6;   // rad per us
+    const double last = (double)(in->count - 1);
+    // Subcarrier by rotation: one sin/cos per line, not per column.
+    const double th0 = in->phase0 + wsc * (m->t0_us + jitter), dth = wsc * m->us_per_col;
+    double sr = sin(th0), cr = cos(th0);
+    const double sd = sin(dth), cd = cos(dth);
+    uint16_t *acc = w->acc;
+    for (int c = 0; c < m->cols; c++) {
+        const float s_now = (float)sr, c_now = (float)cr;
+        const double nsr = sr * cd + cr * sd;
+        cr = cr * cd - sr * sd;
+        sr = nsr;
+        const double t = m->t0_us + c * m->us_per_col + jitter;
+        const double f = (t - in->t0_us) / in->dt_us;
+        if (f < 0.0 || f > last) continue;
+        int i = (int)f;
+        if (i >= in->count - 1) i = in->count - 2;
+        const float fr = (float)(f - i);
+        const float y = in->ire[i] + (in->ire[i + 1] - in->ire[i]) * fr;
+        float val = chroma ? 0.0f : y;
+        if (colour) {
+            const float u = in->u[i] + (in->u[i + 1] - in->u[i]) * fr;
+            const float v = in->v[i] + (in->v[i + 1] - in->v[i]) * fr;
+            val += 100.0f * (u * s_now + v * c_now);
+        }
+        const float bf = (float)((val - m->lo_ire) * bpi);
+        if (bf >= 0.0f && bf < (float)GUI_WFM_BINS) acc[(size_t)(int)bf * GUI_WFM_COLS + (size_t)c]++;
+    }
+    w->acc_meta.lines++;
+}
+
 static void wfm_field_swing(gui_wfm_t *w) {
     if (w->swing_n >= 16) {
         double m = w->swing_sum / (double)w->swing_n;

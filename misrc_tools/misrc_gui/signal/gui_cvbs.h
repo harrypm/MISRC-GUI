@@ -755,4 +755,10 @@ void gui_video_set_rf_tap(gui_video_rf_tap_fn tap,
                           gui_rf_preview_worker_t *(*monitor_override)(gui_app_t *app));
 // Before destroying a worker that may be the monitor source (main thread).
 void gui_video_forget_rf_audio_source(const void *worker);
+// Scopes on the RF Preview output (signal/gui_rf_scopes.c): provider of a
+// channel's scope sink while used (set once at startup).
+void gui_video_set_rf_scope_provider(const gui_rf_scope_sink_t *(*provider)(int channel));
+// Format (GUI_RF_PAL / GUI_RF_NTSC) of the RF Preview a Video panel on this
+// channel runs, -1 if none (or SECAM: no scope feed). Main thread.
+int gui_video_channel_rf_format(gui_app_t *app, int channel);
 #endif // GUI_CVBS_H

@@ -14,6 +14,7 @@
 #include "gui_wfm_panel.h"
 #include "../signal/gui_cvbs.h"
 #include "../signal/gui_wfm.h"
+#include "../signal/gui_rf_scopes.h"   // RF Preview feed
 #include "../signal/gui_vectorscope.h"   // gui_vectorscope_field_period_system
 #include "../core/gui_app.h"
 #include "../ui/gui_ui.h"
@@ -45,6 +46,11 @@ typedef struct {
     // Display thread: the CVBS plugin decode chain + the raster it feeds.
     gui_cvbs_feed_t *feed;
     gui_wfm_t wfm;
+    // Raster source: &wfm (this panel's composite decode) or the channel's
+    // RF Preview feed (gui_rf_scopes.c) while a Video panel on the same
+    // channel runs the RF Preview; rf_fed skips this panel's own decode.
+    gui_wfm_t *src;
+    atomic_bool rf_fed;
     atomic_int pending_system;     // -1 none, else 0=PAL 1=NTSC 2=SECAM
     atomic_int decoder_system;     // The decoder's current pick (for the UI)
     atomic_bool auto_system;       // Auto: 50 Hz fields -> PAL, 59.94 -> NTSC
@@ -200,6 +206,7 @@ static void *wf_create(void) {
     }
     cvbs_decoder_t *dec = gui_cvbs_feed_decoder(s->feed);
     dec->wfm = &s->wfm;
+    s->src = &s->wfm;
     gui_cvbs_feed_set_pixels(s->feed, false);   // monitor only: no picture pass
     atomic_init(&s->pending_system, -1);
     s->gen_seen = -1;
@@ -257,6 +264,7 @@ static void wf_process(void *state_ptr, const int16_t *samples, size_t count,
                        uint32_t sample_rate) {
     wfm_panel_t *s = state_ptr;
     if (!s || !s->feed || !samples || count == 0) return;
+    if (atomic_load(&s->rf_fed)) return;   // fed by the RF Preview's decoder
     int pending = atomic_exchange(&s->pending_system, -1);
     if (pending >= 0 && pending <= 2) {
         s->follow_target = pending;
@@ -475,7 +483,9 @@ static const char *wf_button_label(const wfm_panel_t *s, int b, char *buf, size_
         case WF_BTN_SYSTEM: {
             int sys = atomic_load(&((wfm_panel_t *)s)->decoder_system);
             const char *name = systems[(sys >= 0 && sys <= 2) ? sys : 0];
-            if (atomic_load(&((wfm_panel_t *)s)->auto_system))
+            if (atomic_load(&((wfm_panel_t *)s)->rf_fed))
+                snprintf(buf, n, "System: RF (%s)", name);
+            else if (atomic_load(&((wfm_panel_t *)s)->auto_system))
                 snprintf(buf, n, "System: Auto (%s)", name);
             else
                 snprintf(buf, n, "System: %s", name);
@@ -525,7 +535,22 @@ static void wf_render(void *state_ptr, gui_app_t *app, int channel,
         DrawRectangleRec(bounds, COLOR_METER_BG);
         return;
     }
-    wf_follow_generator(s, app);
+    // RF Preview on this channel (harrypm 2026-11-26): its decoded luma /
+    // chroma instead of decoding the raw RF as composite.
+    const int rf_format = app ? gui_video_channel_rf_format(app, channel) : -1;
+    gui_wfm_t *rf_src = rf_format >= 0 ? gui_rf_scopes_wfm(channel) : NULL;
+    gui_wfm_t *want_src = rf_src ? rf_src : &s->wfm;
+    if (want_src != s->src) {
+        s->src = want_src;
+        s->have_data = false;
+        s->image_dirty = true;
+    }
+    // Channel / Range requests go to the active source every frame.
+    atomic_store(&s->src->want_channel, s->channel);
+    atomic_store(&s->src->want_range, s->range);
+    atomic_store(&s->rf_fed, rf_src != NULL);
+    if (rf_src) atomic_store(&s->decoder_system, rf_format == 1 ? 1 : 0);   // GUI_RF_NTSC = 1
+    else wf_follow_generator(s, app);
     DrawRectangleRec(bounds, wf_back(s));
 
     // Paused playback (harrypm 2026-11-19 "fix pause ... of the WFM"): the
@@ -537,7 +562,7 @@ static void wf_render(void *state_ptr, gui_app_t *app, int channel,
                                gui_playback_is_channel_paused(app, channel));
     const bool step_hold = pb && gui_playback_display_hold_channel(app, channel);
     double now = GetTime();
-    if (!step_hold && gui_wfm_take(&s->wfm, s->grid, &s->meta)) {
+    if (!step_hold && gui_wfm_take(s->src ? s->src : &s->wfm, s->grid, &s->meta)) {
         s->have_data = s->meta.cols > 0;
         s->last_frame_time = now;
         s->image_dirty = true;
@@ -786,6 +811,7 @@ static bool wf_handle_click(void *state_ptr, gui_app_t *app, int channel,
             if (s->btn[b].width <= 0.0f || !CheckCollisionPointRec(click, s->btn[b])) continue;
             switch (b) {
                 case WF_BTN_SYSTEM:
+                    if (atomic_load(&s->rf_fed)) break;   // the RF Preview sets the system
                     s->refeed = true;
                     // Auto -> PAL -> NTSC -> SECAM -> Auto (the Vector panel's cycle).
                     if (atomic_load(&s->auto_system)) {
