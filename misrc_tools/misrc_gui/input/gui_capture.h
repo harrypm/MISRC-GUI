@@ -36,6 +36,16 @@ void gui_capture_poll_hsdaoh_status(gui_app_t *app);
 // today; add a branch here when a second SDR backend is added). Returns 0 on
 // success, -1 if no SDR backend is active.
 int gui_app_set_sdr_frequency(gui_app_t *app, uint64_t hz);
+// Generic SDR gain: step the tuner gain (dir -1 / +1, Auto below the
+// lowest) or set the RTL AGC; persisted and applied live. -1 = no SDR.
+int gui_app_sdr_gain_step(gui_app_t *app, int dir);
+// Retune the running SDR without saving the frequency (Radio sweep). 0 = ok.
+int gui_app_sdr_retune_live(gui_app_t *app, uint64_t hz);
+int gui_app_sdr_set_agc(gui_app_t *app, bool on);
+// SDR sample rate (span; harrypm 2026-11-27: "bandwidth controls now"):
+// persisted; a running capture restarts with it (the rate is fixed per
+// capture: stream timing, recording). Refused while recording. 0 = ok.
+int gui_app_set_sdr_rate(gui_app_t *app, uint32_t hz);
 
 // --- Level autostop helpers (device-aware level scaling) ---
 // The level autostop compares max(peak_a_pos, peak_a_neg) against a normalized

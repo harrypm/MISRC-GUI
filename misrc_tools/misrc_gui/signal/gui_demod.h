@@ -42,4 +42,13 @@ void gui_demod_panel_register(void);
 // True if the Demod panel is usable (always; DSP is self-contained).
 bool gui_demod_available(void);
 
+// --radio <key=value,...>: launch state of new Radio panels:
+// tune=<Hz> (signed offset of the tuning line from the I/Q centre; k / M
+// suffixes allowed). Prints the accepted list and returns false on error.
+bool gui_demod_apply_launch_arg(const char *arg);
+// The --radio keys that are settings (mode, bw, sql, vol, out, region, and
+// the SDR's freq / band / gain / agc / rate): applied once after the
+// settings load, before any capture opens the dongle.
+void gui_demod_apply_launch_settings(gui_app_t *app);
+
 #endif // GUI_DEMOD_H

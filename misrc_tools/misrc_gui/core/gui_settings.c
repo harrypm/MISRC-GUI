@@ -621,6 +621,7 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     settings->demod_squelch = 0.0f;             // 0.0 = squelch open
     settings->demod_volume = 1.0f;              // 1.0 = unity gain
     settings->demod_output_pair = 0;            // 0 = CH1/2, 1 = CH3/4
+    settings->demod_region = 0;                 // 0 = Auto (follows the TV system)
 
     // Video panel default system: PAL unless the user's persisted pick
     // loads (0=PAL, 1=NTSC, 2=SECAM - the CVBS System selector's space).
@@ -812,6 +813,7 @@ void gui_settings_save(const gui_settings_t *settings) {
     fprintf(f, "  \"demod_squelch\": %.3f,\n", settings->demod_squelch);
     fprintf(f, "  \"demod_volume\": %.3f,\n", settings->demod_volume);
     fprintf(f, "  \"demod_output_pair\": %d,\n", settings->demod_output_pair);
+    fprintf(f, "  \"demod_region\": %d,\n", settings->demod_region);
     fprintf(f, "  \"video_system\": %d,\n", settings->video_system);
     fprintf(f, "  \"gen_tape_format\": %d,\n", settings->gen_tape_format);
     // Server/Client networking (cxadc_vhs_server-style peer mode).
@@ -1610,6 +1612,10 @@ void gui_settings_load(gui_settings_t *settings) {
     }
     if ((value = find_value(content, "demod_output_pair")) != NULL) {
         settings->demod_output_pair = atoi(value);
+    }
+    if ((value = find_value(content, "demod_region")) != NULL) {
+        settings->demod_region = atoi(value);
+        if (settings->demod_region < 0 || settings->demod_region > 3) settings->demod_region = 0;
     }
     // Video panel: the CVBS System selector's persisted pick; an invalid
     // saved value keeps the PAL default. (The generator Gen box may store

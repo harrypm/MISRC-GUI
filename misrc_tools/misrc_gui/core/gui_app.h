@@ -387,6 +387,8 @@ typedef struct {
     float   demod_squelch;                // 0.0-1.0 squelch level (0 = open)
     float   demod_volume;                 // 0.0-2.0 output volume (1.0 = unity)
     int     demod_output_pair;            // 0 = CH1/2, 1 = CH3/4 (audio monitor output pair)
+    int     demod_region;                 // 0 Auto (TV system: NTSC -> Americas, else Europe/UK),
+                                          // 1 Europe/UK, 2 Americas, 3 Japan: WFM de-emphasis + AM raster
 
     // Video panel: the CVBS System selector's persisted pick
     // (0=PAL, 1=NTSC, 2=SECAM - gui_cvbs_set_format's value space).

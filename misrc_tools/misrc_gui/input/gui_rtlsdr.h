@@ -67,6 +67,15 @@ bool gui_rtlsdr_get_rf_source(const gui_app_t *app, uint32_t *rate, uint64_t *tu
 // Safe to call whether or not capture is running; returns 0 on success.
 int gui_rtlsdr_set_frequency(gui_app_t *app, uint64_t hz);
 
+// Live gain (harrypm 2026-11-27: "there is no gain control exposed"):
+// step through the tuner's own gain list (dir -1 / +1; below the lowest =
+// Auto, from Auto = ~30 dB) or switch the RTL2832 AGC. Both persist to the
+// settings and apply to the open dongle at once.
+int gui_rtlsdr_gain_step(gui_app_t *app, int dir);
+// Retune the running dongle WITHOUT saving (Radio sweep steps).
+int gui_rtlsdr_retune_live(gui_app_t *app, uint64_t hz);
+int gui_rtlsdr_set_agc(gui_app_t *app, bool on);
+
 #endif // ENABLE_RTLSDR
 
 #endif // GUI_RTLSDR_H

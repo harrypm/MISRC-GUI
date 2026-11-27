@@ -471,6 +471,71 @@ int gui_app_set_sdr_frequency(gui_app_t *app, uint64_t hz)
     return -1;
 }
 
+static bool gui_app_sdr_selected(const gui_app_t *app) {
+#ifdef ENABLE_RTLSDR
+    return app && app->selected_device >= 0 && app->selected_device < app->device_count &&
+           app->devices[app->selected_device].type == DEVICE_TYPE_RTLSDR;
+#else
+    (void)app;
+    return false;
+#endif
+}
+
+int gui_app_sdr_retune_live(gui_app_t *app, uint64_t hz)
+{
+#ifdef ENABLE_RTLSDR
+    if (gui_app_sdr_selected(app)) return gui_rtlsdr_retune_live(app, hz);
+#endif
+    (void)app;
+    (void)hz;
+    return -1;
+}
+
+int gui_app_sdr_gain_step(gui_app_t *app, int dir)
+{
+#ifdef ENABLE_RTLSDR
+    if (gui_app_sdr_selected(app)) return gui_rtlsdr_gain_step(app, dir);
+#endif
+    (void)app;
+    (void)dir;
+    return -1;
+}
+
+int gui_app_set_sdr_rate(gui_app_t *app, uint32_t hz)
+{
+    if (!gui_app_sdr_selected(app) || hz == 0) return -1;
+    if (app->is_recording) {
+        gui_app_set_status(app, "Stop recording before changing the SDR rate");
+        return -1;
+    }
+    if (app->settings.rtlsdr_sample_rate_hz == hz) return 0;
+    app->settings.rtlsdr_sample_rate_hz = hz;
+    gui_settings_save(&app->settings);
+    char msg[64];
+#if defined(__ANDROID__)
+    snprintf(msg, sizeof(msg), "SDR rate %.3f MSPS: reconnect to apply", hz / 1e6);
+#else
+    if (app->is_capturing) {
+        gui_app_stop_capture(app);
+        (void)gui_app_start_capture(app);
+    }
+    snprintf(msg, sizeof(msg), hz > 2560000U ? "SDR rate %.3f MSPS - above 2.56 may drop samples (watch Missed)"
+                                             : "SDR rate %.3f MSPS", hz / 1e6);
+#endif
+    gui_app_set_status(app, msg);
+    return 0;
+}
+
+int gui_app_sdr_set_agc(gui_app_t *app, bool on)
+{
+#ifdef ENABLE_RTLSDR
+    if (gui_app_sdr_selected(app)) return gui_rtlsdr_set_agc(app, on);
+#endif
+    (void)app;
+    (void)on;
+    return -1;
+}
+
 static inline void gui_capture_promote_callback_priority_once(void)
 {
     static MISRC_THREAD_LOCAL bool s_capture_callback_thread_priority_set = false;

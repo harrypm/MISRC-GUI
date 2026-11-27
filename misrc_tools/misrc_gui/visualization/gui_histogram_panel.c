@@ -94,7 +94,7 @@ static const char *const s_parade_ch_names[PARADE_CH_COUNT] = { "RGB", "R", "G",
 static struct {
     int mode, parade_ch, bins;
     bool parade_full, parade_10bit, from_flag;
-} s_hist_launch = { HIST_MODE_AMPLITUDE, PARADE_CH_RGB, 0, false, false, false };
+} s_hist_launch = { HIST_MODE_PARADE, PARADE_CH_RGB, 0, false, false, false };   // Parade default (harrypm 2026-11-27)
 
 static bool hist_flag_value(const char *key, const char *val, size_t len) {
     #define HS_IS(lit) (len == sizeof(lit) - 1 && strncmp(val, lit, len) == 0)

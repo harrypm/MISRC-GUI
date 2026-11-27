@@ -72,9 +72,22 @@ GUI autoload trigger flag.**
   `[AUTO] --wfm` and `[AUTO] WFM panel: ...` per panel). [2026-11-16]
 - Histogram panel Mode / Bins and the Parade mode's Ch / Area / Range buttons:
   - Flag: `--histogram <key=value,...>`: mode=amplitude|parade, channel=rgb|r|g|b|w (w = Rec.601 luma), area=active|full, range=8|10, bins=64..4096.
-  - Launch state of every Histogram panel created after it. Defaults: amplitude, rgb, active, 8-bit, 4096 bins.
+  - Launch state of every Histogram panel created after it. Defaults: parade (since 2026-11-27), rgb, active, 8-bit, 4096 bins.
   - Unknown keys/values print the accepted list and exit 1. Logs `[AUTO] --histogram` and `[AUTO] Histogram panel: ...` per panel.
   - The Bins dropdown had no flag before (an unlisted gap). [2026-11-26]
+- Radio panel tuning line (click / drag / wheel in its spectrum + waterfall):
+  - Flag `--radio <key=value,...>`; every Radio control (harrypm 2026-11-27: "all modes should have CLI load commands"):
+    - Panel state:
+      - `tune=<Hz>`: tuning line = offset from the I/Q centre, or the RF frequency on a real input. k / M suffixes.
+      - `input=auto|iq|real`, `range=1..6`, `zoom=1|2|4|8|16|32`.
+    - Settings (saved; applied after the settings load, before any capture opens the dongle):
+      - `mode=wfm|nfm|am|usb|lsb`. Without `bw=` it resets BW to Auto.
+      - `bw=auto|<Hz>`, `sql=off|<dBFS -100..-1>`, `vol=0..2`, `out=12|34`, `region=auto|eu|us|jp`.
+    - SDR:
+      - `freq=<tuned MHz|Hz>`: centre = freq - 300 kHz, line at +300 kHz.
+      - `band=fm|air|2m|marine|70cm|pmr`, `gain=auto|<dB 0..60>`, `agc=on|off`, `rate=0.25M|1.024M|1.2M|1.536M|2.0M|2.048M|2.4M`.
+    - Logs `[AUTO] --radio`, `[AUTO] --radio settings: ...` and `[AUTO] Radio panel: ...`. [2026-11-27]
+- Radio panel SDR Band dropdown + MHz frequency box: no new flag (the SDR frequency is the `rtlsdr_freq_hz` config key; the mode is `demod_mode`). RTL-SDR stock layout (CH1 single Radio on the first RTL-SDR capture): `--rtl-layout on|off`. [2026-11-27]
 - Player-mode name hints (automatic, no control; off switch for tests):
   - Flag: `--name-hints on|off` (default on; logs `[AUTO] --name-hints` and `[AUTO] name hint: channel X -> ...` when applied). [2026-11-26]
 - View rename (2026-11-26): "Demod" is now "Radio" (`--panel-view ...radio`); the old name `demod` still parses.
@@ -128,6 +141,10 @@ GUI autoload trigger flag.**
   - Without pop-out windows (Android / no GLFW) the same button and `--popout` make the panel full screen inside the app. Back, Esc or its corner button returns it.
   - `MISRC_PANEL_FULLSCREEN=1` (diagnostics) selects that mode on desktop.
   - Added 2026-11-26.
+- Video panel decoder mode (the Decoder cycle, System, RF Format family):
+  - Flag: `--video decoder=cvbs|rf,system=pal|ntsc|secam|mesecam,format=vhs|betamax|laserdisc` (any subset).
+  - Applied to every new Video panel and again after a saved setup is restored, so the flag wins.
+  - Logs `[AUTO] --video` and `[AUTO] Video panel: <spec>`. [2026-11-27]
 - Video panel Frame button (Active / Full, all three decoders):
   - Flag: `--video-frame active|full` (launch state of new Video panels; logs `[AUTO] --video-frame`).
   - Default Full since 2026-11-26; a saved panel keeps its own.
@@ -151,7 +168,7 @@ GUI autoload trigger flag.**
 - Waveform Signal/Mode/Scale/Trig dropdowns,
   waveform playback Res/Range render-resolution dropdowns (per-panel runtime
   state: `res_points`/`res_range`, no settings key),
-  CVBS/RF decoder-mode cycle, OSD/Frame/Levels/Sync selectors: per-panel
+  OSD/Levels/Sync selectors (decoder mode: `--video` since 2026-11-27): per-panel
   runtime state, no launch key today (rule 6 exemption). [Res/Range added
   2026-11-03, playback device only]
 - Player Link mode + per-file transport (PlaybackLinkToggle /

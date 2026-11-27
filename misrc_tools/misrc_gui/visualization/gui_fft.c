@@ -60,6 +60,28 @@ void *gui_fft_plan_create_r2c(int size, float *input, void *output, unsigned fla
 #endif
 }
 
+void *gui_fft_plan_create_c2c(int size, float *input, float *output, unsigned flags) {
+#if LIBFFTW_ENABLED
+    if (size <= 0 || !input || !output) return NULL;
+    gui_fft_library_lock();
+    fftwf_plan plan = fftwf_plan_dft_1d(size, (fftwf_complex *)input, (fftwf_complex *)output,
+                                        FFTW_FORWARD, flags);
+    gui_fft_library_unlock();
+    return plan;
+#else
+    (void)size; (void)input; (void)output; (void)flags;
+    return NULL;
+#endif
+}
+
+void gui_fft_plan_execute(void *plan) {
+#if LIBFFTW_ENABLED
+    if (plan) fftwf_execute((fftwf_plan)plan);   // new-array-free execute is thread-safe
+#else
+    (void)plan;
+#endif
+}
+
 void gui_fft_plan_destroy(void *plan) {
 #if LIBFFTW_ENABLED
     if (!plan) return;
@@ -1505,13 +1527,13 @@ static void fft_vtable_render(void *state_ptr, gui_app_t *app, int channel,
 // Vtable Definition
 //-----------------------------------------------------------------------------
 
-// Double-click chrome-hide state, for the grid's pop-out button.
-static bool fft_vtable_chrome_hidden(void *state) {
-    const fft_panel_state_t *p = (const fft_panel_state_t *)state;
-    return p && gui_chrome_hide_hidden(&p->chrome_hide);
-}
-
-static const panel_vtable_t s_fft_vtable = {
+// Double-click chrome-hide state, for the grid's pop-out button.
+static bool fft_vtable_chrome_hidden(void *state) {
+    const fft_panel_state_t *p = (const fft_panel_state_t *)state;
+    return p && gui_chrome_hide_hidden(&p->chrome_hide);
+}
+
+static const panel_vtable_t s_fft_vtable = {
     .chrome_hidden = fft_vtable_chrome_hidden,
     .name = "FFT",
 

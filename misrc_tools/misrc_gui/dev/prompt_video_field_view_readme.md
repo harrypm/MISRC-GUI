@@ -423,3 +423,140 @@ A **View** button (Frame / Split / Field) under Frame: Active/Full, on all three
   - Applied once per newly opened path per channel. Replays / loops / seeks of the same file keep the user's manual choice. Every Video panel on that channel; status line "CHx Video: ... (from the file name)".
   - Off: `--name-hints off`.
   - Checked: EBU `cvbs-pal-..._Video_RF_...` -> CVBS PAL (config was NTSC; the picture locked); Daimler `..._NTSC_..._video_rf_...` -> RF NTSC; `rfB_CVBS_PAL_...` -> CVBS PAL; `..._rf2-hifi_...` -> no change; `--name-hints off` -> none.
+
+## 2026-11-27: Histogram Parade default, Radio tuning view
+- Prompts (harrypm): "set histrogram mode to prade by defult." / "Can we add an frequenxcy target mode line for the Radio mode using an moddied version of the existing spectrograoh visual code? sort ofl like a real SDR i.g SDR++ can?"
+- Histogram: new panels open in Parade (`--histogram mode=amplitude` for the old view).
+- **Radio tuning view** (`signal/gui_demod.c`), SDR++-style:
+  - Layout: I/Q spectrum (two-sided FFT, 2048 points, Hann, dBFS, 0.5 smoothing, auto floor = median, 80 dB span) over a waterfall (1024 x 256 ring texture, the Spectro palette via the new `gui_spectrogram_palette_lut()`), demod audio strip at the bottom.
+  - Tuning line (red) + channel shading (SSB: one side). Readout: absolute MHz on an SDR (centre + offset), else the offset from the centre.
+  - Click / drag in the spectrum or waterfall tunes; the wheel steps. Snap per mode, on the absolute frequency: WFM 100 kHz, NFM 2.5 kHz, AM 1 kHz, SSB 100 Hz. Hover line + frequency.
+  - Double-click OSD hide now works on the audio strip (clicks in the spectrum tune).
+  - DSP: before this the demod only ever ran on the centre (DC) and the BW setting was unused. Now:
+    - NCO mixes the tuned channel to DC (SSB: the sideband centre).
+    - Integrate & dump by D = fs / (4 BW), then a 31-tap Hamming FIR at BW / 2, decimating by 2: fs_out ~ 2 BW.
+    - Demod at fs_out: FM gain from deviation (WFM 75 kHz, NFM 0.4 BW), WFM de-emphasis fixed to unity DC gain. AM: envelope + 30 Hz DC block + AGC (200 ms release). SSB: shift back + real part + AGC.
+    - BW Auto: WFM 200k, NFM 12.5k, AM 9k, SSB 3k; the BW dropdown now filters.
+  - Input rate: the playback file's resolved rate in player mode (was the kHz-domain display rate).
+  - Complex FFT helpers added to `gui_fft.c`: `gui_fft_plan_create_c2c`, `gui_fft_plan_execute`.
+  - Flag `--radio tune=<Hz>`.
+- Checked:
+  - Synthetic I/Q pair (scratchpad `gen_iq.py`: 2.4 MSPS; WFM +300 kHz with a 1 kHz tone at 75 kHz deviation, AM -500 kHz with a 400 Hz tone at 60 %). FLAC header rate in kHz (2400) per the player's convention.
+  - In the app: carriers at the right frequencies; AM -> clean 400 Hz, WFM -> clean 1 kHz in the audio strip.
+  - Offline models of the exact chain (`sim_am.py`, `sim_fm.py`, `sim_ssb.py`): WFM 1 kHz amplitude 0.724 (expected 0.8 x 0.904 de-emphasis), residual 0.0002. AM residual 0.039 of 0.51 (AGC settling). USB gives the tone; LSB rejects it by ~54 dB.
+  - The model caught a bug in the first cut: the FIR read its ring without the oldest-first offset (time-varying filter, square-ish AM). Fixed in the C code.
+  - Not checked here: click / drag / wheel tuning (no input sent to the GUI) and listening to the audio.
+- Build 65/66 (update_cli baseline).
+- **Radio on real channels + continuous feed** (harrypm: "I have an antenna conencted, try tune into an FM radio station from Oxford UK's regional lists", then "2 - it should work in both modes"):
+  - No RTL-SDR on this PC (no 0BDA:2838 device). The antenna is on the MISRC (MS2130 / hsdaoh, 40 MSPS real).
+  - In button: Auto (I/Q on an SDR, else this channel real) / I/Q (A = I, B = Q) / Real. Real shows 0..fs/2 and labels absolute Hz; a real full-scale tone reads 0 dBFS.
+  - Continuous feed: the display frames are only the latest 64 k samples per drawn frame (~10 % of 40 MSPS).
+    - `gui_video_set_radio_tap()` (gui_cvbs.c) gets every capture block: `gui_video_submit_rf` for real channels, `gui_video_submit_rtlsdr` for u8 I/Q.
+    - The tap copies into 4 M-sample rings: only while a Radio panel is open, only the channels it uses, skipping preview-only blocks. The capture thread never waits.
+    - A worker thread runs the chain on 64 k chunks. It drops to the newest data if it falls behind, resyncs on discontinuity, and leaves a spectrum snapshot for the render thread.
+    - Without a feed (e.g. a remote source) the panel falls back to display frames.
+  - Checked:
+    - The synthetic I/Q pair through the feed.
+    - The live MISRC channel A as Real: the 0-20 MHz spectrum and waterfall fill continuously. Only spikes at exactly 5 and 15 MHz (40 MHz / 8 multiples: clock spurs, not stations) above a ~-85 dBFS floor.
+    - No FM broadcast band (95.2 MHz BBC Radio Oxford would alias to 15.2 MHz) is visible through the MISRC input.
+    - Suite 65/66.
+- **Docs + Region + undersampled FM on the MISRC** (harrypm: "add these to docs and add a region mode"; "I want to lock onto an FM radio station and decode real sound with the MISRC its filter is wide open so it should only be a software filter mode"):
+  - Docs:
+    - `docs/DECODER_MODES.md` "Radio panel modes" (was "Demod panel modes"): chain, mode table with what each is for and how it was verified, Region, Input, undersampling, limits.
+    - `docs/RTL-SDR.md` step 4 and the `docs/README.md` index updated.
+  - Region (Rgn button, saved `demod_region`): Auto (TV system: NTSC -> Americas, else EU/UK) / EU/UK / Americas / Japan.
+    - WFM de-emphasis: 50 us (EU, JP) or 75 us (Americas); was a fixed 75 us.
+    - AM raster and Auto BW: 9 kHz (EU, JP) or 10 kHz (Americas).
+  - Range button (real input): RF zone n covers (n-1) x fs/2 .. n x fs/2 and folds onto 0..fs/2. Even zones are mirrored: the display flips and USB / LSB swap.
+    - Labels, tuning, snap and readouts are in real RF.
+    - `tune=95.2M` picks zone 5 (80-100 MHz) by itself.
+  - Checked with a synthetic real 40 MSPS file (`gen_real.py`: WFM at 95.2 MHz with a 1 kHz tone and 105.4 MHz with a 2 kHz tone, as undersampled):
+    - tune=95.2M -> Range 80-100 MHz, 1 kHz sine.
+    - tune=105.4M -> Range 100-120 MHz inv, 2 kHz sine.
+    - Each station's fold image shows in the other zone (expected without a band filter).
+  - Live MISRC (MS2130, 40 MSPS), both channels, 80-100 MHz: no FM stations above the ~-85 dBFS floor; only the 40 MHz / 8 clock spurs (85 / 95 MHz). The FM band is not reaching the ADC at a usable level.
+  - Build: the Bash tool had resolved MINGW64. This change touched `gui_app.h`, so everything recompiled, and the DDD WinUSB code then failed on MINGW64's libusb 1.0.28. Clean in-place rebuild under the UCRT64 login shell. Suite 65/66.
+- **RTL-SDR live, zoom, squelch, Mode label** (harrypm: driver fixed with Zadig; "range selection is not fine enough"; "99,1mhz has somthing but its very distorted, also why is ch2 showing data? and MODE should say RTLSDR"; "SQL off makes a massive diff"):
+  - The RTL-SDR first failed to open: both Bulk-In interfaces had no driver (PnP status Error). harrypm installed WinUSB on Interface 0; it then opened.
+  - Zoom 1x-32x (button, Ctrl + wheel, `--radio zoom=`) around the tuning line; Shift = 100 Hz tuning steps; spectrum FFT 2048 -> 8192 points.
+  - Distortion = the old squelch, confirmed by harrypm with SQL Off. It zeroed every 48 kHz audio sample below the threshold, i.e. crossover distortion.
+    - Now it gates on the channel power: ~20 ms average, 3 dB hysteresis, 5 ms fade.
+    - SQL shows its threshold in dBFS; the channel power shows under the tuning readout.
+  - Mode button on an RTL-SDR: "Mode: RTL-SDR", disabled.
+    - Starting an RTL-SDR capture clears the MISRC A/B swap (same as CXADC / FX3). In MISRC mode it swapped I/Q in the display and recordings.
+    - A first attempt in `gui_extract.c` broke `gui_rf_input_stamps`, whose contract keeps the swap generic. Moved to `gui_rtlsdr.c`.
+  - CH2 showing data on an RTL-SDR is by design: CH1 = I, CH2 = Q.
+  - Suite 65/66.
+- **Compact Radio controls, frequency ranges, RTL-SDR stock layout** (harrypm: "SQL & Vol buttons need fixing"; "mkae the buttons smaller, fix the frequncy box to have ranges"; "also channe 1 should be single with view set to radio for stock mode with an RTLSDR enab,ed"):
+  - The overlay is rewritten as one compact column: 13 px text, 16 px rows, 2 px gaps, one width (the widest label), short labels.
+    - Rows: In, Range (real), Zoom, Region, Mode, BW, SQL, VOL, Out.
+    - SQL / VOL are `[- | label | +]` steppers with solid backgrounds (before, the label had none and overlapped the +/- ends).
+  - SDR row: `Band v` + the frequency box in MHz. Typing accepts digits and one dot (MHz; an integer above 10000 is Hz). Limits 0.5-1766 MHz, with a status message.
+    - Band presets: FM 98.0, Airband 125.0, 2 m 145.0, Marine 156.8, 70 cm 433.5, PMR446 446.1 MHz. Each sets SDR centre = band centre - 300 kHz, tuning line +300 kHz, and the mode (WFM / AM / NFM).
+  - `gui_rtl_default_layout` (main loop): the first capture on an RTL-SDR (at launch or after another device) sets CH1 split off + Radio, under `panel_config_lock`. `--rtl-layout on|off`.
+  - Checked on harrypm's RTL-SDR with a copy of his settings: `[AUTO] RTL-SDR layout: CH1 single Radio`, compact column and Band / 100.000 MHz row shown, the 99.1 MHz station in the spectrum.
+  - Seen in that capture: the CH1 / CH2 clip counters climb (-1206 / -943 negative clips). The RTL gain is high enough to hit the 8-bit floor.
+- **SDR gain / AGC / rate in the Radio panel; tuned-frequency box** (harrypm: "Not seeing any radio stations on the FM band range I had one at 97.1 Mhz before"; "Oh there is no gain control exposed..."; "bandwith controls now" -> picked "SDR sample rate (span)"):
+  - At the "no stations" report the RTL was clipping hard (CH1 / CH2 Clip about -45.8k and rising, peaks +84 / -76 %); the spectrum was flat at about -40 dBFS. Settings had `rtlsdr_agc: true` and Auto gain.
+  - The frequency box is now the TUNED frequency (centre + line). Inside the band only the line moves; outside, the SDR retunes to f - 300 kHz with the line at +300 kHz. Typing 97.1 had left the line at its old offset (97.7).
+  - Gain was only in Settings -> SDR (gain mode / gain / AGC), applied when the dongle opens. The Radio panel now has:
+    - Gain stepper (tuner gain list via `rtlsdr_get_tuner_gains`; R820T list when closed).
+    - RTL AGC toggle.
+    - Both live via `gui_app_sdr_gain_step` / `gui_app_sdr_set_agc` -> `gui_rtlsdr_gain_step` / `gui_rtlsdr_set_agc`, and saved.
+  - Rate dropdown via `gui_app_set_sdr_rate`: saves, then stop + start capture (desktop), refused while recording.
+  - Checked on harrypm's RTL-SDR: the rows show; a 1.2 MSPS config opens the dongle at 1,200,000 Hz with a 1.2 MHz span. The click paths are untested here (no GUI input). Suite 65/66.
+- **CLI for every mode + per-mode bandwidth** (harrypm: "all modes should have CLI load commands"; "fix the bandwith mode also"):
+  - `--radio` gained the settings keys `mode bw sql vol out freq band gain agc rate`, applied by `gui_demod_apply_launch_settings()` right after the settings load (before `--auto-capture` opens the dongle).
+  - New `--video decoder=cvbs|rf,system=..,format=..` for the Video panel decoder mode.
+    - Reuses `gui_video_panel_restore`; `gui_video_panel_apply_launch` runs at creation and again after a saved setup is restored.
+    - Closes the "decoder-mode cycle" known gap.
+  - BW: per-mode option lists (`s_bw_values`); a mode change resets BW to Auto. Before, one list offered 200k to SSB / AM and a manual pick stuck across modes.
+  - Checked:
+    - I/Q file with `mode=nfm,bw=12.5k,sql=-60,vol=1.2,out=34,region=us,zoom=4` -> settings line as given.
+    - RTL-SDR with `band=fm,freq=99.1,gain=20,agc=off,rate=1.2M` -> "Opened device 0: 1200000 Hz, freq 98800000 Hz, agc=0, gain_mode=1" (line on 99.1). The first try of this run exited early (unexplained; the rerun was fine).
+    - `--video decoder=rf,system=ntsc` -> `[AUTO] Video panel: rf:ntsc:-` after the saved restore.
+    - Suite 65/66.
+- **Wider BW + higher SDR rates** (harrypm: "bandwith should be much higehr", "200-100k thing is what I am on about"):
+  - WFM BW choices 500k / 400k / 300k / 250k / 200k / 150k, Auto 250k (was 200k). Wider NFM / AM / SSB lists too.
+  - Model (`sim_fm.py`): 250k and 500k both give the 1 kHz tone at 0.724, residual 0.0002.
+  - Rate presets add 2.56 / 2.88 / 3.2 MSPS (status warning above 2.56).
+    - harrypm's RTL-SDR opened at 3,200,000 Hz with Missed 0 in a 10 s test.
+- **Distortion on 99.1 MHz: double audio** (harrypm: "99,.1 bbc one is ruenable but there is still distortion"):
+  - Measured with temporary env-gated counters + dumps on his RTL-SDR (his settings, line on 99.1): input 2.42 M samples/s, 0 dropped, but ~97,000 audio frames/s pushed into the 48 kHz monitor.
+  - Cause:
+    - His saved layout CH1 = Vector | Radio created a Radio panel that took the continuous feed.
+    - The RTL stock layout then made CH1 single Radio: a new Radio panel, the old one parked (alive, not drawn).
+    - The parked panel kept the feed and pushed its audio; the visible one ran the display-frame fallback and pushed its own.
+  - Fix:
+    - Feed / audio ownership follows the drawn panel (an owner not drawn for 0.25 s loses it).
+    - Only the owner pushes audio (`radio_feed_owns`).
+  - After: 48,590 frames/s (65,536-sample worker blocks); the audio dump has no clipped samples, -13.2 dBFS RMS. Diagnostics removed. Suite 65/66.
+- **Sweep (wide view)** (harrypm: "Now I need the 80mhx lower range" -> picked "Wider view to see 80-100 MHz"):
+  - `gui_app_sdr_retune_live` / `gui_rtlsdr_retune_live`: retune without saving the frequency.
+  - Sweep engine in `gui_demod.c` (`demod_sweep_start` / `_capture` / `_stop`), fed by the worker snapshots:
+    - 2 snapshots skipped after each retune, 3 FFTs averaged, middle +-40 % of fs stitched into 4096 points (max per point), DC +-3 bins bridged.
+    - Floor from the swept median; one waterfall row per sweep.
+  - Sweep dropdown + `--radio sweep=<lo>-<hi>|off`. Click = tune + stop. Audio muted while sweeping.
+  - NOT verified live: SDR++ (pid 63836, harrypm's) had the RTL-SDR open, so the test instance logged "Failed to open RTL-SDR device". The earlier unexplained exit during the RTL flag test was probably the same.
+- **Pan instead of sweep** (harrypm: "I want a scrollable range like SDR++ tbh rather then a limited sweep range"):
+  - Sweep removed (dropdown, flag, engine), reverted by `sweep_revert.py`. `gui_app_sdr_retune_live` kept.
+  - `demod_pan_by(s, app, df, live)`: centre += df, line offset -= df (clamped to the band), waterfall history shifted (`demod_wf_shift`), labels via `settings.rtlsdr_freq_hz`; live retune rate-limited to 33 ms, saved on release.
+  - Input: right-drag in the spectrum / waterfall; left-drag on the scale strip (bottom 18 px of the spectrum); wheel on the strip = +-1/10 span. Left-click elsewhere still tunes.
+  - Build clean, suite 65/66. NOT verified live: SDR++ still holds the RTL-SDR (pid 63836).
+- **Band = whole range** (harrypm: "The band info is wrong as its not giving the full range" -> picked "Show the whole band at once"; "FIRST BOX is Band and its a range limited"):
+  - The sweep engine is back (re-applied `radio_sweep2.py` + `radio_sweep_max.py`), driven by the Band box. There is no separate Sweep row; `--radio sweep=` stays.
+  - Bands carry lo / hi. Picking one wider than 0.8 x rate starts the whole-band view; narrow ones tune. Panning is off while the whole band shows. `--radio band=` opens it whole too.
+  - Live on harrypm's RTL-SDR (3.2 MSPS): `--radio band=fm` -> "Radio sweep 87.5-108.0 MHz (9 steps)"; the stitched spectrum shows the FM stations across 88-108 MHz.
+  - In that run CH1 / CH2 clipped (peaks +85 / -95 %, Clip -122 / -113) at gain 42.1 + RTL AGC on.
+- **Linear scrubbing in the band view** (harrypm: "Better but its not clean linear left/right scrubbing across the band range"):
+  - Band view states: hopping (refresh, muted) and listening (`sweep_listen`).
+  - A click / drag in the band view: `demod_band_scrub_x` maps x linearly onto lo..hi.
+    - `demod_band_scrub_to` retunes (rate-limited 33 ms, unsaved) only when the line leaves centre +-0.4 fs or comes within 50 kHz of DC; the new centre puts the line at +0.25 fs.
+    - Saved on release.
+  - `demod_sweep_live` FFTs the live slice into the band picture (0.5 smoothing) plus a waterfall row every 0.1 s.
+  - The tuning line is drawn at its absolute frequency; the live slice shows as a blue bar; audio plays while listening.
+  - harrypm clicked the test window: line at 91.700 MHz inside 88-108, live-slice bar shown, audio playing. Suite 65/66.
+- **Wheel scrolls the band** (harrypm: "Its righ lcikc instead of mouse wheel this is why it feels so unintuative for the limited view"):
+  - Live SDR view: wheel = pan +-1/10 of the view (`demod_pan_by`, saved), up = higher.
+  - Shift + wheel = step the line by the mode step. Ctrl + wheel = zoom. Band view: the wheel moves the line. Non-SDR: the wheel tunes.
+  - Right-drag pan kept. Suite 65/66.

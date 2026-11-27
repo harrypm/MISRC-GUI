@@ -420,6 +420,11 @@ int gui_rtlsdr_start(gui_app_t *app) {
     // A prior stop can leave an unread tail in the shared packed FIFO.
     bufmgr_reset(&app->buffers, BUF_CAPTURE_RF);
     atomic_store(&app->rf_source_is_rtlsdr, true);
+    // I/Q mapping is fixed (CH1 = I, CH2 = Q): the MISRC / HSDAOH A/B swap
+    // would mirror the spectrum in the display and recordings. Same reset
+    // as the CXADC / FX3 backends (harrypm 2026-11-27).
+    app->user_capture_mode_misrc = false;
+    app->capture_mode_runtime_misrc = false;
     atomic_store(&s_rtlsdr_running, true);
     app->is_capturing = true;
 
@@ -525,6 +530,83 @@ int gui_rtlsdr_set_frequency(gui_app_t *app, uint64_t hz) {
         }
         fprintf(stderr, "[RTL-SDR] live retune to %llu Hz\n", (unsigned long long)hz);
     }
+    return 0;
+}
+
+// Supported tuner gains (tenths of dB); R820T list when no dongle is open.
+static int rtlsdr_gain_list(int *out, int cap) {
+    static const int r820t[] = { 0, 9, 14, 27, 37, 77, 87, 125, 144, 157, 166, 197, 207, 229, 254,
+                                 280, 297, 328, 338, 364, 372, 386, 402, 421, 434, 439, 445, 480, 496 };
+    int n = 0;
+    if (s_rtlsdr_dev) {
+        n = rtlsdr_get_tuner_gains(s_rtlsdr_dev, NULL);
+        if (n > 0 && n <= cap) n = rtlsdr_get_tuner_gains(s_rtlsdr_dev, out);
+        else n = 0;
+    }
+    if (n <= 0) {
+        n = (int)(sizeof(r820t) / sizeof(r820t[0]));
+        if (n > cap) n = cap;
+        memcpy(out, r820t, (size_t)n * sizeof(int));
+    }
+    return n;
+}
+
+static void rtlsdr_apply_gain_live(gui_app_t *app) {
+    if (!s_rtlsdr_dev || !atomic_load(&s_rtlsdr_running)) return;
+    rtlsdr_set_agc_mode(s_rtlsdr_dev, app->settings.rtlsdr_agc ? 1 : 0);
+    if (app->settings.rtlsdr_gain_mode == 1) {
+        rtlsdr_set_tuner_gain_mode(s_rtlsdr_dev, 1);
+        rtlsdr_set_tuner_gain(s_rtlsdr_dev, app->settings.rtlsdr_gain_tenths_db);
+#ifdef ENABLE_RTLSDR_BLOG_V4_VGA
+        if (rtlsdr_is_blog_v4(s_rtlsdr_dev))
+            rtlsdr_set_blog_v4_vga_index(s_rtlsdr_dev, app->settings.rtlsdr_vga_index);
+#endif
+    } else {
+        rtlsdr_set_tuner_gain_mode(s_rtlsdr_dev, 0);
+    }
+    fprintf(stderr, "[RTL-SDR] live gain: %s%.1f dB, agc=%d\n",
+            app->settings.rtlsdr_gain_mode == 1 ? "" : "auto (last manual ",
+            app->settings.rtlsdr_gain_tenths_db / 10.0, app->settings.rtlsdr_agc ? 1 : 0);
+}
+
+int gui_rtlsdr_retune_live(gui_app_t *app, uint64_t hz) {
+    if (!app || !s_rtlsdr_dev || !atomic_load(&s_rtlsdr_running) || gui_record_rtlsdr_active()) return -1;
+    const uint64_t tuning =
+        (atomic_load(&app->rf_source_rtlsdr_tuning) & ~(RTL_TUNE_STEP - 1)) + RTL_TUNE_STEP;
+    atomic_store(&app->rf_source_rtlsdr_tuning, tuning);
+    atomic_store(&s_rtlsdr_record_tuning, 0);
+    const int r = rtlsdr_set_center_freq(s_rtlsdr_dev, (uint32_t)hz);
+    atomic_store(&app->rf_source_rtlsdr_tuning, tuning | rtlsdr_get_center_freq(s_rtlsdr_dev));
+    return r < 0 ? -1 : 0;
+}
+
+int gui_rtlsdr_gain_step(gui_app_t *app, int dir) {
+    if (!app || dir == 0) return -1;
+    int gains[64];
+    const int n = rtlsdr_gain_list(gains, 64);
+    if (n <= 0) return -1;
+    int idx = 0;
+    const int want = app->settings.rtlsdr_gain_mode == 1 ? app->settings.rtlsdr_gain_tenths_db : 300;
+    for (int i = 1; i < n; i++)
+        if (abs(gains[i] - want) < abs(gains[idx] - want)) idx = i;
+    if (app->settings.rtlsdr_gain_mode != 1) {
+        app->settings.rtlsdr_gain_mode = 1;          // Auto -> ~30 dB
+    } else if (idx + dir < 0) {
+        app->settings.rtlsdr_gain_mode = 0;          // below the lowest -> Auto
+    } else {
+        idx = idx + dir >= n ? n - 1 : idx + dir;
+    }
+    app->settings.rtlsdr_gain_tenths_db = gains[idx];
+    gui_settings_save(&app->settings);
+    rtlsdr_apply_gain_live(app);
+    return 0;
+}
+
+int gui_rtlsdr_set_agc(gui_app_t *app, bool on) {
+    if (!app) return -1;
+    app->settings.rtlsdr_agc = on;
+    gui_settings_save(&app->settings);
+    rtlsdr_apply_gain_live(app);
     return 0;
 }
 

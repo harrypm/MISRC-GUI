@@ -15,8 +15,10 @@ recognized by `librtlsdr`. Use a build with RTL-SDR enabled. See the
 3. Select **Connect** and grant USB permission if prompted on Android. If
    you change the frequency or sample rate in **Settings** during capture,
    disconnect and reconnect to apply the change.
-4. Open **Demod** to listen to radio signals. Pick WFM, NFM, AM, USB, or
-   LSB, then enable **Audio Mon**. See the [Demod modes](DECODER_MODES.md#demod-panel-modes).
+4. Open **Radio** to listen to radio signals. Pick WFM, NFM, AM, USB, or
+   LSB, set **Rgn** to your region (WFM de-emphasis, AM raster), then click
+   or drag in its spectrum to tune and enable **Audio Mon**. See the
+   [Radio modes](DECODER_MODES.md#radio-panel-modes).
 
 ## Blog V4 manual VGA reference
 

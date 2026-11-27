@@ -723,6 +723,13 @@ int gui_cvbs_split_row(int row, int frame_rows, int top_parity, int *top_rows);
 bool gui_video_apply_field_view_arg(const char *value);
 // --video-frame active|full: Frame of new Video panels (default Full).
 bool gui_video_apply_frame_arg(const char *value);
+// --video <key=value,...>: decoder mode of new Video panels (harrypm
+// 2026-11-27: "all modes should have CLI load commands"): decoder=cvbs|rf,
+// system=pal|ntsc|secam|mesecam, format=vhs|betamax|laserdisc (RF Preview).
+// Applied at creation and again after a saved setup is restored (the flag
+// wins).
+bool gui_video_apply_decoder_arg(const char *value);
+void gui_video_panel_apply_launch(void *state);
 void gui_video_panel_set_decoder(void *state, int decoder);
 // A Video slot's saved setup as "<cvbs|tape|rf>:<pal|ntsc|secam|mesecam>:
 // <vhs|betamax|laserdisc|->:<frame|split|field>:<active|full>" (the active
@@ -760,6 +767,14 @@ void gui_video_forget_rf_audio_source(const void *worker);
 // Scopes on the RF Preview output (signal/gui_rf_scopes.c): provider of a
 // channel's scope sink while used (set once at startup).
 void gui_video_set_rf_scope_provider(const gui_rf_scope_sink_t *(*provider)(int channel));
+// Radio panel feed (signal/gui_demod.c): every capture block, continuous,
+// on the extraction / RTL-SDR thread (must not wait). Real RF: a / b per
+// channel; RTL-SDR: interleaved u8 I/Q pairs. Set once by the Radio panel.
+typedef void (*gui_video_radio_tap_fn)(gui_app_t *app, const int16_t *a, const int16_t *b,
+                                       size_t count_a, size_t count_b,
+                                       const uint8_t *iq_u8, size_t iq_pairs,
+                                       const gui_rf_block_info_t info[2]);
+void gui_video_set_radio_tap(gui_video_radio_tap_fn tap);
 // Format (GUI_RF_PAL / GUI_RF_NTSC) of the RF Preview a Video panel on this
 // channel runs, -1 if none (or SECAM: no scope feed). Main thread.
 int gui_video_channel_rf_format(gui_app_t *app, int channel);

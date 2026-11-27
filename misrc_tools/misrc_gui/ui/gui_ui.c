@@ -6367,8 +6367,14 @@ static const char *gui_ui_toolbar_mode_label(bool mode_misrc,
                                              bool ddd_mode,
                                              bool ddd_clockgen_mode,
                                              int tier,
-                                             bool player)
+                                             bool player,
+                                             bool sdr)
 {
+    // An RTL-SDR has a fixed I/Q mapping (CH1 = I, CH2 = Q); the MISRC /
+    // HSDAOH A/B swap does not apply (harrypm 2026-11-27: "MODE should say
+    // RTLSDR").
+    if (sdr) return tier >= GUI_UI_TOOLBAR_TIER_TINY ? "RTL"
+                  : tier >= GUI_UI_TOOLBAR_TIER_VERY_NARROW ? "RTL-SDR" : "Mode: RTL-SDR";
     // The playback device is a player, not a capture mode (harrypm
     // 2026-11-19: "mode selector should say Player ... in player mode").
     if (player) return tier >= GUI_UI_TOOLBAR_TIER_TINY ? "Play" : "Player";
@@ -6454,7 +6460,8 @@ static void render_toolbar(gui_app_t *app, bool ddd_compact_labels) {
     bool mode_source_runtime = app->is_recording;
     bool mode_misrc = mode_source_runtime ? app->capture_mode_runtime_misrc
                                           : app->user_capture_mode_misrc;
-    if (cxadc_mode || fx3_mode || ddd_mode) {
+    const bool sdr_mode = gui_ui_selected_device_is_sdr(app);
+    if (cxadc_mode || fx3_mode || ddd_mode || sdr_mode) {
         mode_misrc = false;
     }
     gui_ui_trace_capture_mode_render(app, mode_misrc, mode_source_runtime);
@@ -6464,6 +6471,7 @@ static void render_toolbar(gui_app_t *app, bool ddd_compact_labels) {
                                !cxadc_mode &&
                                !fx3_mode &&
                                !ddd_mode &&
+                               !sdr_mode &&
                                !gui_net_is_client(app);
     Color mode_bg = mode_misrc ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
     if (!mode_change_allowed) {
@@ -6516,7 +6524,8 @@ static void render_toolbar(gui_app_t *app, bool ddd_compact_labels) {
                                                                ddd_mode,
                                                                ddd_clockgen_mode,
                                                                tier,
-            gui_ui_selected_device_is_playback(app));
+            gui_ui_selected_device_is_playback(app),
+            gui_ui_selected_device_is_sdr(app));
             int mode_w = gui_ui_measure_button_width(app,
                                                      tier_label,
                                                      p.text_size,
@@ -6633,7 +6642,8 @@ static void render_toolbar(gui_app_t *app, bool ddd_compact_labels) {
                                                        ddd_mode,
                                                        ddd_clockgen_mode,
                                                        chosen_tier,
-            gui_ui_selected_device_is_playback(app));
+            gui_ui_selected_device_is_playback(app),
+            gui_ui_selected_device_is_sdr(app));
     int mode_toggle_width = gui_ui_measure_button_width(app,
                                                         mode_label,
                                                         toolbar_text_size,
@@ -11077,6 +11087,8 @@ void gui_handle_interactions(gui_app_t *app) {
                 gui_app_set_status(app, "FX3ADC backend selected; MISRC/HSDAOH mode not applicable");
             } else if (mode_toggle_is_ddd) {
                 gui_app_set_status(app, "DdD backend selected; MISRC/HSDAOH mode not applicable");
+            } else if (gui_ui_selected_device_is_sdr(app)) {
+                gui_app_set_status(app, "RTL-SDR: I/Q is fixed (CH1 = I, CH2 = Q); MISRC/HSDAOH mode not applicable");
             } else if (gui_net_is_client(app)) {
                 gui_app_set_status(app, "Client mode mirrors server capture mode; change mode on server");
             } else if (app->is_recording || gui_record_is_finalizing()) {

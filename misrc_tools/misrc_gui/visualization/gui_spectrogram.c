@@ -248,6 +248,11 @@ static void build_heat_lut(unsigned char lut[256][4]) {
     }
 }
 
+void gui_spectrogram_palette_lut(unsigned char lut[256][4]) {
+    if (s_spec_palette == SPEC_PALETTE_HEAT) build_heat_lut(lut);
+    else build_lut(lut);
+}
+
 static inline const unsigned char *lut_lookup(spectro_engine_t *e, float m) {
     if (m < 0.0f) m = 0.0f;
     if (m > 1.0f) m = 1.0f;

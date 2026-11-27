@@ -153,22 +153,126 @@ parity reject counters), adaptive level state, and a self-measured capture
 rate (median H-spacing + locked-PLL refinement) that overrides a wrong
 declared rate.
 
-## Demod panel modes
+## Radio panel modes
 
-`demod_mode_t` in `signal/gui_demod.h` — device-agnostic I/Q audio demod
-(any I/Q source: RTL-SDR live capture or I/Q FLAC playback):
+The **Radio** panel (formerly **Demod**; `signal/gui_demod.c`, `demod_mode_t` in
+`signal/gui_demod.h`) is an SDR-style receiver: a spectrum and waterfall of
+the input, a red tuning line with its channel shaded, and the demodulated
+audio strip below. Audio is resampled to 48 kHz and plays through
+**Audio Mon**.
 
-| Mode | Processing | State |
+### Tuning
+
+- Click or drag in the spectrum or waterfall to tune. On an SDR the mouse wheel scrolls the band (Shift + wheel steps the line); on other inputs it steps the line.
+- Tuning snaps to the mode's step on the real frequency, as SDR++ does.
+- On an SDR the readout is the absolute frequency (centre + offset).
+- SDR frequency box (top row): shows the SDR centre in MHz.
+  - Click it and type MHz (e.g. `99.1`), then Enter. Values outside 0.5-1766 MHz are refused.
+  - **Band** dropdown: each band is its range (FM 87.5-108, Airband 118-137, 2 m 144-146, Marine 156-162, 70 cm 430-440, PMR446 446.0-446.2 MHz). It also sets the mode.
+    - A band wider than the live view is shown whole: the SDR hops across it (not saved) in steps of 80 % of the rate; each step averages 3 FFTs and the clean middle is stitched in, with the RTL DC spike bridged.
+    - One waterfall row per pass (FM at 3.2 MSPS = 9 steps, about 1 s). Audio is muted meanwhile.
+    - Click or drag in the band view to listen and scrub:
+      - The whole band stays on screen and the tuning line follows the mouse linearly across it, with audio.
+      - The SDR retunes only when the line leaves the clean middle of its live slice (shown as a blue bar under the scale; line a quarter of the rate above the centre). That slice updates live.
+      - The wheel steps the line. The position is saved on release.
+    - Pick the band again to refresh it whole (hopping, audio muted).
+    - Narrow bands (PMR446) just tune.
+    - `--radio band=` does the same; `--radio sweep=<lo>-<hi>` shows any range (1-200 MHz).
+- SDR rows under the frequency box (live, saved to the settings; the same values as Settings -> SDR):
+  - **Gain** stepper: the tuner's own gain list; below the lowest = Auto; from Auto = ~30 dB.
+  - **RTL AGC** on/off. Leave it off with a good antenna: it overloads easily (watch the Clip counters).
+  - **Rate** dropdown (span): 0.25 / 1.024 / 1.2 / 1.536 / 2.0 / 2.048 / 2.4 / 2.56 / 2.88 / 3.2 MSPS (above 2.56 many RTL-SDRs drop samples; watch Missed). It restarts a running capture, because the rate is fixed per capture (stream timing, recording). Refused while recording; on Android it applies on the next connect.
+- **Pan** (SDR, SDR++ style): scroll through the whole tuner range.
+  - Drag with the right mouse button anywhere in the spectrum / waterfall, or with the left button on the frequency scale strip.
+  - The SDR retunes live while dragging (not saved, <= ~30 / s); the final centre is saved on release.
+  - The tuning line keeps its absolute frequency, and the waterfall history shifts with the band.
+  - Mouse wheel (anywhere over the spectrum / waterfall) scrolls the band by a tenth of the view, up = higher (saved).
+  - Shift + wheel steps the tuning line by the mode's step; Ctrl + wheel zooms.
+- With an RTL-SDR the first capture sets CH1 to a single Radio panel (`--rtl-layout off` keeps the saved layout). CH2 then shows the Q half of the I/Q pair.
+- Zoom button (1x-32x around the line) or Ctrl + wheel. Shift while clicking, dragging or scrolling tunes in 100 Hz steps.
+- Launch flag `--radio <key=value,...>` covers every control:
+  - Panel: `tune`, `input`, `range`, `zoom`.
+  - Saved settings: `mode`, `bw`, `sql`, `vol`, `out`, `region`.
+  - SDR (saved): `freq` (tuned MHz), `band`, `gain`, `agc`, `rate`.
+  - Example: `--radio band=fm,freq=99.1,gain=20,agc=off,rate=1.2M`.
+
+### Signal chain (all modes)
+
+1. The tuned channel is mixed to 0 Hz (numerically controlled oscillator).
+2. Integrate and dump by D = fs / (4 x BW).
+3. 31-tap Hamming FIR at BW / 2, decimating by 2. The demod rate is about 2 x BW.
+4. The mode's demodulator (below).
+5. Squelch, volume, then libsoxr to 48 kHz.
+   - Squelch gates on the channel power (about 20 ms average, 3 dB hysteresis, 5 ms fade).
+   - SQL is the threshold in dBFS (-100..0).
+   - The channel power shows under the tuning readout.
+
+**BW Auto** picks the bandwidth per mode; the BW dropdown overrides it and really filters.
+
+- Each mode lists its own widths:
+
+  | Mode | BW choices |
+  |---|---|
+  | WFM | 500k, 400k, 300k, 250k, 200k, 150k (Auto 250k: a stereo + RDS station is ~256-270 kHz wide) |
+  | NFM | 50k, 25k, 12.5k, 10k, 8.33k, 6.25k |
+  | AM | 20k, 15k, 10k, 9k, 6k, 3k |
+  | USB / LSB | 4k, 3.6k, 3k, 2.7k, 2.4k, 1.8k |
+
+- Changing mode (dropdown, Band, `--radio mode=`) resets BW to Auto.
+- The button shows what Auto resolves to, e.g. "BW Auto 200k".
+
+### Modes
+
+| Mode | Use | Demodulator | Auto BW | Snap | Verified |
+|---|---|---|---|---|---|
+| WFM | FM broadcast (88-108 MHz) | Frequency discriminator. 75 kHz deviation = 0.8 full scale. De-emphasis by Region | 250 kHz | 100 kHz | In the app (1 kHz test tone) and an offline model of the chain: level as expected, no measurable distortion |
+| NFM | Two-way radio, PMR446, amateur FM repeaters | Same discriminator, deviation 0.4 x BW (5 kHz at 12.5 kHz), no de-emphasis | 12.5 kHz | 2.5 kHz | Not tested on a signal (same path as WFM apart from the gain) |
+| AM | MW / LW / SW broadcast, airband voice (118-137 MHz) | Envelope, 30 Hz DC block, AGC (200 ms release) | 9 kHz (10 kHz Americas) | 9 kHz (10 kHz Americas) | In the app (400 Hz tone) and the offline model |
+| USB | Amateur voice above 10 MHz, HF marine / aviation, digital modes | The sideband above the line, shifted to audio, AGC | 3 kHz | 100 Hz | Offline model: recovers the tone |
+| LSB | Amateur voice below 10 MHz (80 m / 40 m) | Mirror of USB | 3 kHz | 100 Hz | Offline model: rejects the other sideband by about 54 dB |
+
+### Region (Rgn button)
+
+| Region | WFM de-emphasis | AM raster / Auto BW |
 |---|---|---|
-| WFM | Discriminator + 75 µs de-emphasis (broadcast FM) | Working |
-| NFM | Discriminator, no de-emphasis | Working |
-| AM | Magnitude + DC block + AGC | Working |
-| USB | Upper sideband | Working |
-| LSB | Lower sideband | Working |
+| EU/UK | 50 us | 9 kHz |
+| Americas (also South Korea) | 75 us | 10 kHz |
+| Japan | 50 us | 9 kHz |
+| Auto (default) | follows the TV system setting: NTSC -> Americas, else EU/UK | |
 
-Output is resampled to 48 kHz (libsoxr) and played through the Audio Mon
-path. The panel is always available (`gui_demod_available` — self-contained
-DSP). Bandwidth/squelch/volume are settings, not lock states.
+The Region is saved in the settings (`demod_region`).
+
+### Input (In button)
+
+- **Auto** (default): I/Q on an SDR. Otherwise the panel's own channel as a real signal.
+- **I/Q:** channel A = I, channel B = Q (an RTL-SDR, or an I/Q FLAC pair in the player).
+- **Real:** the panel's own channel. The spectrum shows 0 to fs/2 in absolute Hz.
+
+**Continuous feed.** The panel takes every capture block, not the display
+frames, which are only the latest 64 k samples per drawn frame (about 10 %
+of a 40 MSPS stream).
+
+- Copies are made only while a Radio panel is open, and only for the channels it uses. The capture path never waits for the radio.
+- A worker thread runs the chain.
+- Without a feed (e.g. a remote source) the panel falls back to display frames.
+
+### Real input above fs/2 (undersampling)
+
+With an open input filter, the MISRC (40 MSPS real) also receives signals
+above 20 MHz. They fold into 0-20 MHz.
+
+- **Range** button: picks the 20 MHz RF zone the panel shows and tunes, in real RF frequencies.
+  - Zone n covers (n-1) x fs/2 to n x fs/2.
+  - Even zones are mirrored: the panel undoes it and swaps USB / LSB.
+- `--radio tune=95.2M` picks the zone by itself: 80-100 MHz, where 95.2 MHz is sampled at 15.2 MHz.
+- Everything in the same fold position is received at once. An analog band filter for the wanted range keeps other zones out.
+
+### Not done / limits
+
+- **WFM is mono.** No 19 kHz pilot / stereo decode, no RDS.
+- **No CW mode.** Use USB / LSB tuned slightly off the carrier.
+- **Real input:** reception above 20 MHz depends on the analog front end passing it (see undersampling above).
+- **One audio output.** With two Radio panels open, the first one owns the continuous feed and the audio. The other runs from display frames.
 
 ## Monitor video codecs (MVD1)
 

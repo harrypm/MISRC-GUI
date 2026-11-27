@@ -8974,6 +8974,55 @@ static const char *const s_video_view_names[3] = { "frame", "split", "field" };
 static const char *const s_video_decoder_names[3] = { "cvbs", "tape", "rf" };
 static const char *const s_video_frame_names[2] = { "active", "full" };
 
+static struct { int decoder, system, family; bool set; } s_video_launch = { -1, -1, -1, false };
+
+bool gui_video_apply_decoder_arg(const char *value) {
+    static const char *usage = "--video: expected comma-separated key=value pairs: decoder=cvbs|rf, "
+                               "system=pal|ntsc|secam|mesecam, format=vhs|betamax|laserdisc";
+    const char *p = value;
+    if (!p || !*p) goto bad;
+    while (*p) {
+        const char *comma = strchr(p, ',');
+        const size_t len = comma ? (size_t)(comma - p) : strlen(p);
+        char kv[32];
+        if (len == 0 || len >= sizeof(kv)) goto bad;
+        memcpy(kv, p, len);
+        kv[len] = 0;
+        if (strcmp(kv, "decoder=cvbs") == 0) s_video_launch.decoder = VIDEO_PLUGIN_CVBS;
+        else if (strcmp(kv, "decoder=rf") == 0) s_video_launch.decoder = VIDEO_PLUGIN_VHS_FM;
+        else if (strcmp(kv, "system=pal") == 0) s_video_launch.system = 0;
+        else if (strcmp(kv, "system=ntsc") == 0) s_video_launch.system = 1;
+        else if (strcmp(kv, "system=secam") == 0) s_video_launch.system = 2;
+        else if (strcmp(kv, "system=mesecam") == 0) s_video_launch.system = 3;
+        else if (strcmp(kv, "format=vhs") == 0) s_video_launch.family = GUI_RF_FAMILY_VHS;
+        else if (strcmp(kv, "format=betamax") == 0) s_video_launch.family = GUI_RF_FAMILY_BETAMAX;
+        else if (strcmp(kv, "format=laserdisc") == 0) s_video_launch.family = GUI_RF_FAMILY_LASERDISC;
+        else goto bad;
+        p += len + (comma ? 1 : 0);
+    }
+    s_video_launch.set = true;
+    fprintf(stderr, "[AUTO] --video: decoder=%d system=%d format=%d\n",
+            s_video_launch.decoder, s_video_launch.system, s_video_launch.family);
+    return true;
+bad:
+    fprintf(stderr, "%s (got '%s')\n", usage, value ? value : "");
+    return false;
+}
+
+void gui_video_panel_apply_launch(void *state) {
+    if (!state || !s_video_launch.set) return;
+    video_panel_state_t *panel = (video_panel_state_t *)state;
+    const int d = s_video_launch.decoder >= 0 ? s_video_launch.decoder : (int)atomic_load(&panel->active_plugin);
+    const int sys = s_video_launch.system == 3 && d != VIDEO_PLUGIN_VHS_FM ? 2 : s_video_launch.system;
+    const int fam = d == VIDEO_PLUGIN_VHS_FM ? s_video_launch.family : -1;
+    char spec[64];
+    snprintf(spec, sizeof(spec), "%s:%s:%s", s_video_decoder_names[d],
+             sys >= 0 ? s_video_sys_names[sys] : "-", fam >= 0 ? s_video_family_names[fam] : "-");
+    (void)gui_video_panel_restore(panel, spec, strlen(spec));
+    fprintf(stderr, "[AUTO] Video panel: %s\n", spec);
+}
+
+
 void gui_video_panel_describe(const void *state, char *buf, size_t size) {
     if (!buf || size == 0) return;
     buf[0] = '\0';
@@ -9078,6 +9127,7 @@ static gui_rf_preview_worker_t *s_rf_audio_source;
 static bool s_rf_audio_audible;
 // Hi-Fi on CH3/4 hooks (set once at startup, before capture threads run).
 static gui_video_rf_tap_fn s_rf_tap;
+static gui_video_radio_tap_fn volatile s_radio_tap;   // Radio panel feed (gui_demod.c)
 // Scopes on the RF Preview output (gui_rf_scopes.c): the channel's sink while used.
 static const gui_rf_scope_sink_t *(*s_rf_scope_provider)(int channel);
 static gui_rf_preview_worker_t *(*s_rf_monitor_override)(gui_app_t *app);
@@ -9402,6 +9452,7 @@ void gui_video_submit_rf(gui_app_t *app, const int16_t *samples_a, const int16_t
                          bool input_supported) {
     /* The RTL-SDR producer supplies original I/Q independently of channel mapping. */
     if (!app || atomic_load(&app->rf_source_is_rtlsdr)) return;
+    if (s_radio_tap) s_radio_tap(app, samples_a, samples_b, count_a, count_b, NULL, 0, info);
     if (s_rf_tap) s_rf_tap(app, samples_a, samples_b, count_a, count_b, info, input_supported);
     video_submit_rf(app, samples_a, samples_b, count_a, count_b, info, input_supported, NULL);
 }
@@ -9410,6 +9461,10 @@ void gui_video_set_rf_tap(gui_video_rf_tap_fn tap,
                           gui_rf_preview_worker_t *(*monitor_override)(gui_app_t *app)) {
     s_rf_tap = tap;
     s_rf_monitor_override = monitor_override;
+}
+
+void gui_video_set_radio_tap(gui_video_radio_tap_fn tap) {
+    s_radio_tap = tap;
 }
 
 void gui_video_set_rf_scope_provider(const gui_rf_scope_sink_t *(*provider)(int channel)) {
@@ -9624,6 +9679,7 @@ void gui_video_submit_rtlsdr(gui_app_t *app, const uint8_t *iq, size_t count,
                              const gui_rf_block_info_t *info) {
     if (!app || app->headless_server || !info || !iq) return;
     const gui_rf_block_info_t pair[2] = {*info, *info};
+    if (s_radio_tap) s_radio_tap(app, NULL, NULL, 0, 0, iq, count, pair);
     video_submit_rf(app, NULL, NULL, count, count, pair, true, iq);
 }
 
@@ -9656,6 +9712,7 @@ static void *cvbs_vtable_create(void) {
         gui_cvbs_set_frame_view_mode(&panel->tape_decode.decoder, CVBS_FRAME_VIEW_FULL);
         gui_vhs_fm_set_frame_mode(&panel->vhs_fm.decoder, 1);
     }
+    gui_video_panel_apply_launch(panel);   // --video
     return panel;
 }
 

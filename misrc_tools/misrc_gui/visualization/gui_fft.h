@@ -118,6 +118,10 @@ bool gui_fft_available(void);
 // Without FFTW, plan creation returns NULL and allocation uses malloc/free.
 void *gui_fft_plan_create_r2c(int size, float *input, void *output, unsigned flags);
 void gui_fft_plan_destroy(void *plan);
+// Complex forward FFT plan (interleaved re/im float in / out, size points)
+// and running any plan made here (the Radio panel's I/Q spectrum).
+void *gui_fft_plan_create_c2c(int size, float *input, float *output, unsigned flags);
+void gui_fft_plan_execute(void *plan);
 void *gui_fft_alloc(size_t bytes);
 void gui_fft_free(void *memory);
 

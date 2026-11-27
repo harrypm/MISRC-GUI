@@ -38,6 +38,7 @@
 #include "../visualization/gui_text.h"
 #include "../visualization/gui_wfm_panel.h"
 #include "../visualization/gui_histogram_panel.h"   // --histogram
+#include "../signal/gui_demod.h"   // --radio
 #include "../visualization/gui_vectorscope_panel.h"
 #include "../visualization/gui_hifi_panel.h"
 #include "../visualization/gui_popout.h"
@@ -165,7 +166,7 @@ static void print_usage(const char *program_name) {
             "           channel's Video panel picture), channel=rgb|r|g|b|w\n"
             "           (w = luma), area=active|full, range=8|10 (8-bit 0..255 /\n"
             "           10-bit 0..1023 scale), bins=64..4096 (any subset;\n"
-            "           defaults amplitude, rgb, active, 8, 4096).\n"
+            "           defaults parade, rgb, active, 8, 4096).\n"
             "--popout <a|b>:<left|right>[,...] open those panels in pop-out windows\n"
             "           (own window per panel, any screen, F11 = fullscreen).\n"
             "--hifi <key=value,...> Hi-Fi audio decode on CH3/4 + HiFi panels:\n"
@@ -189,9 +190,28 @@ static void print_usage(const char *program_name) {
             "           (the paused window; any subset; defaults horizontal,\n"
             "           heat, 1frame).\n"
             "--video-frame active|full  launch Frame of Video panels (default full)\n"
+            "--radio <key=value,...> Radio panel: tune=<Hz> (tuning line: offset\n"
+            "           from the I/Q centre, or the frequency on a real input; k / M\n"
+            "           suffixes), input=auto|iq|real (auto: I/Q on an SDR, else\n"
+            "           the panel's channel as a real signal), region=auto|eu|us|jp\n"
+            "           (WFM de-emphasis 50 / 75 us + AM 9 / 10 kHz raster; saved),\n"
+            "           range=1..6 (real input: RF zone, e.g. 5 = 80-100 MHz at 40 MSPS;\n"
+            "           tune=95.2M picks it by itself), zoom=1|2|4|8|16|32 (spectrum\n"
+            "           zoom around the tuning line; Ctrl + wheel; Shift = 100 Hz steps),\n"
+            "           mode=wfm|nfm|am|usb|lsb, bw=auto|<Hz>, sql=off|<dBFS -100..-1>,\n"
+            "           vol=0..2, out=12|34, and on an SDR: freq=<tuned MHz|Hz>,\n"
+            "           band=fm|air|2m|marine|70cm|pmr, gain=auto|<dB>, agc=on|off,\n"
+            "           rate=0.25M|1.024M|1.2M|1.536M|2.0M|2.048M|2.4M|2.56M|2.88M|3.2M\n"
+            "           (above 2.56M many RTL-SDRs drop samples; all saved),\n"
+            "           sweep=off|<lo>-<hi> (SDR wide view by retuning, e.g. 80M-100M)\n"
+            "--rtl-layout on|off  first capture on an RTL-SDR sets CH1 to a single\n"
+            "           Radio panel (default on)\n"
             "--name-hints on|off  player mode: a playback file's name picks its\n"
             "           channel's Video decoder (cvbs / rf, fm, vhs, beta, ld) and\n"
             "           TV system (pal / ntsc / secam / mesecam) on open (default on)\n"
+            "--video <key=value,...> decoder mode of Video panels: decoder=cvbs|rf,\n"
+            "           system=pal|ntsc|secam|mesecam, format=vhs|betamax|laserdisc\n"
+            "           (RF Preview); overrides the saved panel setup\n"
             "--video-fields frame|split|field  launch field view of Video panels\n"
             "           (Frame = woven frame, Split = the two fields stacked,\n"
             "           Field = the newest field stretched; the View button).\n"
@@ -999,6 +1019,27 @@ static void gui_playback_name_hints(gui_app_t *app) {
     }
 }
 
+// RTL-SDR stock layout (harrypm 2026-11-27: "channel 1 should be single
+// with view set to radio for stock mode with an RTLSDR enabled"): the first
+// capture on an RTL-SDR after another device (or at launch) sets CH1 to a
+// single Radio panel. Later reconnects keep whatever the user picked.
+static bool s_rtl_layout_enabled = true;   // --rtl-layout on|off
+static void gui_rtl_default_layout(gui_app_t *app) {
+    static bool was_rtl = false;
+    if (!app->is_capturing) return;
+    const bool rtl = app->selected_device >= 0 && app->selected_device < app->device_count &&
+                     app->devices[app->selected_device].type == DEVICE_TYPE_RTLSDR;
+    if (rtl && !was_rtl && s_rtl_layout_enabled && panel_view_type_available(PANEL_VIEW_DEMOD)) {
+        while (atomic_flag_test_and_set(&app->panel_config_lock)) {
+        }
+        panel_config_set_split(&app->panel_config_a, false);
+        panel_config_set_left_view(&app->panel_config_a, PANEL_VIEW_DEMOD);
+        atomic_flag_clear(&app->panel_config_lock);
+        fprintf(stderr, "[AUTO] RTL-SDR layout: CH1 single Radio\n");
+    }
+    was_rtl = rtl;
+}
+
 static void gui_cut_marker_keys(gui_app_t *app) {
     const bool playback_dev = app->selected_device >= 0 && app->selected_device < app->device_count &&
                               app->devices[app->selected_device].type == DEVICE_TYPE_PLAYBACK;
@@ -1176,6 +1217,7 @@ static void gui_panel_settings_capture(gui_app_t *app) {
 static void gui_panel_settings_apply_decoder(void *state, const char *key, size_t len) {
     if (len == 0 || (len == 1 && key[0] == '-')) return;
     (void)gui_video_panel_restore(state, key, len);
+    gui_video_panel_apply_launch(state);   // --video wins over the saved setup
 }
 
 static void gui_panel_settings_apply(gui_app_t *app) {
@@ -1375,6 +1417,26 @@ int main(int argc, char **argv) {
             if (!gui_video_apply_frame_arg(argv[++i])) return 1;
             continue;
         }
+        if (strcmp(a, "--radio") == 0) {
+            // --radio tune=<Hz>: Radio panel tuning line (offset from the
+            // I/Q centre; hard rule dev/gui_automation_flags_rules.md).
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--radio requires <key=value,...>\n");
+                return 1;
+            }
+            if (!gui_demod_apply_launch_arg(argv[++i])) return 1;
+            continue;
+        }
+        if (strcmp(a, "--rtl-layout") == 0) {
+            // --rtl-layout on|off: CH1 single Radio on an RTL-SDR (default on).
+            if (i + 1 >= argc || (strcmp(argv[i + 1], "on") != 0 && strcmp(argv[i + 1], "off") != 0)) {
+                fprintf(stderr, "--rtl-layout requires on|off\n");
+                return 1;
+            }
+            s_rtl_layout_enabled = strcmp(argv[++i], "on") == 0;
+            fprintf(stderr, "[AUTO] --rtl-layout: %s\n", s_rtl_layout_enabled ? "on" : "off");
+            continue;
+        }
         if (strcmp(a, "--name-hints") == 0) {
             // --name-hints on|off: player-mode decoder / TV system from the
             // playback file name (default on).
@@ -1383,6 +1445,16 @@ int main(int argc, char **argv) {
                 return 1;
             }
             if (!gui_video_apply_name_hints_arg(argv[++i])) return 1;
+            continue;
+        }
+        if (strcmp(a, "--video") == 0) {
+            // --video decoder=cvbs|rf,system=..,format=..: decoder mode of new
+            // Video panels (hard rule dev/gui_automation_flags_rules.md).
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--video requires <key=value,...>\n");
+                return 1;
+            }
+            if (!gui_video_apply_decoder_arg(argv[++i])) return 1;
             continue;
         }
         if (strcmp(a, "--video-fields") == 0) {
@@ -1630,6 +1702,7 @@ int main(int argc, char **argv) {
     if (hifi_src_arg >= 0) app.settings.hifi34_source = hifi_src_arg;
     if (hifi_fmt_arg >= 0) app.settings.hifi34_format = hifi_fmt_arg;
     if (hifi_on_arg >= 0) app.settings.hifi34_enabled = hifi_on_arg != 0;
+    gui_demod_apply_launch_settings(&app);   // --radio settings keys (before any capture opens)
     // 50 ohm CVBS mode only on a DdD source (device or DdD file), and the
     // Hi-Fi on CH3/4 decoder's RF tap / monitor hooks.
     gui_cvbs_set_ddd_query(gui_source_is_ddd);
@@ -2202,6 +2275,7 @@ int main(int argc, char **argv) {
             }
             gui_cut_marker_keys(&app);
             gui_playback_name_hints(&app);
+            gui_rtl_default_layout(&app);
 
             if (IsKeyPressed(KEY_SPACE) && !app.settings_panel_open) {
                 // Space = play/pause (DAW-style). In playback mode it toggles

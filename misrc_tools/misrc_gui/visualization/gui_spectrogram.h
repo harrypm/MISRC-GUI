@@ -57,4 +57,8 @@ void gui_spectrogram_set_vertical(void *state, bool vertical);
 // Returns true if the spectrogram panels are available (requires FFTW, like the FFT panel).
 bool gui_spectrogram_available(void);
 
+// The Spectro panels' current palette (Heat / Phosphor) as a 256-entry
+// RGBA LUT, index = intensity 0..255 (the Radio panel's waterfall).
+void gui_spectrogram_palette_lut(unsigned char lut[256][4]);
+
 #endif // GUI_SPECTROGRAM_H
