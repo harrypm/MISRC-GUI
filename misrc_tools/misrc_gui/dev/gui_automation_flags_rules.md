@@ -70,6 +70,14 @@ GUI autoload trigger flag.**
   auto|pal|ntsc|secam; launch state of every WFM panel created after it;
   unknown keys/values print the accepted list and exit 1; logs
   `[AUTO] --wfm` and `[AUTO] WFM panel: ...` per panel). [2026-11-16]
+- Histogram panel Mode / Bins and the Parade mode's Ch / Area / Range buttons:
+  - Flag: `--histogram <key=value,...>`: mode=amplitude|parade, channel=rgb|r|g|b|w (w = Rec.601 luma), area=active|full, range=8|10, bins=64..4096.
+  - Launch state of every Histogram panel created after it. Defaults: amplitude, rgb, active, 8-bit, 4096 bins.
+  - Unknown keys/values print the accepted list and exit 1. Logs `[AUTO] --histogram` and `[AUTO] Histogram panel: ...` per panel.
+  - The Bins dropdown had no flag before (an unlisted gap). [2026-11-26]
+- Player-mode name hints (automatic, no control; off switch for tests):
+  - Flag: `--name-hints on|off` (default on; logs `[AUTO] --name-hints` and `[AUTO] name hint: channel X -> ...` when applied). [2026-11-26]
+- View rename (2026-11-26): "Demod" is now "Radio" (`--panel-view ...radio`); the old name `demod` still parses.
 - Vector (vectorscope) panel System / Mode / Lines / Field / Graticule /
   Plot / Colour / Trace / Intensity buttons (and the scroll-wheel
   intensity): `--vector <key=value,...>` (mode=standard|advanced, lines=

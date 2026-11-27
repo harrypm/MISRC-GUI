@@ -1548,6 +1548,13 @@ static bool rf_render_field(gui_rf_decoder_t *d, double field_start, int parity,
          * Reject weak porches and spikes before burst-based gain. */
         valid[y]=laserdisc ? magnitudes[y]>=.045 && magnitudes[y]<=.32
                            : envelope>1e-7 && magnitudes[y]>envelope*.005;
+        /* The vertical-sync interval carries no burst (NTSC 6+6+6, PAL 5+5+5
+         * half-line EQ / broad pulses: field lines 0-9 / 0-8). Full mode
+         * renders these rows; their "burst" window reads pulse-edge noise
+         * that passes the lenient VHS test and painted rainbow chroma along
+         * the top of the picture (harrypm 2026-11-26). Keep them luma-only
+         * and out of the colour-lock count. */
+        if (!laserdisc && line < (3*d->p.eq_count+1)/2+1) valid[y]=false;
         if (valid[y]) burst_count++;
     }
     /* VHS PAL heads use 0/-90 degrees per line; NTSC heads use -90/+90.

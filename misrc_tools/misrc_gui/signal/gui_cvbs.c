@@ -21,6 +21,7 @@
 #include "../ui/gui_ui.h"
 #include "../../common/threading.h"
 #include "../../common/rb_event.h"
+#include <ctype.h>
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9427,6 +9428,174 @@ int gui_video_channel_rf_format(gui_app_t *app, int channel) {
     if (profile == GUI_RF_PROFILE_SECAM_VHS || profile == GUI_RF_PROFILE_MESECAM_VHS ||
         gui_rf_profile_is_audio_only(profile)) return -1;
     return (int)gui_rf_profile_format(profile);
+}
+
+static void video_frame_clamp_active(gui_video_frame_view_t *v) {
+    if (v->active_x < 0) v->active_x = 0;
+    if (v->active_y < 0) v->active_y = 0;
+    if (v->active_x >= v->width) v->active_x = 0;
+    if (v->active_y >= v->height) v->active_y = 0;
+    if (v->active_w < 1 || v->active_x + v->active_w > v->width) v->active_w = v->width - v->active_x;
+    if (v->active_h < 1 || v->active_y + v->active_h > v->height) v->active_h = v->height - v->active_y;
+}
+
+static bool video_panel_frame(video_panel_state_t *panel, gui_video_frame_view_t *out) {
+    memset(out, 0, sizeof(*out));
+    if (atomic_load(&panel->active_plugin) == VIDEO_PLUGIN_VHS_FM) {
+        vhs_fm_decoder_t *d = &panel->vhs_fm.decoder;
+        if (!d->rgba || d->width < 1 || d->height < 1) return false;
+        out->pixels = d->rgba;
+        out->width = d->width;
+        out->height = d->height;
+        out->stride = d->width * 4;
+        out->bpp = 4;
+        out->generation = d->generation;
+        out->active_w = d->width;
+        out->active_h = d->height;
+        // Full mode (gui_rf_preview.c): whole line across the same width,
+        // every field line from the field boundary (PAL 626 / NTSC 526
+        // rows). The active window sits at the profile's active_start/end
+        // and from active_first (PAL 22 / NTSC 20) for 576 / 480 rows.
+        const bool pal_full = d->height == 2 * 313, ntsc_full = d->height == 2 * 263;
+        if (pal_full || ntsc_full) {
+            const double line_us = pal_full ? GUI_RF_PAL_LINE_US : GUI_RF_NTSC_LINE_US;
+            const double a0 = pal_full ? GUI_RF_PAL_ACTIVE_START_US : GUI_RF_NTSC_ACTIVE_START_US;
+            const double a1 = pal_full ? GUI_RF_PAL_ACTIVE_END_US : GUI_RF_NTSC_ACTIVE_END_US;
+            const int x0 = (int)ceil(a0 * d->width / line_us - .5);
+            const int x1 = (int)ceil(a1 * d->width / line_us - .5);
+            out->active_x = x0;
+            out->active_w = x1 - x0;
+            out->active_y = 2 * (pal_full ? 22 : 20);
+            out->active_h = pal_full ? GUI_RF_PAL_ACTIVE_HEIGHT : GUI_RF_NTSC_ACTIVE_HEIGHT;
+        }
+        video_frame_clamp_active(out);
+        return true;
+    }
+    cvbs_decoder_t *decoder = video_panel_active_decoder(panel);
+    if (!decoder || !decoder->display_front || decoder->frame_width < 1 || decoder->frame_height < 1) return false;
+    int frame_w = decoder->frame_width, frame_h = decoder->frame_height;
+    if (frame_w > CVBS_MAX_WIDTH) frame_w = CVBS_MAX_WIDTH;
+    if (frame_h > CVBS_MAX_HEIGHT) frame_h = CVBS_MAX_HEIGHT;
+    out->pixels = decoder->display_front;
+    out->width = frame_w;
+    out->height = frame_h;
+    out->stride = decoder->frame_width * 3;
+    out->bpp = 3;
+    // Same crop as the Video panel's Active mode (cvbs render).
+    const cvbs_baseband_profile_t *profile = cvbs_profile(decoder);
+    const double delay_us = (double)CVBS_SYNC_EDGE_DELAY_SAMPLES * 1000000.0 / cvbs_rate(decoder);
+    const int ax0 = (int)((profile->active_start_us - delay_us) / profile->line_us * (double)frame_w + 0.5);
+    const int ax1 = (int)((profile->active_end_us - delay_us) / profile->line_us * (double)frame_w + 0.5);
+    out->active_x = ax0;
+    out->active_w = ax1 - ax0;
+    out->active_y = profile->picture_start_line * 2;
+    out->active_h = profile->picture_lines * 2;
+    video_frame_clamp_active(out);
+    return true;
+}
+
+bool gui_video_channel_frame(gui_app_t *app, int channel, gui_video_frame_view_t *out) {
+    if (!app || !out || channel < 0 || channel > 1) return false;
+    const channel_panel_config_t *cfg = channel ? &app->panel_config_b : &app->panel_config_a;
+    if (cfg->left_view == PANEL_VIEW_CVBS && cfg->left_state &&
+        video_panel_frame((video_panel_state_t *)cfg->left_state, out)) return true;
+    if (cfg->split && cfg->right_view == PANEL_VIEW_CVBS && cfg->right_state &&
+        video_panel_frame((video_panel_state_t *)cfg->right_state, out)) return true;
+    return false;
+}
+
+static bool s_name_hints_enabled = true;   // --name-hints on|off
+
+bool gui_video_apply_name_hints_arg(const char *value) {
+    if (value && (strcmp(value, "on") == 0 || strcmp(value, "off") == 0)) {
+        s_name_hints_enabled = value[1] == 'n';
+        fprintf(stderr, "[AUTO] --name-hints: %s\n", s_name_hints_enabled ? "on" : "off");
+        return true;
+    }
+    fprintf(stderr, "--name-hints: expected on|off (got '%s')\n", value ? value : "");
+    return false;
+}
+
+bool gui_video_name_hint(const char *path, int *decoder, int *system, int *family) {
+    int dec = -1, sys = -1, fam = -1;
+    bool cvbs = false, rf = false, hifi = false, video = false;
+    if (path) {
+        const char *base = path;
+        for (const char *q = path; *q; q++) if (*q == '/' || *q == '\\') base = q + 1;
+        const char *dot = strrchr(base, '.');
+        const char *end = dot && dot != base ? dot : base + strlen(base);
+        const char *t = base;
+        while (t < end) {
+            while (t < end && !isalnum((unsigned char)*t)) t++;
+            const char *te = t;
+            while (te < end && isalnum((unsigned char)*te)) te++;
+            char tok[24];
+            size_t n = (size_t)(te - t);
+            if (n > 0 && n < sizeof(tok)) {
+                for (size_t k = 0; k < n; k++) tok[k] = (char)tolower((unsigned char)t[k]);
+                tok[n] = 0;
+                #define NH_IS(lit) (strcmp(tok, lit) == 0)
+                if (NH_IS("cvbs") || NH_IS("composite")) cvbs = true;
+                else if (NH_IS("rf") || NH_IS("fm")) rf = true;
+                else if (NH_IS("vhs") || NH_IS("svhs")) { rf = true; fam = GUI_RF_FAMILY_VHS; }
+                else if (NH_IS("betamax") || NH_IS("beta") || NH_IS("superbeta")) { rf = true; fam = GUI_RF_FAMILY_BETAMAX; }
+                else if (NH_IS("laserdisc") || NH_IS("ld")) { rf = true; fam = GUI_RF_FAMILY_LASERDISC; }
+                else if (NH_IS("hifi")) hifi = true;
+                else if (NH_IS("video")) video = true;
+                else if (NH_IS("pal")) sys = 0;
+                else if (NH_IS("ntsc")) sys = 1;
+                else if (NH_IS("secam")) sys = 2;
+                else if (NH_IS("mesecam")) sys = 3;
+                #undef NH_IS
+            }
+            t = te;
+        }
+    }
+    if (cvbs) dec = VIDEO_PLUGIN_CVBS;
+    else if (rf && !(hifi && !video && fam < 0)) dec = VIDEO_PLUGIN_VHS_FM;
+    if (dec != VIDEO_PLUGIN_VHS_FM) fam = -1;
+    if (decoder) *decoder = dec;
+    if (system) *system = sys;
+    if (family) *family = fam;
+    return dec >= 0 || sys >= 0;
+}
+
+bool gui_video_apply_name_hints(gui_app_t *app, int channel, const char *path,
+                                char *summary, size_t summary_size) {
+    if (summary && summary_size) summary[0] = 0;
+    if (!s_name_hints_enabled || !app || channel < 0 || channel > 1) return false;
+    int dec, sys, fam;
+    if (!gui_video_name_hint(path, &dec, &sys, &fam)) return false;
+    bool any = false;
+    while (atomic_flag_test_and_set(&app->panel_config_lock)) {
+        /* spin */
+    }
+    channel_panel_config_t *cfg = channel ? &app->panel_config_b : &app->panel_config_a;
+    for (int slot = 0; slot < 2; slot++) {
+        if (slot == 1 && !cfg->split) continue;
+        const panel_view_type_t view = slot ? cfg->right_view : cfg->left_view;
+        void *state = slot ? cfg->right_state : cfg->left_state;
+        if (view != PANEL_VIEW_CVBS || !state) continue;
+        video_panel_state_t *panel = (video_panel_state_t *)state;
+        const int d = dec >= 0 ? dec : (int)atomic_load(&panel->active_plugin);
+        // Composite decoders have no MESECAM (it is SECAM there).
+        const int s = sys == 3 && d != VIDEO_PLUGIN_VHS_FM ? 2 : sys;
+        char spec[64];
+        snprintf(spec, sizeof(spec), "%s:%s:%s", s_video_decoder_names[d],
+                 s >= 0 ? s_video_sys_names[s] : "-", fam >= 0 ? s_video_family_names[fam] : "-");
+        if (gui_video_panel_restore(panel, spec, strlen(spec))) any = true;
+    }
+    atomic_flag_clear(&app->panel_config_lock);
+    if (summary && summary_size) {
+        static const char *const sys_ui[4] = { "PAL", "NTSC", "SECAM", "MESECAM" };
+        static const char *const fam_ui[GUI_RF_FAMILY_COUNT] = { "VHS", "Betamax", "LaserDisc" };
+        snprintf(summary, summary_size, "%s%s%s%s%s",
+                 dec == VIDEO_PLUGIN_VHS_FM ? "RF Preview" : dec == VIDEO_PLUGIN_CVBS ? "CVBS" : "",
+                 fam >= 0 ? " " : "", fam >= 0 ? fam_ui[fam] : "",
+                 sys >= 0 && dec >= 0 ? ", " : "", sys >= 0 ? sys_ui[sys] : "");
+    }
+    if (any) gui_video_update_rf_routes(app);
+    return any;
 }
 
 void gui_video_forget_rf_audio_source(const void *worker) {

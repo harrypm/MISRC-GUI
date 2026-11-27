@@ -23,6 +23,11 @@ struct gui_app;
 // Call this once at startup.
 void gui_histogram_panel_register(void);
 
+// --histogram <key=value,...>: launch state of new Histogram panels
+// (mode=amplitude|parade, channel=rgb|r|g|b|w, area=active|full, range=8|10,
+// bins=64..4096). Prints the accepted list and returns false on error.
+bool gui_histogram_panel_apply_launch_arg(const char *arg);
+
 //-----------------------------------------------------------------------------
 // Histogram Panel Processing (called from display thread)
 //-----------------------------------------------------------------------------

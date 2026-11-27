@@ -492,7 +492,7 @@ static void demod_vtable_render(void *state_ptr, gui_app_t *app, int channel,
     DrawRectangleLinesEx(bounds, 1, COLOR_GRID_MAJOR);
 
     // Panel label (top-left).
-    gui_text_draw("Demod", bounds.x + 6, bounds.y + 4, FONT_SIZE_OSC_LABEL, COLOR_TEXT);
+    gui_text_draw("Radio", bounds.x + 6, bounds.y + 4, FONT_SIZE_OSC_LABEL, COLOR_TEXT);
 
     // Overlay controls (right-aligned vertical stack, CVBS-style).
     // Mode (WFM/NFM/AM/USB/LSB), Bandwidth, Squelch, Volume, Output pair.
@@ -1022,7 +1022,7 @@ static bool demod_vtable_chrome_hidden(void *state) {
 
 static const panel_vtable_t s_demod_vtable = {
     .chrome_hidden = demod_vtable_chrome_hidden,
-    .name = "Demod",
+    .name = "Radio",
     .create = demod_vtable_create,
     .destroy = demod_vtable_destroy,
     .clear = demod_vtable_clear,

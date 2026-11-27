@@ -37,6 +37,7 @@
 #include "../input/gui_playback.h"
 #include "../visualization/gui_text.h"
 #include "../visualization/gui_wfm_panel.h"
+#include "../visualization/gui_histogram_panel.h"   // --histogram
 #include "../visualization/gui_vectorscope_panel.h"
 #include "../visualization/gui_hifi_panel.h"
 #include "../visualization/gui_popout.h"
@@ -152,13 +153,19 @@ static void print_usage(const char *program_name) {
             "           betamax|video8|hi8 (or 0-4). Mirrors the Fmt button on\n"
             "           FM RF waveform panels (the RF modulation family).\n"
             "--panel-view <a|b>:<left>[,<right>] set a channel's panel view(s) at\n"
-            "           launch: waveform|fft|video|histogram|spectro|demod|vector|wfm|hifi\n"
+            "           launch: waveform|fft|video|hifi|vector|wfm|histogram|spectro|radio\n"
             "           (waterfall = spectro with Dir Vertical). One view = single\n"
             "           panel, two = split. Repeatable for both channels.\n"
             "--wfm <key=value,...> launch state of WFM (waveform monitor) panels:\n"
             "           channel=y|yc|c, range=active|frame, units=ire|mv,\n"
             "           phosphor=on|off, intensity=0.1..10, system=auto|pal|ntsc|\n"
             "           secam (any subset; defaults y, active, ire, off, 3.0, auto).\n"
+            "--histogram <key=value,...> launch state of Histogram panels:\n"
+            "           mode=amplitude|parade (Parade = R / G / B raster of the\n"
+            "           channel's Video panel picture), channel=rgb|r|g|b|w\n"
+            "           (w = luma), area=active|full, range=8|10 (8-bit 0..255 /\n"
+            "           10-bit 0..1023 scale), bins=64..4096 (any subset;\n"
+            "           defaults amplitude, rgb, active, 8, 4096).\n"
             "--popout <a|b>:<left|right>[,...] open those panels in pop-out windows\n"
             "           (own window per panel, any screen, F11 = fullscreen).\n"
             "--hifi <key=value,...> Hi-Fi audio decode on CH3/4 + HiFi panels:\n"
@@ -182,6 +189,9 @@ static void print_usage(const char *program_name) {
             "           (the paused window; any subset; defaults horizontal,\n"
             "           heat, 1frame).\n"
             "--video-frame active|full  launch Frame of Video panels (default full)\n"
+            "--name-hints on|off  player mode: a playback file's name picks its\n"
+            "           channel's Video decoder (cvbs / rf, fm, vhs, beta, ld) and\n"
+            "           TV system (pal / ntsc / secam / mesecam) on open (default on)\n"
             "--video-fields frame|split|field  launch field view of Video panels\n"
             "           (Frame = woven frame, Split = the two fields stacked,\n"
             "           Field = the newest field stretched; the View button).\n"
@@ -966,6 +976,29 @@ static void gui_field_step_keys(gui_app_t *app) {
 // Cut markers from the keyboard: I / O set IN / OUT at the playhead of every
 // channel with a running playback file (the marker menu's Set IN / Set OUT).
 // Same gate as the field-step arrows; Ctrl / Cmd chords are left alone.
+// Player mode: the first time a channel opens a playback file, its Video
+// panels take the decoder / TV system the file name implies (harrypm
+// 2026-11-26; gui_video_name_hint). A changed path counts as a new open;
+// replays, loops and seeks of the same file keep the user's choice.
+static void gui_playback_name_hints(gui_app_t *app) {
+    static char last[2][sizeof(app->settings.playback_file_a)];
+    const bool playback_dev = app->selected_device >= 0 && app->selected_device < app->device_count &&
+                              app->devices[app->selected_device].type == DEVICE_TYPE_PLAYBACK;
+    if (!playback_dev || !app->is_capturing || !gui_playback_is_running(app)) return;
+    for (int ch = 0; ch < 2; ch++) {
+        const char *path = ch ? app->settings.playback_file_b : app->settings.playback_file_a;
+        if (!path[0] || strcmp(path, last[ch]) == 0) continue;
+        snprintf(last[ch], sizeof(last[ch]), "%s", path);
+        char summary[64];
+        if (gui_video_apply_name_hints(app, ch, path, summary, sizeof(summary))) {
+            char msg[128];
+            snprintf(msg, sizeof(msg), "CH%c Video: %s (from the file name)", ch ? 'B' : 'A', summary);
+            gui_app_set_status(app, msg);
+            fprintf(stderr, "[AUTO] name hint: channel %c -> %s\n", ch ? 'B' : 'A', summary);
+        }
+    }
+}
+
 static void gui_cut_marker_keys(gui_app_t *app) {
     const bool playback_dev = app->selected_device >= 0 && app->selected_device < app->device_count &&
                               app->devices[app->selected_device].type == DEVICE_TYPE_PLAYBACK;
@@ -1044,6 +1077,17 @@ bad:
 // with Dir: Vertical; *vertical reports it.
 static int gui_parse_panel_view_name(const char *name, size_t len, bool *vertical) {
     *vertical = false;
+    // Renamed views (2026-11-26): saved settings and flags keep working.
+    static const struct { const char *old; panel_view_type_t view; } legacy_names[] = {
+        { "demod", PANEL_VIEW_DEMOD },          // now "Radio"
+    };
+    for (size_t li = 0; li < sizeof(legacy_names) / sizeof(legacy_names[0]); li++) {
+        const char *o = legacy_names[li].old;
+        if (strlen(o) != len) continue;
+        size_t k = 0;
+        while (k < len && tolower((unsigned char)name[k]) == o[k]) k++;
+        if (k == len && panel_view_type_available(legacy_names[li].view)) return (int)legacy_names[li].view;
+    }
     static const char legacy[] = "waterfall";
     if (len == sizeof(legacy) - 1 && panel_view_type_available(PANEL_VIEW_SPECTROGRAPH)) {
         size_t k = 0;
@@ -1071,7 +1115,7 @@ static bool gui_apply_panel_view_arg(gui_app_t *app, const char *arg) {
 
 static bool gui_apply_panel_view_spec(gui_app_t *app, const char *arg, const char *source) {
     const char *usage = "--panel-view: expected <a|b>:<left>[,<right>] with views "
-                        "waveform|fft|video|histogram|spectro|demod|vector|wfm|hifi "
+                        "waveform|fft|video|hifi|vector|wfm|histogram|spectro|radio "
                         "(waterfall = spectro, Dir Vertical)";
     char ch = arg ? (char)tolower((unsigned char)arg[0]) : 0;
     if ((ch != 'a' && ch != 'b') || arg[1] != ':') {
@@ -1278,6 +1322,17 @@ int main(int argc, char **argv) {
             if (!gui_wfm_panel_apply_launch_arg(argv[++i])) return 1;
             continue;
         }
+        if (strcmp(a, "--histogram") == 0) {
+            // --histogram <key=value,...>: launch state of new Histogram
+            // panels incl. the Parade mode (hard rule
+            // dev/gui_automation_flags_rules.md).
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--histogram requires <key=value,...>\n");
+                return 1;
+            }
+            if (!gui_histogram_panel_apply_launch_arg(argv[++i])) return 1;
+            continue;
+        }
         if (strcmp(a, "--popout") == 0) {
             // --popout <a|b>:<left|right>[,...]: open pop-out panel windows
             // at launch (hard rule dev/gui_automation_flags_rules.md).
@@ -1318,6 +1373,16 @@ int main(int argc, char **argv) {
                 return 1;
             }
             if (!gui_video_apply_frame_arg(argv[++i])) return 1;
+            continue;
+        }
+        if (strcmp(a, "--name-hints") == 0) {
+            // --name-hints on|off: player-mode decoder / TV system from the
+            // playback file name (default on).
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--name-hints requires on|off\n");
+                return 1;
+            }
+            if (!gui_video_apply_name_hints_arg(argv[++i])) return 1;
             continue;
         }
         if (strcmp(a, "--video-fields") == 0) {
@@ -2136,6 +2201,7 @@ int main(int argc, char **argv) {
                 }
             }
             gui_cut_marker_keys(&app);
+            gui_playback_name_hints(&app);
 
             if (IsKeyPressed(KEY_SPACE) && !app.settings_panel_open) {
                 // Space = play/pause (DAW-style). In playback mode it toggles

@@ -763,4 +763,29 @@ void gui_video_set_rf_scope_provider(const gui_rf_scope_sink_t *(*provider)(int 
 // Format (GUI_RF_PAL / GUI_RF_NTSC) of the RF Preview a Video panel on this
 // channel runs, -1 if none (or SECAM: no scope feed). Main thread.
 int gui_video_channel_rf_format(gui_app_t *app, int channel);
+// The decoded picture of the first Video panel on this channel (CVBS RGB24
+// display buffer or the RF Preview RGBA frame) plus the active picture
+// rectangle inside it (the Video panel's Active crop). Main thread only;
+// the pixels stay valid until the next Video render. False if none.
+typedef struct {
+    const uint8_t *pixels;
+    int width, height, stride, bpp;     // bpp 3 (RGB) or 4 (RGBA)
+    int active_x, active_y, active_w, active_h;
+    uint64_t generation;                // RF frame serial, 0 for CVBS
+} gui_video_frame_view_t;
+bool gui_video_channel_frame(gui_app_t *app, int channel, gui_video_frame_view_t *out);
+// Player mode: the decoder and TV system a playback file's NAME implies
+// (harrypm 2026-11-26). Tokens split on non-alphanumerics, any case:
+// cvbs / composite -> CVBS (wins over rf: MISRC names CVBS captures
+// "..._Video_RF_..."); rf / fm / vhs / svhs / betamax / beta / superbeta /
+// laserdisc / ld -> RF Preview (+ its format family); pal / ntsc / secam /
+// mesecam -> system. A hifi file with no video token gives no decoder.
+// decoder -1 / system -1 / family -1 = no hint. True if anything matched.
+bool gui_video_name_hint(const char *path, int *decoder, int *system, int *family);
+// Apply those hints to every Video panel on the channel (main thread, the
+// first time a file is opened); summary gets e.g. "RF Preview, NTSC".
+// Off with --name-hints off.
+bool gui_video_apply_name_hints(gui_app_t *app, int channel, const char *path,
+                                char *summary, size_t summary_size);
+bool gui_video_apply_name_hints_arg(const char *value);
 #endif // GUI_CVBS_H

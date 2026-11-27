@@ -394,3 +394,32 @@ A **View** button (Frame / Split / Field) under Frame: Active/Full, on all three
   - Inside any modal loop (`gui_win32_modal_in_loop`), `gui_popout_frame` only renders and presents. No open / close / fullscreen / click / wheel, so the window being dragged is never reconfigured mid-drag.
   - Non-Windows: no-op stubs (X11 / Cocoa keep the loop running).
   - Not verifiable here without injecting mouse drags into harrypm's session; needs harrypm's check. Regression check: pop-out and main render normally. Suite 65/66.
+
+## 2026-11-26 batch: Radio, menu order, Histogram Parade, RF top-of-frame chroma
+- Prompts (harrypm): "Cahnge demod to Radio" / "Move Vector and WFM under HiFi for the dropdown" / "Replace Histogram mode with an true R / G / B / W all 3 and or selectable channel, WFM style one" -> corrected to "Histogram should have a Prade mode in the pannel and it should be called Histogram mode in the drop down still" / "Histogram should target active area by stock mode" / "range should be 256 / 8-bit and 1024 - 10-bit" / "Fix the chroma noise artifacting at the top of the full-frame for FM decoders".
+- **Radio**: the Demod view and its panel title are now "Radio". Saved settings / `--panel-view demod` still work (legacy alias in `gui_parse_panel_view_name`).
+- **Dropdown order**: Waveform, FFT, Video, HiFi, Vector, WFM, Histogram, Spectro, Radio.
+- **Histogram Parade** (`visualization/gui_histogram_panel.c`):
+  - Mode button: Amplitude (the old sample histogram) / Parade. The sample histogram is skipped while in Parade.
+  - Parade reads the decoded picture of the Video panel on the same channel via the new `gui_video_channel_frame()` (`signal/gui_cvbs.c`): CVBS `display_front` RGB24, or the RF Preview RGBA frame. Main thread, no copies.
+  - Ch: RGB (R | G | B side by side), R, G, B, W (Rec.601 luma).
+  - Area: Active (default; the Video panel's Active crop, also inside an RF Full frame) / Full.
+  - Range (harrypm: "8/10-bit is not showing the correct level scales"): standard video code values. The decoders' display bytes put 0 IRE at 10 and 100 IRE at 245 (`RF_DISPLAY_BLACK_255` / `WHITE_255`); Parade undoes that onto 8-bit black 16 / white 235 and 10-bit 64 / 940. Graticule: 0, black, 50 %, white, max labelled; 25 / 75 % minor. (Beta RF profiles keep a full-range mapping, so their levels read off on this scale.) Was: raw bytes on 0..255 and x1023/255 for 10-bit. The decoded buffers are 8-bit per channel, so 10-bit RGB is the 8-bit data on the 10-bit scale; W keeps the luma sum's extra precision.
+  - Raster: counts per (level, column), at most 25 updates/s and only on a new RF frame; rows are capped at the plot height (no GPU minification of sparse 10-bit rows).
+  - Flag `--histogram mode=,channel=,area=,range=,bins=`.
+  - Checked: EBU bars PAL CVBS (RGB, 8 and 10-bit: the bar steps sit where expected) and the Daimler NTSC RF tape (W, Active / Full; Full shows the sync tip at 0).
+- **RF chroma at the top of Full frames** (`signal/gui_rf_preview.c` `rf_render_field`): lines inside the vertical-sync interval (NTSC 0-9, PAL 0-8) are never burst-valid, so they stay luma-only and out of the colour-lock count. Daimler Full frame: the rainbow band is gone.
+- Build 65/66 (update_cli baseline; gui_capture_watchdog_test upstream link break skipped).
+- **Parade R / G / B looked 1:1** (harrypm "R / G / B channels are looking 1:1 instead of accurate respective colours on real images"):
+  - Checked with a temporary dump of the exact pixels the Parade reads (Daimler NTSC RF, Active, 535x480): mean |R-G| 3.9, |G-B| 3.8, |R-B| 6.3; 0.0 % of pixels with a channel spread > 30. The tape is black-and-white footage, so near-identical traces are correct there.
+  - EBU bars (colour) show distinct R / G / B. No code change; the dump was removed.
+- **Name hints in player mode** (harrypm "Add smart name triggering for decoders if a file is named CVBS / FM VHS / RF etc ... on intial open for player mode" + "Same goes for TV system"):
+  - `gui_video_name_hint()` / `gui_video_apply_name_hints()` (`signal/gui_cvbs.c`); main-loop hook `gui_playback_name_hints()` (`core/misrc_gui.c`).
+  - File-name tokens (split on non-alphanumerics, any case, extension ignored):
+    - Decoder: cvbs / composite -> CVBS. CVBS wins over rf, because MISRC names CVBS captures `..._Video_RF_...`.
+    - rf / fm -> RF Preview. vhs / svhs, betamax / beta / superbeta, laserdisc / ld -> RF Preview with that format family.
+    - System: pal / ntsc / secam / mesecam (CVBS takes MESECAM as SECAM).
+    - A hifi file with no video token gives no decoder hint.
+  - Applied once per newly opened path per channel. Replays / loops / seeks of the same file keep the user's manual choice. Every Video panel on that channel; status line "CHx Video: ... (from the file name)".
+  - Off: `--name-hints off`.
+  - Checked: EBU `cvbs-pal-..._Video_RF_...` -> CVBS PAL (config was NTSC; the picture locked); Daimler `..._NTSC_..._video_rf_...` -> RF NTSC; `rfB_CVBS_PAL_...` -> CVBS PAL; `..._rf2-hifi_...` -> no change; `--name-hints off` -> none.

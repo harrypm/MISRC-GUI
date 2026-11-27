@@ -30,10 +30,10 @@ static const char* s_view_names[] = {
     [PANEL_VIEW_WAVEFORM] = "Waveform",
     [PANEL_VIEW_FFT] = "FFT",
     [PANEL_VIEW_CVBS] = "Video",
-    [PANEL_VIEW_HISTOGRAM] = "Histogram",
+    [PANEL_VIEW_HISTOGRAM] = "Histogram",  // Mode: Amplitude / Parade (RGB, 2026-11-26)
     [PANEL_VIEW_WATERFALL] = "Waterfall",
     [PANEL_VIEW_SPECTROGRAPH] = "Spectro",
-    [PANEL_VIEW_DEMOD] = "Demod",
+    [PANEL_VIEW_DEMOD] = "Radio",          // was "Demod" (2026-11-26)
     [PANEL_VIEW_VECTORSCOPE] = "Vector",
     [PANEL_VIEW_WFM] = "WFM",
     [PANEL_VIEW_HIFI] = "HiFi",
@@ -43,9 +43,10 @@ static const char* s_view_names[] = {
 // as they are (saved settings / flags use names; tables use ids).
 panel_view_type_t panel_view_menu_order(int index) {
     static const panel_view_type_t order[PANEL_VIEW_COUNT] = {
+        // harrypm 2026-11-26: Vector and WFM under HiFi.
         PANEL_VIEW_WAVEFORM, PANEL_VIEW_FFT, PANEL_VIEW_CVBS, PANEL_VIEW_HIFI,
-        PANEL_VIEW_HISTOGRAM, PANEL_VIEW_WATERFALL, PANEL_VIEW_SPECTROGRAPH,
-        PANEL_VIEW_DEMOD, PANEL_VIEW_VECTORSCOPE, PANEL_VIEW_WFM,
+        PANEL_VIEW_VECTORSCOPE, PANEL_VIEW_WFM, PANEL_VIEW_HISTOGRAM,
+        PANEL_VIEW_WATERFALL, PANEL_VIEW_SPECTROGRAPH, PANEL_VIEW_DEMOD,
     };
     return (index >= 0 && index < PANEL_VIEW_COUNT) ? order[index] : PANEL_VIEW_WAVEFORM;
 }
