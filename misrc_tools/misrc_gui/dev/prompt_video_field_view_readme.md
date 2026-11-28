@@ -594,3 +594,14 @@ A **View** button (Frame / Split / Field) under Frame: Active/Full, on all three
   - VBI snap/fit already covered PAL: VBI rows within ~0.4 sample of 320 on the Munday tape. CPU 147 % of one core (unchanged).
   - SECAM / MESECAM left on its rising edge - 4.7 us: no SECAM VHS RF capture on hand to measure.
   - The first PM5544 run showed "System: SECAM" in grey although launched with `system=pal` (dump and log both PAL); likely a click in the launched window. Later runs decoded PAL in colour.
+- **Player: separate transport for different-length files** (harrypm: "fix player loaded files if dir not equal indpedent channel play/pause applys seprately", then "duration*"):
+  - The per-file Play/Pause + Loop already existed behind `Link: Separate`, but every load reset it to Synced.
+  - Now each load picks: A and B durations differ by > 0.1 s -> Separate; else Synced. Unknown length -> Synced. The Link toggle still overrides.
+  - Checked: PM5544 SP (15.77 s) + EBU LP (15.63 s) -> `Link mode: SEPARATE`; same file on both -> no message (Synced). Per-row Pause buttons visible on both timelines.
+- **Crash: Play/Pause cycling on one channel** (harrypm: "play pause cyceling crashes when doing it on a single channel"):
+  - Reproduced with `MISRC_DEBUG_CHANNEL_PAUSE=a@4:0.7x30` (new diagnostics hook): access violation 0xC0000005 on the 2nd pause.
+  - gdb (release exe keeps symbols): heap corruption caught in `soxr_clear` <- `waveform_resample_to_buffer` <- `waveform_paused_window` (render thread).
+  - Cause: same-rate (paired) playback pads a channel paused on its own with silence and the display thread kept processing its panels, while the render thread processed the same panel for the paused file view -> one panel resampler on two threads.
+  - Fix: the paired display thread skips a channel with `playback_channel_paused` set (it keeps its last live frame); the waveform resampler scratch buffers (static, shared by all panels) get a spin lock for the one frame in flight when the pause lands.
+  - Also removed three leftover `[DBGA]` prints from the cut-marker work (one per playback batch on CH A).
+  - Checked: A/B, 0.3-0.7 s cycling, waveform / spectro / FFT / video panels, 30-51 toggles each: no crash. A held while B ran on. Suite 65/66.

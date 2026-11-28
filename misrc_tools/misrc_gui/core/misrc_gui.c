@@ -1067,6 +1067,31 @@ static void gui_debug_view_switch(gui_app_t *app) {
     atomic_flag_clear(&app->panel_config_lock);
 }
 
+// Diagnostics: MISRC_DEBUG_CHANNEL_PAUSE=<a|b>@<start s>:<period s>[x<count>]
+// toggles one channel's Play/Pause (same call as its timeline button) on a
+// timer, for automated checks of per-channel transport (2026-11-28 crash).
+static void gui_debug_channel_pause(gui_app_t *app) {
+    static int state = 0;   // 0 unparsed, 1 armed, 2 off
+    static int ch = 0, left = 0;
+    static double next = 0.0, period = 1.0;
+    if (state == 2) return;
+    if (state == 0) {
+        const char *env = getenv("MISRC_DEBUG_CHANNEL_PAUSE");
+        char c = 0; double start = 0.0; int count = 20;
+        if (!env || sscanf(env, "%c@%lf:%lfx%d", &c, &start, &period, &count) < 3 ||
+            (c != 'a' && c != 'b') || period <= 0.0) { state = 2; return; }
+        ch = c == 'b'; left = count; next = GetTime() + start; state = 1;
+    }
+    if (GetTime() < next) return;
+    next += period;
+    if (!app->is_capturing || !gui_playback_is_running(app)) return;
+    const bool was = gui_playback_is_channel_paused(app, ch);
+    gui_playback_toggle_pause_channel(app, ch);
+    fprintf(stderr, "[DEBUG] channel %c %s (%d left)\n", ch ? 'B' : 'A',
+            was ? "resumed" : "paused", left - 1);
+    if (--left <= 0) state = 2;
+}
+
 static void gui_cut_marker_keys(gui_app_t *app) {
     const bool playback_dev = app->selected_device >= 0 && app->selected_device < app->device_count &&
                               app->devices[app->selected_device].type == DEVICE_TYPE_PLAYBACK;
@@ -2304,6 +2329,7 @@ int main(int argc, char **argv) {
             gui_playback_name_hints(&app);
             gui_rtl_default_layout(&app);
             gui_debug_view_switch(&app);
+            gui_debug_channel_pause(&app);
 
             if (IsKeyPressed(KEY_SPACE) && !app.settings_panel_open) {
                 // Space = play/pause (DAW-style). In playback mode it toggles

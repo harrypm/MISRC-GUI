@@ -122,13 +122,26 @@ static int display_thread_func(void *ctx) {
         /* Process all panels via unified vtable dispatch
          * This handles histogram, FFT, CVBS, and any other panel types that process raw samples.
          */
+        /* A player channel paused on its own (Link: Separate) is padded
+         * with silence in the paired block, and its panels render the
+         * paused file window on the render thread. Processing them here as
+         * well ran one panel's resampler on two threads -> heap corruption
+         * (harrypm 2026-11-28: "play pause cycling crashes when doing it on
+         * a single channel"). Skip the paused channel; it keeps its last
+         * live frame. The flags are only set by the player. */
+        const bool hold_a = atomic_load(&app->playback_channel_paused[0]);
+        const bool hold_b = atomic_load(&app->playback_channel_paused[1]);
+        const int16_t *proc_a = hold_a ? NULL : samples_a;
+        const int16_t *proc_b = hold_b ? NULL : samples_b;
         uint32_t sample_rate = atomic_load(&app->sample_rate);
-        gui_waveform_set_trigger_source_buffers(samples_a, samples_b, DISPLAY_FRAME_SAMPLES);
-        panel_process_all(app, samples_a, samples_b, DISPLAY_FRAME_SAMPLES, sample_rate);
+        if (proc_a || proc_b) {
+            gui_waveform_set_trigger_source_buffers(proc_a, proc_b, DISPLAY_FRAME_SAMPLES);
+            panel_process_all(app, proc_a, proc_b, DISPLAY_FRAME_SAMPLES, sample_rate);
+        }
 
         /* Copy samples to output buffer for render thread */
-        memcpy(dt->samples.samples_a, samples_a, DISPLAY_CHANNEL_SIZE);
-        memcpy(dt->samples.samples_b, samples_b, DISPLAY_CHANNEL_SIZE);
+        if (proc_a) memcpy(dt->samples.samples_a, samples_a, DISPLAY_CHANNEL_SIZE);
+        if (proc_b) memcpy(dt->samples.samples_b, samples_b, DISPLAY_CHANNEL_SIZE);
         dt->samples.sample_count = DISPLAY_FRAME_SAMPLES;
         dt->samples.sample_rate = atomic_load(&app->sample_rate);
 

@@ -156,6 +156,11 @@ GUI autoload trigger flag.**
   <seconds>` pauses playback once, that long after it starts (logs
   `[AUTO] --auto-pause`). Used to verify the paused Waveform file window
   and its field / line marks. [2026-11-19]
+- Per-channel Play/Pause (timeline row buttons, partial): env
+  `MISRC_DEBUG_CHANNEL_PAUSE=<a|b>@<start s>:<period s>[x<count>]` toggles
+  one channel the way its button does, on a timer (logs `[DEBUG] channel
+  A paused|resumed`). Link mode starts Separate when A and B durations
+  differ (> 0.1 s), logged `[PLAYBACK] Link mode: SEPARATE`. [2026-11-28]
 - Waveform launch state and the paused player-mode Lock button (Line / HS):
   `--wave <key=value,...>` with zoom=<1..128> (samples per pixel),
   trig=off|rise|fall|sync|cvbs|hs (the Trig dropdown; hs = Head SW),

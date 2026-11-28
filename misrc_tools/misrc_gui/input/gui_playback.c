@@ -5006,7 +5006,6 @@ static int playback_thread_func(void *ctx_ptr) {
                 deadline_us = 0; continue;
             }
 #endif
-            fprintf(stderr, "[DBGA] seek store %llu (state=%d)\n", (unsigned long long)seek_target, (int)atomic_load(&ctx->state));
             gui_playback_cancel_rf_end(ctx, 0);
             atomic_store(&ctx->cue_sample[0], paused ? target : PLAYBACK_NO_SEEK);
             atomic_store(&ctx->current_sample_a, seek_target);
@@ -5311,7 +5310,6 @@ static int playback_thread_func(void *ctx_ptr) {
                 fprintf(stderr,"[PLAYBACK] Channel A loop seek failed\n");
                 atomic_store(&ctx->state,PLAYBACK_STATE_PAUSED); continue;
             }
-            fprintf(stderr, "[DBGA] loop store 0\n");
             ld_loop_drain_deadline[0] = 0;
             atomic_store(&ctx->current_sample_a, 0);
             epochs[0] = atomic_fetch_add(&app->rf_stream_epoch, 1) + 1;
@@ -5527,7 +5525,6 @@ static int playback_thread_func(void *ctx_ptr) {
         // newly published length must not turn an EOF position into zero.
         if (channel_a_active) {
             uint64_t next_a = atomic_load(&ctx->current_sample_a) + (uint64_t)samples_to_output;
-            fprintf(stderr, "[DBGA] output store %llu (state=%d)\n", (unsigned long long)next_a, (int)atomic_load(&ctx->state));
             atomic_store(&ctx->current_sample_a, next_a);
         }
         if (channel_b_active) {
@@ -6245,7 +6242,28 @@ static int gui_playback_commit_prepared(gui_app_t *app, playback_ctx_t *prepared
     atomic_store(&app->playback_independent_mode, mixed_rate);
     atomic_store(&app->playback_channel_paused[0], false);
     atomic_store(&app->playback_channel_paused[1], false);
-    atomic_store(&app->playback_link_separate, false);
+    // Files of different duration are different recordings (harrypm
+    // 2026-11-28: "if duration not equal independent channel play/pause
+    // applies separately"): start with Link: Separate so each file's
+    // Play/Pause and Loop act on that file only. One capture's A/B pair has
+    // the same length and keeps the shared transport. Unknown length
+    // (0 samples / unresolved rate) keeps Synced. The Link toggle overrides.
+    bool other_length = false;
+    double dur_a = 0.0, dur_b = 0.0;
+    if (s_playback->file_a && s_playback->file_b &&
+        s_playback->info_a.total_samples && s_playback->info_b.total_samples) {
+        if (rate_a_hz > 0.0 && rate_b_hz > 0.0) {
+            dur_a = (double)s_playback->info_a.total_samples / rate_a_hz;
+            dur_b = (double)s_playback->info_b.total_samples / rate_b_hz;
+            other_length = fabs(dur_a - dur_b) > 0.1;   // > 0.1 s apart
+        } else {
+            other_length = s_playback->info_a.total_samples != s_playback->info_b.total_samples;
+        }
+    }
+    atomic_store(&app->playback_link_separate, other_length);
+    if (other_length)
+        fprintf(stderr, "[PLAYBACK] Link mode: SEPARATE (A %.2f s, B %.2f s: different durations)\n",
+                dur_a, dur_b);
     if (mixed_rate) {
         fprintf(stderr, "[PLAYBACK] Independent mixed-rate mode: A=%.0fHz B=%.0fHz "
                 "(per-channel FIFOs, per-channel preview)\n", rate_a_hz, rate_b_hz);

@@ -1293,9 +1293,16 @@ static size_t waveform_resample_to_buffer(waveform_panel_state_t *state,
         return count;
     }
 
-    // Temporary buffers for float conversion
+    // Temporary buffers for float conversion. Shared by every panel and
+    // used from two threads (display thread live, render thread for a
+    // paused window): one user at a time (2026-11-28 per-channel pause
+    // crash). Uncontended except while a channel is paused.
     static float temp_input[DISPLAY_BUFFER_SIZE * 256];
     static float temp_output[DISPLAY_BUFFER_SIZE];
+    static atomic_flag temp_lock = ATOMIC_FLAG_INIT;
+    while (atomic_flag_test_and_set(&temp_lock)) {
+    }
+    size_t result = 0;
 
     size_t max_input = sizeof(temp_input) / sizeof(temp_input[0]);
     if (source_samples_needed > max_input) {
@@ -1312,7 +1319,7 @@ static size_t waveform_resample_to_buffer(waveform_panel_state_t *state,
     // Get or create resampler for this decimation ratio
     soxr_t resampler = waveform_ensure_resampler(state, decimation);
     if (!resampler) {
-        return 0;
+        goto done;
     }
 
     // Clear resampler state for fresh data each frame
@@ -1325,15 +1332,17 @@ static size_t waveform_resample_to_buffer(waveform_panel_state_t *state,
                                           temp_output, display_count, &out_done);
 
     if (soxr_err || out_done == 0) {
-        return 0;
+        goto done;
     }
 
     // Copy to destination
     for (size_t i = 0; i < out_done; i++) {
         dest[i].value = temp_output[i];
     }
-
-    return out_done;
+    result = out_done;
+done:
+    atomic_flag_clear(&temp_lock);
+    return result;
 #else
     // No libsoxr: simple point sampling
     for (size_t i = 0; i < display_count; i++) {
@@ -3240,13 +3249,13 @@ static void waveform_render(void *state_ptr, gui_app_t *app, int channel,
 // Unified Waveform Panel Vtable
 //-----------------------------------------------------------------------------
 
-// Double-click chrome-hide state, for the grid's pop-out button.
-static bool waveform_vtable_chrome_hidden(void *state) {
-    const waveform_panel_state_t *p = (const waveform_panel_state_t *)state;
-    return p && gui_chrome_hide_hidden(&p->chrome_hide);
-}
-
-static const panel_vtable_t s_waveform_vtable = {
+// Double-click chrome-hide state, for the grid's pop-out button.
+static bool waveform_vtable_chrome_hidden(void *state) {
+    const waveform_panel_state_t *p = (const waveform_panel_state_t *)state;
+    return p && gui_chrome_hide_hidden(&p->chrome_hide);
+}
+
+static const panel_vtable_t s_waveform_vtable = {
     .chrome_hidden = waveform_vtable_chrome_hidden,
     .name = "Waveform",
     .create = waveform_create,

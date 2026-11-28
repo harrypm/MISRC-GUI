@@ -237,6 +237,11 @@
     a channel reaching EOF without loop pauses only itself. Per-channel freeze
     comes free from producer starvation (no worker changes). Scrub stays
     per-timeline in both modes (timeline rows are already per channel).
+  - Auto link (2026-11-28, harrypm: "if duration not equal independent
+    channel play/pause applies separately"): each load starts Separate when
+    A and B differ in length by > 0.1 s (samples / rate; equal sample counts
+    when a rate is unresolved), else Synced. Logged as `[PLAYBACK] Link mode:
+    SEPARATE (A x s, B y s: different durations)`. The toggle still overrides.
 - Verified: build + link OK (44/46 meson: only the two PRE-EXISTING baseline
   failures `update_cli` + `gui_rf_routes`, reproduced on stashed baseline;
   `gui_rf_playback_start` + `gui_rf_preview` suites pass). User real-GUI
