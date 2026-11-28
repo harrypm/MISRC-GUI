@@ -573,6 +573,11 @@ typedef struct gui_app {
     // read by the toolbar. Peaks use the audio_peak scale (24-bit magnitude).
     atomic_bool hifi34_owns_ch34;
     atomic_uint_fast32_t hifi34_peak[2];
+    // Radio panel audio level on the CH3/4 meters (harrypm 2026-11-27: "working
+    // level meters in Ch3/4 when decoding FM like HiFi-Decoding"): peak of the
+    // last block pushed (24-bit scale) and when (ms); stale = meters fall back.
+    atomic_uint_fast32_t radio_peak;
+    atomic_uint_fast64_t radio_peak_ms;
 
     // Buffer manager (centralized ringbuffer management)
     buffer_manager_t buffers;

@@ -862,8 +862,17 @@ static void demod_process_frame(demod_state_t *s, gui_app_t *app,
         s->wave[s->wave_pos % DEMOD_WAVE_LEN] = (int16_t)v;
         s->wave_pos++;
     }
-    if (radio_feed_owns(s) && (!s->sweep_on || s->sweep_listen))   // one voice; muted while hopping
+    if (radio_feed_owns(s) && (!s->sweep_on || s->sweep_listen)) {   // one voice; muted while hopping
         gui_audio_push_demod(s->audio_out, frames);
+        int32_t pk = 0;   // CH3/4 meters (mono: both)
+        for (size_t k = 0; k < frames; k++) {
+            const int32_t v = s->audio_out[k * 2];
+            const int32_t a = v < 0 ? -v : v;
+            if (a > pk) pk = a;
+        }
+        atomic_store(&app->radio_peak, (uint32_t)pk << 8);   // 16 -> 24-bit scale
+        atomic_store(&app->radio_peak_ms, (uint64_t)(GetTime() * 1000.0));
+    }
 }
 
 //-----------------------------------------------------------------------------
@@ -958,6 +967,8 @@ static void radio_ring_copy(int ch, uint64_t from, int16_t *dst, size_t n) {
     }
 }
 
+static void demod_sweep_stop(demod_state_t *s, gui_app_t *app);   /* defined below */
+
 static int radio_feed_worker(void *arg) {
     (void)arg;
     static int16_t buf_a[RADIO_CHUNK], buf_b[RADIO_CHUNK];
@@ -971,6 +982,22 @@ static int radio_feed_worker(void *arg) {
         if (!s || !app) { synced = false; thrd_sleep_ms(5); continue; }
         atomic_store(&s_feed.busy, s);
         if (atomic_load(&s_feed.active) != s) { atomic_store(&s_feed.busy, NULL); continue; }
+        // Not drawn any more (harrypm 2026-11-27: the radio kept running after
+        // the panel was switched to another decoder; a switched-away panel is
+        // parked, not destroyed): let go of the feed, the sample copying and
+        // the audio; a whole-band view puts the SDR back on its saved centre.
+        // The panel takes the feed again on its next drawn frame.
+        if (s->last_render > 0.0 && GetTime() - s->last_render > 0.3) {
+            demod_state_t *expect = s;
+            if (atomic_compare_exchange_strong(&s_feed.active, &expect, NULL)) {
+                atomic_store(&s_feed.need, 0);
+                if (s->sweep_on) demod_sweep_stop(s, app);
+                fprintf(stderr, "[RADIO] panel not shown: feed, audio and band view released\n");
+            }
+            atomic_store(&s_feed.busy, NULL);
+            synced = false;
+            continue;
+        }
         const int input = atomic_load(&s->feed_input);
         const uint64_t w0 = atomic_load_explicit(&s_feed.w[0], memory_order_acquire);
         const uint64_t w1 = atomic_load_explicit(&s_feed.w[1], memory_order_acquire);

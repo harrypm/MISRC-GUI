@@ -249,6 +249,7 @@ struct gui_rf_decoder {
     bool in_pulse;
     double pulse_start, previous_sync;
     double last_h, previous_h, last_h_width, previous_h_width;
+    double h_width_avg;   /* running H pulse width (5 MSPS samples): NTSC midpoint / PAL rising-edge timing */
     double first_eq, last_pulse, last_pulse_end, first_v;
     int eq_run, v_run, candidate_v_run, good_h;
     bool have_short_broad, have_split_broad, split_broad_weak;
@@ -259,6 +260,10 @@ struct gui_rf_decoder {
     rf_pulse_kind_t last_kind;
     double h_positions[RF_PULSE_SIZE];
     unsigned h_head, h_count;
+    /* EQ / broad pulse starts: in the VBI they fall every half line, the
+     * whole-line ones on the line starts H would have had. */
+    double v_positions[64];
+    unsigned v_head, v_count;
     double field_start;
     int field_parity;
     bool have_field;
@@ -594,7 +599,9 @@ static void rf_reacquire_sync(gui_rf_decoder_t *d) {
     d->period=d->p.line_us*5.0;
     d->good_h=0;d->last_h=d->previous_h=0.0;
     d->last_h_width=d->previous_h_width=0.0;
+    d->h_width_avg=0.0;
     d->h_head=d->h_count=0;
+    d->v_head=d->v_count=0;
     d->in_pulse=false;d->last_kind=RF_PULSE_NONE;
     d->eq_run=d->v_run=d->candidate_v_run=0;
     d->have_short_broad=d->have_split_broad=false;
@@ -1454,7 +1461,7 @@ static bool rf_render_field(gui_rf_decoder_t *d, double field_start, int parity,
     double lines[RF_MAX_LINES+1], periods[RF_MAX_LINES];
     rf_complex_t burst[RF_MAX_LINES], corrected[RF_MAX_LINES];
     double magnitudes[RF_MAX_LINES], gain[RF_MAX_LINES], luma_wow[RF_MAX_LINES];
-    bool valid[RF_MAX_LINES], anchors[RF_MAX_LINES+1];
+    bool valid[RF_MAX_LINES], anchors[RF_MAX_LINES+1], h_anchor[RF_MAX_LINES+1];
     int measured_count=0, burst_count=0;
     double nominal = d->p.line_us*5.0;
     const bool laserdisc=rf_laserdisc(d);
@@ -1502,6 +1509,22 @@ static bool rf_render_field(gui_rf_decoder_t *d, double field_start, int parity,
         rf_reject_field(d,RF_REJECT_LINE_MAP,"insufficient measured line sync");
         return false;
     }
+    /* VBI rows (no H): snap to an EQ / broad pulse start at the line start
+     * (+-6 % of a line; the half-line ones are 50 % away). They carry the
+     * real post-head-switch timing that a straight extrapolation cannot
+     * follow (harrypm 2026-11-27: the top of the Full frame was skewed). */
+    memcpy(h_anchor,anchors,sizeof(bool)*(size_t)(rows+1));
+    if (!laserdisc && !rf_secam_fm(d)) {
+        for (int y=0; y<=rows; ++y) if (!anchors[y]) {
+            double best=nominal*.06, at=0.0;
+            for (unsigned n=0; n<d->v_count; ++n) {
+                const double pos=d->v_positions[(d->v_head+64u-1u-n)%64u];
+                const double dist=fabs(pos-lines[y]);
+                if (dist<best) { best=dist; at=pos; }
+            }
+            if (at>0.0) { lines[y]=at; anchors[y]=true; }
+        }
+    }
     /* Fill missing H pulses between real neighboring anchors. Never replace
      * every line's measured timing by a nominal constant line length. */
     for (int y=0; y<=rows; ++y) if (!anchors[y]) {
@@ -1510,6 +1533,51 @@ static bool rf_render_field(gui_rf_decoder_t *d, double field_start, int parity,
         while (right<=rows && !anchors[right]) right++;
         if (left>=0 && right<=rows)
             lines[y]=lines[left]+(lines[right]-lines[left])*(y-left)/(right-left);
+    }
+    /* VBI rows must sit on the line period of the first steady run of H
+     * anchors: the pre-equalizing pulses slice 1-2 us early (measured on the
+     * Daimler NTSC SP tape: row 2 spacing 323-329 samples vs 317.8, rows 1 and
+     * 3-9 within 0.5 sample), which stepped the top rows of the Full frame.
+     * A VBI row more than 2 samples off that line goes onto it. */
+    if (!laserdisc && !rf_secam_fm(d)) {
+        int k=0;
+        while (k+5<=rows) {
+            int run=0;
+            while (run<5 && k+run<=rows && h_anchor[k+run] && lines[k+run]>0.0) run++;
+            if (run==5) break;
+            k+=run+1;
+        }
+        if (k+5<=rows && k>0) {
+            const double p=rf_clamp((lines[k+4]-lines[k])/4.0,nominal*.98,nominal*1.02);
+            for (int y=0; y<k; ++y) {
+                const double expect=lines[k]-(k-y)*p;
+                if (fabs(lines[y]-expect)>2.0) lines[y]=expect;
+            }
+        }
+    }
+    /* Rows before the first / after the last anchor (the VBI's EQ / broad
+     * pulses carry no H): extrapolate from that anchor with the measured
+     * local line period. Chaining them forward from the field start with
+     * the whole-field average accumulated its error row by row and slanted
+     * the top of the Full frame (harrypm 2026-11-27). */
+    {
+        int first=0, last=rows;
+        while (first<=rows && !anchors[first]) first++;
+        while (last>=0 && !anchors[last]) last--;
+        if (first<=last) {
+            double p=d->period;
+            int k=0, j=first;
+            for (int y=first+1; y<=last && k<8; ++y) if (anchors[y]) { j=y; k++; }
+            if (j>first) p=(lines[j]-lines[first])/(j-first);
+            p=rf_clamp(p,nominal*.98,nominal*1.02);
+            for (int y=0; y<first; ++y) lines[y]=lines[first]-(first-y)*p;
+            double q=d->period;
+            k=0; j=last;
+            for (int y=last-1; y>=first && k<8; --y) if (anchors[y]) { j=y; k++; }
+            if (j<last) q=(lines[last]-lines[j])/(last-j);
+            q=rf_clamp(q,nominal*.98,nominal*1.02);
+            for (int y=last+1; y<=rows; ++y) lines[y]=lines[last]+(y-last)*q;
+        }
     }
     for (int y=0; y<rows; ++y)
         periods[y]=rf_clamp(lines[y+1]-lines[y], nominal*.8, nominal*1.2);
@@ -1966,6 +2034,11 @@ static void rf_commit_pulse_mode(gui_rf_decoder_t *d, double start, double end,
             && fabs(spacing-nominal*.5)<nominal*.12 ? d->candidate_v_run+1 : 1;
         if (d->candidate_v_run==3) d->status.vsync_candidates++;
     } else d->candidate_v_run=0;
+    if (kind==RF_PULSE_EQ || kind==RF_PULSE_V) {   /* VBI timing references */
+        d->v_positions[d->v_head]=start;
+        d->v_head=(d->v_head+1u)%64u;
+        if (d->v_count<64u) d->v_count++;
+    }
     if (kind==RF_PULSE_H) {
         /* LaserDisc contributes calibrated IRE; tape profiles contribute Hz. */
         double level_tolerance=rf_laserdisc(d) ? 25.0 : 400000.0;
@@ -1998,8 +2071,34 @@ static void rf_commit_pulse_mode(gui_rf_decoder_t *d, double start, double end,
          * measured end of THIS pulse and the physical 4.7us H duration for
          * rendering; retain its original start for pulse/cadence tracking.
          * No neighbouring line position is smoothed into the tape timing. */
-        d->h_positions[d->h_head]=rf_secam_fm(d)
-            ? end-4.7*5.0*d->luma_wow : start;
+        /* NTSC tape (harrypm 2026-11-27: "improve NTSC H-Sync on VHS FM
+         * decoding a little without making CPU usage higher"): time the line
+         * from the pulse MIDPOINT, both edges averaging their independent FM
+         * noise and cancelling slicer-level wander, minus half the running
+         * width so the mean position stays on the falling edge (no picture
+         * shift). Measured on the Daimler NTSC SP tape: line-to-line jitter
+         * (robust sigma of the 2nd difference) 23.6 -> 18.4 ns, p95 57 -> 41 ns.
+         * Two additions per H pulse.
+         * PAL tape (harrypm 2026-11-27: "apply these improvements to
+         * PAL/SECAM"): the falling edge is the noisier one there, so lean
+         * on the RISING edge: 0.3 falling + 0.7 (rising - running width),
+         * same mean position. Robust sigma / p95: Munday PAL SP home tape
+         * 21.9 -> 13.8 ns / 53 -> 32 ns; EBU bars LP 43.2 -> 30.0 / 87 ->
+         * 67 ns; PM5544 SP (poor sample) 50.5 -> 26 / 185 -> 67 ns. The
+         * midpoint (0.5) and pure rising edge (1.0) were both worse on
+         * the good tape (14.3 / 17.0 ns). */
+        double h_at=start;
+        if (rf_secam_fm(d)) {
+            h_at=end-4.7*5.0*d->luma_wow;
+        } else if (!rf_laserdisc(d)) {
+            const double width=end-start;
+            if (width>4.0*5.0 && width<5.5*5.0) {
+                d->h_width_avg=d->h_width_avg>0.0 ? d->h_width_avg*.98+width*.02 : width;
+                h_at=d->format==GUI_RF_PAL ? .3*start+.7*(end-d->h_width_avg)
+                                           : .5*(start+end)-.5*d->h_width_avg;
+            }
+        }
+        d->h_positions[d->h_head]=h_at;
         d->h_head=(d->h_head+1u)%RF_PULSE_SIZE;
         if (d->h_count<RF_PULSE_SIZE) d->h_count++;
         d->status.hsync_count++;

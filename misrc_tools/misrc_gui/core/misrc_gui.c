@@ -1040,6 +1040,33 @@ static void gui_rtl_default_layout(gui_app_t *app) {
     was_rtl = rtl;
 }
 
+static bool gui_apply_panel_view_spec(gui_app_t *app, const char *arg, const char *source);
+
+// Diagnostics: MISRC_DEBUG_VIEW_SWITCH=<a|b>:<view>[,<view>]@<seconds>
+// applies a panel-view change mid-run (automated checks of what a panel
+// does when it is switched away, e.g. the Radio releasing its feed).
+static void gui_debug_view_switch(gui_app_t *app) {
+    static int state = 0;   // 0 unparsed, 1 armed, 2 done / off
+    static char spec[64];
+    static double at = 0.0;
+    if (state == 2) return;
+    if (state == 0) {
+        const char *env = getenv("MISRC_DEBUG_VIEW_SWITCH");
+        const char *amp = env ? strchr(env, '@') : NULL;
+        if (!env || !amp || (size_t)(amp - env) >= sizeof(spec)) { state = 2; return; }
+        memcpy(spec, env, (size_t)(amp - env));
+        spec[amp - env] = 0;
+        at = GetTime() + atof(amp + 1);
+        state = 1;
+    }
+    if (GetTime() < at) return;
+    state = 2;
+    while (atomic_flag_test_and_set(&app->panel_config_lock)) {
+    }
+    (void)gui_apply_panel_view_spec(app, spec, "MISRC_DEBUG_VIEW_SWITCH");
+    atomic_flag_clear(&app->panel_config_lock);
+}
+
 static void gui_cut_marker_keys(gui_app_t *app) {
     const bool playback_dev = app->selected_device >= 0 && app->selected_device < app->device_count &&
                               app->devices[app->selected_device].type == DEVICE_TYPE_PLAYBACK;
@@ -2276,6 +2303,7 @@ int main(int argc, char **argv) {
             gui_cut_marker_keys(&app);
             gui_playback_name_hints(&app);
             gui_rtl_default_layout(&app);
+            gui_debug_view_switch(&app);
 
             if (IsKeyPressed(KEY_SPACE) && !app.settings_panel_open) {
                 // Space = play/pause (DAW-style). In playback mode it toggles

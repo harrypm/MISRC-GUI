@@ -560,3 +560,37 @@ A **View** button (Frame / Split / Field) under Frame: Active/Full, on all three
   - Live SDR view: wheel = pan +-1/10 of the view (`demod_pan_by`, saved), up = higher.
   - Shift + wheel = step the line by the mode step. Ctrl + wheel = zoom. Band view: the wheel moves the line. Non-SDR: the wheel tunes.
   - Right-drag pan kept. Suite 65/66.
+
+## 2026-11-27: NTSC VHS FM H-sync + Full-frame top rows (RF Preview)
+- Prompts (harrypm): "improve NTSC H-Sync on VHS FM decoding a little without making CPU usage higher"; "I am using the diamler test file"; "the top of the full signal frmae is skuied a ibt" (pop-out screenshot); "use pop out mode to get cleaner screenshots at afull output res od decoded pictures".
+- Method: a temporary env-gated dump of every H pulse (start / end edge, levels) and of the first 24 line positions per field, on the Daimler NTSC SP tape. Line-to-line jitter = second difference of line times over normal lines (VHS timebase error is slow, so this is mostly measurement noise); robust sigma = 1.4826 x median |d2|.
+- H timing:
+  - The line time is now the pulse MIDPOINT minus half the running H width (NTSC tape profiles; mean position unchanged, -0.01 ns).
+  - 225k lines: robust sigma 23.4 -> 18.3 ns (-22 %), p95 57.0 -> 40.9 ns (-28 %).
+  - Weight sweep: rising weight 0.4 = 17.8 ns, 0.5 = 18.4 ns. 0.5 taken: simpler, better RMS / p95.
+- Full-frame top rows:
+  - VBI rows have no H. They were chained forward from the field start with the field-average period.
+  - EQ / broad pulse starts are now kept (`v_positions`). VBI rows snap to the one at their line start (+-6 % of a line).
+  - Rows before the first / after the last anchor are extrapolated with the local measured period.
+  - The pre-equalizing rows sliced 1-2 us early (row 2 spacing 323-329 samples vs 317.8). VBI rows more than 2 samples off the line through the first steady run of 5 H anchors are put on it.
+  - After: every VBI row within ~0.8 sample of the line period. The maximized pop-out shows straight pulse edges at the top.
+- CPU (Daimler, RF Preview Full, 20 s after 5 s warm-up, 2 runs each): new 148.9 / 141.2 %, baseline (HEAD gui_rf_preview.c) 146.3 / 145.0 % of one core. Within noise.
+- Screenshots: `--popout a:left`, then maximize the pop-out via Win32 ShowWindow (scratchpad `maximize_popout.ps1`; own test process only) = 3456 x 1416 decoded picture.
+- Gotcha: Copy-Item keeps the old mtime, so ninja skipped the restored file. Touch before rebuilding.
+- Suite 65/66.
+- **Radio releases when switched away; CH3/4 meters** (harrypm: "fix radio decoder mode not disengaging when pannel changed to diff decoder"; "Also it should have working level meaters in Ch3/4 when decoding FM like HiFi-Decoding"):
+  - A switched-away panel is parked, not destroyed. The parked Radio kept the feed, the worker DSP, the tap copying and the audio. A whole-band view also left the SDR on its last hop.
+  - Fix: the worker releases a panel not drawn for 0.3 s (owner NULL, need 0, band view stopped -> SDR back on its saved centre) and logs `[RADIO] panel not shown: feed, audio and band view released`. The panel takes the feed again on its next drawn frame.
+  - Diagnostics hook: `MISRC_DEBUG_VIEW_SWITCH=<a|b>:<view>[,<view>]@<seconds>` applies a panel-view change mid-run. Test: `a:video@6` on a Radio run -> release logged.
+  - Meters: `app->radio_peak` (24-bit scale) + `radio_peak_ms` from each pushed Radio audio block. CH3/4 show it while recent (< 300 ms) and Hi-Fi does not own CH3/4. Muted hopping / released panels stop it.
+  - Checked: I/Q WFM test (1 kHz at 0.72) -> CH3 / CH4 at ~72 %. Suite 65/66.
+  - The RTL-SDR was unplugged at this point ("no device matches RTL").
+- **PAL H-sync** (harrypm: "can you apply these improvements to PAL/SECAM?"; "The PAL RF sample is a poor quality one we should use a better example"):
+  - PAL tape is the other way round from NTSC: the falling edge is the noisier one. Edge sweep (robust sigma of 2nd difference / p95):
+    - Munday PAL SP home tape (DdD 40 MSPS): falling 21.9 / 53 ns; midpoint 14.3; 0.7 rising blend 13.8 / 32 ns; pure rising 17.0 / 41 ns.
+    - EBU bars LP (NV-HS930): 43.2 / 87 -> 30.0 / 67 ns at 0.7.
+    - PM5544 SP (NV-HS930, poor sample): 50.5 / 185 -> 26 / 67 ns at 0.7 (pure rising 22 ns on this one only).
+  - Applied: PAL (not SECAM / MESECAM, not LaserDisc) times from `0.3*falling + 0.7*(rising - running width)`; mean position unchanged (<0.2 ns).
+  - VBI snap/fit already covered PAL: VBI rows within ~0.4 sample of 320 on the Munday tape. CPU 147 % of one core (unchanged).
+  - SECAM / MESECAM left on its rising edge - 4.7 us: no SECAM VHS RF capture on hand to measure.
+  - The first PM5544 run showed "System: SECAM" in grey although launched with `system=pal` (dump and log both PAL); likely a click in the launched window. Later runs decoded PAL in colour.

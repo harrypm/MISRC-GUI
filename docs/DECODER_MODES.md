@@ -272,6 +272,8 @@ above 20 MHz. They fold into 0-20 MHz.
 - **WFM is mono.** No 19 kHz pilot / stereo decode, no RDS.
 - **No CW mode.** Use USB / LSB tuned slightly off the carrier.
 - **Real input:** reception above 20 MHz depends on the analog front end passing it (see undersampling above).
+- **Level meters:** while the Radio plays, its audio level shows on the CH3/4 meters (as for Hi-Fi decoding).
+- **Switching away:** a Radio panel switched to another view (or hidden) stops within 0.3 s: no audio, no DSP, and the band view returns the SDR to its saved frequency. Switching back resumes.
 - **One audio output.** With two Radio panels open, the first one owns the continuous feed and the audio. The other runs from display frames.
 
 ## Monitor video codecs (MVD1)

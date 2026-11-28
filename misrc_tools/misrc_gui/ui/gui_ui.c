@@ -6086,10 +6086,14 @@ static void render_toolbar_audio_group(gui_app_t *app,
             .cornerRadius = CLAY_CORNER_RADIUS(4)
         }) {
             const bool hifi34 = atomic_load(&app->hifi34_owns_ch34);
+            // Radio audio (recent) shows on CH3/4 like the Hi-Fi decoder.
+            const bool radio34 = !hifi34 &&
+                (uint64_t)(GetTime() * 1000.0) - atomic_load(&app->radio_peak_ms) < 300u;
             for (int i = 0; i < 4; i++) {
                 // CH3/4 = decoded Hi-Fi L / R when the device has no real
                 // CH3/4 audio (processing/gui_hifi34.c).
                 uint32_t p = (hifi34 && i >= 2) ? (uint32_t)atomic_load(&app->hifi34_peak[i - 2])
+                           : (radio34 && i >= 2) ? (uint32_t)atomic_load(&app->radio_peak)
                                                 : (uint32_t)atomic_load(&app->audio_peak[i]);
                 float frac = (p > 0) ? (float)p / 8388607.0f : 0.0f;
                 if (frac > 1.0f) frac = 1.0f;
